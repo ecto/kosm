@@ -49,7 +49,7 @@ pub struct Water {
     pub mass: f64,
     pub vol0: f64,
     // grid
-    g_mass: Vec<f64>,
+    pub g_mass: Vec<f64>,
     g_mom: Vec<Vec3>,
     /// Grid velocity before the update, for the FLIP part of the transfer.
     g_vel_old: Vec<Vec3>,
@@ -65,6 +65,9 @@ pub struct Water {
     pub level_offset: f64,
     /// Particle order by scatter group from the last step (see `compact`).
     order: Vec<u32>,
+    /// The same solver on the GPU, when enabled; then `x`, `v`, `j` and
+    /// `g_mass` are mirrors refreshed by `sync_from_gpu`.
+    pub gpu: Option<newt_mpm::GpuMpm>,
 }
 
 /// The collider the water feels: an ellipsoid with a velocity.
@@ -150,6 +153,7 @@ impl Water {
             interior_mass: 0.0,
             level_offset: 0.0,
             order: Vec::new(),
+            gpu: None,
         }
     }
 
@@ -418,11 +422,88 @@ impl Water {
 
     /// Let the fill pack down under gravity with nothing in the pool, then
     /// take the extracted surface's mean as the rest level.
+    /// Move the solver to the GPU. `max_subs` is the largest block one
+    /// `step_block` call will ask for.
+    pub fn enable_gpu(&mut self, max_subs: u32) -> Result<(), String> {
+        let f = |v: &Vec3| [v.x as f32, v.y as f32, v.z as f32];
+        let particles = newt_mpm::Particles {
+            x: self.x.iter().zip(&self.j).map(|(x, j)| [x.x as f32, x.y as f32, x.z as f32, (*j - 1.0) as f32]).collect(),
+            v: self.v.iter().map(|v| { let a = f(v); [a[0], a[1], a[2], 0.0] }).collect(),
+            c: self.c.iter().flat_map(|c| (0..3).map(move |k| [c[(0, k)] as f32, c[(1, k)] as f32, c[(2, k)] as f32, 0.0])).collect(),
+        };
+        let params = newt_mpm::Params {
+            h: self.h as f32,
+            dt: self.dt as f32,
+            origin: f(&self.origin),
+            n: [self.nx as u32, self.ny as u32, self.nz as u32],
+            mass: self.mass as f32,
+            vol0: self.vol0 as f32,
+            bulk: self.bulk as f32,
+            flip: self.flip as f32,
+            gravity: GRAVITY as f32,
+        };
+        self.gpu = Some(newt_mpm::GpuMpm::new(params, &particles, max_subs)?);
+        Ok(())
+    }
+
+    fn gpu_body(body: &Body) -> newt_mpm::Body {
+        let f = |v: &Vec3| [v.x as f32, v.y as f32, v.z as f32];
+        newt_mpm::Body { centre: f(&body.centre), axis: f(&body.axis), vel: f(&body.vel), semi: [MELON_AXES[0] as f32, MELON_AXES[1] as f32, MELON_AXES[2] as f32] }
+    }
+
+    /// `subs` substeps against one body pose; the mean force on the body.
+    pub fn step_block(&mut self, body: &Body, subs: usize) -> Vec3 {
+        if let Some(gpu) = self.gpu.as_mut() {
+            let reactions = gpu.step(&Self::gpu_body(body), subs as u32);
+            let mut f = Vec3::zeros();
+            let mut interior = 0.0;
+            for r in &reactions {
+                // the force on the body is minus what the fluid gained, per unit time
+                f -= Vec3::new(r.impulse[0], r.impulse[1], r.impulse[2]) * (self.mass / self.dt);
+                interior = r.interior_mass * self.mass;
+            }
+            self.interior_mass = interior;
+            self.time = gpu.time;
+            return f / subs as f64;
+        }
+        self.compact();
+        let mut f = Vec3::zeros();
+        for _ in 0..subs {
+            f += self.step(body);
+        }
+        f / subs as f64
+    }
+
+    /// Refresh the CPU mirrors (positions, velocities, J, grid mass) from the GPU.
+    pub fn sync_from_gpu(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let (x, v) = gpu.download();
+        for (i, (xp, vp)) in x.iter().zip(&v).enumerate() {
+            self.x[i] = Vec3::new(xp[0] as f64, xp[1] as f64, xp[2] as f64);
+            self.j[i] = 1.0 + xp[3] as f64;
+            self.v[i] = Vec3::new(vp[0] as f64, vp[1] as f64, vp[2] as f64);
+        }
+        for (dst, m) in self.g_mass.iter_mut().zip(gpu.grid_mass()) {
+            *dst = m as f64;
+        }
+    }
+
     pub fn settle(&mut self, seconds: f64) {
         let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
         let n = (seconds / self.dt) as usize;
-        for _ in 0..n {
-            self.step(&far);
+        if self.gpu.is_some() {
+            let mut left = n;
+            while left > 0 {
+                let block = left.min(256);
+                self.step_block(&far, block);
+                left -= block;
+            }
+            self.gpu.as_mut().unwrap().still();
+            self.sync_from_gpu();
+        } else {
+            for _ in 0..n {
+                self.step(&far);
+            }
         }
         // damp the settling out
         for v in self.v.iter_mut() {

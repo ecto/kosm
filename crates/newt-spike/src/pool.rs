@@ -270,6 +270,14 @@ impl Drop {
         let cs = (bulk / 1000.0f64).sqrt();
         let dt = 0.35 * h / cs;
         let mut water = crate::splash::Water::fill(h, dt, 1.0, bulk);
+        // NEWT_GPU=0 keeps the solver on the CPU
+        if std::env::var("NEWT_GPU").map(|v| v != "0").unwrap_or(true) {
+            let subs = (self.model.dt / dt).ceil() as u32;
+            match water.enable_gpu(subs.max(256)) {
+                Ok(()) => println!("splash  water on the GPU"),
+                Err(e) => println!("splash  water on the CPU ({e})"),
+            }
+        }
         // pack the fill down before anything arrives, and take the rest level
         water.settle(0.6);
         self.water = Some(water);
@@ -288,12 +296,7 @@ impl Drop {
             axis: Vec3::new(melon.axis.x, melon.axis.y, melon.axis.z),
             vel: Vec3::new(vel.x, vel.y, vel.z),
         };
-        let mut f = Vec3::zeros();
-        water.compact();
-        for _ in 0..subs {
-            f += water.step(&body);
-        }
-        let f = f / subs as f64;
+        let f = water.step_block(&body, subs);
         let fv = V::new(f.x, f.y, f.z);
         if fv.norm() > self.fluid_force.norm() { self.fluid_force = fv; }
         // NEWT_HOLD=<z>: pin the melon at that depth and just read the force
@@ -323,6 +326,9 @@ impl Drop {
     /// grid is too coarse to show a 1 cm drop's ripple; the ring model is
     /// the sub-grid physics for it, scaled by the drop's speed.
     pub fn read_water(&mut self) {
+        if let Some(w) = self.water.as_mut() {
+            w.sync_from_gpu();
+        }
         if let Some(w) = &self.water {
             let g = w.surface(0.02);
             let now = w.droplets(&g, 0.02, 250);

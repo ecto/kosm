@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/newt-spike", "crates/newt-view"]
+members = ["crates/newt-spike", "crates/newt-view", "crates/newt-mpm"]
 
 [workspace.package]
 version = "0.0.1"

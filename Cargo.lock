@@ -1859,6 +1859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-mpm"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "pollster 0.4.0",
+ "wgpu 30.0.1",
+]
+
+[[package]]
 name = "newt-spike"
 version = "0.0.1"
 dependencies = [
@@ -1866,6 +1875,7 @@ dependencies = [
  "hound",
  "image",
  "ipse-map",
+ "newt-mpm",
  "phyz",
  "phyz-camera",
  "phyz-collision",
