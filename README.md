@@ -27,11 +27,42 @@ diff levels/marble.loon out/solved/marble.loon   # the solved knobs, written bac
 
 The document is the only description of the geometry. `colliders.rs` walks
 the vcad IR (`Union`, `Translate`, `Rotate`, `LinearPattern`,
-`CircularPattern` over `Cube` / `Cylinder` / `Sphere`) into phyz colliders on one fixed track body, falls back to a convex
-hull for anything else with a warning, and checks every collider's support
-function against the tessellation before the first step. Plate, walls and cup
-are all real colliders; the cup is a ring of box segments with a mouth facing
-uphill so it catches.
+`CircularPattern` over `Cube` / `Cylinder` / `Sphere`) into phyz colliders on one
+fixed track body, and checks every collider's support function against the
+tessellation before the first step. Plate, walls and cup are all real colliders;
+the cup is a ring of box segments with a mouth facing uphill so it catches.
+
+### a cup that is actually hollow ([`levels/marble-cup.loon`](levels/marble-cup.loon))
+
+A ring of box segments is a union of convex primitives, which is what a phyz
+collider is. Modelled the way a person would actually model it — a cylinder with
+a bore taken out and a slot cut in the uphill side — the cup is a `Difference`,
+and a difference has no convex collider. Hulling it turns the cup into a puck
+and the marble bounces off the lid.
+
+So `colliders.rs` decomposes a `Difference` instead. It evaluates the subtree to
+a mesh, clips that mesh against a family of convex sectors — a grid on the cut's
+bounding box, or angular wedges about an axis through it — and hulls each
+sector's share, including the points where the mesh's edges cross the sector
+planes, so the pieces tile the solid rather than merely sample it. Candidates
+are tried fewest-pieces-first and each is scored before it is accepted:
+**coverage** (points all over the result's surface must each land inside some
+piece, so the union is the solid and not a sieve) and **intrusion** (no point of
+any piece may lie more than 0.5 mm inside anything that was cut away). The
+first candidate that passes both wins; if none does, it is still the old single
+hull and the old warning.
+
+`verify_no_intrusion` is the second half of the pre-flight check, next to the
+support test. The support test only ever sees the outside of the level, where a
+cup and a puck are the same shape — it is exactly blind to this bug.
+
+```bash
+cargo run --release -p newt-spike levels/marble-cup.loon
+```
+
+The cup comes out as 24 wedges reaching 0.376 mm into the bore, and the marble
+is caught after the same hint and tilt solves as `marble.loon`. Both levels run;
+the pattern-based cup is still there.
 
 Two phyz bugs surfaced and were fixed in the phyz worktree this depends on:
 sphere-on-box contact points were taken from the box's degenerate face
