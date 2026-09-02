@@ -108,6 +108,7 @@ pub struct GpuMpm {
     g2p: wgpu::ComputePipeline,
     pub time: f64,
     damp: f32,
+    sponge: f32,
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -270,7 +271,13 @@ impl GpuMpm {
             react_stage,
             time: 0.0,
             damp: 1.0,
+            sponge: 0.0,
         })
+    }
+
+    /// Width of the damping band along the side walls (0 = none).
+    pub fn set_sponge(&mut self, w: f32) {
+        self.sponge = w;
     }
 
     /// Per-substep velocity factor (1 = none); used while settling.
@@ -305,7 +312,7 @@ impl GpuMpm {
             b_b: v4(b, 0.0),
             b_c: v4(cc, 0.0),
             b_vel: v4(body.vel, 0.0),
-            semi: v4(body.semi, 0.0),
+            semi: v4(body.semi, self.sponge),
         }
     }
 

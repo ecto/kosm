@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
-use newt_spike::pool::{self, Caustic, Surface, DEPTH, MELON_AXES, POOL_X, POOL_Y};
+use newt_spike::pool::{self, box_half, Caustic, Surface, DEPTH, MELON_AXES, POOL_X, POOL_Y};
 use newt_spike::splash::Droplet;
 use tang::Vec3 as V;
 
@@ -148,7 +148,7 @@ impl Resources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let caustic_dims = ((2.0 * POOL_X / 0.01) as u32, (2.0 * POOL_Y / 0.01) as u32);
+        let caustic_dims = ((2.0 * (box_half() + 1.2) / 0.01) as u32, (2.0 * (box_half() + 1.2) / 0.01) as u32);
         let caustic_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("caustic"),
             size: wgpu::Extent3d { width: caustic_dims.0, height: caustic_dims.1, depth_or_array_layers: 1 },
@@ -294,8 +294,12 @@ impl Resources {
         let static_verts = static_geometry();
         let static_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("static"), contents: bytemuck::cast_slice(&static_verts), usage: wgpu::BufferUsages::VERTEX });
         // water grid
-        let (wi, water_n) = grid_indices(WATER_NX, WATER_NY);
-        let water_vb = device.create_buffer(&wgpu::BufferDescriptor { label: Some("water"), size: (WATER_NX * WATER_NY * std::mem::size_of::<Vertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // two water meshes: the far field over the pool, the fine box over the splash
+        let (mut wi, n1) = grid_indices(WATER_NX, WATER_NY);
+        let (wi2, _) = grid_indices(WATER_NX, WATER_NY);
+        wi.extend(wi2.iter().map(|i| i + (WATER_NX * WATER_NY) as u32));
+        let water_n = 2 * n1;
+        let water_vb = device.create_buffer(&wgpu::BufferDescriptor { label: Some("water"), size: (2 * WATER_NX * WATER_NY * std::mem::size_of::<Vertex>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let water_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("water idx"), contents: bytemuck::cast_slice(&wi), usage: wgpu::BufferUsages::INDEX });
         // spheres: melon (per-frame vertices) and bead (unit, instanced)
         let (sv, si) = unit_sphere(SPHERE_SEG, 3);
@@ -454,22 +458,26 @@ impl CallbackTrait for LiveCallback {
             );
         }
 
-        // water surface mesh: one height per vertex, normals by central
-        // differences of the sampled grid (5x fewer surface lookups)
+        // water surface meshes: one height per vertex, normals by central
+        // differences of the sampled grid; the far field over the pool and
+        // the fine box over the splash (drawn on top: same material, closer)
         let (nx, ny) = res.wn;
-        let xs: Vec<f64> = (0..nx).map(|i| -POOL_X + (i as f64 / (nx - 1) as f64) * 2.0 * POOL_X).collect();
-        let ys: Vec<f64> = (0..ny).map(|j| -POOL_Y + (j as f64 / (ny - 1) as f64) * 2.0 * POOL_Y).collect();
-        let hs: Vec<f64> = ys.iter().flat_map(|&y| xs.iter().map(move |&x| (x, y))).map(|(x, y)| f.surface.height(x, y)).collect();
-        let mut wv = Vec::with_capacity(nx * ny);
-        for j in 0..ny {
-            for i in 0..nx {
-                let h = |ii: usize, jj: usize| hs[jj * nx + ii];
-                let (i0, i1) = (i.saturating_sub(1), (i + 1).min(nx - 1));
-                let (j0, j1) = (j.saturating_sub(1), (j + 1).min(ny - 1));
-                let dx = (h(i1, j) - h(i0, j)) / (xs[i1] - xs[i0]);
-                let dy = (h(i, j1) - h(i, j0)) / (ys[j1] - ys[j0]);
-                let n = V::new(-dx, -dy, 1.0).normalize();
-                wv.push(Vertex { pos: [xs[i] as f32, ys[j] as f32, h(i, j) as f32], nrm: [n.x as f32, n.y as f32, n.z as f32], aux: [0.0; 3], mat: 2 });
+        let mut wv = Vec::with_capacity(2 * nx * ny);
+        let bh = box_half();
+        for (hx, hy, lift) in [(POOL_X, POOL_Y, 0.0), (bh, bh, 0.0005)] {
+            let xs: Vec<f64> = (0..nx).map(|i| -hx + (i as f64 / (nx - 1) as f64) * 2.0 * hx).collect();
+            let ys: Vec<f64> = (0..ny).map(|j| -hy + (j as f64 / (ny - 1) as f64) * 2.0 * hy).collect();
+            let hs: Vec<f64> = ys.iter().flat_map(|&y| xs.iter().map(move |&x| (x, y))).map(|(x, y)| f.surface.height(x, y)).collect();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let h = |ii: usize, jj: usize| hs[jj * nx + ii];
+                    let (i0, i1) = (i.saturating_sub(1), (i + 1).min(nx - 1));
+                    let (j0, j1) = (j.saturating_sub(1), (j + 1).min(ny - 1));
+                    let dx = (h(i1, j) - h(i0, j)) / (xs[i1] - xs[i0]);
+                    let dy = (h(i, j1) - h(i, j0)) / (ys[j1] - ys[j0]);
+                    let n = V::new(-dx, -dy, 1.0).normalize();
+                    wv.push(Vertex { pos: [xs[i] as f32, ys[j] as f32, (h(i, j) + lift) as f32], nrm: [n.x as f32, n.y as f32, n.z as f32], aux: [0.0; 3], mat: 2 });
+                }
             }
         }
         queue.write_buffer(&res.water_vb, 0, bytemuck::cast_slice(&wv));
@@ -591,7 +599,7 @@ fn quad(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3
 
 fn static_geometry() -> Vec<Vertex> {
     let (hx, hy, dp) = (POOL_X as f32, POOL_Y as f32, DEPTH as f32);
-    let big = 6.0f32;
+    let big = hx + 20.0;
     let mut v = Vec::new();
     let up = [0.0, 0.0, 1.0];
     // the deck, four slabs around the water at coping height

@@ -21,7 +21,7 @@ struct Params {
     b_b: vec4<f32>,
     b_c: vec4<f32>,
     b_vel: vec4<f32>,
-    semi: vec4<f32>,       // ellipsoid semi-axes
+    semi: vec4<f32>,       // ellipsoid semi-axes, sponge width
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -182,6 +182,15 @@ fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (j > i32(P.n.y) - 3 && vel.y > 0.0) { vel.y = 0.0; }
     if (k < 2 && vel.z < 0.0) { vel.z = 0.0; }
     if (k > i32(P.n.z) - 3 && vel.z > 0.0) { vel.z = 0.0; }
+    // the sponge: the box's outer band damps the motion (see the CPU solver)
+    let sw = P.semi.w;
+    if (sw > 0.0) {
+        let inset = min(min(xi.x - P.lo.x, P.hi.x - xi.x), min(xi.y - P.lo.y, P.hi.y - xi.y));
+        if (inset < sw) {
+            let r = 1.0 - max(inset / sw, 0.0);
+            vel = vel * (1.0 - 0.03 * r * r);
+        }
+    }
     // the melon: nodes within half a cell of its surface or inside take its
     // normal velocity; what that costs is booked as the reaction
     let sd = body_sdf(xi);

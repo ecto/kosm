@@ -34,9 +34,20 @@ use crate::glass::{fresnel, refract, reflect};
 
 // ---- the pool ---------------------------------------------------------------
 
-pub const POOL_X: f64 = 1.2; // half-lengths of the water
-pub const POOL_Y: f64 = 0.8;
-pub const DEPTH: f64 = 0.7;
+// An Olympic pool: 50 m by 25 m; FINA's minimum depth is 2 m.
+pub const POOL_X: f64 = 25.0; // half-lengths of the water
+pub const POOL_Y: f64 = 12.5;
+pub const DEPTH: f64 = 2.0;
+/// The fine MPM box around the melon: half-width (NEWT_BOX overrides) and
+/// depth. Beyond it the water is the far field (see `far`).
+pub fn box_half() -> f64 {
+    static HALF: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *HALF.get_or_init(|| std::env::var("NEWT_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+}
+pub const BOX_DEPTH: f64 = 1.5;
+/// The box's outer band where the fluid's velocity is damped so waves leave
+/// instead of reflecting off a wall two metres from the splash.
+pub const SPONGE: f64 = 0.25;
 /// Frames per second of a recording (NEWT_FPS overrides).
 pub fn fps() -> f64 {
     std::env::var("NEWT_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0)
@@ -99,24 +110,41 @@ impl Ring {
 pub struct Surface {
     pub rings: Vec<Ring>,
     pub t: f64,
-    /// When the water is simulated, its free surface replaces the rings.
+    /// When the water is simulated, its free surface replaces the rings
+    /// inside the box...
     pub grid: Option<crate::splash::HeightGrid>,
+    /// ...and the far field's height carries on beyond it.
+    pub far: Option<crate::splash::HeightGrid>,
 }
 
 impl Surface {
     pub fn height(&self, x: f64, y: f64) -> f64 {
+        // ambient ripple, 1 mm, so still water is not a mirror
+        let ambient = 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos()) + 0.0005 * ((11.0 * x - 4.0 * y + 1.7 * self.t).sin());
         if let Some(g) = &self.grid {
-            // the fluid's surface; the sub-grid rings from landing drops are
-            // baked into the grid once per frame, so this is one lookup
-            return g.at(x, y);
+            // the fluid's surface inside the box (the sub-grid rings from
+            // landing drops are baked in once per frame), blending into the
+            // far field over the box's last decimetre
+            // the fine surface counts inside the sponge band only: at the
+            // box wall it dips (the wall layer, the extraction's edge) and a
+            // blend across that dip is a lens
+            let half = box_half();
+            let inset = half - x.abs().max(y.abs());
+            let far = self.far.as_ref().map(|f| f.at(x, y) + ambient).unwrap_or(ambient);
+            if inset > SPONGE + 0.1 {
+                return g.at(x, y);
+            }
+            if inset <= SPONGE {
+                return far;
+            }
+            let w = (inset - SPONGE) / 0.1;
+            return w * g.at(x, y) + (1.0 - w) * far;
         }
         let mut h = 0.0;
         for r in &self.rings {
             h += r.height(x, y, self.t);
         }
-        // ambient ripple, 1 mm, so still water is not a mirror
-        h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
-            + 0.0005 * ((11.0 * x - 4.0 * y + 1.7 * self.t).sin())
+        h + ambient
     }
     /// Mean height of the fluid surface over the pool's interior (0 = rest).
     pub fn mean_level(&self) -> f64 {
@@ -150,8 +178,10 @@ impl Surface {
         };
         let mut t = 0.0;
         let mut prev = f(0.0);
-        let step = 0.004;
         while t < t_max {
+            // 4 mm steps up close, where the splash is; coarser with distance,
+            // where the far field is smooth and the pool is fifty metres long
+            let step = 0.004 + 0.012 * t;
             let tn = (t + step).min(t_max);
             let cur = f(tn);
             if (prev > 0.0) != (cur > 0.0) {
@@ -252,6 +282,8 @@ pub struct Drop {
     pub droplets: Vec<crate::splash::Droplet>,
     /// Last frame's fluid force on the melon, for the log.
     pub fluid_force: V<f64>,
+    /// The pool beyond the box.
+    pub far: Option<crate::far::Far>,
 }
 
 impl Drop {
@@ -274,16 +306,18 @@ impl Drop {
             model,
             state,
             sim: Simulator::new(),
-            surface: Surface { rings: Vec::new(), t: 0.0, grid: None },
+            surface: Surface { rings: Vec::new(), t: 0.0, grid: None, far: None },
             last_splash: -1.0,
             entered: false,
             water: None,
             droplets: Vec::new(),
             fluid_force: V::zero(),
+            far: None,
         }
     }
 
-    /// Turn the water on: a dense MPM over the whole pool.
+    /// Turn the water on: a dense MPM in the box around the melon, a wave
+    /// field over the rest of the pool.
     pub fn with_water(mut self, h: f64) -> Self {
         // speed of sound ~ 45 m/s: at 5 m/s the impact pressure compresses the
         // water under a percent, which is what stops a melon instead of
@@ -303,6 +337,7 @@ impl Drop {
         // pack the fill down before anything arrives, and take the rest level
         water.settle(2.0);
         self.water = Some(water);
+        self.far = Some(crate::far::Far::new(0.1));
         self
     }
 
@@ -319,6 +354,9 @@ impl Drop {
             vel: Vec3::new(vel.x, vel.y, vel.z),
         };
         let f = water.step_block(&body, subs);
+        if let Some(far) = self.far.as_mut() {
+            far.step(self.model.dt);
+        }
         let fv = V::new(f.x, f.y, f.z);
         if fv.norm() > self.fluid_force.norm() { self.fluid_force = fv; }
         // NEWT_HOLD=<z>: pin the melon at that depth and just read the force
@@ -384,6 +422,10 @@ impl Drop {
                         g.z[jy * g.nx + ix] += h;
                     }
                 }
+            }
+            if let Some(far) = self.far.as_mut() {
+                far.force(&g, box_half() - SPONGE - 0.1, t);
+                self.surface.far = Some(far.grid.clone());
             }
             self.surface.grid = Some(g);
         }
@@ -485,9 +527,12 @@ impl Caustic {
 /// Sunlight through the surface onto the floor: irradiance relative to what a
 /// flat surface would pass, so still water reads as 1 and ripples focus it.
 pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
-    let nx = ((2.0 * POOL_X) / cell) as usize;
-    let ny = ((2.0 * POOL_Y) / cell) as usize;
-    let origin = [-POOL_X, -POOL_Y];
+    // over the box and a margin: the sun's refracted rays land a metre
+    // sideways over two metres of depth, and beyond the map the floor reads 1
+    let half = box_half() + 1.2;
+    let nx = ((2.0 * half) / cell) as usize;
+    let ny = ((2.0 * half) / cell) as usize;
+    let origin = [-half, -half];
     let mut e = vec![0.0; nx * ny];
     let s = sun_dir();
     let d = -s;
@@ -577,6 +622,14 @@ fn sky(d: V<f64>) -> [f64; 3] {
 }
 
 fn tile(x: f64, y: f64) -> [f64; 3] {
+    // lane lines: ten lanes of 2.5 m across the width, a 25 cm dark line
+    // along the length of each, with the T two metres from the end walls
+    let lane = ((y + POOL_Y) / 2.5).floor() * 2.5 - POOL_Y + 1.25;
+    let on_line = (y - lane).abs() < 0.125;
+    let on_t = (x.abs() - (POOL_X - 2.0)).abs() < 0.125 && (y - lane).abs() < 0.5;
+    if on_line || on_t {
+        return [0.05, 0.09, 0.18];
+    }
     let f = |v: f64| ((v / 0.1).rem_euclid(1.0) - 0.5).abs();
     let grout = f(x) > 0.46 || f(y) > 0.46;
     if grout {
@@ -640,7 +693,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
         let t_line = if d.z != 0.0 { (0.06 - o.z) / d.z } else { 0.0 };
         let p_line = o + d * t_line.max(0.0);
         if inside_pool(p0) || inside_pool(p_line) {
-            t_water = drop.surface.hit(p0, d, 6.0).map(|t| t + t_start);
+            t_water = drop.surface.hit(p0, d, 80.0).map(|t| t + t_start);
         }
     }
     // pool walls seen from above the water (the tiled inside faces above z=0)
@@ -931,7 +984,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     }
     // from the deck corner, low, so the far water reflects the sky and the near
     // water shows the tiles
-    let view = View { eye: V::new(-1.42, -1.22, 0.31), target: V::new(0.02, 0.12, -0.06), width, height, vfov: 0.9 };
+    let view = View { eye: V::new(-3.2, -2.6, 0.9), target: V::new(0.0, 0.1, -0.1), width, height, vfov: 0.9 };
     let steps_per_frame = (1.0 / fps() / drop.model.dt).round() as usize;
     let t0 = std::time::Instant::now();
     let mut lowest = f64::INFINITY;
@@ -967,7 +1020,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                 let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
                 zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let mean = zs.iter().sum::<f64>() / zs.len() as f64;
-                println!("water  frame {k:3}  particle z mean {:+.1} mm (rest -350)  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
+                println!("water  frame {k:3}  particle z mean {:+.1} mm (rest {:.0})  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, -BOX_DEPTH * 500.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
             }
             println!(
                 "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  level {:+.1} mm  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={}  {} ms/frame",

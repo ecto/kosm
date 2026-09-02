@@ -2,6 +2,7 @@
 //! pool and the splash, so the viewer and the CLI share one implementation.
 pub mod audio;
 pub mod colliders;
+pub mod far;
 pub mod frame;
 pub mod garage;
 pub mod glass;

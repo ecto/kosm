@@ -35,7 +35,7 @@ pub fn take_prof() -> [u64; 5] {
     std::array::from_fn(|i| PROF[i].swap(0, Ordering::Relaxed))
 }
 
-use crate::pool::{DEPTH, MELON_AXES, POOL_X, POOL_Y};
+use crate::pool::{BOX_DEPTH, MELON_AXES, SPONGE, box_half};
 
 pub struct Water {
     pub h: f64,
@@ -111,10 +111,12 @@ impl Body {
 impl Water {
     /// Fill the pool: one particle per cell, jittered, `depth` deep.
     pub fn fill(h: f64, dt: f64, air_above: f64, bulk: f64) -> Self {
-        let origin = Vec3::new(-POOL_X - 2.0 * h, -POOL_Y - 2.0 * h, -DEPTH - 2.0 * h);
-        let nx = ((2.0 * POOL_X + 4.0 * h) / h).ceil() as usize + 1;
-        let ny = ((2.0 * POOL_Y + 4.0 * h) / h).ceil() as usize + 1;
-        let nz = ((DEPTH + air_above + 4.0 * h) / h).ceil() as usize + 1;
+        // the box around the melon, not the pool: see pool::box_half
+        let (bx, by, depth) = (box_half(), box_half(), BOX_DEPTH);
+        let origin = Vec3::new(-bx - 2.0 * h, -by - 2.0 * h, -depth - 2.0 * h);
+        let nx = ((2.0 * bx + 4.0 * h) / h).ceil() as usize + 1;
+        let ny = ((2.0 * by + 4.0 * h) / h).ceil() as usize + 1;
+        let nz = ((depth + air_above + 4.0 * h) / h).ceil() as usize + 1;
         let mut x = Vec::new();
         let mut seed = 12345u32;
         let mut rnd = || {
@@ -128,11 +130,11 @@ impl Water {
         // water boils
         let ppa: usize = std::env::var("NEWT_PPC").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
         let sp = h / ppa as f64;
-        let mut px = -POOL_X + sp * 0.5;
-        while px < POOL_X - sp * 0.25 {
-            let mut py = -POOL_Y + sp * 0.5;
-            while py < POOL_Y - sp * 0.25 {
-                let mut pz = -DEPTH + sp * 0.5;
+        let mut px = -bx + sp * 0.5;
+        while px < bx - sp * 0.25 {
+            let mut py = -by + sp * 0.5;
+            while py < by - sp * 0.25 {
+                let mut pz = -depth + sp * 0.5;
                 while pz < -sp * 0.25 {
                     x.push(Vec3::new(px + rnd() * sp * 0.6, py + rnd() * sp * 0.6, pz + rnd() * sp * 0.6));
                     pz += sp;
@@ -377,6 +379,13 @@ impl Water {
                         if xi.y > hi.y && vel.y > 0.0 { vel.y = 0.0; }
                         if xi.z < lo.z && vel.z < 0.0 { vel.z = 0.0; }
                         if xi.z > hi.z && vel.z > 0.0 { vel.z = 0.0; }
+                        // the sponge: the box's outer band damps the motion so
+                        // waves leave for the far field instead of reflecting
+                        let inset = (xi.x - lo.x).min(hi.x - xi.x).min(xi.y - lo.y).min(hi.y - xi.y);
+                        if inset < SPONGE {
+                            let r = 1.0 - (inset / SPONGE).max(0.0);
+                            vel = vel * (1.0 - 0.03 * r * r);
+                        }
                         // the melon: nodes within half a cell of its surface or inside
                         // take its normal velocity; what that costs is booked
                         let (d, nrm) = body.sdf(xi);
@@ -553,6 +562,7 @@ impl Water {
     pub fn step_block(&mut self, body: &Body, subs: usize) -> Vec3 {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_damp(self.damp as f32);
+            gpu.set_sponge(SPONGE as f32);
             let reactions = gpu.step(&Self::gpu_body(body), subs as u32);
             let mut f = Vec3::zeros();
             let mut interior = 0.0;
@@ -637,8 +647,9 @@ impl Water {
     /// mass fraction crosses one half, interpolated. Columns with no water
     /// (a cavity) report the floor.
     pub fn surface(&self, cell: f64) -> HeightGrid {
-        let nx = ((2.0 * POOL_X) / cell) as usize;
-        let ny = ((2.0 * POOL_Y) / cell) as usize;
+        let (bx, by) = (box_half(), box_half());
+        let nx = ((2.0 * bx) / cell) as usize;
+        let ny = ((2.0 * by) / cell) as usize;
         let full = 1000.0 * self.h * self.h * self.h;
         // a 3×3×3 box blur of the mass fraction first: the grid is coarse and
         // a raw threshold makes cliffs
@@ -659,11 +670,11 @@ impl Water {
                 }
             }
         }
-        let mut z = vec![-DEPTH; nx * ny];
+        let mut z = vec![-BOX_DEPTH; nx * ny];
         for jy in 0..ny {
             for ix in 0..nx {
-                let x = -POOL_X + (ix as f64 + 0.5) * cell;
-                let y = -POOL_Y + (jy as f64 + 0.5) * cell;
+                let x = -bx + (ix as f64 + 0.5) * cell;
+                let y = -by + (jy as f64 + 0.5) * cell;
                 // nearest grid column
                 let gi = (((x - self.origin.x) / self.h).round() as i64).clamp(0, self.nx as i64 - 1) as usize;
                 let gj = (((y - self.origin.y) / self.h).round() as i64).clamp(0, self.ny as i64 - 1) as usize;
@@ -681,7 +692,7 @@ impl Water {
             }
         }
         // a 3×3 smooth, twice
-        let mut out = HeightGrid { origin: [-POOL_X, -POOL_Y], cell, nx, ny, z };
+        let mut out = HeightGrid { origin: [-bx, -by], cell, nx, ny, z };
         for _ in 0..2 {
             let mut s = out.z.clone();
             for jy in 1..ny - 1 {
