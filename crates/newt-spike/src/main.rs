@@ -994,7 +994,7 @@ fn light_stage(
     let lamp_local = xf.world_to_body_point(lamp0.pos);
     let lamp_t = tang::Vec3::new(lamp_local.x, lamp_local.y, lamp_local.z);
     let c_t = tang::Vec3::new(centre_local.x, centre_local.y, centre_local.z);
-    let (window, cells, rays) = (0.05, 200, 40_000);
+    let (window, cells, rays) = (0.04, 240, 120_000);
     let t0 = std::time::Instant::now();
     let caustic = light::trace::<f64>(lamp_t, c_t, r, nd_true, window, cells, rays);
     let ld = light::out_dir(out);
@@ -1011,7 +1011,14 @@ fn light_stage(
     let mut img = frame::render(&scene_at(c_world), pose, intr);
     let n = light::composite(&mut img, &caustic, pose, intr, xf, 0.09, &scene_at(c_world));
     img.save(ld.join("frame.png"))?;
-    println!("light  caustic composited over {n} plate pixels → {}/frame.png", ld.display());
+    // and a close-up: 12 cm from the marble, looking down past it at the caustic
+    let close_intr = CameraIntrinsics::from_vfov(800, 600, 0.6, 0.02, 5.0);
+    let up = Vec3::z();
+    let close_pose = CameraPose::look_at(c_world + Vec3::new(-0.06, -0.09, 0.07), c_world + Vec3::new(0.0, 0.0, -0.005), up);
+    let mut close = frame::render(&scene_at(c_world), &close_pose, &close_intr);
+    let n2 = light::composite(&mut close, &caustic, &close_pose, &close_intr, xf, 0.09, &scene_at(c_world));
+    close.save(ld.join("frame_close.png"))?;
+    println!("light  caustic composited over {n} plate pixels (room view) and {n2} (close-up) → {}/frame.png, frame_close.png", ld.display());
 
     // ∂loss/∂n_d: duals vs finite differences, against the true caustic as target
     let (_, g) = light::loss_grad(lamp_t, c_t, r, 1.48, &caustic, rays);

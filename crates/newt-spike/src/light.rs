@@ -136,8 +136,13 @@ pub fn trace<S: Scalar>(
         let n_glass = index::<S>(nd, *lambda);
         for i in 0..side {
             for j in 0..side {
-                let a = (i as f64 + 0.5) / side as f64 * 2.0 - 1.0;
-                let c = (j as f64 + 0.5) / side as f64 * 2.0 - 1.0;
+                // a deterministic jitter per lattice cell trades the lattice's
+                // moiré for fine noise; the same jitter on every call keeps
+                // duals and finite differences on identical rays
+                let h = (i.wrapping_mul(73856093) ^ j.wrapping_mul(19349663) ^ b.wrapping_mul(83492791)) as u32;
+                let (jx, jy) = (((h & 0xffff) as f64 / 65535.0) - 0.5, (((h >> 16) & 0xffff) as f64 / 65535.0) - 0.5);
+                let a = (i as f64 + 0.5 + jx) / side as f64 * 2.0 - 1.0;
+                let c = (j as f64 + 0.5 + jy) / side as f64 * 2.0 - 1.0;
                 if a * a + c * c > 1.0 {
                     continue;
                 }
