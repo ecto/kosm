@@ -617,9 +617,6 @@ impl Drop {
             vel: Vec3::new(vel.x, vel.y, vel.z),
         };
         let f = water.step_block(&body, subs);
-        if let Some(far) = self.far.as_mut() {
-            far.step(self.model.dt);
-        }
         let fv = V::new(f.x, f.y, f.z);
         if fv.norm() > self.fluid_force.norm() { self.fluid_force = fv; }
         // NEWT_HOLD=<z>: pin the melon at that depth and just read the force
@@ -788,6 +785,8 @@ impl Drop {
                 }
             }
             if let Some(far) = self.far.as_mut() {
+                // spectral, so one exact step per frame
+                far.step((t - far.time).max(0.0));
                 far.force(&g, box_half() - SPONGE - BLEND, box_half() - SPONGE, t);
                 self.surface.far = Some(far.grid.clone());
             }

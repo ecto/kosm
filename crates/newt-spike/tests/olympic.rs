@@ -41,3 +41,29 @@ fn caustic_of_flat_water_is_one() {
         println!("{name}: caustic within 3 m: min {lo:.3} max {hi:.3} mean {:.3}", sum / n as f64);
     }
 }
+
+#[test]
+fn seam_profile_at_impact() {
+    let h: f64 = std::env::var("NEWT_TEST_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.025);
+    let frame: usize = std::env::var("NEWT_TEST_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(46);
+    let mut d = Drop::new(1.3).with_water(h);
+    let steps = (1.0 / pool::fps() / d.model.dt).round() as usize;
+    for _ in 0..frame {
+        for _ in 0..steps {
+            d.step();
+        }
+        d.read_water();
+    }
+    let half = pool::box_half();
+    println!("box half {half}  sponge {}  blend {}", pool::SPONGE, pool::BLEND);
+    let mut x = 0.0;
+    while x < half + 0.6 {
+        let y = if std::env::var_os("NEWT_TEST_DIAG").is_some() { x } else { 0.0 };
+        let hgt = d.surface.height(x, y);
+        let fine = d.surface.grid.as_ref().map(|g| g.at(x, y)).unwrap_or(f64::NAN);
+        let far = d.surface.far.as_ref().map(|g| g.at(x, y)).unwrap_or(f64::NAN);
+        let n = d.surface.normal(x, y);
+        println!("x={x:5.2}  h {:+7.1} mm  fine {:+7.1}  far {:+7.1}  slope {:.3}", hgt * 1000.0, fine * 1000.0, far * 1000.0, n.x.hypot(n.y) / n.z);
+        x += 0.05;
+    }
+}

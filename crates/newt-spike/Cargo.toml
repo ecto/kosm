@@ -24,6 +24,7 @@ vcad-kernel-export.workspace = true
 vcad-render.workspace = true
 image.workspace = true
 rayon = "1"
+rustfft = "6"
 newt-mpm = { path = "../newt-mpm" }
 tang.workspace = true
 tang-3dgs.workspace = true
