@@ -66,6 +66,17 @@ The cup comes out as 24 wedges reaching 0.376 mm into the bore, and the marble
 is caught after the same hint and tilt solves as `marble.loon`. Both levels run;
 the pattern-based cup is still there.
 
+### the frame
+
+`frame.rs` is a ray caster written once, generic over `tang::Scalar`. On `f64`
+it renders the level with real penumbra shadows from a lamp of finite radius,
+cast by the derived colliders themselves (800×600 in ~50 ms on the CPU). On
+`Dual<f64>` the same code is its own derivative: the shadow pass's
+`∂visibility/∂marble` matches central differences to five digits. Chained to
+the contact adjoint, "put the shadow here in the image" solves for the release
+point. Only box colliders are rendered so far; the decomposed cup's hull
+pieces are not.
+
 ### the lamp
 
 `lamp.rs` puts a point lamp in the room and changes the objective to "the
