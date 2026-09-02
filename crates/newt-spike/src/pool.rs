@@ -623,7 +623,7 @@ impl Drop {
                 }
             }
             if let Some(far) = self.far.as_mut() {
-                far.force(&g, box_half() - SPONGE - 0.3, t);
+                far.force(&g, box_half() - SPONGE - 0.3, box_half() - SPONGE, t);
                 self.surface.far = Some(far.grid.clone());
             }
             self.surface.grid = Some(g);

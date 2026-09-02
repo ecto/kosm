@@ -66,10 +66,12 @@ impl Far {
         }
     }
 
-    /// Hold the far field to the fine surface where the box is; the forced
-    /// cells also take the velocity implied since the last forcing, so the
-    /// splash radiates instead of appearing as a static dent.
-    pub fn force(&mut self, fine: &HeightGrid, half: f64, t: f64) {
+    /// Nudge the far field toward the fine surface: fully inside `inner`,
+    /// ramping to nothing at `outer` with the same smoothstep the renderer
+    /// blends with, so the two surfaces agree by construction. Overwriting
+    /// a square of cells left a step at its edge wherever the fine surface
+    /// had a dent or a ring the far field had not been told about yet.
+    pub fn force(&mut self, fine: &HeightGrid, inner: f64, outer: f64, t: f64) {
         let dt = (t - self.forced_t).max(1e-3);
         let (nx, ny, cell) = (self.grid.nx, self.grid.ny, self.grid.cell);
         let mut now = Vec::new();
@@ -77,17 +79,22 @@ impl Far {
             for i in 0..nx {
                 let x = self.grid.origin[0] + (i as f64 + 0.5) * cell;
                 let y = self.grid.origin[1] + (j as f64 + 0.5) * cell;
-                if x.abs() < half - 0.05 && y.abs() < half - 0.05 {
-                    now.push((j * nx + i, fine.at(x, y)));
+                let m = x.abs().max(y.abs());
+                if m >= outer {
+                    continue;
                 }
+                let u = ((outer - m) / (outer - inner)).clamp(0.0, 1.0);
+                let a = u * u * (3.0 - 2.0 * u);
+                now.push((j * nx + i, fine.at(x, y), a));
             }
         }
-        for (k, (g, h)) in now.iter().enumerate() {
+        for (k, (g, h, a)) in now.iter().enumerate() {
             let prev = self.forced_prev.get(k).filter(|(pg, _)| pg == g).map(|(_, ph)| *ph).unwrap_or(*h);
-            self.v[*g] = (h - prev) / dt;
-            self.grid.z[*g] = *h;
+            let v_fine = (h - prev) / dt;
+            self.v[*g] += a * (v_fine - self.v[*g]);
+            self.grid.z[*g] += a * (h - self.grid.z[*g]);
         }
-        self.forced_prev = now;
+        self.forced_prev = now.into_iter().map(|(g, h, _)| (g, h)).collect();
         self.forced_t = t;
     }
 }
