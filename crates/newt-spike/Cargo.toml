@@ -27,5 +27,6 @@ tang.workspace = true
 tang-3dgs.workspace = true
 ipse-map.workspace = true
 vcad-kernel-acoustics.workspace = true
+vcad-kernel-optics.workspace = true
 hound.workspace = true
 anyhow = "1"

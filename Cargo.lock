@@ -1072,6 +1072,7 @@ dependencies = [
  "vcad-kernel",
  "vcad-kernel-acoustics",
  "vcad-kernel-export",
+ "vcad-kernel-optics",
  "vcad-loon",
  "vcad-render",
 ]
@@ -2203,6 +2204,14 @@ dependencies = [
  "tang",
  "vcad-kernel-geom",
  "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-optics"
+version = "0.9.4"
+dependencies = [
+ "serde",
+ "vcad-receipt",
 ]
 
 [[package]]

@@ -77,6 +77,18 @@ the contact adjoint, "put the shadow here in the image" solves for the release
 point. Only box colliders are rendered so far; the decomposed cup's hull
 pieces are not.
 
+### light as physics
+
+`light.rs` makes the marble glass. Light from the lamp refracts in and out
+by Snell's law with Fresnel losses at each face, five wavelength bands with
+Sellmeier dispersion (N-BK7's shape, the d-line index as the knob), and lands
+on the plate as a spectral caustic: forward light transport, energy
+conserving, generic over `tang::Scalar`. On `Dual` the same trace gives
+`∂caustic/∂n_d`, which matches finite differences to four digits, and a
+gradient fit recovers the marble's index of refraction from its caustic
+(1.5169 against a true 1.5168) in nine steps. The generic Sellmeier is checked
+against `vcad-kernel-optics` N-BK7 to machine precision.
+
 ### the garage
 
 `garage.rs` drops the marble onto ipse's captured garage (`ipse-map`: a splat

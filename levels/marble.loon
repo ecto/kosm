@@ -12,6 +12,7 @@
 [defparam start_y 25.0]
 [defparam marble_r 10.0]      ; a glass marble
 [defparam marble_g 12.0]      ; grams
+[defparam marble_nd 1.5168]   ; index of refraction at the d line; N-BK7. the caustic's knob
 [defparam t_end 1.2]          ; seconds until the marble should be in the cup
 
 ; ---- the lamp ---------------------------------------------------------------

@@ -131,6 +131,17 @@ impl<S: Scalar> Scene<S> {
         smoothstep((miss / w + S::HALF).clamp(S::ZERO, S::ONE))
     }
 
+    /// Where a primary ray meets the plate (box 0), if it does, with the
+    /// marble out of the way.
+    pub fn plate_point(&self, o: Vec3<S>, d: Vec3<S>) -> Option<Vec3<S>> {
+        let mut s = self.clone();
+        s.marble = Vec3::new(S::ZERO, S::ZERO, S::from_f64(-10.0));
+        match s.hit(o, d) {
+            Some((t, _, _, true)) => Some(o + d * t),
+            _ => None,
+        }
+    }
+
     /// Radiance for one primary ray.
     pub fn shade(&self, o: Vec3<S>, d: Vec3<S>) -> (S, bool) {
         let Some((t, n, albedo, plate)) = self.hit(o, d) else {
@@ -198,6 +209,10 @@ fn box_hit<S: Scalar>(b: &OBox<S>, o: Vec3<S>, d: Vec3<S>) -> Option<(S, Vec3<S>
 }
 
 /// Camera ray for pixel (u, v), world frame.
+pub fn primary_ray(pose: &CameraPose, intr: &CameraIntrinsics, u: f64, v: f64) -> (Vec3<f64>, Vec3<f64>) {
+    ray::<f64>(pose, intr, u, v)
+}
+
 fn ray<S: Scalar>(pose: &CameraPose, intr: &CameraIntrinsics, u: f64, v: f64) -> (Vec3<S>, Vec3<S>) {
     let dir_opt = phyz_math::Vec3::new((u - intr.cx) / intr.fx, (v - intr.cy) / intr.fy, 1.0);
     let dir = (pose.world_from_optical * dir_opt).normalize();

@@ -26,6 +26,7 @@ mod colliders;
 mod frame;
 mod garage;
 mod lamp;
+mod light;
 mod room;
 
 use std::collections::HashMap;
@@ -855,6 +856,11 @@ fn main() -> anyhow::Result<()> {
         frame::render(&scene_at(c_img), &pose, &intr).save(fd.join("frame_solved.png"))?;
         println!("frame  release solved on the shadow pass to ({:+.3}, {:+.3}): patch visibility {:.4} (lit: {:.4})", xy_img[0], xy_img[1], jimg * jimg, j_far);
         fs::write(fd.join("marble.loon"), level.with_params(&[("start_x", xy_img[0] / MM), ("start_y", xy_img[1] / MM)]))?;
+
+        // 8. light as physics: the marble is glass. the lamp's light refracts
+        //    through it onto the plate as a spectral caustic, and the index of
+        //    refraction is recovered from that caustic by the same code on duals.
+        light_stage(&level, &model, &xf, &lamp0, r, &pose, &intr, &scene_at, out)?;
     }
 
     // 7. a captured place: the marble on the real garage floor, and the
@@ -963,4 +969,85 @@ fn garage_stage(level: &Level, map_dir: &Path, out: &Path) -> anyhow::Result<()>
 fn traj_end(model: &Model, q0: &DVec, steps: usize) -> Vec3 {
     let (t, _) = simulate(model, q0, steps);
     t[t.len() - 1]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn light_stage(
+    level: &Level,
+    model: &Model,
+    xf: &SpatialTransform,
+    lamp0: &lamp::Lamp,
+    r: f64,
+    pose: &CameraPose,
+    intr: &CameraIntrinsics,
+    scene_at: &dyn Fn(Vec3) -> frame::Scene<f64>,
+    out: &Path,
+) -> anyhow::Result<()> {
+    // the generic Sellmeier against vcad-kernel-optics' N-BK7: one glass, two crates
+    let bk7 = vcad_kernel_optics::glass::Glass::n_bk7();
+    let worst = [0.45, 0.5876, 0.65].iter().map(|&l| (light::sellmeier::<f64>(l) - bk7.index(l)).abs()).fold(0.0, f64::max);
+    let nd_true = level.params.get("marble_nd").copied().unwrap_or(1.5168);
+    println!("light  N-BK7 Sellmeier agrees with vcad-kernel-optics to {worst:.1e}; marble n_d = {nd_true} (n(450 nm) − n(650 nm) = {:+.4})", light::index::<f64>(nd_true, 0.45) - light::index::<f64>(nd_true, 0.65));
+
+    // the marble at rest at the plate's centre, under the lamp
+    let centre_local = Vec3::new(0.0, 0.0, r);
+    let lamp_local = xf.world_to_body_point(lamp0.pos);
+    let lamp_t = tang::Vec3::new(lamp_local.x, lamp_local.y, lamp_local.z);
+    let c_t = tang::Vec3::new(centre_local.x, centre_local.y, centre_local.z);
+    let (window, cells, rays) = (0.05, 200, 40_000);
+    let t0 = std::time::Instant::now();
+    let caustic = light::trace::<f64>(lamp_t, c_t, r, nd_true, window, cells, rays);
+    let ld = light::out_dir(out);
+    fs::create_dir_all(&ld)?;
+    let peak = caustic.e.iter().flat_map(|b| b.iter()).cloned().fold(0.0, f64::max) / light::BANDS_LEN as f64;
+    println!(
+        "light  traced {} rays × 5 bands through the marble in {} ms ({} lost to total internal reflection); caustic peak irradiance {:.1}× the plate's direct light, spread {:.2} mm rms (450 nm) vs {:.2} mm (650 nm)",
+        caustic.traced, t0.elapsed().as_millis(), caustic.tir, peak * (lamp_local.z - r).powi(2) / lamp_local.z.powi(2) * lamp_local.z.powi(2), (caustic.spread(0)).sqrt() * 1e3, (caustic.spread(4)).sqrt() * 1e3
+    );
+    light::image(&caustic, 0.02).save(ld.join("caustic.png"))?;
+
+    // the frame with the caustic on the plate
+    let c_world = local_to_world(model, centre_local);
+    let mut img = frame::render(&scene_at(c_world), pose, intr);
+    let n = light::composite(&mut img, &caustic, pose, intr, xf, 0.09, &scene_at(c_world));
+    img.save(ld.join("frame.png"))?;
+    println!("light  caustic composited over {n} plate pixels → {}/frame.png", ld.display());
+
+    // ∂loss/∂n_d: duals vs finite differences, against the true caustic as target
+    let (_, g) = light::loss_grad(lamp_t, c_t, r, 1.48, &caustic, rays);
+    let h = 1e-4;
+    let fd = (light::loss(&light::trace::<f64>(lamp_t, c_t, r, 1.48 + h, window, cells, rays), &caustic)
+        - light::loss(&light::trace::<f64>(lamp_t, c_t, r, 1.48 - h, window, cells, rays), &caustic)) / (2.0 * h);
+    println!("light  ∂loss/∂n_d at n_d = 1.48: dual {g:+.4e}  fd {fd:+.4e}");
+
+    // recover n_d from the caustic
+    let mut nd = 1.42;
+    let mut step = 0.02;
+    let mut l = light::loss(&light::trace::<f64>(lamp_t, c_t, r, nd, window, cells, rays), &caustic);
+    for it in 0..25 {
+        let (_, g) = light::loss_grad(lamp_t, c_t, r, nd, &caustic, rays);
+        println!("light  fit it {it:2}: n_d = {nd:.4}  loss {l:.3e}  ∂ {g:+.3e}");
+        if (nd - nd_true).abs() < 2e-4 {
+            break;
+        }
+        let dir = -g.signum();
+        let mut accepted = false;
+        for _ in 0..8 {
+            let cand = nd + dir * step;
+            let lc = light::loss(&light::trace::<f64>(lamp_t, c_t, r, cand, window, cells, rays), &caustic);
+            if lc < l {
+                nd = cand;
+                l = lc;
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    println!("light  recovered n_d = {nd:.4} (true {nd_true}); N-BK7 is 1.5168, soda-lime is ~1.52, fused silica 1.458");
+    fs::write(ld.join("marble.loon"), level.with_params(&[("marble_nd", nd)]))?;
+    Ok(())
 }
