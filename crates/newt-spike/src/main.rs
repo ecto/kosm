@@ -24,6 +24,7 @@
 mod audio;
 mod colliders;
 mod frame;
+mod garage;
 mod lamp;
 mod room;
 
@@ -850,6 +851,107 @@ fn main() -> anyhow::Result<()> {
         println!("frame  release solved on the shadow pass to ({:+.3}, {:+.3}): patch visibility {:.4} (lit: {:.4})", xy_img[0], xy_img[1], jimg * jimg, j_far);
         fs::write(fd.join("marble.loon"), level.with_params(&[("start_x", xy_img[0] / MM), ("start_y", xy_img[1] / MM)]))?;
     }
+
+    // 7. a captured place: the marble on the real garage floor, and the
+    //    splat as the frame's backdrop. rung 4 in miniature.
+    let map_dir = std::env::var("NEWT_MAP").unwrap_or_else(|_| "/Users/cam/Developer/ipse/maps/garage-perim".into());
+    if Path::new(&map_dir).join("map.toml").exists() {
+        garage_stage(&level, Path::new(&map_dir), out)?;
+    }
+    Ok(())
+}
+
+fn garage_stage(level: &Level, map_dir: &Path, out: &Path) -> anyhow::Result<()> {
+    let g = garage::Garage::load(map_dir)?;
+    let (lo, hi) = g.extents();
+    let (cx, cy) = g.centre_xy();
+    println!(
+        "garage {}: sdf {:.1}×{:.1}×{:.1} m at {:.2} m cells; floor under the centre at z = {:+.3} m",
+        map_dir.display(), hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, g.map.sdf.as_ref().map(|s| s.cell).unwrap_or(0.0), g.floor_z
+    );
+    let r = level.marble_r()?;
+    let model = garage::marble_model(r, level.p("marble_g")? * 1e-3);
+    let mat = material();
+    let t0 = std::time::Instant::now();
+    let (path, state) = garage::roll(&model, &g, (cx, cy), 2.5, &mat)?;
+    let (a, b) = (path[0], path[path.len() - 1]);
+    let drift = Vec3::new(b.x - a.x, b.y - a.y, 0.0);
+    let secs = path.len() as f64 * model.dt;
+    println!(
+        "garage marble dropped at ({:+.2}, {:+.2}); after {:.2} s it is at ({:+.3}, {:+.3}, {:+.3}), {:.1} cm away, heading ({:+.2}, {:+.2}). {} ms of physics",
+        cx, cy, secs, b.x, b.y, b.z, drift.norm() * 100.0, drift.x / drift.norm().max(1e-9), drift.y / drift.norm().max(1e-9), t0.elapsed().as_millis()
+    );
+    if std::env::var_os("NEWT_TRACE").is_some() {
+        // what moves the marble on a flat scan?
+        for (label, rr, mu) in [("r = 1 cm, μ = 0.4", r, 0.4), ("r = 1 cm, μ = 0", r, 0.0), ("r = 5 cm, μ = 0.4", 0.05, 0.4), ("r = 5 cm, μ = 0", 0.05, 0.0)] {
+            let m = garage::marble_model(rr, level.p("marble_g")? * 1e-3 * (rr / r).powi(3));
+            let mat = ContactMaterial { friction: mu, ..Default::default() };
+            let (pth, _) = garage::roll(&m, &g, (cx, cy), 2.5, &mat)?;
+            let d = pth[pth.len() - 1] - pth[0];
+            eprintln!("garage experiment {label}: rolled {:.1} cm in {:.2} s", d.x.hypot(d.y) * 100.0, pth.len() as f64 * m.dt);
+        }
+        let sdf = g.map.sdf.as_ref().unwrap();
+        for k in 0..=8 {
+            let p = a + (b - a) * (k as f64 / 8.0);
+            let fz = g.floor_at(p.x, p.y);
+            let grad = fz.and_then(|z| sdf.sample_with_gradient(Vec3::new(p.x, p.y, z + 0.01)));
+            let (gx, gy, gz, gn) = grad.map(|(_, n)| (n.x, n.y, n.z, n.norm())).unwrap_or((0.0, 0.0, 0.0, 0.0));
+            eprintln!("garage path {k}/8 at ({:+.3},{:+.3}): floor z {:+.4} m; ∇sdf 1 cm above = ({:+.3},{:+.3},{:+.3}) |∇|={:.3}, tilt {:.2}°",
+                p.x, p.y, fz.unwrap_or(f64::NAN), gx, gy, gz, gn, (gx.hypot(gy)/gz.abs().max(1e-9)).atan().to_degrees());
+        }
+    }
+    // the floor the marble actually crossed, read back from the level set
+    let profile: Vec<(f64, f64)> = (0..=16)
+        .map(|k| {
+            let p = a + (b - a) * (k as f64 / 16.0);
+            (drift.norm() * k as f64 / 16.0, g.floor_at(p.x, p.y).unwrap_or(f64::NAN))
+        })
+        .collect();
+    let z0 = profile[0].1;
+    let (deepest_s, deepest) = profile.iter().copied().fold((0.0, z0), |acc, (s, z)| if z < acc.1 { (s, z) } else { acc });
+    let grade_in = (z0 - deepest) / deepest_s.max(1e-9);
+    println!(
+        "garage floor along the path: {:.1} mm lower {:.0} cm in, back to {:+.1} mm at the end. that first stretch is a {:.1}% grade; rolling on it predicts {:.2} m/s², the marble averaged {:.2} m/s²",
+        (z0 - deepest) * 1e3, deepest_s * 100.0, (profile[16].1 - z0) * 1e3, grade_in * 100.0,
+        5.0 / 7.0 * GRAVITY * grade_in.atan().sin(), 2.0 * drift.norm() / (secs * secs)
+    );
+    // the frame: splat backdrop, ray-cast marble on top
+    let (w, h) = (800u32, 600u32);
+    let intr = CameraIntrinsics::from_vfov(w, h, 0.75, 0.05, 50.0);
+    let target = Vec3::new(b.x, b.y, b.z);
+    // Up close the splat is mush (ipse-map's own warning: the SDF exists for a
+    // reason), so the frame is the room view with the marble's path drawn on.
+    let eye = match std::env::var("NEWT_VIEW").ok().as_deref() {
+        Some("top") => Vec3::new(cx, cy, 3.0),
+        Some("close") => target + Vec3::new(-0.35, -0.6, 0.45),
+        _ => Vec3::new(cx + 2.4, cy - 2.4, 1.5),
+    };
+    let target = Vec3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, 0.0);
+    let t1 = std::time::Instant::now();
+    let (rgb, count) = garage::render_splat(&g, eye, target, intr.fx, w, h)?;
+    let mut img = image::RgbaImage::new(w, h);
+    for (i, px) in img.pixels_mut().enumerate() {
+        let c = |k: usize| (rgb[i * 3 + k].clamp(0.0, 1.0) * 255.0) as u8;
+        *px = image::Rgba([c(0), c(1), c(2), 255]);
+    }
+    // the marble, ray cast with the same generic caster, composited where it hits
+    let pose = CameraPose::look_at(eye, target, Vec3::z());
+    let lamp = Vec3::new(target.x, target.y, target.z + 2.0);
+    let scene = frame::Scene::<f64>::new(&SpatialTransform::identity(), &[], tang::Vec3::new(b.x, b.y, b.z), r, lamp, 0.05);
+    let hits = frame::composite_marble(&scene, &pose, &intr, &mut img);
+    // the path, as amber dots on the floor
+    for p in path.iter().step_by(10) {
+        if let Some((u, v)) = pose.project(&intr, *p) {
+            if u >= 0.0 && v >= 0.0 && (u as u32) < w && (v as u32) < h {
+                img.put_pixel(u as u32, v as u32, image::Rgba([235, 170, 50, 255]));
+            }
+        }
+    }
+    let gd = out.join("garage");
+    fs::create_dir_all(&gd)?;
+    img.save(gd.join("frame.png"))?;
+    println!("garage frame: {count} gaussians rendered by tang-3dgs in {} ms, marble composited over {hits} pixels → {}/frame.png", t1.elapsed().as_millis(), gd.display());
+    let _ = state;
     Ok(())
 }
 

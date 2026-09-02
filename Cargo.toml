@@ -29,6 +29,8 @@ vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-a
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
 tang         = { path = "/Users/cam/Developer/tang/crates/tang" }
+tang-3dgs    = { path = "/Users/cam/Developer/tang/crates/tang-3dgs" }
+ipse-map     = { path = "/Users/cam/Developer/ipse/crates/ipse-map" }
 
 # One tang. vcad builds against the sibling checkout; phyz against crates.io.
 # Unify on the checkout so tang::Scalar is one trait across the graph.
@@ -37,3 +39,10 @@ tang      = { path = "/Users/cam/Developer/tang/crates/tang" }
 tang-la   = { path = "/Users/cam/Developer/tang/crates/tang-la" }
 tang-expr = { path = "/Users/cam/Developer/tang/crates/tang-expr" }
 tang-ad   = { path = "/Users/cam/Developer/tang/crates/tang-ad" }
+
+# ipse-map pins phyz by git rev; point it at the same worktree everything else uses,
+# or `Model` splits into two types.
+[patch."https://github.com/ecto/phyz"]
+phyz-math      = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
+phyz-model     = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
+phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }

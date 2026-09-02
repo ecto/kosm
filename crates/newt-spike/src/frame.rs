@@ -403,3 +403,22 @@ pub fn objective(
 pub fn out_dir(out: &std::path::Path) -> std::path::PathBuf {
     out.join("frame")
 }
+
+/// Paint the marble (and only the marble) into an existing image: pixels whose
+/// primary ray hits the sphere take the caster's shading. For a scene whose
+/// backdrop is a splat rather than colliders.
+pub fn composite_marble(scene: &Scene<f64>, pose: &CameraPose, intr: &CameraIntrinsics, img: &mut image::RgbaImage) -> usize {
+    let mut n = 0;
+    for y in 0..intr.height {
+        for x in 0..intr.width {
+            let (o, d) = ray::<f64>(pose, intr, x as f64 + 0.5, y as f64 + 0.5);
+            if sphere_hit(scene.marble, scene.marble_r, o, d).is_some() {
+                let (l, _) = scene.shade(o, d);
+                let g = (l.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+                img.put_pixel(x, y, image::Rgba([g, g, g, 255]));
+                n += 1;
+            }
+        }
+    }
+    n
+}

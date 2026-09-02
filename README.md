@@ -77,6 +77,19 @@ the contact adjoint, "put the shadow here in the image" solves for the release
 point. Only box colliders are rendered so far; the decomposed cup's hull
 pieces are not.
 
+### the garage
+
+`garage.rs` drops the marble onto ipse's captured garage (`ipse-map`: a splat
+for appearance, a fused-depth SDF to stand on) using phyz's own contact
+pipeline with the plane swapped for the field, exactly as ipse-sim does for the
+robot. The marble rolls into a 9 mm dip in the real floor at the acceleration
+a 3 % grade predicts. Contact normals come from the level set, not `∇sdf`: the
+fused field is truncated (|∇| ≈ 0.7) and its gradient leans a consistent few
+degrees off the surface it bounds, which a frictionless marble reads as a
+push (2.2 m in 2.2 s on a flat floor) and a robot's foot never notices. The
+frame is the splat, rendered by tang-3dgs, with the path drawn on the floor.
+Set `NEWT_MAP` to another map directory.
+
 ### the lamp
 
 `lamp.rs` puts a point lamp in the room and changes the objective to "the
