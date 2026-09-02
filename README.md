@@ -109,6 +109,22 @@ surface onto the tiles each frame, Fresnel sky reflection, refraction into
 water that absorbs red first, and the melon seen through it. 1280×720 at
 ~0.3–1 s a frame on the CPU, encoded with ffmpeg to `out/pool.mp4`.
 
+### the splash
+
+`newt-spike --splash [frames]` runs the same drop with the water simulated
+(`splash.rs`): a dense-grid MLS-MPM for weakly compressible water over the
+whole pool, APIC transfer with a FLIP blend, and the thing phyz-particle's
+reference solver lacks, a rigid collider that pushes back. Grid nodes inside
+the melon lose their normal relative velocity and the momentum that costs is
+booked as the force phyz applies to the melon. The impact (740–860 N peak),
+the crater, the Worthington jet and the drops are the fluid's. What the
+coupling does *not* yet deliver is hydrostatics: a melon held submerged reads
+8–25 N of support instead of the 68 N of displaced water, so a 5 %-buoyant
+melon hovers at half depth instead of floating. That is the finding for
+phyz-particle: at 2.5–3 cm cells a weakly compressible EOS can't resolve the
+pressure integral over an 11 cm body; it wants a pressure projection or a
+much finer grid.
+
 ### the garage
 
 `garage.rs` drops the marble onto ipse's captured garage (`ipse-map`: a splat

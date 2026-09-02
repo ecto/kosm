@@ -29,6 +29,7 @@ mod glass;
 mod lamp;
 mod light;
 mod pool;
+mod splash;
 mod room;
 
 use std::collections::HashMap;
@@ -483,7 +484,12 @@ fn main() -> anyhow::Result<()> {
     // `newt-spike --pool [frames]` drops a watermelon into a pool and exits.
     if std::env::args().nth(1).as_deref() == Some("--pool") {
         let frames = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(150);
-        return pool::run(Path::new("out"), frames, 1280, 720);
+        return pool::run(Path::new("out"), frames, 1280, 720, false);
+    }
+    // `newt-spike --splash [frames]`: the same drop with the water simulated.
+    if std::env::args().nth(1).as_deref() == Some("--splash") {
+        let frames = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(150);
+        return pool::run(Path::new("out"), frames, 1280, 720, true);
     }
     // `newt-spike --splat some.ply` surveys a splat and exits.
     if std::env::args().nth(1).as_deref() == Some("--splat") {

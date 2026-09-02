@@ -44,7 +44,9 @@ const ABSORB: [f64; 3] = [0.45, 0.10, 0.04];
 // ---- the melon --------------------------------------------------------------
 
 pub const MELON_AXES: [f64; 3] = [0.15, 0.105, 0.105];
-const MELON_DENSITY: f64 = 950.0;
+fn melon_density() -> f64 {
+    std::env::var("NEWT_MELON_RHO").ok().and_then(|v| v.parse().ok()).unwrap_or(950.0)
+}
 const WATER_DENSITY: f64 = 1000.0;
 
 // ---- the sun ----------------------------------------------------------------
@@ -92,10 +94,15 @@ impl Ring {
 pub struct Surface {
     pub rings: Vec<Ring>,
     pub t: f64,
+    /// When the water is simulated, its free surface replaces the rings.
+    pub grid: Option<crate::splash::HeightGrid>,
 }
 
 impl Surface {
     pub fn height(&self, x: f64, y: f64) -> f64 {
+        if let Some(g) = &self.grid {
+            return g.at(x, y);
+        }
         let mut h = 0.0;
         for r in &self.rings {
             h += r.height(x, y, self.t);
@@ -215,12 +222,17 @@ pub struct Drop {
     pub surface: Surface,
     pub last_splash: f64,
     pub entered: bool,
+    /// The simulated water, when the splash is on.
+    pub water: Option<crate::splash::Water>,
+    pub droplets: Vec<V<f64>>,
+    /// Last frame's fluid force on the melon, for the log.
+    pub fluid_force: V<f64>,
 }
 
 impl Drop {
     pub fn new(height: f64) -> Self {
         let vol = 4.0 / 3.0 * std::f64::consts::PI * MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2];
-        let m = MELON_DENSITY * vol;
+        let m = melon_density() * vol;
         let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
         let i = 0.4 * m * r * r;
         let mut model = ModelBuilder::new()
@@ -233,7 +245,79 @@ impl Drop {
         state.q[3] = -0.15;
         state.q[4] = 0.05;
         state.q[5] = height;
-        Self { model, state, sim: Simulator::new(), surface: Surface { rings: Vec::new(), t: 0.0 }, last_splash: -1.0, entered: false }
+        Self {
+            model,
+            state,
+            sim: Simulator::new(),
+            surface: Surface { rings: Vec::new(), t: 0.0, grid: None },
+            last_splash: -1.0,
+            entered: false,
+            water: None,
+            droplets: Vec::new(),
+            fluid_force: V::zero(),
+        }
+    }
+
+    /// Turn the water on: a dense MPM over the whole pool.
+    pub fn with_water(mut self, h: f64) -> Self {
+        // speed of sound ~ 45 m/s: at 5 m/s the impact pressure compresses the
+        // water under a percent, which is what stops a melon instead of
+        // letting it plough through
+        let bulk = 2.0e6;
+        let cs = (bulk / 1000.0f64).sqrt();
+        let dt = 0.35 * h / cs;
+        self.water = Some(crate::splash::Water::fill(h, dt, 0.45, bulk));
+        self
+    }
+
+    /// One 1 ms physics step when the water is simulated: the fluid pushes
+    /// on the melon through the grid, phyz moves the melon.
+    fn step_with_water(&mut self) {
+        let melon = self.melon();
+        let vel = V::new(self.state.v[3], self.state.v[4], self.state.v[5]);
+        let water = self.water.as_mut().expect("water");
+        let subs = (self.model.dt / water.dt).ceil() as usize;
+        let body = crate::splash::Body {
+            centre: Vec3::new(melon.centre.x, melon.centre.y, melon.centre.z),
+            axis: Vec3::new(melon.axis.x, melon.axis.y, melon.axis.z),
+            vel: Vec3::new(vel.x, vel.y, vel.z),
+        };
+        let mut f = Vec3::zeros();
+        for _ in 0..subs {
+            f += water.step(&body);
+        }
+        let f = f / subs as f64;
+        let fv = V::new(f.x, f.y, f.z);
+        if fv.norm() > self.fluid_force.norm() { self.fluid_force = fv; }
+        // NEWT_HOLD=<z>: pin the melon at that depth and just read the force
+        // the water puts on it; a hydrostatic check of the coupling
+        if let Some(z) = std::env::var("NEWT_HOLD").ok().and_then(|v| v.parse::<f64>().ok()) {
+            self.state.q[5] = z;
+            self.state.v[3] = 0.0;
+            self.state.v[4] = 0.0;
+            self.state.v[5] = 0.0;
+            self.state.time += self.model.dt;
+            self.surface.t = self.state.time;
+            return;
+        }
+        self.state.ctrl = phyz_math::DVec::from_slice(&[0.0, 0.0, 0.0, f.x, f.y, f.z]);
+        self.state.v[0] = 0.0;
+        self.state.v[1] = 0.0;
+        self.state.v[2] = 0.0;
+        self.sim.step_with_contacts(&self.model, &mut self.state, -DEPTH, &Default::default());
+        self.state.q[0] = 0.0;
+        self.state.q[1] = 0.0;
+        self.state.q[2] = 0.0;
+        self.surface.t = self.state.time;
+    }
+
+    /// After a frame's worth of steps: read the surface and the drops.
+    pub fn read_water(&mut self) {
+        if let Some(w) = &self.water {
+            let g = w.surface(0.02);
+            self.droplets = w.droplets(&g, 0.02, 400);
+            self.surface.grid = Some(g);
+        }
     }
 
     pub fn centre(&self) -> V<f64> {
@@ -257,6 +341,9 @@ impl Drop {
     }
 
     pub fn step(&mut self) {
+        if self.water.is_some() {
+            return self.step_with_water();
+        }
         self.surface.t = self.state.time;
         let (v_sub, frac) = self.submerged();
         let vel = V::new(self.state.v[3], self.state.v[4], self.state.v[5]);
@@ -483,9 +570,25 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: 
         }
         best
     };
-    // pick the nearest of melon / water / wall / deck
+    // drops in the air: small spheres
+    let mut t_drop: Option<(f64, V<f64>)> = None;
+    for c in &drop.droplets {
+        let oc = o - *c;
+        let b = oc.dot(&d);
+        let disc = b * b - (oc.norm_sq() - 0.012 * 0.012);
+        if disc > 0.0 {
+            let t = -b - disc.sqrt();
+            if t > 1e-6 && t_drop.is_none_or(|x| t < x.0) {
+                t_drop = Some((t, (o + d * t - *c).normalize()));
+            }
+        }
+    }
+    // pick the nearest of melon / water / wall / deck / drop
     let mut best_t = f64::INFINITY;
     let mut what = 0; // 0 sky
+    if let Some((t, _)) = t_drop {
+        if t < best_t { best_t = t; what = 5; }
+    }
     if let Some((t, _)) = t_melon {
         if t < best_t { best_t = t; what = 1; }
     }
@@ -544,6 +647,19 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: 
             let lit = SUN_IRRADIANCE * n.dot(&s).max(0.0) * if sun_blocked_air(melon, p) { 0.15 } else { 1.0 };
             let mut c = [0.0; 3];
             for k in 0..3 { c[k] = deck()[k] * (0.35 * sky(n)[k] + lit); }
+            c
+        }
+        5 => {
+            // a drop: a bead of water, mostly reflection and a bright rim
+            let (_, n) = t_drop.unwrap();
+            let r = 0.04 + 0.96 * (1.0 + d.dot(&n)).clamp(0.0, 1.0).powi(5);
+            let sk = sky(reflect(d, n));
+            let mut c = [0.0; 3];
+            for k in 0..3 {
+                c[k] = r * sk[k] + (1.0 - r) * [0.55, 0.72, 0.85][k] * 0.8;
+            }
+            let hl = n.dot(&(s - d).normalize()).max(0.0).powf(80.0) * 2.0;
+            for v in &mut c { *v += hl; }
             c
         }
         _ => sky(d),
@@ -665,10 +781,15 @@ pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
 }
 
 /// The whole thing: drop the melon, render `frames` at 30 fps, encode.
-pub fn run(out: &Path, frames: usize, width: u32, height: u32) -> anyhow::Result<()> {
-    let dir = out.join("pool");
+pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> anyhow::Result<()> {
+    let dir = out.join(if splash { "splash" } else { "pool" });
     std::fs::create_dir_all(&dir)?;
     let mut drop = Drop::new(1.3);
+    if splash {
+        drop = drop.with_water(std::env::var("NEWT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.025));
+        let w = drop.water.as_ref().unwrap();
+        println!("splash {} water particles on a {}×{}×{} grid at {} cm, dt {:.2e} s ({} substeps per ms)", w.count(), w.nx, w.ny, w.nz, w.h * 100.0, w.dt, (drop.model.dt / w.dt).ceil());
+    }
     // from the deck corner, low, so the far water reflects the sky and the near
     // water shows the tiles
     let view = View { eye: V::new(-1.42, -1.22, 0.31), target: V::new(0.02, 0.12, -0.06), width, height, vfov: 0.9 };
@@ -680,20 +801,23 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32) -> anyhow::Result
             drop.step();
         }
         lowest = lowest.min(drop.centre().z);
+        drop.read_water();
         let c = caustic(&drop.surface, 0.01);
+        let peak_force = drop.fluid_force;
+        drop.fluid_force = V::zero();
         let img = render(&view, &drop, &c);
         img.save(dir.join(format!("frame_{k:03}.png")))?;
-        if k == 0 || k % 15 == 0 || k + 1 == frames {
+        if k == 0 || k % 5 == 0 || k + 1 == frames {
             let m = drop.centre();
             println!(
-                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  rings={}  {} ms/frame",
-                drop.state.time, m.z, drop.state.v[5], drop.surface.rings.len(), t0.elapsed().as_millis() / (k as u128 + 1)
+                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={}  {} ms/frame",
+                drop.state.time, m.z, drop.state.v[5], peak_force.z, drop.water.as_ref().map(|w| w.interior_mass).unwrap_or(0.0), drop.water.as_ref().map(|w| w.interior_mass * GRAVITY).unwrap_or(0.0), drop.droplets.len(), t0.elapsed().as_millis() / (k as u128 + 1)
             );
         }
     }
     let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
     println!("pool   the melon went {:.2} m under and floats with {:.0}% of its radius above the line", -(lowest - r), (drop.centre().z / r) * 100.0);
-    let mp4 = out.join("pool.mp4");
+    let mp4 = out.join(if splash { "splash.mp4" } else { "pool.mp4" });
     let st = std::process::Command::new("ffmpeg")
         .args(["-y", "-loglevel", "error", "-framerate", "30", "-i"])
         .arg(dir.join("frame_%03d.png"))
