@@ -269,7 +269,7 @@ impl Drop {
         let bulk = 2.0e6;
         let cs = (bulk / 1000.0f64).sqrt();
         let dt = 0.35 * h / cs;
-        let mut water = crate::splash::Water::fill(h, dt, 0.45, bulk);
+        let mut water = crate::splash::Water::fill(h, dt, 1.0, bulk);
         // pack the fill down before anything arrives, and take the rest level
         water.settle(0.6);
         self.water = Some(water);
