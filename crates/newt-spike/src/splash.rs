@@ -19,7 +19,9 @@ use phyz_math::{GRAVITY, Mat3, Vec3};
 use rayon::prelude::*;
 
 /// Per-substep share of the mass-based J blended into the integrated J.
-pub const J_RELAX: f64 = 0.02;
+pub fn j_relax() -> f64 {
+    std::env::var("NEWT_JRELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02)
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Nanoseconds spent per phase of `Water::step` since the last `take_prof`:
@@ -157,7 +159,7 @@ impl Water {
             g_mass: vec![0.0; nx * ny * nz],
             g_mom: vec![Vec3::zeros(); nx * ny * nz],
             g_vel_old: vec![Vec3::zeros(); nx * ny * nz],
-            flip: 0.9,
+            flip: std::env::var("NEWT_FLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9),
             bulk,
             time: 0.0,
             interior_mass: 0.0,
@@ -166,6 +168,41 @@ impl Water {
             gpu: None,
             damp: 1.0,
         }
+    }
+
+    /// The density estimate the pressure uses, at a point, over rest density:
+    /// sum of B-spline weights times node mass, raw and 3x3x3-blurred.
+    pub fn density_at(&self, p: Vec3) -> (f64, f64) {
+        let h = self.h;
+        let full = 1000.0 * h * h * h;
+        let rel = (p - self.origin) / h;
+        let base = (rel - Vec3::new(0.5, 0.5, 0.5)).map_floor();
+        let fx = rel - base;
+        let w = weights(fx);
+        let mut raw = 0.0;
+        let mut blur = 0.0;
+        for di in 0..3 {
+            for dj in 0..3 {
+                for dk in 0..3 {
+                    let (i, j, k) = (base.x as i64 + di as i64, base.y as i64 + dj as i64, base.z as i64 + dk as i64);
+                    if i < 1 || j < 1 || k < 1 || i + 1 >= self.nx as i64 || j + 1 >= self.ny as i64 || k + 1 >= self.nz as i64 {
+                        continue;
+                    }
+                    let wt = w[0][di] * w[1][dj] * w[2][dk];
+                    raw += wt * self.g_mass[self.idx(i as usize, j as usize, k as usize)];
+                    let mut acc = 0.0;
+                    for a in -1..=1i64 {
+                        for b in -1..=1i64 {
+                            for c in -1..=1i64 {
+                                acc += self.g_mass[self.idx((i + a) as usize, (j + b) as usize, (k + c) as usize)];
+                            }
+                        }
+                    }
+                    blur += wt * acc / 27.0;
+                }
+            }
+        }
+        (raw / full, blur / full)
     }
 
     pub fn count(&self) -> usize {
@@ -383,10 +420,13 @@ impl Water {
                 for dk in -1i64..=1 {
                     for dj in -1i64..=1 {
                         for di in -1i64..=1 {
-                            let (a, b, cc) = (i as i64 + di, jj as i64 + dj, k as i64 + dk);
-                            if a < 0 || b < 0 || cc < 0 || a >= nx as i64 || b >= ny as i64 || cc >= nz as i64 {
-                                continue;
-                            }
+                            // ghost rows hold little mass; a particle at a wall
+                            // would read half density and build no pressure, so
+                            // the wall layer packs (3x). Read the interior
+                            // instead: the fluid continues as if mirrored.
+                            let a = (i as i64 + di).clamp(2, nx as i64 - 3);
+                            let b = (jj as i64 + dj).clamp(2, ny as i64 - 3);
+                            let cc = (k as i64 + dk).clamp(2, nz as i64 - 3);
                             acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
                         }
                     }
@@ -399,7 +439,9 @@ impl Water {
         let damp = self.damp;
         // a node's mass when the water around it is at rest density
         let full = 1000.0 * h * h * h;
-        let e = 1.5 * h;
+        // particles stay on the fluid side of the wall plane (origin + 2h);
+        // half a cell beyond it was a band that packed 2x
+        let e = 2.0 * h;
         let (xmax, ymax, zmax) = (origin.x + (nx - 1) as f64 * h - e, origin.y + (ny - 1) as f64 * h - e, origin.z + (nz - 1) as f64 * h - e);
         {
             let Water { x, v, c, j, g_mass, g_mom, g_vel_old, .. } = &mut *self;
@@ -423,6 +465,9 @@ impl Water {
                                 continue;
                             }
                             let g = (k as usize * ny + jj as usize) * nx + i as usize;
+                            // the density the pressure sees: mirrored at the walls (see g_blur)
+                            let gr = (k.clamp(2, nz as i64 - 3) as usize * ny + jj.clamp(2, ny as i64 - 3) as usize) * nx + i.clamp(2, nx as i64 - 3) as usize;
+                            rho += w[0][di] * w[1][dj] * w[2][dk] * g_blur[gr];
                             let m = g_mass[g];
                             if m <= 0.0 {
                                 continue;
@@ -433,7 +478,6 @@ impl Water {
                             vnew += gv * wt;
                             dv += (gv - g_vel_old[g]) * wt;
                             b = b + outer(gv * wt, dpos);
-                            rho += wt * g_blur[g];
                         }
                     }
                 }
@@ -458,7 +502,7 @@ impl Water {
                 // the column ~15% denser than rest, an open item.
                 let j_int = *jp * (1.0 + dt * (cp[(0, 0)] + cp[(1, 1)] + cp[(2, 2)]));
                 let j_mass = full / rho.max(1e-12);
-                *jp = (j_int + (j_mass - j_int) * J_RELAX).clamp(0.5, 2.0);
+                *jp = (j_int + (j_mass - j_int) * j_relax()).clamp(0.5, 2.0);
                 *xp += vnew * dt;
                 // keep particles in the box
                 xp.x = xp.x.clamp(origin.x + e, xmax);
@@ -494,7 +538,7 @@ impl Water {
             bulk: self.bulk as f32,
             flip: self.flip as f32,
             gravity: GRAVITY as f32,
-            j_relax: J_RELAX as f32,
+            j_relax: j_relax() as f32,
         };
         self.gpu = Some(newt_mpm::GpuMpm::new(params, &particles, max_subs)?);
         Ok(())

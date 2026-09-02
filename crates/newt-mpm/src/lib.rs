@@ -287,7 +287,7 @@ impl GpuMpm {
         let h = p.h;
         let n = p.n;
         let o = p.origin;
-        let e = 1.5 * h;
+        let e = 2.0 * h; // the wall plane, see the CPU solver
         let a = norm(body.axis);
         let b = norm(cross([0.0, 0.0, 1.0], a));
         let cc = cross(a, b);

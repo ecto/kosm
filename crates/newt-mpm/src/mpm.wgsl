@@ -248,10 +248,13 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 let k = bk + dk;
                 if (i < 0 || j < 0 || k < 0 || i >= i32(P.n.x) || j >= i32(P.n.y) || k >= i32(P.n.z)) { continue; }
                 let g = u32(node_index(i, j, k));
+                let wt = wx[di] * wy[dj] * wz[dk];
+                // the density the pressure sees, mirrored at the walls
+                let gr = u32(node_index(clamp(i, 2, i32(P.n.x) - 3), clamp(j, 2, i32(P.n.y) - 3), clamp(k, 2, i32(P.n.z) - 3)));
+                rho += wt * gvold[gr].w;
                 let gv4 = gvel[g];
                 if (gv4.w <= 0.0) { continue; }
                 let dpos = (vec3<f32>(f32(di), f32(dj), f32(dk)) - fx) * h;
-                let wt = wx[di] * wy[dj] * wz[dk];
                 let gv = gv4.xyz;
                 vnew += gv * wt;
                 dv += (gv - gvold[g].xyz) * wt;
@@ -260,7 +263,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 b0 += a * dpos.x;
                 b1 += a * dpos.y;
                 b2 += a * dpos.z;
-                rho += wt * gvold[g].w;
             }
         }
     }
@@ -459,10 +461,10 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     for (var dk = -1; dk <= 1; dk++) {
         for (var dj = -1; dj <= 1; dj++) {
             for (var di = -1; di <= 1; di++) {
-                let a = i + di;
-                let b = j + dj;
-                let cc = k + dk;
-                if (a < 0 || b < 0 || cc < 0 || a >= i32(P.n.x) || b >= i32(P.n.y) || cc >= i32(P.n.z)) { continue; }
+                // mirrored at the walls: see the CPU solver's g_blur
+                let a = clamp(i + di, 2, i32(P.n.x) - 3);
+                let b = clamp(j + dj, 2, i32(P.n.y) - 3);
+                let cc = clamp(k + dk, 2, i32(P.n.z) - 3);
                 acc += gvel[u32(node_index(a, b, cc))].w;
             }
         }
