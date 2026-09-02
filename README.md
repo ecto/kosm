@@ -98,6 +98,17 @@ a square pyramid, all convex solids the same code handles for the camera and
 for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 `pyramid_h_mm`, `sample_yaw_deg`) so they can be set to real samples.
 
+### the pool
+
+`newt-spike --pool [frames]` drops a watermelon into a pool (`pool.rs`). The
+melon is a phyz rigid body with Archimedes buoyancy and quadratic drag applied
+as generalized forces, so it plunges, slows and floats. The water surface is a
+wave field driven by the impact (deep-water dispersion, spreading and decaying
+rings), not a fluid solve; the light is real: sun caustics traced through the
+surface onto the tiles each frame, Fresnel sky reflection, refraction into
+water that absorbs red first, and the melon seen through it. 1280×720 at
+~0.3–1 s a frame on the CPU, encoded with ffmpeg to `out/pool.mp4`.
+
 ### the garage
 
 `garage.rs` drops the marble onto ipse's captured garage (`ipse-map`: a splat

@@ -28,6 +28,7 @@ mod garage;
 mod glass;
 mod lamp;
 mod light;
+mod pool;
 mod room;
 
 use std::collections::HashMap;
@@ -479,6 +480,11 @@ fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::L
 // ---- main -------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
+    // `newt-spike --pool [frames]` drops a watermelon into a pool and exits.
+    if std::env::args().nth(1).as_deref() == Some("--pool") {
+        let frames = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(150);
+        return pool::run(Path::new("out"), frames, 1280, 720);
+    }
     // `newt-spike --splat some.ply` surveys a splat and exits.
     if std::env::args().nth(1).as_deref() == Some("--splat") {
         let ply = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("--splat needs a .ply"))?;
