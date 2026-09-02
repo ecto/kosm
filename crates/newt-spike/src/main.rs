@@ -1011,8 +1011,8 @@ fn light_stage(
         // slab lands near 1×, a sphere's focus in the hundreds
         let peak = c.e.iter().flat_map(|b| b.iter()).cloned().fold(0.0, f64::max);
         println!(
-            "light  {name:8} {} rays × 5 bands in {} ms, {} lost inside; caustic peak {:.1}× direct, spread {:.1} mm rms, blue−red spread {:+.2} mm",
-            c.traced, t0.elapsed().as_millis(), c.tir, peak * (lamp_local.z).powi(2), c.spread(2).sqrt() * 1e3, (c.spread(0).sqrt() - c.spread(4).sqrt()) * 1e3
+            "light  {name:8} {} rays × 5 bands in {} ms, {} lost inside, {} landed outside a {:.0} mm window; caustic peak {:.1}× direct, spread {:.1} mm rms, blue−red spread {:+.2} mm",
+            c.traced, t0.elapsed().as_millis(), c.tir, c.outside, c.n as f64 * c.cell * 1e3, peak * (lamp_local.z).powi(2), c.spread(2).sqrt() * 1e3, (c.spread(0).sqrt() - c.spread(4).sqrt()) * 1e3
         );
         light::image(&c, 0.02).save(ld.join(format!("caustic_{name}.png")))?;
         caustics.push(c);

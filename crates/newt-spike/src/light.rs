@@ -67,9 +67,11 @@ pub struct Caustic<S: Scalar> {
     pub n: usize,
     /// `bands × n × n` irradiance, W/m² per unit lamp radiant intensity.
     pub e: Vec<Vec<S>>,
-    /// Rays traced, rays lost to total internal reflection.
+    /// Rays traced, rays lost to total internal reflection, rays that left
+    /// the glass but landed outside the window.
     pub traced: usize,
     pub tir: usize,
+    pub outside: usize,
 }
 
 /// Trace `rays_per_band` light rays per band from the lamp through a glass
@@ -82,18 +84,25 @@ pub fn trace<S: Scalar>(
     cells: usize,
     rays_per_band: usize,
 ) -> Caustic<S> {
-    let cell = window / cells as f64;
     let (centre_s, bound_s) = shape.bounds();
     let centre = Vec3::new(centre_s.x.to_f64(), centre_s.y.to_f64(), centre_s.z.to_f64());
     let bound = bound_s.to_f64();
-    // the window is centred on where the lamp's ray through the object's
-    // centre meets the plate
     let to = centre - lamp;
-    let t = -lamp.z / to.z;
-    let hit0 = lamp + to * t;
-    let origin = [hit0.x - window * 0.5, hit0.y - window * 0.5];
+    // the window: `window` is the cell budget's extent; the grid is centred on
+    // where the light actually lands (a first pass on f64 at low density),
+    // and grown to hold it, keeping the cell size. A pyramid throws its light
+    // well past its own footprint and a fixed window silently dropped it.
+    let cell = window / cells as f64;
+    let (origin, cells) = {
+        let (lo, hi) = landing_box(lamp, shape, nd.to_f64(), 4_000);
+        let ext = ((hi[0] - lo[0]).max(hi[1] - lo[1]) + 4.0 * cell).max(window);
+        let n = ((ext / cell).ceil() as usize).min(720);
+        let ext = n as f64 * cell;
+        let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        ([c[0] - ext * 0.5, c[1] - ext * 0.5], n)
+    };
     let mut e = vec![vec![S::ZERO; cells * cells]; BANDS.len()];
-    let (mut traced, mut tir) = (0usize, 0usize);
+    let (mut traced, mut tir, mut outside) = (0usize, 0usize, 0usize);
 
     // rays: a jittered lattice over the disc of directions that covers the
     // object's bounding sphere
@@ -136,7 +145,7 @@ pub fn trace<S: Scalar>(
                     continue;
                 };
                 let t_in = S::ONE - crate::glass::fresnel(S::ONE, n_glass, cos_i, cos_t);
-                let Some((p2, d_out, t_out)) = crate::glass::walk_inside(shape, p1, d_in, n_glass, S::ZERO, 4) else {
+                let Some((p2, d_out, t_out)) = crate::glass::walk_inside(shape, p1, d_in, n_glass, S::ZERO, 8) else {
                     tir += 1;
                     continue;
                 };
@@ -151,6 +160,7 @@ pub fn trace<S: Scalar>(
                 let gy = (hit.y - S::from_f64(origin[1])) / S::from_f64(cell) - S::HALF;
                 let (fx, fy) = (gx.to_f64().floor(), gy.to_f64().floor());
                 if !(fx > -2.0 && fy > -2.0 && fx < cells as f64 + 1.0 && fy < cells as f64 + 1.0) {
+                    outside += 1;
                     continue;
                 }
                 let (wx, wy) = (gx - S::from_f64(fx), gy - S::from_f64(fy));
@@ -165,7 +175,68 @@ pub fn trace<S: Scalar>(
             }
         }
     }
-    Caustic { origin, cell, n: cells, e, traced, tir }
+    Caustic { origin, cell, n: cells, e, traced, tir, outside }
+}
+
+/// Where the transmitted light lands on the plate: the 2nd..98th percentile
+/// box of hit points from a low-density f64 trace at the d line.
+fn landing_box(lamp: Vec3<f64>, shape: &crate::glass::Shape<impl Scalar>, nd: f64, rays: usize) -> ([f64; 2], [f64; 2]) {
+    let shape = shape_f64(shape);
+    let (centre, bound) = shape.bounds();
+    let to = centre - lamp;
+    let dist = to.norm();
+    let axis = to / dist;
+    let u = if axis.x.abs() < 0.9 { Vec3::x() } else { Vec3::y() };
+    let e1 = axis.cross(&u).normalize();
+    let e2 = axis.cross(&e1);
+    let ang = (bound / dist).min(0.999).asin();
+    let side = (rays as f64).sqrt().ceil() as usize;
+    let n_glass = index::<f64>(nd, D_LINE_UM);
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for i in 0..side {
+        for j in 0..side {
+            let a = (i as f64 + 0.5) / side as f64 * 2.0 - 1.0;
+            let c = (j as f64 + 0.5) / side as f64 * 2.0 - 1.0;
+            if a * a + c * c > 1.0 {
+                continue;
+            }
+            let theta = ang * (a * a + c * c).sqrt();
+            let phi = c.atan2(a);
+            let d = axis * theta.cos() + (e1 * phi.cos() + e2 * phi.sin()) * theta.sin();
+            let Some((t1, n1)) = shape.enter(lamp, d) else { continue };
+            let p1 = lamp + d * t1;
+            let Some((d_in, _, _)) = crate::glass::refract(d, n1, 1.0, n_glass) else { continue };
+            let Some((p2, d_out, _)) = crate::glass::walk_inside(&shape, p1, d_in, n_glass, 0.0, 8) else { continue };
+            if d_out.z >= 0.0 {
+                continue;
+            }
+            let hit = p2 + d_out * (-p2.z / d_out.z);
+            xs.push(hit.x);
+            ys.push(hit.y);
+        }
+    }
+    if xs.len() < 8 {
+        let hit0 = lamp + to * (-lamp.z / to.z);
+        return ([hit0.x - 0.01, hit0.y - 0.01], [hit0.x + 0.01, hit0.y + 0.01]);
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+    ys.sort_by(|a, b| a.total_cmp(b));
+    let q = |v: &[f64], f: f64| v[((v.len() - 1) as f64 * f) as usize];
+    ([q(&xs, 0.02), q(&ys, 0.02)], [q(&xs, 0.98), q(&ys, 0.98)])
+}
+
+/// Any-scalar shape to f64 (reads the real parts).
+fn shape_f64<S: Scalar>(shape: &crate::glass::Shape<S>) -> crate::glass::Shape<f64> {
+    use crate::glass::Shape;
+    let v = |p: Vec3<S>| Vec3::new(p.x.to_f64(), p.y.to_f64(), p.z.to_f64());
+    match shape {
+        Shape::Sphere { centre, r } => Shape::Sphere { centre: v(*centre), r: r.to_f64() },
+        Shape::Convex { planes, centre, bound_r } => Shape::Convex {
+            planes: planes.iter().map(|(n, d)| (v(*n), d.to_f64())).collect(),
+            centre: v(*centre),
+            bound_r: bound_r.to_f64(),
+        },
+    }
 }
 
 impl Caustic<f64> {
