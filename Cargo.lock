@@ -1875,6 +1875,7 @@ dependencies = [
  "phyz-model",
  "phyz-rigid",
  "phyz-world",
+ "rayon",
  "tang",
  "tang-3dgs",
  "vcad",

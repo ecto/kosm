@@ -23,6 +23,7 @@ vcad-loon.workspace = true
 vcad-kernel-export.workspace = true
 vcad-render.workspace = true
 image.workspace = true
+rayon = "1"
 tang.workspace = true
 tang-3dgs.workspace = true
 ipse-map.workspace = true

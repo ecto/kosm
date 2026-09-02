@@ -16,6 +16,19 @@
 //! Units: metres, z up, water at rest at z = 0.
 
 use phyz_math::{GRAVITY, Mat3, Vec3};
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Nanoseconds spent per phase of `Water::step` since the last `take_prof`:
+/// zero, bin, p2g, grid, g2p.
+static PROF: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+fn prof(slot: usize, t: &mut std::time::Instant) {
+    PROF[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    *t = std::time::Instant::now();
+}
+pub fn take_prof() -> [u64; 5] {
+    std::array::from_fn(|i| PROF[i].swap(0, Ordering::Relaxed))
+}
 
 use crate::pool::{DEPTH, MELON_AXES, POOL_X, POOL_Y};
 
@@ -50,6 +63,8 @@ pub struct Water {
     pub interior_mass: f64,
     /// The extracted surface's rest level, so still water reads as z = 0.
     pub level_offset: f64,
+    /// Particle order by scatter group from the last step (see `compact`).
+    order: Vec<u32>,
 }
 
 /// The collider the water feels: an ellipsoid with a velocity.
@@ -134,6 +149,7 @@ impl Water {
             time: 0.0,
             interior_mass: 0.0,
             level_offset: 0.0,
+            order: Vec::new(),
         }
     }
 
@@ -151,149 +167,249 @@ impl Water {
         self.origin + Vec3::new(i as f64, j as f64, k as f64) * self.h
     }
 
+    /// Reorder the particles by the scatter group they were in last step, so
+    /// the parallel scatter reads them sequentially. Once a frame is plenty;
+    /// a particle moves well under a cell per substep.
+    pub fn compact(&mut self) {
+        if self.order.len() != self.x.len() {
+            return;
+        }
+        let o = &self.order;
+        let pick = |v: &Vec<Vec3>| o.par_iter().map(|&p| v[p as usize]).collect::<Vec<_>>();
+        self.x = pick(&self.x);
+        self.v = pick(&self.v);
+        self.c = o.par_iter().map(|&p| self.c[p as usize]).collect();
+        self.j = o.par_iter().map(|&p| self.j[p as usize]).collect();
+        self.order.clear();
+    }
+
     /// One substep. Returns the wrench the water put on the body (force only).
     pub fn step(&mut self, body: &Body) -> Vec3 {
         let h = self.h;
         let inv_h = 1.0 / h;
         let dt = self.dt;
         let n = self.x.len();
-        for m in self.g_mass.iter_mut() {
-            *m = 0.0;
-        }
-        for m in self.g_mom.iter_mut() {
-            *m = Vec3::zeros();
-        }
+        let mut pt = std::time::Instant::now();
+        self.g_mass.par_iter_mut().for_each(|m| *m = 0.0);
+        self.g_mom.par_iter_mut().for_each(|m| *m = Vec3::zeros());
+        prof(0, &mut pt);
         // ---- P2G (MLS-MPM: stress folded into the affine momentum) ----
+        // Scatter in parallel by colouring the grid in 3x3 columns of cells:
+        // a particle's base (i, j) puts it in group (i/3, j/3), whose 3x3x3
+        // stencil touches i in [3gx, 3gx+5) and j in [3gy, 3gy+5), so groups
+        // whose gx and gy both share parity never share a node. Four passes,
+        // each parallel over its ~200 groups. (Colouring in k was tried first;
+        // the water only fills the bottom rows, so few groups had work.)
         let d_inv = 4.0 * inv_h * inv_h; // quadratic B-spline
-        for p in 0..n {
-            let xp = self.x[p];
-            let base = ((xp - self.origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
-            let fx = (xp - self.origin) * inv_h - base;
-            let w = weights(fx);
-            // pressure from the equation of state: p = K (1/J − 1), clamped so
-            // stretched (splashing) water does not pull
-            let jp = self.j[p];
-            let pressure = (self.bulk * (1.0 / jp - 1.0)).max(0.0);
-            let stress = Mat3::identity() * (-pressure);
-            let affine = stress * (-dt * self.vol0 * jp * d_inv) + self.c[p] * self.mass;
-            let bi = base.x as i64;
-            let bj = base.y as i64;
-            let bk = base.z as i64;
-            for di in 0..3 {
-                for dj in 0..3 {
-                    for dk in 0..3 {
-                        let (i, j, k) = (bi + di as i64, bj + dj as i64, bk + dk as i64);
-                        if i < 0 || j < 0 || k < 0 || i >= self.nx as i64 || j >= self.ny as i64 || k >= self.nz as i64 {
-                            continue;
-                        }
-                        let dpos = (Vec3::new(di as f64, dj as f64, dk as f64) - fx) * h;
-                        let wt = w[0][di] * w[1][dj] * w[2][dk];
-                        let g = self.idx(i as usize, j as usize, k as usize);
-                        self.g_mass[g] += wt * self.mass;
-                        self.g_mom[g] += (self.v[p] * self.mass + affine * dpos) * wt;
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let origin = self.origin;
+        let (mass, vol0, bulk) = (self.mass, self.vol0, self.bulk);
+        let slab = 3usize;
+        let (ngx, ngy) = (nx / slab + 1, ny / slab + 1);
+        let ngroups = ngx * ngy;
+        let group = |xp: &Vec3| {
+            let b = ((*xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
+            let gx = ((b.x.max(0.0) as usize) / slab).min(ngx - 1);
+            let gy = ((b.y.max(0.0) as usize) / slab).min(ngy - 1);
+            (gy * ngx + gx) as u32
+        };
+        let group_of: Vec<u32> = self.x.par_iter().map(group).collect();
+        let mut counts = group_of
+            .par_chunks(8192)
+            .fold(
+                || vec![0usize; ngroups + 1],
+                |mut c, chunk| {
+                    for &g in chunk {
+                        c[g as usize + 1] += 1;
                     }
+                    c
+                },
+            )
+            .reduce(|| vec![0usize; ngroups + 1], |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += y;
                 }
+                a
+            });
+        for g in 0..ngroups {
+            counts[g + 1] += counts[g];
+        }
+        let mut fill = counts.clone();
+        let mut order = vec![0u32; n];
+        for (p, &g) in group_of.iter().enumerate() {
+            order[fill[g as usize]] = p as u32;
+            fill[g as usize] += 1;
+        }
+        self.order = order;
+        prof(1, &mut pt);
+        {
+            let Water { x, v, c, j, g_mass, g_mom, order, .. } = &mut *self;
+            let (x, v, c, j, order) = (&*x, &*v, &*c, &*j, &*order);
+            #[derive(Clone, Copy)]
+            struct Grid(*mut f64, *mut Vec3);
+            unsafe impl Sync for Grid {}
+            unsafe impl Send for Grid {}
+            let grid = Grid(g_mass.as_mut_ptr(), g_mom.as_mut_ptr());
+            let idx = |i: usize, jj: usize, k: usize| (k * ny + jj) * nx + i;
+            for colour in 0..4 {
+                let (cx, cy) = (colour % 2, colour / 2);
+                (0..ngroups).into_par_iter().filter(|g| (g % ngx) % 2 == cx && (g / ngx) % 2 == cy).for_each(|g| {
+                    let grid = grid;
+                    for &p in &order[counts[g]..counts[g + 1]] {
+                        let p = p as usize;
+                        let xp = x[p];
+                        let base = ((xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
+                        let fx = (xp - origin) * inv_h - base;
+                        let w = weights(fx);
+                        // pressure from the equation of state: p = K (1/J − 1), clamped so
+                        // stretched (splashing) water does not pull
+                        let jp = j[p];
+                        let pressure = (bulk * (1.0 / jp - 1.0)).max(0.0);
+                        let stress = Mat3::identity() * (-pressure);
+                        let affine = stress * (-dt * vol0 * jp * d_inv) + c[p] * mass;
+                        let mv = v[p] * mass;
+                        let bi = base.x as i64;
+                        let bj = base.y as i64;
+                        let bk = base.z as i64;
+                        for di in 0..3 {
+                            for dj in 0..3 {
+                                for dk in 0..3 {
+                                    let (i, jj, k) = (bi + di as i64, bj + dj as i64, bk + dk as i64);
+                                    if i < 0 || jj < 0 || k < 0 || i >= nx as i64 || jj >= ny as i64 || k >= nz as i64 {
+                                        continue;
+                                    }
+                                    let dpos = (Vec3::new(di as f64, dj as f64, dk as f64) - fx) * h;
+                                    let wt = w[0][di] * w[1][dj] * w[2][dk];
+                                    let gi = idx(i as usize, jj as usize, k as usize);
+                                    // SAFETY: groups of one colour touch disjoint (i, j) columns (see above),
+                                    // and gi is in bounds by the check just made.
+                                    unsafe {
+                                        *grid.0.add(gi) += wt * mass;
+                                        *grid.1.add(gi) += (mv + affine * dpos) * wt;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
         }
-        // ---- grid: gravity, walls, the body ----
-        let mut reaction = Vec3::zeros();
-        let mut interior = 0.0;
-        let (lo, hi) = (self.origin + Vec3::new(2.0, 2.0, 2.0) * h, self.origin + Vec3::new((self.nx - 3) as f64, (self.ny - 3) as f64, (self.nz - 3) as f64) * h);
-        for k in 0..self.nz {
-            for j in 0..self.ny {
-                for i in 0..self.nx {
-                    let g = self.idx(i, j, k);
-                    let m = self.g_mass[g];
-                    if m <= 0.0 {
-                        continue;
-                    }
-                    let mut vel = self.g_mom[g] / m;
-                    self.g_vel_old[g] = vel;
-                    vel.z -= GRAVITY * dt;
-                    let xi = self.node_pos(i, j, k);
-                    // the pool: floor and walls, free-slip
-                    if xi.x < lo.x && vel.x < 0.0 { vel.x = 0.0; }
-                    if xi.x > hi.x && vel.x > 0.0 { vel.x = 0.0; }
-                    if xi.y < lo.y && vel.y < 0.0 { vel.y = 0.0; }
-                    if xi.y > hi.y && vel.y > 0.0 { vel.y = 0.0; }
-                    if xi.z < lo.z && vel.z < 0.0 { vel.z = 0.0; }
-                    if xi.z > hi.z && vel.z > 0.0 { vel.z = 0.0; }
-                    // the melon: nodes within half a cell of its surface or inside
-                    // take its normal velocity; what that costs is booked
-                    let (d, nrm) = body.sdf(xi);
-                    if d < 0.0 {
-                        // inside the melon: no relative motion through the
-                        // surface in either direction, so pressure from below
-                        // *and* above reaches the body; the tangential part is
-                        // left alone, since a sticky interior turned out to be
-                        // a brake that held the melon at neutral depth
-                        interior += m;
-                        let rel = vel - body.vel;
-                        let new = vel - nrm * rel.dot(&nrm);
-                        reaction += (new - vel) * m;
-                        vel = new;
-                    } else if d < 0.5 * h {
-                        // the shell: no approach through the surface, free slip along it
-                        let rel = vel - body.vel;
-                        let vn = rel.dot(&nrm);
-                        if vn < 0.0 {
-                            let new = vel - nrm * vn;
-                            reaction += (new - vel) * m;
-                            vel = new;
-                        }
-                    }
-                    self.g_mom[g] = vel * m;
-                }
-            }
-        }
-        // ---- G2P (APIC) ----
-        for p in 0..n {
-            let xp = self.x[p];
-            let base = ((xp - self.origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
-            let fx = (xp - self.origin) * inv_h - base;
-            let w = weights(fx);
-            let mut vnew = Vec3::zeros();
-            let mut dv = Vec3::zeros();
-            let mut b = zero3();
-            let bi = base.x as i64;
-            let bj = base.y as i64;
-            let bk = base.z as i64;
-            for di in 0..3 {
-                for dj in 0..3 {
-                    for dk in 0..3 {
-                        let (i, j, k) = (bi + di as i64, bj + dj as i64, bk + dk as i64);
-                        if i < 0 || j < 0 || k < 0 || i >= self.nx as i64 || j >= self.ny as i64 || k >= self.nz as i64 {
-                            continue;
-                        }
-                        let g = self.idx(i as usize, j as usize, k as usize);
-                        let m = self.g_mass[g];
+        prof(2, &mut pt);
+        // ---- grid: gravity, walls, the body ----  (parallel over rows)
+        let (lo, hi) = (origin + Vec3::new(2.0, 2.0, 2.0) * h, origin + Vec3::new((nx - 3) as f64, (ny - 3) as f64, (nz - 3) as f64) * h);
+        let (reaction, interior) = self
+            .g_mom
+            .par_chunks_mut(nx)
+            .zip(self.g_vel_old.par_chunks_mut(nx))
+            .zip(self.g_mass.par_chunks(nx))
+            .enumerate()
+            .map(|(row, ((mom, vold), gm))| {
+                let (k, jj) = (row / ny, row % ny);
+                let mut reaction = Vec3::zeros();
+                let mut interior = 0.0;
+                {
+                    for i in 0..nx {
+                        let g = i;
+                        let m = gm[g];
                         if m <= 0.0 {
                             continue;
                         }
-                        let dpos = (Vec3::new(di as f64, dj as f64, dk as f64) - fx) * h;
-                        let wt = w[0][di] * w[1][dj] * w[2][dk];
-                        let gv = self.g_mom[g] / m;
-                        vnew += gv * wt;
-                        dv += (gv - self.g_vel_old[g]) * wt;
-                        b = b + outer(gv * wt, dpos);
+                        let mut vel = mom[g] / m;
+                        vold[g] = vel;
+                        vel.z -= GRAVITY * dt;
+                        let xi = origin + Vec3::new(i as f64, jj as f64, k as f64) * h;
+                        // the pool: floor and walls, free-slip
+                        if xi.x < lo.x && vel.x < 0.0 { vel.x = 0.0; }
+                        if xi.x > hi.x && vel.x > 0.0 { vel.x = 0.0; }
+                        if xi.y < lo.y && vel.y < 0.0 { vel.y = 0.0; }
+                        if xi.y > hi.y && vel.y > 0.0 { vel.y = 0.0; }
+                        if xi.z < lo.z && vel.z < 0.0 { vel.z = 0.0; }
+                        if xi.z > hi.z && vel.z > 0.0 { vel.z = 0.0; }
+                        // the melon: nodes within half a cell of its surface or inside
+                        // take its normal velocity; what that costs is booked
+                        let (d, nrm) = body.sdf(xi);
+                        if d < 0.0 {
+                            // inside the melon: no relative motion through the
+                            // surface in either direction, so pressure from below
+                            // *and* above reaches the body; the tangential part is
+                            // left alone, since a sticky interior turned out to be
+                            // a brake that held the melon at neutral depth
+                            interior += m;
+                            let rel = vel - body.vel;
+                            let new = vel - nrm * rel.dot(&nrm);
+                            reaction += (new - vel) * m;
+                            vel = new;
+                        } else if d < 0.5 * h {
+                            // the shell: no approach through the surface, free slip along it
+                            let rel = vel - body.vel;
+                            let vn = rel.dot(&nrm);
+                            if vn < 0.0 {
+                                let new = vel - nrm * vn;
+                                reaction += (new - vel) * m;
+                                vel = new;
+                            }
+                        }
+                        mom[g] = vel * m;
                     }
                 }
-            }
-            // FLIP keeps the particle's own velocity and adds the grid's change;
-            // PIC takes the grid's velocity. The blend is the usual trade of
-            // dissipation for noise.
-            self.v[p] = (self.v[p] + dv) * self.flip + vnew * (1.0 - self.flip);
-            self.c[p] = b * d_inv;
-            // volume from the trace of the velocity gradient
-            self.j[p] *= 1.0 + dt * (self.c[p][(0, 0)] + self.c[p][(1, 1)] + self.c[p][(2, 2)]);
-            self.j[p] = self.j[p].clamp(0.5, 2.0);
-            self.x[p] += vnew * dt;
-            // keep particles in the box
-            let e = 1.5 * h;
-            self.x[p].x = self.x[p].x.clamp(self.origin.x + e, self.origin.x + (self.nx - 1) as f64 * h - e);
-            self.x[p].y = self.x[p].y.clamp(self.origin.y + e, self.origin.y + (self.ny - 1) as f64 * h - e);
-            self.x[p].z = self.x[p].z.clamp(self.origin.z + e, self.origin.z + (self.nz - 1) as f64 * h - e);
+                (reaction, interior)
+            })
+            .reduce(|| (Vec3::zeros(), 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        prof(3, &mut pt);
+        // ---- G2P (APIC) ----  (parallel over particles, grid read-only)
+        let flip = self.flip;
+        let e = 1.5 * h;
+        let (xmax, ymax, zmax) = (origin.x + (nx - 1) as f64 * h - e, origin.y + (ny - 1) as f64 * h - e, origin.z + (nz - 1) as f64 * h - e);
+        {
+            let Water { x, v, c, j, g_mass, g_mom, g_vel_old, .. } = &mut *self;
+            let (g_mass, g_mom, g_vel_old) = (&*g_mass, &*g_mom, &*g_vel_old);
+            x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).for_each(|(((xp, vp), cp), jp)| {
+                let base = ((*xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
+                let fx = (*xp - origin) * inv_h - base;
+                let w = weights(fx);
+                let mut vnew = Vec3::zeros();
+                let mut dv = Vec3::zeros();
+                let mut b = zero3();
+                let bi = base.x as i64;
+                let bj = base.y as i64;
+                let bk = base.z as i64;
+                for di in 0..3 {
+                    for dj in 0..3 {
+                        for dk in 0..3 {
+                            let (i, jj, k) = (bi + di as i64, bj + dj as i64, bk + dk as i64);
+                            if i < 0 || jj < 0 || k < 0 || i >= nx as i64 || jj >= ny as i64 || k >= nz as i64 {
+                                continue;
+                            }
+                            let g = (k as usize * ny + jj as usize) * nx + i as usize;
+                            let m = g_mass[g];
+                            if m <= 0.0 {
+                                continue;
+                            }
+                            let dpos = (Vec3::new(di as f64, dj as f64, dk as f64) - fx) * h;
+                            let wt = w[0][di] * w[1][dj] * w[2][dk];
+                            let gv = g_mom[g] / m;
+                            vnew += gv * wt;
+                            dv += (gv - g_vel_old[g]) * wt;
+                            b = b + outer(gv * wt, dpos);
+                        }
+                    }
+                }
+                // FLIP keeps the particle's own velocity and adds the grid's change;
+                // PIC takes the grid's velocity. The blend is the usual trade of
+                // dissipation for noise.
+                *vp = (*vp + dv) * flip + vnew * (1.0 - flip);
+                *cp = b * d_inv;
+                // volume from the trace of the velocity gradient
+                *jp *= 1.0 + dt * (cp[(0, 0)] + cp[(1, 1)] + cp[(2, 2)]);
+                *jp = jp.clamp(0.5, 2.0);
+                *xp += vnew * dt;
+                // keep particles in the box
+                xp.x = xp.x.clamp(origin.x + e, xmax);
+                xp.y = xp.y.clamp(origin.y + e, ymax);
+                xp.z = xp.z.clamp(origin.z + e, zmax);
+            });
         }
+        prof(4, &mut pt);
         self.time += dt;
         self.interior_mass = interior;
         // the force on the body is minus what the fluid gained, per unit time

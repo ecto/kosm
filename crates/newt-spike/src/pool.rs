@@ -23,6 +23,7 @@
 //! Same conventions as the rest: metres, z up, the water at rest at z = 0.
 
 use std::path::Path;
+use rayon::prelude::*;
 
 use phyz::Simulator;
 use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
@@ -288,6 +289,7 @@ impl Drop {
             vel: Vec3::new(vel.x, vel.y, vel.z),
         };
         let mut f = Vec3::zeros();
+        water.compact();
         for _ in 0..subs {
             f += water.step(&body);
         }
@@ -469,37 +471,53 @@ pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
     let flat_cos = -d_flat.z;
     let sub = 3; // rays per cell per axis
     let per_ray = 1.0 / (sub * sub) as f64;
-    for iy in 0..ny * sub {
-        for ix in 0..nx * sub {
-            // launch from the surface point that the flat refraction would
-            // send to this floor cell, so the reference is uniform
-            let fx = origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
-            let fy = origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
-            let back = DEPTH / flat_cos;
-            let sx = fx - d_flat.x * back;
-            let sy = fy - d_flat.y * back;
-            let n = surface.normal(sx, sy);
-            let Some((dr, ci, ct)) = refract(d, n, 1.0, N_WATER) else { continue };
-            let tr = 1.0 - fresnel(1.0, N_WATER, ci, ct);
-            let z0 = surface.height(sx, sy);
-            let tt = (z0 + DEPTH) / -dr.z;
-            let hx = sx + dr.x * tt;
-            let hy = sy + dr.y * tt;
-            let w = per_ray * (tr / t_flat) * (-dr.z / flat_cos);
-            let gx = (hx - origin[0]) / cell - 0.5;
-            let gy = (hy - origin[1]) / cell - 0.5;
-            let (bx, by) = (gx.floor(), gy.floor());
-            let (wx, wy) = (gx - bx, gy - by);
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let (jx, jy) = (bx as i64 + dx, by as i64 + dy);
-                if jx < 0 || jy < 0 || jx >= nx as i64 || jy >= ny as i64 {
-                    continue;
+    // one row of launch points per task, each with its own accumulator
+    let e = (0..ny * sub)
+        .into_par_iter()
+        .fold(
+            || vec![0.0; nx * ny],
+            |mut e, iy| {
+                for ix in 0..nx * sub {
+                    // launch from the surface point that the flat refraction would
+                    // send to this floor cell, so the reference is uniform
+                    let fx = origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
+                    let fy = origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
+                    let back = DEPTH / flat_cos;
+                    let sx = fx - d_flat.x * back;
+                    let sy = fy - d_flat.y * back;
+                    let n = surface.normal(sx, sy);
+                    let Some((dr, ci, ct)) = refract(d, n, 1.0, N_WATER) else { continue };
+                    let tr = 1.0 - fresnel(1.0, N_WATER, ci, ct);
+                    let z0 = surface.height(sx, sy);
+                    let tt = (z0 + DEPTH) / -dr.z;
+                    let hx = sx + dr.x * tt;
+                    let hy = sy + dr.y * tt;
+                    let w = per_ray * (tr / t_flat) * (-dr.z / flat_cos);
+                    let gx = (hx - origin[0]) / cell - 0.5;
+                    let gy = (hy - origin[1]) / cell - 0.5;
+                    let (bx, by) = (gx.floor(), gy.floor());
+                    let (wx, wy) = (gx - bx, gy - by);
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (jx, jy) = (bx as i64 + dx, by as i64 + dy);
+                        if jx < 0 || jy < 0 || jx >= nx as i64 || jy >= ny as i64 {
+                            continue;
+                        }
+                        let ww = (if dx == 0 { 1.0 - wx } else { wx }) * (if dy == 0 { 1.0 - wy } else { wy });
+                        e[jy as usize * nx + jx as usize] += w * ww;
+                    }
                 }
-                let ww = (if dx == 0 { 1.0 - wx } else { wx }) * (if dy == 0 { 1.0 - wy } else { wy });
-                e[jy as usize * nx + jx as usize] += w * ww;
-            }
-        }
-    }
+                e
+            },
+        )
+        .reduce(
+            || vec![0.0; nx * ny],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += y;
+                }
+                a
+            },
+        );
     Caustic { origin, cell, nx, ny, e }
 }
 
@@ -573,7 +591,7 @@ fn sun_blocked_air(melon: &Melon, p: V<f64>) -> bool {
 }
 
 /// Radiance along a camera ray.
-pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: &Caustic, depth: u32) -> [f64; 3] {
+pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caustic, depth: u32) -> [f64; 3] {
     let o = view_o;
     let s = sun_dir();
     // candidates: melon, deck/coping, water surface, pool walls above water
@@ -732,7 +750,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: 
 }
 
 /// A reflected ray from the water surface: melon or sky.
-fn radiance_above(o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
+fn radiance_above(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
     if let Some((t, n)) = melon.hit(o, d) {
         let p = o + d * t;
         return shade_melon(p, n, d, melon, drop, caustic, true);
@@ -741,7 +759,7 @@ fn radiance_above(o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: &Ca
 }
 
 /// A ray inside the water: absorb along the way, hit melon, walls, or the floor.
-fn underwater(o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
+fn underwater(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
     let inside_pool = |p: V<f64>| p.x.abs() < POOL_X + 1e-3 && p.y.abs() < POOL_Y + 1e-3;
     let mut best_t = f64::INFINITY;
     let mut what = 0;
@@ -790,7 +808,7 @@ fn underwater(o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: &Causti
     c
 }
 
-fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Drop, caustic: &Caustic, in_air: bool) -> [f64; 3] {
+fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Scene, caustic: &Caustic, in_air: bool) -> [f64; 3] {
     let s = sun_dir();
     let base = melon.albedo(p);
     let cos = n.dot(&s).max(0.0);
@@ -821,27 +839,43 @@ fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Drop, caus
     c
 }
 
+/// What a ray can see: the surface and the beads, borrowed from the drop so
+/// rendering can run across threads without the simulator.
+#[derive(Clone, Copy)]
+pub struct Scene<'a> {
+    pub surface: &'a Surface,
+    pub droplets: &'a [crate::splash::Droplet],
+}
+
 pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
+    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets };
+    let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
     let up = right.cross(&fwd);
     let fy = 0.5 * view.height as f64 / (0.5 * view.vfov).tan();
-    let mut img = image::RgbaImage::new(view.width, view.height);
     let to8 = |v: f64| {
         // a filmic-ish curve so the sun's highlight rolls off instead of clipping
         let v = v / (1.0 + v * 0.35) * 1.2;
         (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8
     };
-    for y in 0..view.height {
-        for x in 0..view.width {
-            let px = (x as f64 + 0.5 - view.width as f64 / 2.0) / fy;
-            let py = (view.height as f64 / 2.0 - y as f64 - 0.5) / fy;
-            let d = (fwd + right * px + up * py).normalize();
-            let c = radiance(view.eye, d, drop, &melon, caustic, 1);
-            img.put_pixel(x, y, image::Rgba([to8(c[0]), to8(c[1]), to8(c[2]), 255]));
-        }
-    }
+    let w = view.width as usize;
+    let rows: Vec<Vec<u8>> = (0..view.height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = Vec::with_capacity(4 * w);
+            for x in 0..view.width {
+                let px = (x as f64 + 0.5 - view.width as f64 / 2.0) / fy;
+                let py = (view.height as f64 / 2.0 - y as f64 - 0.5) / fy;
+                let d = (fwd + right * px + up * py).normalize();
+                let c = radiance(view.eye, d, drop, &melon, caustic, 1);
+                row.extend_from_slice(&[to8(c[0]), to8(c[1]), to8(c[2]), 255]);
+            }
+            row
+        })
+        .collect();
+    let img = image::RgbaImage::from_raw(view.width, view.height, rows.concat()).expect("image");
     img
 }
 
@@ -862,16 +896,31 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     let t0 = std::time::Instant::now();
     let mut lowest = f64::INFINITY;
     for k in 0..frames {
+        let mut lap = std::time::Instant::now();
+        let mut ms = [0u128; 5];
+        let mut tick = |slot: usize, lap: &mut std::time::Instant| {
+            ms[slot] = lap.elapsed().as_millis();
+            *lap = std::time::Instant::now();
+        };
         for _ in 0..steps_per_frame {
             drop.step();
         }
+        tick(0, &mut lap);
         lowest = lowest.min(drop.centre().z);
         drop.read_water();
+        tick(1, &mut lap);
         let c = caustic(&drop.surface, 0.01);
+        tick(2, &mut lap);
         let peak_force = drop.fluid_force;
         drop.fluid_force = V::zero();
         let img = render(&view, &drop, &c);
+        tick(3, &mut lap);
         img.save(dir.join(format!("frame_{k:03}.png")))?;
+        tick(4, &mut lap);
+        if std::env::var_os("NEWT_PROF").is_some() {
+            let w = crate::splash::take_prof().map(|ns| ns / 1_000_000);
+            println!("prof   frame {k:3}  step {:5} ms (zero {} bin {} p2g {} grid {} g2p {})  read_water {:5} ms  caustic {:5} ms  render {:5} ms  save {:4} ms", ms[0], w[0], w[1], w[2], w[3], w[4], ms[1], ms[2], ms[3], ms[4]);
+        }
         if k == 0 || k % 5 == 0 || k + 1 == frames {
             let m = drop.centre();
             println!(
