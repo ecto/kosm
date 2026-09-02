@@ -1,0 +1,61 @@
+; the marble — a newt level.
+;
+; This file is the level. The printer, the physics, the renderer and the hint
+; button all read this and nothing else. Geometry is vcad (Z-up, mm, degrees,
+; cube corner at origin, cylinder base at z=0, subject-last). The knobs are
+; `defparam`s so a solver can turn them and write the file back.
+
+; ---- knobs ------------------------------------------------------------------
+[defparam pitch_deg 5.0]      ; tilt about y; positive lowers the +x end
+[defparam roll_deg 0.0]       ; tilt about x; positive lowers the -y end
+[defparam start_x -100.0]     ; marble release point, plate frame (mm)
+[defparam start_y 25.0]
+[defparam marble_r 10.0]      ; a glass marble
+[defparam marble_g 12.0]      ; grams
+[defparam t_end 1.2]          ; seconds until the marble should be in the cup
+
+; ---- the track --------------------------------------------------------------
+[defparam plate_x 300.0]
+[defparam plate_y 200.0]
+[defparam plate_t 10.0]
+[defparam wall_h 30.0]
+[defparam wall_t 8.0]
+[defparam cup_x 90.0]         ; cup centre, plate frame; +x is downhill
+[defparam cup_r 22.0]         ; inside radius
+[defparam cup_wall 3.0]
+[defparam cup_h 14.0]
+
+; centred box: vcad's cube has a corner at the origin.
+[let box-c [fn [x y z] [translate [/ x -2.0] [/ y -2.0] [/ z -2.0] [cube x y z]]]]
+
+; plate top is z = 0
+[let plate [translate 0.0 0.0 [/ plate_t -2.0] [box-c plate_x plate_y plate_t]]]
+
+[let side-wall [fn [sign]
+  [translate 0.0 [* sign [/ [+ plate_y wall_t] 2.0]] [/ wall_h 2.0]
+    [box-c [+ plate_x [* 2.0 wall_t]] wall_t wall_h]]]]
+[let end-wall [fn [sign]
+  [translate [* sign [/ [+ plate_x wall_t] 2.0]] 0.0 [/ wall_h 2.0]
+    [box-c wall_t plate_y wall_h]]]]
+
+; the cup: a ring of box segments with its mouth facing uphill (-x), so it
+; catches. 16 segments of 22.5°; 11 are kept, starting at 247.5° and sweeping
+; through +x round to 112.5°. one segment at angle 0, patterned about the cup
+; axis, then the whole ring turned to its start angle.
+[let seg-n 16]
+[let seg-kept 11]
+[let seg-deg [/ 360.0 seg-n]]
+[let seg-len [* 1.02 [* 2.0 [* [+ cup_r cup_wall] 0.19509]]]]   ; 2 R sin(11.25°)
+[let r-mid [+ cup_r [/ cup_wall 2.0]]]
+[let seg0 [translate r-mid 0.0 [/ cup_h 2.0] [rotate 0.0 0.0 90.0 [box-c seg-len cup_wall cup_h]]]]
+[let ring [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 seg-kept [* seg-kept seg-deg] seg0]]
+[let cup [translate cup_x 0.0 0.0 [rotate 0.0 0.0 247.5 ring]]]
+
+[let track [pipe plate
+  [union [side-wall 1.0]]
+  [union [side-wall -1.0]]
+  [union [end-wall 1.0]]
+  [union [end-wall -1.0]]
+  [union cup]]]
+
+[root track "pla"]

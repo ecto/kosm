@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/newt-spike"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# phyz: the clean worktree at main HEAD (the main checkout is on a feature branch).
+phyz         = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz" }
+phyz-math    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
+phyz-model   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
+phyz-rigid   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-rigid" }
+phyz-contact = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-contact" }
+phyz-diff    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-diff" }
+phyz-world   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-world" }
+phyz-camera  = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-camera" }
+vcad         = { path = "/Users/cam/Developer/vcad/crates/vcad", default-features = false }
+vcad-kernel  = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel", features = ["no-builtin-font"] }
+vcad-eval    = { path = "/Users/cam/Developer/vcad/crates/vcad-eval" }
+vcad-ir      = { path = "/Users/cam/Developer/vcad/crates/vcad-ir" }
+phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
+vcad-loon    = { path = "/Users/cam/Developer/vcad/crates/vcad-loon" }
+vcad-kernel-export = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-export" }
+vcad-render  = { path = "/Users/cam/Developer/vcad/crates/vcad-render", default-features = false }
+image        = { version = "0.25", default-features = false, features = ["png"] }
+
+# One tang. vcad builds against the sibling checkout; phyz against crates.io.
+# Unify on the checkout so tang::Scalar is one trait across the graph.
+[patch.crates-io]
+tang      = { path = "/Users/cam/Developer/tang/crates/tang" }
+tang-la   = { path = "/Users/cam/Developer/tang/crates/tang-la" }
+tang-expr = { path = "/Users/cam/Developer/tang/crates/tang-expr" }
+tang-ad   = { path = "/Users/cam/Developer/tang/crates/tang-ad" }

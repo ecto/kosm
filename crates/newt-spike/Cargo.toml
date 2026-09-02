@@ -1,0 +1,26 @@
+[package]
+name = "newt-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The marble: one capture-free level that is a CAD file, a physics rollout, a gradient, a frame, and a print"
+
+[dependencies]
+phyz.workspace = true
+phyz-math.workspace = true
+phyz-model.workspace = true
+phyz-rigid.workspace = true
+phyz-contact.workspace = true
+phyz-diff.workspace = true
+phyz-world.workspace = true
+phyz-camera.workspace = true
+vcad.workspace = true
+vcad-kernel.workspace = true
+vcad-eval.workspace = true
+vcad-ir.workspace = true
+phyz-collision.workspace = true
+vcad-loon.workspace = true
+vcad-kernel-export.workspace = true
+vcad-render.workspace = true
+image.workspace = true
+anyhow = "1"
