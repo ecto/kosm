@@ -48,6 +48,8 @@ pub struct Water {
     /// Diagnostics from the last step: water mass inside the body, and the
     /// part of the reaction that is just that mass' weight.
     pub interior_mass: f64,
+    /// The extracted surface's rest level, so still water reads as z = 0.
+    pub level_offset: f64,
 }
 
 /// The collider the water feels: an ellipsoid with a velocity.
@@ -131,6 +133,7 @@ impl Water {
             bulk,
             time: 0.0,
             interior_mass: 0.0,
+            level_offset: 0.0,
         }
     }
 
@@ -297,6 +300,32 @@ impl Water {
         -reaction / dt
     }
 
+    /// Let the fill pack down under gravity with nothing in the pool, then
+    /// take the extracted surface's mean as the rest level.
+    pub fn settle(&mut self, seconds: f64) {
+        let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+        let n = (seconds / self.dt) as usize;
+        for _ in 0..n {
+            self.step(&far);
+        }
+        // damp the settling out
+        for v in self.v.iter_mut() {
+            *v = Vec3::zeros();
+        }
+        for c in self.c.iter_mut() {
+            *c = zero3();
+        }
+        self.time = 0.0;
+        self.level_offset = 0.0;
+        let g = self.surface(0.02);
+        let inner: Vec<f64> = (0..g.ny)
+            .flat_map(|j| (0..g.nx).map(move |i| (i, j)))
+            .filter(|(i, j)| *i > 2 && *j > 2 && *i + 3 < g.nx && *j + 3 < g.ny)
+            .map(|(i, j)| g.z[j * g.nx + i])
+            .collect();
+        self.level_offset = inner.iter().sum::<f64>() / inner.len().max(1) as f64;
+    }
+
     /// The free surface as a height field at `cell` resolution over the pool,
     /// read from the grid's mass: the first node from the top where the
     /// mass fraction crosses one half, interpolated. Columns with no water
@@ -338,7 +367,7 @@ impl Water {
                     if f >= 0.5 {
                         // interpolate between this node and the one above
                         let t = if prev < 0.5 && k + 1 < self.nz { (0.5 - prev) / (f - prev).max(1e-9) } else { 0.0 };
-                        z[jy * nx + ix] = self.node_pos(gi, gj, k).z + (1.0 - t) * self.h;
+                        z[jy * nx + ix] = self.node_pos(gi, gj, k).z + (1.0 - t) * self.h - self.level_offset;
                         break;
                     }
                     prev = f;
@@ -365,20 +394,41 @@ impl Water {
         out
     }
 
-    /// Particles flying above the local surface: the drops.
-    pub fn droplets(&self, surface: &HeightGrid, above: f64, max: usize) -> Vec<Vec3> {
-        let mut d: Vec<(f64, Vec3)> = self
+    /// Particles flying above the local surface: the drops, with their
+    /// velocity and how much water is around them (0..1, from the grid mass
+    /// at their node), which sets how big a bead to draw.
+    pub fn droplets(&self, surface: &HeightGrid, above: f64, max: usize) -> Vec<Droplet> {
+        let full = 1000.0 * self.h * self.h * self.h;
+        let mut d: Vec<(f64, Droplet)> = self
             .x
             .iter()
-            .filter_map(|p| {
-                let s = surface.at(p.x, p.y);
-                (p.z > s + above).then_some((p.z - s, *p))
+            .zip(&self.v)
+            .filter_map(|(p, v)| {
+                // the surface grid is level-corrected for rendering; particle
+                // positions are raw, so compare in raw terms
+                let s = surface.at(p.x, p.y) + self.level_offset;
+                if p.z <= s + above {
+                    return None;
+                }
+                let gi = (((p.x - self.origin.x) / self.h).round() as i64).clamp(0, self.nx as i64 - 1) as usize;
+                let gj = (((p.y - self.origin.y) / self.h).round() as i64).clamp(0, self.ny as i64 - 1) as usize;
+                let gk = (((p.z - self.origin.z) / self.h).round() as i64).clamp(0, self.nz as i64 - 1) as usize;
+                let crowd = (self.g_mass[self.idx(gi, gj, gk)] / full).min(1.0);
+                Some((p.z - s, Droplet { pos: *p, vel: *v, crowd }))
             })
             .collect();
         d.sort_by(|a, b| b.0.total_cmp(&a.0));
         d.truncate(max);
         d.into_iter().map(|(_, p)| p).collect()
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct Droplet {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    /// How much water shares the drop's cell, 0..1.
+    pub crowd: f64,
 }
 
 #[derive(Clone)]

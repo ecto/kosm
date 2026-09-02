@@ -100,12 +100,13 @@ pub struct Surface {
 
 impl Surface {
     pub fn height(&self, x: f64, y: f64) -> f64 {
-        if let Some(g) = &self.grid {
-            return g.at(x, y);
-        }
         let mut h = 0.0;
         for r in &self.rings {
             h += r.height(x, y, self.t);
+        }
+        if let Some(g) = &self.grid {
+            // the fluid's surface, plus sub-grid rings from drops landing
+            return g.at(x, y) + h;
         }
         // ambient ripple, 1 mm, so still water is not a mirror
         h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
@@ -224,7 +225,7 @@ pub struct Drop {
     pub entered: bool,
     /// The simulated water, when the splash is on.
     pub water: Option<crate::splash::Water>,
-    pub droplets: Vec<V<f64>>,
+    pub droplets: Vec<crate::splash::Droplet>,
     /// Last frame's fluid force on the melon, for the log.
     pub fluid_force: V<f64>,
 }
@@ -266,7 +267,10 @@ impl Drop {
         let bulk = 2.0e6;
         let cs = (bulk / 1000.0f64).sqrt();
         let dt = 0.35 * h / cs;
-        self.water = Some(crate::splash::Water::fill(h, dt, 0.45, bulk));
+        let mut water = crate::splash::Water::fill(h, dt, 0.45, bulk);
+        // pack the fill down before anything arrives, and take the rest level
+        water.settle(0.6);
+        self.water = Some(water);
         self
     }
 
@@ -311,11 +315,30 @@ impl Drop {
         self.surface.t = self.state.time;
     }
 
-    /// After a frame's worth of steps: read the surface and the drops.
+    /// After a frame's worth of steps: read the surface and the drops, and
+    /// launch a small ring wherever a drop from last frame has landed. The
+    /// grid is too coarse to show a 1 cm drop's ripple; the ring model is
+    /// the sub-grid physics for it, scaled by the drop's speed.
     pub fn read_water(&mut self) {
         if let Some(w) = &self.water {
             let g = w.surface(0.02);
-            self.droplets = w.droplets(&g, 0.02, 400);
+            let now = w.droplets(&g, 0.02, 400);
+            let t = self.state.time;
+            let mut landed = 0;
+            let off = w.level_offset;
+            for d in &self.droplets {
+                let z_here = g.at(d.pos.x, d.pos.y) + off;
+                let still_up = now.iter().any(|n| (n.pos - d.pos).norm() < 0.05 && n.pos.z > z_here + 0.02);
+                if !still_up && d.pos.z < z_here + 0.12 && d.vel.z < -0.3 && landed < 10 && self.surface.rings.len() < 80 {
+                    let speed = d.vel.norm();
+                    self.surface.rings.push(Ring { x: d.pos.x, y: d.pos.y, t0: t, amp: (0.0015 * speed).min(0.006), wavelength: 0.06 });
+                    let _ = off;
+                    landed += 1;
+                }
+            }
+            // rings that have died out
+            self.surface.rings.retain(|r| t - r.t0 < 3.0);
+            self.droplets = now;
             self.surface.grid = Some(g);
         }
     }
@@ -570,23 +593,41 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: 
         }
         best
     };
-    // drops in the air: small spheres
-    let mut t_drop: Option<(f64, V<f64>)> = None;
-    for c in &drop.droplets {
-        let oc = o - *c;
-        let b = oc.dot(&d);
-        let disc = b * b - (oc.norm_sq() - 0.012 * 0.012);
+    // drops in the air: beads stretched along their velocity, bigger where
+    // more water travels together, with a soft edge
+    let mut t_drop: Option<(f64, V<f64>, f64)> = None;
+    // secondary rays (depth 0) skip the beads: cheap, and it is how a bead
+    // sees what is behind it
+    for dr in drop.droplets.iter().filter(|_| depth > 0) {
+        let r = 0.006 + 0.010 * dr.crowd;
+        let speed = dr.vel.norm();
+        let axis = if speed > 0.2 { dr.vel / speed } else { V::new(0.0, 0.0, 1.0) };
+        let stretch = 1.0 + (speed * 0.25).min(2.0);
+        // ellipsoid: scale space along `axis` by 1/stretch
+        let oc = o - dr.pos;
+        let along = oc.dot(&axis);
+        let ol = oc - axis * along + axis * (along / stretch);
+        let dal = d.dot(&axis);
+        let dl = d - axis * dal + axis * (dal / stretch);
+        let aa = dl.norm_sq();
+        let bb = ol.dot(&dl);
+        let cc = ol.norm_sq() - r * r;
+        let disc = bb * bb - aa * cc;
         if disc > 0.0 {
-            let t = -b - disc.sqrt();
+            let t = (-bb - disc.sqrt()) / aa;
             if t > 1e-6 && t_drop.is_none_or(|x| t < x.0) {
-                t_drop = Some((t, (o + d * t - *c).normalize()));
+                let pl = ol + dl * t;
+                let nl = pl - axis * pl.dot(&axis) + axis * (pl.dot(&axis) / stretch);
+                // how central the hit is, for the soft rim
+                let edge = 1.0 - (disc.sqrt() / (r * aa.sqrt())).clamp(0.0, 1.0);
+                t_drop = Some((t, nl.normalize(), edge));
             }
         }
     }
     // pick the nearest of melon / water / wall / deck / drop
     let mut best_t = f64::INFINITY;
     let mut what = 0; // 0 sky
-    if let Some((t, _)) = t_drop {
+    if let Some((t, _, _)) = t_drop {
         if t < best_t { best_t = t; what = 5; }
     }
     if let Some((t, _)) = t_melon {
@@ -650,16 +691,23 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Drop, melon: &Melon, caustic: 
             c
         }
         5 => {
-            // a drop: a bead of water, mostly reflection and a bright rim
-            let (_, n) = t_drop.unwrap();
+            // a drop: a bead of water. reflection of the sky, a glint of sun,
+            // and a soft rim that lets what is behind it through
+            let (t, n, edge) = t_drop.unwrap();
+            let p = o + d * t;
             let r = 0.04 + 0.96 * (1.0 + d.dot(&n)).clamp(0.0, 1.0).powi(5);
             let sk = sky(reflect(d, n));
-            let mut c = [0.0; 3];
+            let mut bead = [0.0; 3];
             for k in 0..3 {
-                c[k] = r * sk[k] + (1.0 - r) * [0.55, 0.72, 0.85][k] * 0.8;
+                bead[k] = r * sk[k] + (1.0 - r) * [0.60, 0.76, 0.88][k] * 0.85;
             }
-            let hl = n.dot(&(s - d).normalize()).max(0.0).powf(80.0) * 2.0;
-            for v in &mut c { *v += hl; }
+            let hl = n.dot(&(s - d).normalize()).max(0.0).powf(60.0) * 2.5;
+            for v in &mut bead { *v += hl; }
+            // behind the bead: the scene, without this bead
+            let behind = radiance(p + d * 1e-4, d, drop, melon, caustic, 0);
+            let a = (edge * 1.6).clamp(0.0, 1.0);
+            let mut c = [0.0; 3];
+            for k in 0..3 { c[k] = a * bead[k] + (1.0 - a) * behind[k]; }
             c
         }
         _ => sky(d),
