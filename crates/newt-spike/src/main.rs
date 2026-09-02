@@ -477,6 +477,11 @@ fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::L
 // ---- main -------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
+    // `newt-spike --splat some.ply` surveys a splat and exits.
+    if std::env::args().nth(1).as_deref() == Some("--splat") {
+        let ply = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("--splat needs a .ply"))?;
+        return garage::survey_splat(Path::new(&ply), Path::new("out/splat"), 960, 720);
+    }
     let level_path = std::env::args().nth(1).unwrap_or_else(|| "levels/marble.loon".into());
     let out = Path::new("out");
     let ctrl = |_: usize| DVec::zeros(6);

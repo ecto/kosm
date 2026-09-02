@@ -202,8 +202,34 @@ pub fn render_splat(
     width: u32,
     height: u32,
 ) -> anyhow::Result<(Vec<f32>, usize)> {
-    let path = garage.map.splat_path().ok_or_else(|| anyhow::anyhow!("map has no splat"))?;
-    let cloud = tang_3dgs::load_ply(&path).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // NEWT_SPLAT picks another .ply in the map directory (the map ships several
+    // trainings: splat7k is the dense uncleaned one, splat_clean0.12 the most pruned).
+    let path = match std::env::var("NEWT_SPLAT") {
+        Ok(name) => garage.map.dir.join(name),
+        Err(_) => garage.map.splat_path().ok_or_else(|| anyhow::anyhow!("map has no splat"))?,
+    };
+    let mut cloud = tang_3dgs::load_ply(&path).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // NEWT_SPLAT_MAX_SCALE (metres) drops the floaters: gaussians larger than
+    // this are made transparent. The dense training has a few metres-wide ones
+    // parked in front of every camera.
+    // Load-time pruning knobs. A sparse-view training grows needles (extreme
+    // anisotropy), floaters (huge scale) and dust (near-zero opacity); all
+    // three are cosmetic to remove and none are what the SDF stands on.
+    let env = |k: &str, default: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(default);
+    let (max_scale, max_aniso, min_opacity) = (env("NEWT_SPLAT_MAX_SCALE", f32::INFINITY), env("NEWT_SPLAT_MAX_ANISO", f32::INFINITY), env("NEWT_SPLAT_MIN_OPACITY", 0.0));
+    if max_scale.is_finite() || max_aniso.is_finite() || min_opacity > 0.0 {
+        let (mut big, mut needle, mut dust) = (0, 0, 0);
+        for i in 0..cloud.count {
+            let s = cloud.scales[i].map(f32::exp);
+            let (lo, hi) = (s.iter().cloned().fold(f32::MAX, f32::min), s.iter().cloned().fold(f32::MIN, f32::max));
+            let opacity = 1.0 / (1.0 + (-cloud.opacities[i]).exp());
+            let drop = if hi > max_scale { big += 1; true } else if hi / lo.max(1e-6) > max_aniso { needle += 1; true } else if opacity < min_opacity { dust += 1; true } else { false };
+            if drop {
+                cloud.opacities[i] = -20.0;
+            }
+        }
+        eprintln!("garage splat: pruned {big} wider than {max_scale} m, {needle} with anisotropy over {max_aniso}, {dust} under opacity {min_opacity}");
+    }
     let camera = tang_3dgs::Camera::look_at(
         [eye.x as f32, eye.y as f32, eye.z as f32],
         [target.x as f32, target.y as f32, target.z as f32],
@@ -218,4 +244,98 @@ pub fn render_splat(
     let rasterizer = tang_3dgs::Rasterizer::new(config);
     let out = rasterizer.forward(&cloud, &camera);
     Ok((out.image, cloud.count))
+}
+
+/// Standalone: render any splat `.ply` from six axis directions around the
+/// cloud's core, so an unfamiliar frame (COLMAP scenes have their own up)
+/// can be read off by eye. Writes `<out>/<stem>_{px,nx,py,ny,pz,nz}.png`.
+pub fn survey_splat(ply: &Path, out: &Path, width: u32, height: u32) -> anyhow::Result<()> {
+    let mut cloud = tang_3dgs::load_ply(ply).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // the core: the middle 80% of positions per axis, so background floaters
+    // do not decide the framing
+    let mut xs: Vec<f32> = cloud.positions.iter().map(|p| p[0]).collect();
+    let mut ys: Vec<f32> = cloud.positions.iter().map(|p| p[1]).collect();
+    let mut zs: Vec<f32> = cloud.positions.iter().map(|p| p[2]).collect();
+    for v in [&mut xs, &mut ys, &mut zs] {
+        v.sort_by(|a, b| a.total_cmp(b));
+    }
+    let q = |v: &[f32], f: f64| v[((v.len() - 1) as f64 * f) as usize] as f64;
+    let lo = Vec3::new(q(&xs, 0.1), q(&ys, 0.1), q(&zs, 0.1));
+    let hi = Vec3::new(q(&xs, 0.9), q(&ys, 0.9), q(&zs, 0.9));
+    let centre = (lo + hi) * 0.5;
+    let radius = (hi - lo).norm() * 0.5;
+    println!(
+        "splat  {}: {} gaussians, sh degree {}; core {:.2}×{:.2}×{:.2} around ({:+.2}, {:+.2}, {:+.2}), median ({:+.2}, {:+.2}, {:+.2})",
+        ply.display(), cloud.count, cloud.sh_degree, hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, centre.x, centre.y, centre.z,
+        q(&xs, 0.5), q(&ys, 0.5), q(&zs, 0.5)
+    );
+    // optional pruning, same knobs as the garage
+    let env = |k: &str, default: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(default);
+    let (max_scale, max_aniso, min_opacity) = (env("NEWT_SPLAT_MAX_SCALE", f32::INFINITY), env("NEWT_SPLAT_MAX_ANISO", f32::INFINITY), env("NEWT_SPLAT_MIN_OPACITY", 0.0));
+    if max_scale.is_finite() || max_aniso.is_finite() || min_opacity > 0.0 {
+        for i in 0..cloud.count {
+            let sc = cloud.scales[i].map(f32::exp);
+            let (lo_s, hi_s) = (sc.iter().cloned().fold(f32::MAX, f32::min), sc.iter().cloned().fold(f32::MIN, f32::max));
+            let opacity = 1.0 / (1.0 + (-cloud.opacities[i]).exp());
+            if hi_s > max_scale || hi_s / lo_s.max(1e-6) > max_aniso || opacity < min_opacity {
+                cloud.opacities[i] = -20.0;
+            }
+        }
+    }
+    // the object of interest: the median position, which sits on the thing
+    // the cameras circled rather than in the middle of the background
+    let median = Vec3::new(q(&xs, 0.5), q(&ys, 0.5), q(&zs, 0.5));
+    let stem = ply.file_stem().and_then(|s| s.to_str()).unwrap_or("splat");
+    std::fs::create_dir_all(out)?;
+    let fx = std::env::var("NEWT_SPLAT_FX").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.9 * height as f64);
+    let config = tang_3dgs::RasterConfig { width, height, bg_color: [0.03, 0.03, 0.04], ..Default::default() };
+    let rasterizer = tang_3dgs::Rasterizer::new(config);
+    // NEWT_SPLAT_VIEW="ex,ey,ez;tx,ty,tz;ux,uy,uz" renders one free view
+    // instead of the survey; NEWT_SPLAT_UP="-y" picks the survey's up.
+    let parse3 = |t: &str| -> Option<Vec3> {
+        let v: Vec<f64> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+    };
+    let up_axis = match std::env::var("NEWT_SPLAT_UP").as_deref() {
+        Ok("-y") => -Vec3::y(), Ok("y") => Vec3::y(), Ok("-z") => -Vec3::z(), _ => Vec3::z(),
+    };
+    let side = if up_axis.y.abs() > 0.5 { Vec3::z() } else { Vec3::y() };
+    let mut views: Vec<(String, Vec3, Vec3, Vec3)> = Vec::new();
+    if let Ok(spec) = std::env::var("NEWT_SPLAT_VIEW") {
+        let parts: Vec<&str> = spec.split(';').collect();
+        if let (Some(e), Some(t), Some(u)) = (parts.first().and_then(|p| parse3(p)), parts.get(1).and_then(|p| parse3(p)), parts.get(2).and_then(|p| parse3(p))) {
+            views.push(("view".into(), e, t, u));
+        }
+    } else {
+        for (name, dir, up) in [
+            ("px", Vec3::x(), up_axis), ("nx", -Vec3::x(), up_axis),
+            ("py", Vec3::y(), if up_axis.y.abs() > 0.5 { Vec3::z() } else { up_axis }), ("ny", -Vec3::y(), if up_axis.y.abs() > 0.5 { Vec3::z() } else { up_axis }),
+            ("pz", Vec3::z(), if up_axis.z.abs() > 0.5 { Vec3::y() } else { up_axis }), ("nz", -Vec3::z(), if up_axis.z.abs() > 0.5 { Vec3::y() } else { up_axis }),
+        ] {
+            views.push((name.into(), centre + dir * (radius * 1.6), centre, up));
+        }
+        // and a close-up: from the side, a little above, at the median
+        let eye = median + side * (radius * 0.35) - up_axis * (radius * 0.12);
+        views.push(("close".into(), eye, median, up_axis));
+    }
+    for (name, eye, target, up) in views {
+        let camera = tang_3dgs::Camera::look_at(
+            [eye.x as f32, eye.y as f32, eye.z as f32],
+            [target.x as f32, target.y as f32, target.z as f32],
+            [up.x as f32, up.y as f32, up.z as f32],
+            tang_3dgs::Intrinsics { fx: fx as f32, fy: fx as f32, cx: width as f32 / 2.0, cy: height as f32 / 2.0 },
+            width, height, 0.01, 100.0,
+        );
+        let t0 = std::time::Instant::now();
+        let o = rasterizer.forward(&cloud, &camera);
+        let mut img = image::RgbaImage::new(width, height);
+        for (i, px) in img.pixels_mut().enumerate() {
+            let c = |k: usize| (o.image[i * 3 + k].clamp(0.0, 1.0) * 255.0) as u8;
+            *px = image::Rgba([c(0), c(1), c(2), 255]);
+        }
+        let path = out.join(format!("{stem}_{name}.png"));
+        img.save(&path)?;
+        println!("splat  view {name}: {} ms → {}", t0.elapsed().as_millis(), path.display());
+    }
+    Ok(())
 }
