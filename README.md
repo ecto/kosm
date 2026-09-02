@@ -18,7 +18,7 @@ marble, horizon). Everything else is derived from that one file:
   point, checked against central differences
 - a two-knob tilt solve by finite differences of the same rollout
 - three RGBD frames from phyz-camera
-- `out/marble.wav`: the hinted run, heard — modal synthesis, no samples
+- `out/marble.wav`: the hinted run, heard — modal synthesis in a room, no samples
 
 ```bash
 cargo run --release -p newt-spike            # or: newt-spike levels/other.loon
@@ -110,6 +110,23 @@ excitation: a velocity jump along a contact normal is an impact, scaled by a
 Hertzian contact time (a hard light marble is a bright hammer), and everything
 else in contact is rolling — speed-scaled noise poured through the plate's
 modes.
+
+A dry modal sum sounds like it is in space, so `room.rs` puts the tray on a
+table in a shoebox room (`room_*`, `table_*`, `ear_*`, `room_absorb_*`) and a
+head 60 cm from it. The room impulse response is the direct path plus every
+image source up to order 6 (Allen–Berkley, `1/r`, `√(1−α)` per bounce, air
+absorption as a distance-dependent HF loss, fractional delay), handed over at
+the mixing time to an exponentially decaying seeded-noise tail whose `RT60`
+is Eyring on the room's own volume and absorption. Two receivers 17 cm apart
+give the ITD for free and a head-shadow low-pass gives the ILD; the tail is
+decorrelated per ear. The marble moves, so the dry sound is rendered onto
+three anchors — release, cup, end wall — and each gets its own RIR. Two more
+things stop it sounding synthetic: every mode is weighted by its **radiation
+efficiency** (a baffled piston of the same area, times a coincidence factor
+for the plate), which tames the big slow low modes; and rolling is **surface
+roughness** — noise low-passed at `v / 0.2 mm`, the speed at which the marble
+crosses the printed layer lines, as a continuous force on the plate rather
+than a stack of impulses.
 
 The marble is a sphere and no bar, so its modes come from Lamb's radial
 frequency equation, solved in `sphere_radial_hz`. It answers ~450 kHz: a 10 mm

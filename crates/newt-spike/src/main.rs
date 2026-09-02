@@ -25,6 +25,7 @@ mod audio;
 mod colliders;
 mod frame;
 mod lamp;
+mod room;
 
 use std::collections::HashMap;
 use std::fs;
@@ -331,6 +332,27 @@ fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
     })
 }
 
+/// The room the tray is in, from the level's `defparam`s where it declares
+/// them and from `room::RoomSpec`'s documented defaults where it does not.
+/// Everything but the absorption coefficients is millimetres in the level.
+fn room_spec(level: &Level) -> room::RoomSpec {
+    let d = room::RoomSpec::default();
+    let mm = |name: &str, fallback: f64| level.params.get(name).copied().map(|v| v * MM).unwrap_or(fallback);
+    let raw = |name: &str, fallback: f64| level.params.get(name).copied().unwrap_or(fallback);
+    room::RoomSpec {
+        dims: [mm("room_x", d.dims[0]), mm("room_y", d.dims[1]), mm("room_z", d.dims[2])],
+        table: [mm("table_x", d.table[0]), mm("table_y", d.table[1]), mm("table_z", d.table[2])],
+        ear: [mm("ear_x", d.ear[0]), mm("ear_y", d.ear[1]), mm("ear_z", d.ear[2])],
+        absorb: [
+            raw("room_absorb_floor", d.absorb[0]),
+            raw("room_absorb_ceiling", d.absorb[1]),
+            raw("room_absorb_walls", d.absorb[2]),
+        ],
+        order: raw("room_order", d.order as f64).round().max(0.0) as usize,
+        ear_spacing: mm("ear_spacing", d.ear_spacing),
+    }
+}
+
 /// Which part a contact point (track-local, metres) belongs to, and where on it.
 fn classify(level: &Level, local: Vec3) -> anyhow::Result<(audio::Part, [f64; 2])> {
     let (px, py) = (level.p("plate_x")? * MM, level.p("plate_y")? * MM);
@@ -393,12 +415,28 @@ fn simulate_listening(
             let n = c.contact_normal;
             if dv.dot(&n).abs() > 0.02 && cooldown == 0 {
                 let jump = dv.dot(&n).abs();
-                out.impacts.push(audio::Impact { t, impulse: mass * jump, speed: 0.5 * jump, part, uv });
+                out.impacts.push(audio::Impact {
+                    t,
+                    impulse: mass * jump,
+                    speed: 0.5 * jump,
+                    part,
+                    uv,
+                    pos: [local.x, local.y, local.z],
+                });
                 cooldown = 5;
             }
             let tangential = (v - n * v.dot(&n)).norm();
             if tangential > 1e-3 {
-                out.rolls.push(audio::Roll { t, speed: tangential, uv });
+                // The load on the contact is the marble's weight resolved onto
+                // the plate; phyz does not hand back the solved normal force.
+                let normal = mass * -GRAVITY * n.z.abs();
+                out.rolls.push(audio::Roll {
+                    t,
+                    speed: tangential,
+                    uv,
+                    pos: [local.x, local.y, local.z],
+                    normal,
+                });
             }
         }
         cooldown = cooldown.saturating_sub(1);
@@ -585,9 +623,31 @@ fn main() -> anyhow::Result<()> {
     let marble = audio::marble_bank(spec.marble.0, spec.marble_mat);
     let hz = |v: Vec<f64>| v.iter().map(|f| format!("{f:.0}")).collect::<Vec<_>>().join(" ");
     let t0 = std::time::Instant::now();
-    let samples = audio::render(&spec, &banks, &heard, steps as f64 * DT + 0.5);
+    // The dry sound is rendered onto three fixed source positions — where the
+    // marble is let go, the cup, and the end wall — and each of those gets its
+    // own room impulse response, so the reflections and the pan move with the
+    // marble without a crossfade smearing the impacts.
+    let anchors = [
+        [start[0], start[1], spec.marble.0],
+        [level.p("cup_x")? * MM, 0.0, 0.02],
+        [level.p("plate_x")? * MM * 0.5, 0.0, 0.02],
+    ];
+    let air = room_spec(&level);
+    let rt60 = air.rt60();
+    let roughness = level.params.get("track_roughness_mm").copied().unwrap_or(0.2) * MM;
+    let dry = audio::render_dry(
+        &spec,
+        &banks,
+        &heard,
+        steps as f64 * DT + 0.5,
+        &anchors,
+        roughness,
+    );
+    let buses: Vec<_> = anchors.iter().copied().zip(dry).collect();
+    let (samples, room_summary) =
+        room::mix(&air, &buses, 1, audio::SR, steps as f64 * DT + rt60);
     let wav = out.join("marble.wav");
-    audio::write_wav(&wav, &samples)?;
+    room::write_wav_stereo(&wav, &samples, audio::SR)?;
     for (_, b) in &banks {
         println!("audio  {:<44} {} Hz", b.name, hz(b.top(5)));
     }
@@ -597,11 +657,23 @@ fn main() -> anyhow::Result<()> {
         hz(marble.top(5).iter().map(|f| f / 1e3).collect())
     );
     println!(
-        "audio  {} impacts, {} rolling steps → {} ({:.2} s, {:.0} ms to render)",
+        "room   {:.0}×{:.0}×{:.0} cm, RT60 {:.2} s (Eyring, ᾱ={:.2}), {} image sources, ears {:.0} cm apart at {:.2} m, DRR at the cup {:+.1} dB",
+        air.dims[0] * 100.0,
+        air.dims[1] * 100.0,
+        air.dims[2] * 100.0,
+        room_summary.rt60,
+        air.mean_absorption(),
+        room_summary.images,
+        air.ear_spacing * 100.0,
+        room_summary.ear_distance,
+        room_summary.drr_db,
+    );
+    println!(
+        "audio  {} impacts, {} rolling steps → {} (stereo, {:.2} s, {:.0} ms to render)",
         heard.impacts.len(),
         heard.rolls.len(),
         wav.display(),
-        samples.len() as f64 / audio::SR,
+        samples.len() as f64 / 2.0 / audio::SR,
         t0.elapsed().as_secs_f64() * 1e3
     );
 

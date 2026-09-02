@@ -26,6 +26,7 @@
 //!
 //! Units: SI everywhere inside this module (metres, kg, Pa, seconds).
 
+use vcad_kernel_acoustics::radiation::bessel_j1;
 use vcad_kernel_acoustics::strike::{BarSpec, fem_hz, free_free_beta_l, mode_shape};
 
 /// Render sample rate (Hz).
@@ -90,12 +91,19 @@ pub struct Mode {
     pub beta_l: f64,
     /// Which of the part's two surface coordinates this mode runs along.
     pub axis: usize,
+    /// Radiation efficiency σ of this mode: how much of its surface velocity
+    /// actually becomes air. See [`radiation_efficiency`].
+    pub rad: f64,
 }
 
 impl Mode {
     /// |φₙ| at a strike `frac ∈ [0,1]` along the mode's axis.
     fn shape(&self, uv: [f64; 2]) -> f64 {
         mode_shape(self.beta_l, uv[self.axis].clamp(0.0, 1.0)).abs()
+    }
+    /// Amplitude weight from the radiation efficiency: pressure goes as √σ.
+    fn radiates(&self) -> f64 {
+        self.rad.sqrt()
     }
 }
 
@@ -138,7 +146,7 @@ pub fn bar_modes(len: f64, wid: f64, thk: f64, mat: Material, count: usize, axis
     let q = mat.q();
     hz.iter()
         .zip(betas)
-        .map(|(&hz, beta_l)| Mode { hz, decay: std::f64::consts::PI * hz / q, beta_l, axis })
+        .map(|(&hz, beta_l)| Mode { hz, decay: std::f64::consts::PI * hz / q, beta_l, axis, rad: 1.0 })
         .collect()
 }
 
@@ -178,9 +186,60 @@ pub fn marble_bank(radius: f64, mat: Material) -> Bank {
     let q = mat.q();
     let modes = sphere_radial_hz(radius, mat, 6)
         .into_iter()
-        .map(|hz| Mode { hz, decay: std::f64::consts::PI * hz / q, beta_l: 4.730, axis: 0 })
+        .map(|hz| Mode { hz, decay: std::f64::consts::PI * hz / q, beta_l: 4.730, axis: 0, rad: 1.0 })
         .collect();
     Bank { name: "marble (glass sphere, Lamb radial)", modes, level: 1.0 }
+}
+
+
+// ---- radiation ---------------------------------------------------------------
+
+/// Speed of sound in air (m/s), for the coincidence frequency.
+const C_AIR: f64 = 343.0;
+
+/// How much of a mode's surface velocity actually becomes sound.
+///
+/// A vibrating plate is a poor loudspeaker, and it is poor in a very specific,
+/// frequency-dependent way — which is why a dry modal sum sounds buzzy: it
+/// radiates every mode as if it were a piston. Two effects, multiplied:
+///
+/// 1. **The plate is small compared to the wavelength.** At low frequency the
+///    two sides of the plate short-circuit each other around the edge. The
+///    baffled-piston radiation resistance of an equivalent-area disc,
+///    `σ = 1 − J₁(2ka)/(ka)` with `a = √(A/π)`, is the textbook version of
+///    that; it is ∝ (ka)²/2 at low `ka` and → 1 above it. `J₁` here is
+///    `vcad-kernel-acoustics`' own `radiation::bessel_j1` — that module is the
+///    crate's air-side radiator (baffled piston, Rayleigh integral,
+///    directivity) and has no *plate* radiation-efficiency function, so the
+///    coincidence half below is ours, but the Bessel function is theirs.
+/// 2. **Bending waves are slower than sound below coincidence.** Under the
+///    critical frequency `f_c = c²/(1.8·c_L·t)` (with the plate longitudinal
+///    speed `c_L = √(E/ρ(1−ν²))`) the bending wavelength is shorter than the
+///    acoustic one and the plate only radiates from its edges; above it the
+///    plate and the air are phase-matched and σ → 1. `min(1, f/f_c)` is the
+///    crude, monotone stand-in for Maidanik's edge/corner-mode formulae.
+///
+/// The product tames exactly what needed taming: the big slow low modes.
+pub fn radiation_efficiency(hz: f64, area: f64, thickness: f64, mat: Material) -> f64 {
+    if hz <= 0.0 || area <= 0.0 {
+        return 0.0;
+    }
+    let a = (area / std::f64::consts::PI).sqrt();
+    let ka = 2.0 * std::f64::consts::PI * hz / C_AIR * a;
+    let piston = if ka < 1e-6 { 0.0 } else { (1.0 - bessel_j1(2.0 * ka) / ka).clamp(0.0, 1.0) };
+    let c_l = (mat.e / (mat.rho * (1.0 - mat.nu * mat.nu))).sqrt();
+    let f_c = C_AIR * C_AIR / (1.8 * c_l * thickness);
+    (piston * (hz / f_c).min(1.0)).clamp(1e-4, 1.0)
+}
+
+impl Bank {
+    /// Weight every mode by the radiating panel it belongs to.
+    fn radiating(mut self, area: f64, thickness: f64, mat: Material) -> Self {
+        for m in &mut self.modes {
+            m.rad = radiation_efficiency(m.hz, area, thickness, mat);
+        }
+        self
+    }
 }
 
 // ---- the track's parts -------------------------------------------------------
@@ -223,6 +282,7 @@ impl TrackSpec {
         modes.extend(bar_modes(ly, lx, t, self.track_mat, 6, 1));
         modes.sort_by(|a, b| a.hz.total_cmp(&b.hz));
         Bank { name: "plate (PLA, free-free bar on both axes)", modes, level: 1.0 }
+            .radiating(lx * ly, t, self.track_mat)
     }
 
     /// A side wall: a tall thin bar standing on edge, so its bending stiffness
@@ -230,7 +290,11 @@ impl TrackSpec {
     pub fn wall_bank(&self) -> Bank {
         let [h, t] = self.wall;
         let modes = bar_modes(self.plate[0] + 2.0 * t, h, t, self.track_mat, 6, 0);
-        Bank { name: "wall (PLA)", modes, level: 0.7 }
+        Bank { name: "wall (PLA)", modes, level: 0.7 }.radiating(
+            (self.plate[0] + 2.0 * t) * h,
+            t,
+            self.track_mat,
+        )
     }
 
     /// The cup: the kept arc of the ring, unrolled into a bar of that arc
@@ -240,7 +304,7 @@ impl TrackSpec {
         let [_, r, w, h] = self.cup;
         let arc = 2.0 * std::f64::consts::PI * (r + 0.5 * w) * (11.0 / 16.0);
         let modes = bar_modes(arc, h, w, self.track_mat, 6, 0);
-        Bank { name: "cup (PLA arc)", modes, level: 1.3 }
+        Bank { name: "cup (PLA arc)", modes, level: 1.3 }.radiating(arc * h, w, self.track_mat)
     }
 
     /// Hertzian contact duration (s) for the marble striking the track at
@@ -270,6 +334,8 @@ pub struct Impact {
     pub part: Part,
     /// Where, as two normalized surface coordinates of that part.
     pub uv: [f64; 2],
+    /// Where in the level's frame (m), so the room knows where to put it.
+    pub pos: [f64; 3],
 }
 
 /// One step of rolling contact: broadband excitation, not an event.
@@ -281,6 +347,10 @@ pub struct Roll {
     pub speed: f64,
     /// Where on the plate.
     pub uv: [f64; 2],
+    /// Where in the level's frame (m).
+    pub pos: [f64; 3],
+    /// Normal force pressing the marble into the plate (N).
+    pub normal: f64,
 }
 
 /// Everything the rollout heard.
@@ -316,7 +386,13 @@ fn contact_gain(hz: f64, tc: f64) -> f64 {
 fn strike_into(out: &mut [f64], start_in: usize, bank: &Bank, imp: &Impact, tc: f64, gain: f64) {
     let start = start_in.min(out.len());
     for m in bank.audible() {
-        let a0 = gain * bank.level * imp.impulse * m.shape(imp.uv) * contact_gain(m.hz, tc) / m.hz.sqrt();
+        let a0 = gain
+            * bank.level
+            * imp.impulse
+            * m.shape(imp.uv)
+            * m.radiates()
+            * contact_gain(m.hz, tc)
+            / m.hz.sqrt();
         if a0.abs() < 1e-12 {
             continue;
         }
@@ -333,51 +409,111 @@ fn strike_into(out: &mut [f64], start_in: usize, bank: &Bank, imp: &Impact, tc: 
     }
 }
 
-/// Rolling: speed-scaled noise poured through the plate's modes as
-/// two-pole resonators. Continuous excitation, not an event.
-fn roll_into(out: &mut [f64], bank: &Bank, rolls: &[Roll], gain: f64) {
+/// Rolling, as surface roughness.
+///
+/// The old version poured one noise sample per physics step through the modes,
+/// which is a train of impulses at 1 kHz wearing a noise costume — it sounded
+/// synthetic because it *was* a synthesizer. A marble rolling on a printed
+/// tray is doing something simpler and more specific: it is tracing the layer
+/// lines. The nozzle laid them down every `asperity` metres (0.2 mm is a
+/// normal layer/line spacing), so a marble at `v` m/s crosses them at `v/λ`
+/// per second, and that — not the sample rate, not the step rate — is the
+/// corner frequency of the excitation. Faster marble, brighter roll; that is
+/// the whole trick, and it is the Stronge / Othman rolling-noise picture in its
+/// simplest form.
+///
+/// So: white noise, band-limited by a one-pole at `f_c = v/λ`, scaled by the
+/// normal force and the speed, is a **continuous force** on the plate; the
+/// modes are two-pole resonators driven by it at whatever point the marble has
+/// reached. The roughness itself is fixed and seeded, so the same run makes
+/// the same noise; the level and the colour of it come from the physics.
+fn roll_into(out: &mut [f64], bank: &Bank, rolls: &[Roll], asperity: f64, gain: f64) {
     if rolls.is_empty() {
         return;
     }
     let n = out.len();
-    let mut noise = vec![0.0; n];
-    let mut rng = Rng(0x9e3779b97f4a7c15);
-    for r in rolls {
-        let k = (r.t * SR) as usize;
-        if k < n {
-            noise[k] = rng.next() * r.speed;
+    // The rollout samples contact at the physics step; the render wants it at
+    // the sample rate. Hold-and-interpolate speed, load and position between
+    // steps, so nothing changes discontinuously under the filter.
+    let mut speed = vec![0.0; n];
+    let mut load = vec![0.0; n];
+    let mut uv = vec![[0.0_f64; 2]; n];
+    for w in rolls.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (ka, kb) = ((a.t * SR) as usize, (b.t * SR) as usize);
+        if ka >= n {
+            break;
+        }
+        let kb = kb.min(n);
+        for k in ka..kb {
+            let f = if kb > ka { (k - ka) as f64 / (kb - ka) as f64 } else { 0.0 };
+            speed[k] = a.speed + f * (b.speed - a.speed);
+            load[k] = a.normal + f * (b.normal - a.normal);
+            uv[k] = [a.uv[0] + f * (b.uv[0] - a.uv[0]), a.uv[1] + f * (b.uv[1] - a.uv[1])];
         }
     }
-    let mut drive = vec![0.0; n];
+    // The roughness force: unit-variance noise through a speed-tracking
+    // one-pole, times the load and the speed. `√(1−a²)` keeps the filter's
+    // output variance at one whatever the corner does, so the level is the
+    // physics and not the filter.
+    let mut force = vec![0.0; n];
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    let mut lp = 0.0;
+    for k in 0..n {
+        let e = rng.next();
+        let fc = (speed[k] / asperity).clamp(20.0, 0.45 * SR);
+        let a = (-2.0 * std::f64::consts::PI * fc / SR).exp();
+        lp = a * lp + (1.0 - a * a).sqrt() * e;
+        force[k] = gain * load[k] * speed[k] * lp;
+    }
     for m in bank.audible() {
-        // The contact point moves, so each mode is driven through its own
-        // shape at wherever the marble is at that instant.
-        drive.iter_mut().for_each(|d| *d = 0.0);
-        for r in rolls {
-            let k = (r.t * SR) as usize;
-            if k < n {
-                drive[k] = noise[k] * m.shape(r.uv);
-            }
-        }
         let r = (-m.decay / SR).exp();
         let w = 2.0 * std::f64::consts::PI * m.hz / SR;
         let (a1, a2) = (2.0 * r * w.cos(), -r * r);
-        let g = gain * (1.0 - r) / m.hz.sqrt();
+        let g = (1.0 - r) * m.radiates() / m.hz.sqrt();
         let (mut y1, mut y2) = (0.0, 0.0);
-        for (o, &x) in out.iter_mut().zip(drive.iter()) {
+        for k in 0..n {
+            let x = force[k] * m.shape(uv[k]);
             let y = g * x + a1 * y1 + a2 * y2;
             y2 = y1;
             y1 = y;
-            *o += y;
+            out[k] += y;
         }
     }
 }
 
-/// The whole soundtrack: impacts on their parts, plus the roll, peak-normalized
-/// to −1 dBFS. `duration` includes the ring-out tail.
-pub fn render(spec: &TrackSpec, banks: &[(Part, Bank)], contacts: &Contacts, duration: f64) -> Vec<f32> {
+/// The soundtrack, dry, split onto one bus per source **anchor**.
+///
+/// The marble moves, and a room impulse response is per position, so the dry
+/// sound is rendered onto a handful of fixed positions instead of one: each
+/// impact goes to whichever anchor it happened nearest, and the roll — which
+/// is continuous and would not survive being cut up — goes whole to the anchor
+/// nearest the middle of its own path. `room::mix` gives each bus its own RIR.
+///
+/// Anchors are level-frame metres. `duration` includes the ring-out.
+pub fn render_dry(
+    spec: &TrackSpec,
+    banks: &[(Part, Bank)],
+    contacts: &Contacts,
+    duration: f64,
+    anchors: &[[f64; 3]],
+    roughness: f64,
+) -> Vec<Vec<f64>> {
     let n = (duration * SR) as usize;
-    let mut buf = vec![0.0_f64; n];
+    let mut buses = vec![vec![0.0_f64; n]; anchors.len().max(1)];
+    let nearest = |p: [f64; 3]| -> usize {
+        anchors
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let d = |q: &[f64; 3]| {
+                    (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2)
+                };
+                d(a).total_cmp(&d(b))
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
     let plate = banks.iter().find(|(p, _)| *p == Part::Plate).map(|(_, b)| b);
     for imp in &contacts.impacts {
         let start = (imp.t * SR) as usize;
@@ -385,36 +521,41 @@ pub fn render(spec: &TrackSpec, banks: &[(Part, Bank)], contacts: &Contacts, dur
             continue;
         }
         let tc = spec.contact_time(imp.speed);
+        let bus = &mut buses[nearest(imp.pos)];
         if let Some((_, bank)) = banks.iter().find(|(p, _)| *p == imp.part) {
-            strike_into(&mut buf, start, bank, imp, tc, 1.0);
+            strike_into(bus, start, bank, imp, tc, 1.0);
         }
         // Every strike also shakes the plate the part is printed onto.
         if let Some(b) = plate.filter(|_| imp.part != Part::Plate) {
-            strike_into(&mut buf, start, b, imp, tc, 0.35);
+            strike_into(bus, start, b, imp, tc, 0.35);
         }
     }
     if let Some(b) = plate {
-        roll_into(&mut buf, b, &contacts.rolls, 0.9);
+        let mut mid = [0.0; 3];
+        for r in &contacts.rolls {
+            for k in 0..3 {
+                mid[k] += r.pos[k] / contacts.rolls.len() as f64;
+            }
+        }
+        let i = nearest(mid);
+        let bus = &mut buses[i];
+        roll_into(bus, b, &contacts.rolls, roughness, 0.9);
     }
-    let peak = buf.iter().fold(1e-12_f64, |p, &v| p.max(v.abs()));
-    let norm = 0.891 / peak;
-    buf.iter().map(|&v| (v * norm) as f32).collect()
+    buses
 }
 
-/// Write mono f32 samples as a 16-bit PCM WAV.
-pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> anyhow::Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: SR as u32,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut w = hound::WavWriter::create(path, spec)?;
-    for &s in samples {
-        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
-    }
-    w.finalize()?;
-    Ok(())
+/// Layer-line spacing of a printed tray (m): the default asperity length.
+pub const ROUGHNESS: f64 = 0.2e-3;
+
+/// The dry mix, mono and peak-normalized — what `out/marble.wav` was before
+/// there was a room. Kept because it is the thing the room is applied *to*,
+/// and because the modal tests want a signal without a tail on it.
+pub fn render(spec: &TrackSpec, banks: &[(Part, Bank)], contacts: &Contacts, duration: f64) -> Vec<f32> {
+    let buses =
+        render_dry(spec, banks, contacts, duration, &[[0.0, 0.0, 0.0]], ROUGHNESS);
+    let peak = buses[0].iter().fold(1e-12_f64, |p, &v| p.max(v.abs()));
+    let norm = 0.891 / peak;
+    buses[0].iter().map(|&v| (v * norm) as f32).collect()
 }
 
 // ---- tests -------------------------------------------------------------------
@@ -467,6 +608,7 @@ mod tests {
                 speed: 1.0,
                 part: Part::Plate,
                 uv: [0.3, 0.4],
+                pos: [0.0, 0.0, 0.0],
             }],
             rolls: Vec::new(),
         };
@@ -484,5 +626,44 @@ mod tests {
         let hz = sphere_radial_hz(0.010, GLASS, 3);
         assert!(hz[0] > 300e3 && hz[0] < 600e3, "sphere fundamental {} Hz", hz[0]);
         assert!(hz.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn radiation_tames_the_low_modes() {
+        let s = spec();
+        let plate = s.plate_bank();
+        let lo = plate.modes.first().unwrap();
+        let hi = plate.modes.iter().rev().find(|m| m.hz < 18_000.0).unwrap();
+        assert!(lo.rad < 0.2 * hi.rad, "low mode σ={} vs high σ={}", lo.rad, hi.rad);
+        // σ is a fraction of a piston, and monotone in frequency for one panel.
+        let sig = |hz| radiation_efficiency(hz, 0.06, 0.010, PLA);
+        assert!((0.0..=1.0).contains(&sig(100.0)) && (0.0..=1.0).contains(&sig(10_000.0)));
+        assert!(sig(100.0) < sig(1_000.0) && sig(1_000.0) < sig(10_000.0));
+    }
+
+    #[test]
+    fn rolling_noise_level_scales_with_speed() {
+        let s = spec();
+        let banks = vec![(Part::Plate, s.plate_bank())];
+        let rms = |v: f64| {
+            let rolls: Vec<Roll> = (0..1000)
+                .map(|k| Roll {
+                    t: k as f64 * 1e-3,
+                    speed: v,
+                    uv: [0.5, 0.5],
+                    pos: [0.0, 0.0, 0.0],
+                    normal: 0.12,
+                })
+                .collect();
+            let contacts = Contacts { impacts: Vec::new(), rolls };
+            let buses =
+                render_dry(&s, &banks, &contacts, 1.0, &[[0.0, 0.0, 0.0]], ROUGHNESS);
+            let n = buses[0].len() as f64;
+            (buses[0].iter().map(|x| x * x).sum::<f64>() / n).sqrt()
+        };
+        let (a, b, c) = (rms(0.1), rms(0.4), rms(1.6));
+        assert!(a > 0.0, "silence");
+        assert!(b > 2.0 * a, "0.4 m/s ({b}) is not louder than 0.1 m/s ({a})");
+        assert!(c > 2.0 * b, "1.6 m/s ({c}) is not louder than 0.4 m/s ({b})");
     }
 }
