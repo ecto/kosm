@@ -97,7 +97,7 @@ impl Body {
         (a, b, c)
     }
     /// Approximate signed distance (negative inside) and outward normal.
-    fn sdf(&self, p: Vec3) -> (f64, Vec3) {
+    pub fn sdf(&self, p: Vec3) -> (f64, Vec3) {
         let (a, b, c) = self.frame();
         let rel = p - self.centre;
         let l = Vec3::new(rel.dot(&a) / MELON_AXES[0], rel.dot(&b) / MELON_AXES[1], rel.dot(&c) / MELON_AXES[2]);
@@ -399,9 +399,12 @@ impl Water {
                             // *and* above reaches the body; the tangential part is
                             // left alone, since a sticky interior turned out to be
                             // a brake that held the melon at neutral depth
+                            // ...fully: an interior that only blocked the
+                            // normal let particles seep in through the shell
+                            // (0.7 kg of water rode inside the melon, and it
+                            // sank at exactly the rate that deficit predicts)
                             interior += m;
-                            let rel = vel - body.vel;
-                            let new = vel - nrm * rel.dot(&nrm);
+                            let new = body.vel;
                             reaction += (new - vel) * m;
                             vel = new;
                         } else if d < 0.5 * h {
@@ -425,6 +428,7 @@ impl Water {
         // the raw node mass is too noisy an estimate (the water boils); a
         // 3x3x3 box blur is not, and unlike integrating the divergence it
         // cannot drift from the positions
+        let full_node = 1000.0 * h * h * h;
         let g_blur: Vec<f64> = (0..nx * ny * nz)
             .into_par_iter()
             .map(|g| {
@@ -440,7 +444,16 @@ impl Water {
                             let a = (i as i64 + di).clamp(2, nx as i64 - 3);
                             let b = (jj as i64 + dj).clamp(2, ny as i64 - 3);
                             let cc = (k as i64 + dk).clamp(2, nz as i64 - 3);
-                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
+                            // inside the body the water continues at rest
+                            // density, as at the walls: otherwise the fluid
+                            // next to the melon reads thin, builds no
+                            // pressure, and the melon feels no buoyancy
+                            let xi = origin + Vec3::new(a as f64, b as f64, cc as f64) * h;
+                            if body.sdf(xi).0 < 0.0 {
+                                acc += full_node;
+                            } else {
+                                acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
+                            }
                         }
                     }
                 }
@@ -526,7 +539,9 @@ impl Water {
                 // put back on its surface with no inward relative velocity
                 let (d, n) = body.sdf(*xp);
                 if d < 0.0 {
-                    *xp -= n * d;
+                    // a quarter cell clear of the surface, so the next
+                    // substep's pressure does not put it straight back
+                    *xp -= n * (d - 0.25 * h);
                     let vn = (*vp - body.vel).dot(&n);
                     if vn < 0.0 {
                         *vp -= n * vn;
@@ -708,9 +723,10 @@ impl Water {
                 }
             }
         }
-        // a 3×3 smooth, twice
+        // a 3×3 smooth, four times: the solver cannot carry waves under
+        // two cells, and what it has there is noise that lenses the caustic
         let mut out = HeightGrid { origin: [-bx, -by], cell, nx, ny, z };
-        for _ in 0..2 {
+        for _ in 0..4 {
             let mut s = out.z.clone();
             for jy in 1..ny - 1 {
                 for ix in 1..nx - 1 {

@@ -44,7 +44,7 @@ pub fn box_half() -> f64 {
     static HALF: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *HALF.get_or_init(|| std::env::var("NEWT_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
-pub const BOX_DEPTH: f64 = 1.5;
+pub const BOX_DEPTH: f64 = DEPTH; // the full depth: a floor the melon could fall through is no floor
 /// The box's outer band where the fluid's velocity is damped so waves leave
 /// instead of reflecting off a wall two metres from the splash.
 pub const SPONGE: f64 = 0.25;
@@ -307,17 +307,21 @@ impl Surface {
             // the fine surface counts inside the sponge band only: at the
             // box wall it dips (the wall layer, the extraction's edge) and a
             // blend across that dip is a lens
+            // ...and the blend must be wide and C1: a 10 cm linear blend
+            // between two surfaces a millimetre apart is a ring of curvature,
+            // and a ring of curvature is a lens (the caustic showed a frame)
             let half = box_half();
             let inset = half - x.abs().max(y.abs());
-            let far = self.far.as_ref().map(|f| f.at(x, y) + ambient).unwrap_or(ambient);
-            if inset > SPONGE + 0.1 {
-                return g.at(x, y);
+            let far = self.far.as_ref().map(|f| f.at(x, y)).unwrap_or(0.0) + ambient;
+            if inset > SPONGE + 0.3 {
+                return g.at(x, y) + ambient;
             }
             if inset <= SPONGE {
                 return far;
             }
-            let w = (inset - SPONGE) / 0.1;
-            return w * g.at(x, y) + (1.0 - w) * far;
+            let u = (inset - SPONGE) / 0.3;
+            let w = u * u * (3.0 - 2.0 * u);
+            return w * (g.at(x, y) + ambient) + (1.0 - w) * far;
         }
         let mut h = 0.0;
         for r in &self.rings {
@@ -602,8 +606,24 @@ impl Drop {
                     }
                 }
             }
+            // the box's mean level drifts by millimetres (the sponge, the
+            // extraction); joined to a far field at zero that is a dish
+            // four metres wide, and a dish that wide is a lens
+            {
+                let (mut sum, mut n) = (0.0, 0.0f64);
+                for jy in 3..g.ny.saturating_sub(3) {
+                    for ix in 3..g.nx.saturating_sub(3) {
+                        sum += g.z[jy * g.nx + ix];
+                        n += 1.0;
+                    }
+                }
+                let mean = sum / n.max(1.0);
+                for z in g.z.iter_mut() {
+                    *z -= mean;
+                }
+            }
             if let Some(far) = self.far.as_mut() {
-                far.force(&g, box_half() - SPONGE - 0.1, t);
+                far.force(&g, box_half() - SPONGE - 0.3, t);
                 self.surface.far = Some(far.grid.clone());
             }
             self.surface.grid = Some(g);
@@ -708,10 +728,15 @@ impl Caustic {
 pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
     // over the box and a margin: the sun's refracted rays land a metre
     // sideways over two metres of depth, and beyond the map the floor reads 1
-    let half = box_half() + 1.2;
+    let half = box_half() + 3.0;
     let nx = ((2.0 * half) / cell) as usize;
     let ny = ((2.0 * half) / cell) as usize;
     let origin = [-half, -half];
+    // launch from beyond the map too: a cell near the map's edge is lit by
+    // rays from both sides, or the edge shows as a frame
+    let margin = 1.5;
+    let (lx, ly) = (((2.0 * half + 2.0 * margin) / cell) as usize, ((2.0 * half + 2.0 * margin) / cell) as usize);
+    let l_origin = [-half - margin, -half - margin];
     let mut e = vec![0.0; nx * ny];
     let s = sun_dir();
     let d = -s;
@@ -724,16 +749,16 @@ pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
     let sub = 3; // rays per cell per axis
     let per_ray = 1.0 / (sub * sub) as f64;
     // one row of launch points per task, each with its own accumulator
-    let e = (0..ny * sub)
+    let e = (0..ly * sub)
         .into_par_iter()
         .fold(
             || vec![0.0; nx * ny],
             |mut e, iy| {
-                for ix in 0..nx * sub {
+                for ix in 0..lx * sub {
                     // launch from the surface point that the flat refraction would
                     // send to this floor cell, so the reference is uniform
-                    let fx = origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
-                    let fy = origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
+                    let fx = l_origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
+                    let fy = l_origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
                     let back = DEPTH / flat_cos;
                     let sx = fx - d_flat.x * back;
                     let sy = fy - d_flat.y * back;
@@ -1192,7 +1217,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
         lowest = lowest.min(drop.centre().z);
         drop.read_water();
         tick(1, &mut lap);
-        let c = caustic(&drop.surface, 0.01);
+        let c = caustic(&drop.surface, 0.02);
         tick(2, &mut lap);
         let peak_force = drop.fluid_force;
         drop.fluid_force = V::zero();
@@ -1210,6 +1235,43 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                 let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
                 zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let mean = zs.iter().sum::<f64>() / zs.len() as f64;
+                let mel = drop.melon();
+                let body = crate::splash::Body { centre: Vec3::new(mel.centre.x, mel.centre.y, mel.centre.z), axis: Vec3::new(mel.axis.x, mel.axis.y, mel.axis.z), vel: Vec3::zeros() };
+                let inside = w.x.iter().filter(|p| body.sdf(**p).0 < 0.0).count();
+                println!("water  frame {k:3}  particles inside the melon {inside} ({:.2} kg)", inside as f64 * w.mass);
+                if let Some(far) = &drop.surface.far {
+                    let mut amp = 0.0f64;
+                    for j in 0..far.ny {
+                        for i in 0..far.nx {
+                            let x = far.origin[0] + (i as f64 + 0.5) * far.cell;
+                            let y = far.origin[1] + (j as f64 + 0.5) * far.cell;
+                            let r = x.hypot(y);
+                            if r > 1.5 && r < 3.0 {
+                                amp = amp.max(far.z[j * far.nx + i].abs());
+                            }
+                        }
+                    }
+                    // and what the renderer sees there: slope and caustic
+                    let (mut slope, mut cmin, mut cmax, mut cin_min, mut cin_max) = (0.0f64, 9.0f64, 0.0f64, 9.0f64, 0.0f64);
+                    for j in 0..c.ny {
+                        for i in 0..c.nx {
+                            let x = c.origin[0] + (i as f64 + 0.5) * c.cell;
+                            let y = c.origin[1] + (j as f64 + 0.5) * c.cell;
+                            let r = x.hypot(y);
+                            let e = c.e[j * c.nx + i];
+                            if r > 1.5 && r < 3.0 {
+                                cmin = cmin.min(e);
+                                cmax = cmax.max(e);
+                                let n = drop.surface.normal(x, y);
+                                slope = slope.max((n.x.hypot(n.y)) / n.z);
+                            } else if r < 0.5 {
+                                cin_min = cin_min.min(e);
+                                cin_max = cin_max.max(e);
+                            }
+                        }
+                    }
+                    println!("far    frame {k:3}  max |h| at 1.5-3 m: {:.1} mm  slope max {:.4}  caustic there {:.2}..{:.2}  in the box {:.2}..{:.2}", amp * 1000.0, slope, cmin, cmax, cin_min, cin_max);
+                }
                 println!("water  frame {k:3}  particle z mean {:+.1} mm (rest {:.0})  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, -BOX_DEPTH * 500.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
             }
             println!(

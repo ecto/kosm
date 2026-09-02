@@ -148,7 +148,7 @@ impl Resources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let caustic_dims = ((2.0 * (box_half() + 1.2) / 0.01) as u32, (2.0 * (box_half() + 1.2) / 0.01) as u32);
+        let caustic_dims = ((2.0 * (box_half() + 3.0) / 0.02) as u32, (2.0 * (box_half() + 3.0) / 0.02) as u32);
         let caustic_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("caustic"),
             size: wgpu::Extent3d { width: caustic_dims.0, height: caustic_dims.1, depth_or_array_layers: 1 },

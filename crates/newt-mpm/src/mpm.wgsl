@@ -200,10 +200,9 @@ fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     var inside = 0.0;
     if (d < 0.0) {
         inside = m_units;
-        let rel = vel - P.b_vel.xyz;
-        let vn2 = vel - nrm * dot(rel, nrm);
-        dv = vn2 - vel;
-        vel = vn2;
+        // fully the body's velocity inside (see the CPU solver)
+        dv = P.b_vel.xyz - vel;
+        vel = P.b_vel.xyz;
     } else if (d < 0.5 * h) {
         let rel = vel - P.b_vel.xyz;
         let vn = dot(rel, nrm);
@@ -300,7 +299,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     // and out of the body (see the CPU solver)
     let sd = body_sdf(pos);
     if (sd.w < 0.0) {
-        pos -= sd.xyz * sd.w;
+        pos -= sd.xyz * (sd.w - 0.25 * h);
         let vn = dot(vp - P.b_vel.xyz, sd.xyz);
         if (vn < 0.0) { vp -= sd.xyz * vn; }
     }
@@ -473,6 +472,8 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let i = i32(g % P.n.x);
     let j = i32((g / P.n.x) % P.n.y);
     let k = i32(g / (P.n.x * P.n.y));
+    let hh = P.origin_h.w;
+    let full_node = P.k.z * hh * hh * hh / P.k.w;
     var acc = 0.0;
     for (var dk = -1; dk <= 1; dk++) {
         for (var dj = -1; dj <= 1; dj++) {
@@ -481,7 +482,13 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 let a = clamp(i + di, 2, i32(P.n.x) - 3);
                 let b = clamp(j + dj, 2, i32(P.n.y) - 3);
                 let cc = clamp(k + dk, 2, i32(P.n.z) - 3);
-                acc += gvel[u32(node_index(a, b, cc))].w;
+                // inside the body: rest density (see the CPU solver)
+                let xn = P.origin_h.xyz + vec3<f32>(f32(a), f32(b), f32(cc)) * P.origin_h.w;
+                if (body_sdf(xn).w < 0.0) {
+                    acc += full_node;
+                } else {
+                    acc += gvel[u32(node_index(a, b, cc))].w;
+                }
             }
         }
     }
