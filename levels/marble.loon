@@ -14,6 +14,16 @@
 [defparam marble_g 12.0]      ; grams
 [defparam t_end 1.2]          ; seconds until the marble should be in the cup
 
+; ---- what things are made of (the sound is these) ---------------------------
+[defparam track_density 1240.0]   ; PLA, kg/m^3
+[defparam track_e 3.5e9]          ; Young's modulus, Pa
+[defparam track_nu 0.36]
+[defparam track_loss 0.03]        ; structural loss factor; Q = 1/eta
+[defparam marble_density 2500.0]  ; soda-lime glass
+[defparam marble_e 70.0e9]
+[defparam marble_nu 0.23]
+[defparam marble_loss 0.001]
+
 ; ---- the track --------------------------------------------------------------
 [defparam plate_x 300.0]
 [defparam plate_y 200.0]

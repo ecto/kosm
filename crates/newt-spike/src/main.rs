@@ -21,6 +21,7 @@
 //!   - **tilt**: hold the release point, rotate the plate. Two scalars, central
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
+mod audio;
 mod colliders;
 
 use std::collections::HashMap;
@@ -29,7 +30,7 @@ use std::path::Path;
 
 use phyz::Simulator;
 use phyz_camera::{CameraPose, RenderScene, RgbdCamera, SceneOptions};
-use phyz_contact::{ContactMaterial, ContactSolverConfig};
+use phyz_contact::{ContactMaterial, ContactSolverConfig, find_contacts};
 use phyz_diff::{
     ConvexContactRollout, FinalStateObjective, convex_adjoint_gradient, convex_rollout_objective,
 };
@@ -290,6 +291,119 @@ fn verdict(model: &Model, level: &Level, traj: &[Vec3]) -> anyhow::Result<&'stat
     Ok(if in_cup(model, level, traj[traj.len() - 1])? { "in the cup" } else { "not in the cup" })
 }
 
+
+// ---- audio ------------------------------------------------------------------
+
+/// The level's acoustic description: geometry in metres, materials from the
+/// level's `defparam`s where it declares them and from `audio`'s documented
+/// defaults where it does not.
+fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
+    let m = |name: &str, fallback: f64| level.params.get(name).copied().unwrap_or(fallback);
+    let track_mat = audio::Material {
+        rho: m("track_density", audio::PLA.rho),
+        e: m("track_e", audio::PLA.e),
+        nu: m("track_nu", audio::PLA.nu),
+        loss: m("track_loss", audio::PLA.loss),
+    };
+    let marble_mat = audio::Material {
+        rho: m("marble_density", audio::GLASS.rho),
+        e: m("marble_e", audio::GLASS.e),
+        nu: m("marble_nu", audio::GLASS.nu),
+        loss: m("marble_loss", audio::GLASS.loss),
+    };
+    Ok(audio::TrackSpec {
+        plate: [level.p("plate_x")? * MM, level.p("plate_y")? * MM, level.p("plate_t")? * MM],
+        wall: [level.p("wall_h")? * MM, level.p("wall_t")? * MM],
+        cup: [
+            level.p("cup_x")? * MM,
+            level.p("cup_r")? * MM,
+            level.p("cup_wall")? * MM,
+            level.p("cup_h")? * MM,
+        ],
+        marble: (level.marble_r()?, level.p("marble_g")? * 1e-3),
+        track_mat,
+        marble_mat,
+    })
+}
+
+/// Which part a contact point (track-local, metres) belongs to, and where on it.
+fn classify(level: &Level, local: Vec3) -> anyhow::Result<(audio::Part, [f64; 2])> {
+    let (px, py) = (level.p("plate_x")? * MM, level.p("plate_y")? * MM);
+    let (cx, cr, cw, ch) = (
+        level.p("cup_x")? * MM,
+        level.p("cup_r")? * MM,
+        level.p("cup_wall")? * MM,
+        level.p("cup_h")? * MM,
+    );
+    let d = ((local.x - cx).powi(2) + local.y * local.y).sqrt();
+    if d < cr + 3.0 * cw && local.z < ch + 0.02 {
+        let a = local.y.atan2(local.x - cx);
+        let u = (a / (2.0 * std::f64::consts::PI) + 0.5).clamp(0.0, 1.0);
+        return Ok((audio::Part::Cup, [u, (local.z / ch).clamp(0.0, 1.0)]));
+    }
+    let wall = local.x.abs() > px / 2.0 - 0.005 || local.y.abs() > py / 2.0 - 0.005;
+    let u = ((local.x + px / 2.0) / px).clamp(0.0, 1.0);
+    let v = ((local.y + py / 2.0) / py).clamp(0.0, 1.0);
+    if wall { Ok((audio::Part::Wall, [u, v])) } else { Ok((audio::Part::Plate, [u, v])) }
+}
+
+/// The same forward rollout, listening. An impact is a step where the marble's
+/// velocity jumps by more than gravity could have done while a contact is open;
+/// everything else in contact is rolling — a continuous excitation whose level
+/// is the tangential speed.
+fn simulate_listening(
+    model: &Model,
+    level: &Level,
+    q0: &DVec,
+    steps: usize,
+) -> anyhow::Result<(Vec<Vec3>, State, audio::Contacts)> {
+    let sim = Simulator::new();
+    let mut state = model.default_state();
+    state.q = q0.clone();
+    let mat = material();
+    let mass = level.p("marble_g")? * 1e-3;
+    let xf = track_xform(model);
+    let mut traj: Vec<Vec3> = Vec::with_capacity(steps);
+    let mut out = audio::Contacts::default();
+    let mut prev_v = Vec3::zeros();
+    let mut p_prev = Vec3::new(q0[POS], q0[POS + 1], q0[POS + 2]);
+    // A ball that has just been struck stays in contact for a few steps; one
+    // impact per contact episode, not one per step.
+    let mut cooldown = 0usize;
+    for k in 0..steps {
+        sim.step_with_contacts(model, &mut state, -10.0, &mat);
+        let p = Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]);
+        let v = (p - p_prev) / DT;
+        let dv = v - prev_v + Vec3::new(0.0, 0.0, GRAVITY * DT);
+        let contacts = find_contacts(model, &state, 1e-3);
+        let t = k as f64 * DT;
+        // Of an open manifold, the contact that took the blow is the one whose
+        // normal the velocity jump ran along.
+        let hit = contacts.iter().max_by(|a, b| {
+            dv.dot(&a.contact_normal).abs().total_cmp(&dv.dot(&b.contact_normal).abs())
+        });
+        if let Some(c) = hit {
+            let local = xf.world_to_body_point(c.contact_point);
+            let (part, uv) = classify(level, local)?;
+            let n = c.contact_normal;
+            if dv.dot(&n).abs() > 0.02 && cooldown == 0 {
+                let jump = dv.dot(&n).abs();
+                out.impacts.push(audio::Impact { t, impulse: mass * jump, speed: 0.5 * jump, part, uv });
+                cooldown = 5;
+            }
+            let tangential = (v - n * v.dot(&n)).norm();
+            if tangential > 1e-3 {
+                out.rolls.push(audio::Roll { t, speed: tangential, uv });
+            }
+        }
+        cooldown = cooldown.saturating_sub(1);
+        prev_v = v;
+        p_prev = p;
+        traj.push(p);
+    }
+    Ok((traj, state, out))
+}
+
 // ---- frame ------------------------------------------------------------------
 
 fn render(model: &Model, state: &State, path: &Path) -> anyhow::Result<()> {
@@ -425,7 +539,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    let (traj, hinted) = simulate(&model, &q0_for(&model, &level, xy), steps);
+    let (traj, hinted, heard) = simulate_listening(&model, &level, &q0_for(&model, &level, xy), steps)?;
     println!("hint   final: release ({:+.3}, {:+.3}), {}", xy[0], xy[1], verdict(&model, &level, &traj)?);
     render(&model, &hinted, &out.join("frame_hint.png"))?;
     fs::create_dir_all(out.join("hinted"))?;
@@ -433,6 +547,36 @@ fn main() -> anyhow::Result<()> {
         out.join("hinted/marble.loon"),
         level.with_params(&[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)]),
     )?;
+
+    // 5. the hinted run, heard: the same contacts, as modal synthesis
+    let spec = track_spec(&level)?;
+    let banks = vec![
+        (audio::Part::Plate, spec.plate_bank()),
+        (audio::Part::Wall, spec.wall_bank()),
+        (audio::Part::Cup, spec.cup_bank()),
+    ];
+    let marble = audio::marble_bank(spec.marble.0, spec.marble_mat);
+    let hz = |v: Vec<f64>| v.iter().map(|f| format!("{f:.0}")).collect::<Vec<_>>().join(" ");
+    let t0 = std::time::Instant::now();
+    let samples = audio::render(&spec, &banks, &heard, steps as f64 * DT + 0.5);
+    let wav = out.join("marble.wav");
+    audio::write_wav(&wav, &samples)?;
+    for (_, b) in &banks {
+        println!("audio  {:<44} {} Hz", b.name, hz(b.top(5)));
+    }
+    println!(
+        "audio  {:<44} {} kHz (ultrasonic — computed, not rendered)",
+        marble.name,
+        hz(marble.top(5).iter().map(|f| f / 1e3).collect())
+    );
+    println!(
+        "audio  {} impacts, {} rolling steps → {} ({:.2} s, {:.0} ms to render)",
+        heard.impacts.len(),
+        heard.rolls.len(),
+        wav.display(),
+        samples.len() as f64 / audio::SR,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
 
     // 4. the other knob: tilt, by central differences of the same rollout
     let j_at = |t: Tilt| -> anyhow::Result<f64> {
