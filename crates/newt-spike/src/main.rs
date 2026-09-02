@@ -37,7 +37,7 @@ use phyz_diff::{
     ConvexContactRollout, FinalStateObjective, convex_adjoint_gradient, convex_rollout_objective,
 };
 use phyz_math::{DVec, GRAVITY, Mat3, SpatialInertia, SpatialTransform, SpatialTransformExt, Vec3};
-use phyz_model::{Geometry, Model, ModelBuilder, State};
+use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 use phyz_world::{CameraIntrinsics, Scene, SensorContext};
 use vcad_ir::{CsgOp, Document, Node};
@@ -191,7 +191,11 @@ fn export_track(doc: &Document, t: Tilt, out: &Path) -> anyhow::Result<()> {
 
 /// The marble plus the track body, whose colliders and visuals are the
 /// document's derivation.
-fn build_model(level: &Level, t: Tilt) -> anyhow::Result<Model> {
+///
+/// The colliders are passed in rather than re-derived: only the track's *pose*
+/// changes as the tilt solver hunts, and decomposing a `Difference` is far too
+/// expensive to redo fifty times for an answer that cannot have changed.
+fn build_model(level: &Level, t: Tilt, colliders: &[GeomInstance]) -> anyhow::Result<Model> {
     let r = level.marble_r()?;
     let m = level.p("marble_g")? * 1e-3;
     let i = 0.4 * m * r * r;
@@ -205,9 +209,8 @@ fn build_model(level: &Level, t: Tilt) -> anyhow::Result<Model> {
         .add_fixed_body("track", -1, t.pose(), static_inertia)
         .build();
     model.bodies[MARBLE].geometry = Some(Geometry::Sphere { radius: r });
-    let derived = colliders::colliders_from_document(&level.doc)?;
-    model.bodies[TRACK].collisions = derived.colliders.clone();
-    model.bodies[TRACK].visuals = derived.colliders;
+    model.bodies[TRACK].collisions = colliders.to_vec();
+    model.bodies[TRACK].visuals = colliders.to_vec();
     Ok(model)
 }
 
@@ -460,6 +463,9 @@ fn main() -> anyhow::Result<()> {
     for w in &derived.warnings {
         println!("warn   {w}");
     }
+    for n in &derived.notes {
+        println!("derive {n}");
+    }
     let worst = colliders::verify_against_mesh(&level.doc, &derived)?;
     println!(
         "derive {} colliders; support functions agree with the tessellation to {:.3} mm",
@@ -467,9 +473,20 @@ fn main() -> anyhow::Result<()> {
         worst / MM
     );
     anyhow::ensure!(worst < 0.5 * MM, "colliders disagree with the CAD");
+    // The support test only ever sees the outside of the level, where a cup and
+    // a puck are the same shape. Cut geometry gets the second check.
+    if !derived.removed.is_empty() {
+        let intrusion = colliders::verify_no_intrusion(&derived);
+        println!(
+            "derive {} cut volume(s); no collider reaches more than {:.3} mm into what was removed",
+            derived.removed.len(),
+            intrusion / MM
+        );
+        anyhow::ensure!(intrusion < 0.5 * MM, "colliders fill a hole the CAD cut out");
+    }
 
     // 2. the level as physics
-    let model = build_model(&level, tilt)?;
+    let model = build_model(&level, tilt, &derived.colliders)?;
     let g = goal(&model, &level)?;
     let obj = objective(g);
     let q0 = q0_for(&model, &level, start);
@@ -590,7 +607,7 @@ fn main() -> anyhow::Result<()> {
 
     // 4. the other knob: tilt, by central differences of the same rollout
     let j_at = |t: Tilt| -> anyhow::Result<f64> {
-        let m = build_model(&level, t)?;
+        let m = build_model(&level, t, &derived.colliders)?;
         let g = goal(&m, &level)?;
         Ok(convex_rollout_objective(&rollout(&m, q0_for(&m, &level, start), steps, &ctrl), &objective(g)))
     };
@@ -646,7 +663,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    let solved = build_model(&level, t)?;
+    let solved = build_model(&level, t, &derived.colliders)?;
     let (traj, solved_state) = simulate(&solved, &q0_for(&solved, &level, start), steps);
     println!("tilt   final: {}", verdict(&solved, &level, &traj)?);
     render(&solved, &solved_state, &out.join("frame_tilted.png"))?;
