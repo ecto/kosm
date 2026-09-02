@@ -18,10 +18,12 @@ marble, horizon). Everything else is derived from that one file:
   point, checked against central differences
 - a two-knob tilt solve by finite differences of the same rollout
 - three RGBD frames from phyz-camera
+- `out/marble.wav`: the hinted run, heard — modal synthesis, no samples
 
 ```bash
 cargo run --release -p newt-spike            # or: newt-spike levels/other.loon
 open out/track.svg out/frame_before.png out/frame_hint.png out/frame_tilted.png
+afplay out/marble.wav
 diff levels/marble.loon out/solved/marble.loon   # the solved knobs, written back
 ```
 
@@ -52,6 +54,26 @@ support (the marble fell through the plate), and the body-body adjoint froze
 a sphere's contact point in the sphere's frame and let the sphere own the
 contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.rs`,
 `phyz-diff/tests/sphere_body_body_adjoint.rs`.
+
+## the sound (`audio.rs`)
+
+Nothing is sampled. `audio.rs` asks `vcad-kernel-acoustics` for the level's
+modes — its `strike` module is a free-free Euler–Bernoulli bar (`BarSpec` →
+`fem_hz`, plus `free_free_beta_l` / `mode_shape` for the strike gains), which
+is the only structural eigensolver the crate has; the rest of it is air-side.
+So the plate is run through that solver on both of its in-plane axes, and the
+walls and the cup arc each get their own bar. Materials are the level's
+`track_*` and `marble_*` `defparam`s. The rollout's contacts are the
+excitation: a velocity jump along a contact normal is an impact, scaled by a
+Hertzian contact time (a hard light marble is a bright hammer), and everything
+else in contact is rolling — speed-scaled noise poured through the plate's
+modes.
+
+The marble is a sphere and no bar, so its modes come from Lamb's radial
+frequency equation, solved in `sphere_radial_hz`. It answers ~450 kHz: a 10 mm
+glass sphere is not a bell, it is an ultrasonic click. Those modes are printed
+and then gated out of the render, and the glassy edge you hear is the track
+rung through a 100 µs contact.
 
 ## building
 
