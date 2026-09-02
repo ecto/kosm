@@ -105,8 +105,9 @@ impl Surface {
             h += r.height(x, y, self.t);
         }
         if let Some(g) = &self.grid {
-            // the fluid's surface, plus sub-grid rings from drops landing
-            return g.at(x, y) + h;
+            // the fluid's surface; the sub-grid rings from landing drops are
+            // baked into the grid once per frame, so this is one lookup
+            return g.at(x, y);
         }
         // ambient ripple, 1 mm, so still water is not a mirror
         h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
@@ -322,7 +323,7 @@ impl Drop {
     pub fn read_water(&mut self) {
         if let Some(w) = &self.water {
             let g = w.surface(0.02);
-            let now = w.droplets(&g, 0.02, 400);
+            let now = w.droplets(&g, 0.02, 250);
             let t = self.state.time;
             let mut landed = 0;
             let off = w.level_offset;
@@ -337,8 +338,23 @@ impl Drop {
                 }
             }
             // rings that have died out
-            self.surface.rings.retain(|r| t - r.t0 < 3.0);
+            self.surface.rings.retain(|r| t - r.t0 < 1.5);
             self.droplets = now;
+            // bake the rings into the grid for this frame
+            let mut g = g;
+            if !self.surface.rings.is_empty() {
+                for jy in 0..g.ny {
+                    for ix in 0..g.nx {
+                        let x = g.origin[0] + (ix as f64 + 0.5) * g.cell;
+                        let y = g.origin[1] + (jy as f64 + 0.5) * g.cell;
+                        let mut h = 0.0;
+                        for r in &self.surface.rings {
+                            h += r.height(x, y, t);
+                        }
+                        g.z[jy * g.nx + ix] += h;
+                    }
+                }
+            }
             self.surface.grid = Some(g);
         }
     }

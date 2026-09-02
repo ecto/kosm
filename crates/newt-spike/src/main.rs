@@ -21,17 +21,8 @@
 //!   - **tilt**: hold the release point, rotate the plate. Two scalars, central
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
-mod audio;
-mod colliders;
-mod frame;
-mod garage;
-mod glass;
-mod lamp;
-mod light;
-mod pool;
-mod splash;
-mod room;
 
+use newt_spike::{audio, colliders, frame, garage, glass, lamp, light, pool, room, splash};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

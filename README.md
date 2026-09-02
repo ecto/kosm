@@ -195,6 +195,18 @@ glass sphere is not a bell, it is an ultrasonic click. Those modes are printed
 and then gated out of the render, and the glassy edge you hear is the track
 rung through a 100 µs contact.
 
+## the window
+
+`cargo run --release -p newt-view [-- --splash] [--frames=N]` opens the pool
+(or the splash) in a window. The simulation runs on its own thread and hands
+over a snapshot per frame; the window keeps every snapshot, so the timeline
+is a recording: play, pause, scrub, follow live, and an inspector for the
+frame under the cursor (melon state, fluid force, rings, drops, particles,
+surface extents), with the melon annotated in the frame. Rendering is the
+same CPU tracer the CLI uses, preview size while playing and full size when
+paused; "export mp4" runs the CLI's render. First slice of the viewer plan:
+recording-shaped now, wgpu live rendering and wasm next.
+
 ## building
 
 `vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;
