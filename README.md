@@ -89,6 +89,15 @@ gradient fit recovers the marble's index of refraction from its caustic
 (1.5169 against a true 1.5168) in nine steps. The generic Sellmeier is checked
 against `vcad-kernel-optics` N-BK7 to machine precision.
 
+`glass.rs` makes the camera see glass too: Fresnel splits each ray into a
+reflected share (which can land on the lamp's disc, the highlight being the
+lamp's image) and a refracted share that walks through the solid with up to
+four internal bounces before it leaves and is shaded by whatever it lands on.
+Three samples sit on a plate with a printed 5 mm grid: the marble, a cube and
+a square pyramid, all convex solids the same code handles for the camera and
+for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
+`pyramid_h_mm`, `sample_yaw_deg`) so they can be set to real samples.
+
 ### the garage
 
 `garage.rs` drops the marble onto ipse's captured garage (`ipse-map`: a splat

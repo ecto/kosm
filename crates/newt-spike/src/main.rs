@@ -25,6 +25,7 @@ mod audio;
 mod colliders;
 mod frame;
 mod garage;
+mod glass;
 mod lamp;
 mod light;
 mod room;
@@ -860,7 +861,7 @@ fn main() -> anyhow::Result<()> {
         // 8. light as physics: the marble is glass. the lamp's light refracts
         //    through it onto the plate as a spectral caustic, and the index of
         //    refraction is recovered from that caustic by the same code on duals.
-        light_stage(&level, &model, &xf, &lamp0, r, &pose, &intr, &scene_at, out)?;
+        light_stage(&level, &model, &xf, &lamp0, r, out)?;
     }
 
     // 7. a captured place: the marble on the real garage floor, and the
@@ -978,9 +979,6 @@ fn light_stage(
     xf: &SpatialTransform,
     lamp0: &lamp::Lamp,
     r: f64,
-    pose: &CameraPose,
-    intr: &CameraIntrinsics,
-    scene_at: &dyn Fn(Vec3) -> frame::Scene<f64>,
     out: &Path,
 ) -> anyhow::Result<()> {
     // the generic Sellmeier against vcad-kernel-optics' N-BK7: one glass, two crates
@@ -989,50 +987,76 @@ fn light_stage(
     let nd_true = level.params.get("marble_nd").copied().unwrap_or(1.5168);
     println!("light  N-BK7 Sellmeier agrees with vcad-kernel-optics to {worst:.1e}; marble n_d = {nd_true} (n(450 nm) − n(650 nm) = {:+.4})", light::index::<f64>(nd_true, 0.45) - light::index::<f64>(nd_true, 0.65));
 
-    // the marble at rest at the plate's centre, under the lamp
-    let centre_local = Vec3::new(0.0, 0.0, r);
+    // three glass samples on the tray: a marble, a cube, a pyramid. sizes are
+    // the level's, so they can be set to the real ones.
     let lamp_local = xf.world_to_body_point(lamp0.pos);
     let lamp_t = tang::Vec3::new(lamp_local.x, lamp_local.y, lamp_local.z);
-    let c_t = tang::Vec3::new(centre_local.x, centre_local.y, centre_local.z);
+    let cube_a = level.params.get("cube_mm").copied().unwrap_or(20.0) * MM;
+    let pyr_a = level.params.get("pyramid_mm").copied().unwrap_or(25.0) * MM;
+    let pyr_h = level.params.get("pyramid_h_mm").copied().unwrap_or(20.0) * MM;
+    let yaw = level.params.get("sample_yaw_deg").copied().unwrap_or(25.0).to_radians();
+    let samples: Vec<(&str, glass::Shape<f64>)> = vec![
+        ("marble", glass::Shape::Sphere { centre: tang::Vec3::new(-0.05, 0.0, r), r }),
+        ("cube", glass::Shape::cube(0.0, 0.0, cube_a, yaw)),
+        ("pyramid", glass::Shape::pyramid(0.05, 0.0, pyr_a, pyr_h, yaw)),
+    ];
     let (window, cells, rays) = (0.04, 240, 120_000);
-    let t0 = std::time::Instant::now();
-    let caustic = light::trace::<f64>(lamp_t, c_t, r, nd_true, window, cells, rays);
     let ld = light::out_dir(out);
     fs::create_dir_all(&ld)?;
-    let peak = caustic.e.iter().flat_map(|b| b.iter()).cloned().fold(0.0, f64::max) / light::BANDS_LEN as f64;
-    println!(
-        "light  traced {} rays × 5 bands through the marble in {} ms ({} lost to total internal reflection); caustic peak irradiance {:.1}× the plate's direct light, spread {:.2} mm rms (450 nm) vs {:.2} mm (650 nm)",
-        caustic.traced, t0.elapsed().as_millis(), caustic.tir, peak * (lamp_local.z - r).powi(2) / lamp_local.z.powi(2) * lamp_local.z.powi(2), (caustic.spread(0)).sqrt() * 1e3, (caustic.spread(4)).sqrt() * 1e3
-    );
-    light::image(&caustic, 0.02).save(ld.join("caustic.png"))?;
+    let mut caustics = Vec::new();
+    for (name, shape) in &samples {
+        let t0 = std::time::Instant::now();
+        let c = light::trace::<f64>(lamp_t, shape, nd_true, window, cells, rays);
+        // per-band irradiance against per-band direct light (P/z²): a flat
+        // slab lands near 1×, a sphere's focus in the hundreds
+        let peak = c.e.iter().flat_map(|b| b.iter()).cloned().fold(0.0, f64::max);
+        println!(
+            "light  {name:8} {} rays × 5 bands in {} ms, {} lost inside; caustic peak {:.1}× direct, spread {:.1} mm rms, blue−red spread {:+.2} mm",
+            c.traced, t0.elapsed().as_millis(), c.tir, peak * (lamp_local.z).powi(2), c.spread(2).sqrt() * 1e3, (c.spread(0).sqrt() - c.spread(4).sqrt()) * 1e3
+        );
+        light::image(&c, 0.02).save(ld.join(format!("caustic_{name}.png")))?;
+        caustics.push(c);
+    }
+    let caustic = &caustics[0];
 
-    // the frame with the caustic on the plate
-    let c_world = local_to_world(model, centre_local);
-    let mut img = frame::render(&scene_at(c_world), pose, intr);
-    let n = light::composite(&mut img, &caustic, pose, intr, xf, 0.09, &scene_at(c_world));
-    img.save(ld.join("frame.png"))?;
-    // and a close-up: 12 cm from the marble, looking down past it at the caustic
-    let close_intr = CameraIntrinsics::from_vfov(800, 600, 0.6, 0.02, 5.0);
-    let up = Vec3::z();
-    let close_pose = CameraPose::look_at(c_world + Vec3::new(-0.06, -0.09, 0.07), c_world + Vec3::new(0.0, 0.0, -0.005), up);
-    let mut close = frame::render(&scene_at(c_world), &close_pose, &close_intr);
-    let n2 = light::composite(&mut close, &caustic, &close_pose, &close_intr, xf, 0.09, &scene_at(c_world));
+    // the frame: the three samples as glass, on a plate with a printed grid,
+    // with every caustic on it. the scene's *own* frame is in plate coordinates
+    // (glass shapes are built there), so build it in the plate frame and use a
+    // plate-frame camera.
+    let plate_scene = {
+        // colliders in plate coordinates: identity track transform
+        let ident = SpatialTransform::identity();
+        let mut sc = frame::Scene::<f64>::new(&ident, &model.bodies[TRACK].collisions, tang::Vec3::new(0.0, 0.0, -10.0), r, lamp_local, lamp0_r(level));
+        sc.glass = samples.iter().map(|(_, sh)| glass::Glass { shape: sh.clone(), nd: nd_true }).collect();
+        sc.plate = Some(ident);
+        sc
+    };
+    let close_intr = CameraIntrinsics::from_vfov(1000, 700, 0.55, 0.02, 5.0);
+    let close_pose = CameraPose::look_at(Vec3::new(-0.02, -0.19, 0.11), Vec3::new(0.0, 0.0, 0.008), Vec3::z());
+    let t0 = std::time::Instant::now();
+    let mut close = frame::render(&plate_scene, &close_pose, &close_intr);
+    let ms = t0.elapsed().as_millis();
+    let ident = SpatialTransform::identity();
+    let mut n_px = 0;
+    for c in &caustics {
+        n_px += light::composite(&mut close, c, &close_pose, &close_intr, &ident, 0.09, &plate_scene);
+    }
     close.save(ld.join("frame_close.png"))?;
-    println!("light  caustic composited over {n} plate pixels (room view) and {n2} (close-up) → {}/frame.png, frame_close.png", ld.display());
-
+    println!("light  glass frame {}×{} in {ms} ms, caustics composited over {n_px} plate pixels → {}/frame_close.png", close_intr.width, close_intr.height, ld.display());
+    let c_t = samples[0].1.clone();
     // ∂loss/∂n_d: duals vs finite differences, against the true caustic as target
-    let (_, g) = light::loss_grad(lamp_t, c_t, r, 1.48, &caustic, rays);
+    let (_, g) = light::loss_grad(lamp_t, &c_t, 1.48, caustic, rays);
     let h = 1e-4;
-    let fd = (light::loss(&light::trace::<f64>(lamp_t, c_t, r, 1.48 + h, window, cells, rays), &caustic)
-        - light::loss(&light::trace::<f64>(lamp_t, c_t, r, 1.48 - h, window, cells, rays), &caustic)) / (2.0 * h);
+    let fd = (light::loss(&light::trace::<f64>(lamp_t, &c_t, 1.48 + h, window, cells, rays), caustic)
+        - light::loss(&light::trace::<f64>(lamp_t, &c_t, 1.48 - h, window, cells, rays), caustic)) / (2.0 * h);
     println!("light  ∂loss/∂n_d at n_d = 1.48: dual {g:+.4e}  fd {fd:+.4e}");
 
     // recover n_d from the caustic
     let mut nd = 1.42;
     let mut step = 0.02;
-    let mut l = light::loss(&light::trace::<f64>(lamp_t, c_t, r, nd, window, cells, rays), &caustic);
+    let mut l = light::loss(&light::trace::<f64>(lamp_t, &c_t, nd, window, cells, rays), caustic);
     for it in 0..25 {
-        let (_, g) = light::loss_grad(lamp_t, c_t, r, nd, &caustic, rays);
+        let (_, g) = light::loss_grad(lamp_t, &c_t, nd, caustic, rays);
         println!("light  fit it {it:2}: n_d = {nd:.4}  loss {l:.3e}  ∂ {g:+.3e}");
         if (nd - nd_true).abs() < 2e-4 {
             break;
@@ -1041,7 +1065,7 @@ fn light_stage(
         let mut accepted = false;
         for _ in 0..8 {
             let cand = nd + dir * step;
-            let lc = light::loss(&light::trace::<f64>(lamp_t, c_t, r, cand, window, cells, rays), &caustic);
+            let lc = light::loss(&light::trace::<f64>(lamp_t, &c_t, cand, window, cells, rays), caustic);
             if lc < l {
                 nd = cand;
                 l = lc;
@@ -1057,4 +1081,8 @@ fn light_stage(
     println!("light  recovered n_d = {nd:.4} (true {nd_true}); N-BK7 is 1.5168, soda-lime is ~1.52, fused silica 1.458");
     fs::write(ld.join("marble.loon"), level.with_params(&[("marble_nd", nd)]))?;
     Ok(())
+}
+
+fn lamp0_r(level: &Level) -> f64 {
+    level.params.get("lamp_r").copied().unwrap_or(25.0) * MM
 }

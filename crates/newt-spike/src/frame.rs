@@ -23,6 +23,7 @@ use phyz_diff::FinalStateObjective;
 use phyz_math::SpatialTransformExt;
 use phyz_model::{GeomInstance, Geometry};
 use phyz_world::CameraIntrinsics;
+use crate::glass::{self, Glass};
 use tang::{Dual, Mat3, Scalar, Vec3};
 
 const POS: usize = 3;
@@ -46,6 +47,19 @@ pub struct Scene<S: Scalar> {
     lamp_r: S,
     lamp_power: S,
     ambient: S,
+    /// Glass solids the camera sees through. When non-empty the opaque
+    /// marble is out of the picture.
+    pub glass: Vec<Glass<S>>,
+    /// Plate frame (world→plate), for the printed grid under the samples.
+    pub plate: Option<phyz_math::SpatialTransform>,
+}
+
+/// What a primary ray landed on.
+#[derive(Clone, Copy)]
+enum Hit<S: Scalar> {
+    Solid { albedo: S, plate: bool },
+    Marble,
+    Glass(usize),
 }
 
 fn v3<S: Scalar>(v: phyz_math::Vec3) -> Vec3<S> {
@@ -87,6 +101,119 @@ impl<S: Scalar> Scene<S> {
             lamp_r: S::from_f64(lamp_r),
             lamp_power: S::from_f64(0.09),
             ambient: S::from_f64(0.16),
+            glass: Vec::new(),
+            plate: None,
+        }
+    }
+
+    /// Camera bands (µm) for glass: three are enough to show colour fringes.
+    const CAM_BANDS: [f64; 3] = [0.65, 0.55, 0.45];
+
+    /// Plate albedo with a 5 mm printed grid, so refraction has something to bend.
+    fn plate_albedo(&self, p_world: Vec3<S>) -> S {
+        let Some(xf) = &self.plate else { return S::from_f64(0.78) };
+        let pl = xf.world_to_body_point(phyz_math::Vec3::new(p_world.x.to_f64(), p_world.y.to_f64(), p_world.z.to_f64()));
+        let f = |v: f64| ((v / 0.005).rem_euclid(1.0) - 0.5).abs();
+        let on_line = f(pl.x) > 0.44 || f(pl.y) > 0.44;
+        S::from_f64(if on_line { 0.45 } else { 0.82 })
+    }
+
+    /// Radiance of the lamp's disc if a ray hits it.
+    fn lamp_seen(&self, o: Vec3<S>, d: Vec3<S>) -> Option<S> {
+        let oc = self.lamp - o;
+        let t = oc.dot(&d);
+        if t <= S::ZERO {
+            return None;
+        }
+        let miss = (oc - d * t).norm();
+        // radiance = radiant intensity / disc area; it saturates, as a lamp does
+        (miss < self.lamp_r).then(|| self.lamp_power / (S::PI * self.lamp_r * self.lamp_r))
+    }
+
+    /// Nearest hit including glass.
+    fn hit_any(&self, o: Vec3<S>, d: Vec3<S>) -> Option<(S, Vec3<S>, Hit<S>)> {
+        let mut best: Option<(S, Vec3<S>, Hit<S>)> = self.hit(o, d).map(|(t, n, a, plate)| (t, n, Hit::Solid { albedo: a, plate }));
+        if self.glass.is_empty() {
+            if let Some(t) = sphere_hit(self.marble, self.marble_r, o, d) {
+                if best.as_ref().is_none_or(|h| t < h.0) {
+                    best = Some((t, (o + d * t - self.marble).normalize(), Hit::Marble));
+                }
+            }
+        }
+        for (i, g) in self.glass.iter().enumerate() {
+            if let Some((t, n)) = g.shape.enter(o, d) {
+                if best.as_ref().is_none_or(|h| t < h.0) {
+                    best = Some((t, n, Hit::Glass(i)));
+                }
+            }
+        }
+        best
+    }
+
+    /// Radiance along a ray for one camera band, following glass for up to
+    /// `depth` interface events.
+    pub fn radiance(&self, o: Vec3<S>, d: Vec3<S>, band: usize, depth: usize) -> S {
+        if let Some(l) = self.lamp_seen(o, d) {
+            // the lamp itself, if nothing is in front of it
+            if self.hit_any(o, d).is_none_or(|h| h.0 > (self.lamp - o).norm()) {
+                return l;
+            }
+        }
+        let Some((t, n, what)) = self.hit_any(o, d) else {
+            // the room: a soft hemisphere, brighter toward the ceiling, so
+            // glass has something to reflect besides black
+            return S::from_f64(0.06) + (d.z.max(S::ZERO)) * S::from_f64(0.22);
+        };
+        let p = o + d * t;
+        match what {
+            Hit::Solid { albedo, plate } => {
+                let albedo = if plate { self.plate_albedo(p) } else { albedo };
+                let q = p + n * S::from_f64(1e-5);
+                let to = self.lamp - q;
+                let r2 = to.norm_sq();
+                let l = to / r2.sqrt();
+                let cos = n.dot(&l).max(S::ZERO);
+                albedo * (self.ambient + self.lamp_power * cos / r2 * self.lamp_visibility(q))
+            }
+            Hit::Marble => {
+                let q = p + n * S::from_f64(1e-5);
+                let to = self.lamp - q;
+                let r2 = to.norm_sq();
+                let l = to / r2.sqrt();
+                let cos = n.dot(&l).max(S::ZERO);
+                S::from_f64(0.92) * (self.ambient + self.lamp_power * cos / r2 * self.lamp_visibility(q))
+            }
+            Hit::Glass(i) => {
+                if depth == 0 {
+                    return S::from_f64(0.02);
+                }
+                let g = &self.glass[i];
+                let n_glass = crate::light::index::<S>(g.nd, Self::CAM_BANDS[band]);
+                let Some((d_in, cos_i, cos_t)) = glass::refract(d, n, S::ONE, n_glass) else {
+                    return S::ZERO;
+                };
+                let r = glass::fresnel(S::ONE, n_glass, cos_i, cos_t);
+                // the reflected share sees the world, the lamp included
+                let d_r = glass::reflect(d, n);
+                let reflected = self.radiance(p + n * S::from_f64(1e-6), d_r, band, depth - 1);
+                // the refracted share walks through and out
+                let transmitted = match glass::walk_inside(&g.shape, p, d_in, n_glass, S::from_f64(0.5), 4) {
+                    Some((q, d_out, tr)) => tr * self.radiance(q + d_out * S::from_f64(1e-6), d_out, band, depth - 1),
+                    None => S::ZERO,
+                };
+                r * reflected + (S::ONE - r) * transmitted
+            }
+        }
+    }
+
+    /// Camera RGB for a pixel: three bands through glass, one otherwise.
+    pub fn rgb(&self, o: Vec3<S>, d: Vec3<S>) -> [S; 3] {
+        match self.hit_any(o, d) {
+            Some((_, _, Hit::Glass(_))) => [self.radiance(o, d, 0, 4), self.radiance(o, d, 1, 4), self.radiance(o, d, 2, 4)],
+            _ => {
+                let v = self.radiance(o, d, 1, 1);
+                [v, v, v]
+            }
         }
     }
 
@@ -120,6 +247,17 @@ impl<S: Scalar> Scene<S> {
                     return S::ZERO;
                 }
             }
+        }
+        for g in &self.glass {
+            if let Some((t, _)) = g.shape.enter(p, d) {
+                if t < dist {
+                    // the glass blocks the direct light; its caustic puts the light back
+                    return S::ZERO;
+                }
+            }
+        }
+        if !self.glass.is_empty() {
+            return S::ONE;
         }
         // Closest approach of the shadow segment to the marble centre.
         let oc = self.marble - p;
@@ -223,12 +361,12 @@ fn ray<S: Scalar>(pose: &CameraPose, intr: &CameraIntrinsics, u: f64, v: f64) ->
 pub fn render(scene: &Scene<f64>, pose: &CameraPose, intr: &CameraIntrinsics) -> image::RgbaImage {
     let (w, h) = (intr.width, intr.height);
     let mut img = image::RgbaImage::new(w, h);
+    let to8 = |v: f64| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
     for y in 0..h {
         for x in 0..w {
             let (o, d) = ray::<f64>(pose, intr, x as f64 + 0.5, y as f64 + 0.5);
-            let (l, _) = scene.shade(o, d);
-            let g = (l.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
-            img.put_pixel(x, y, image::Rgba([g, g, g, 255]));
+            let c = scene.rgb(o, d);
+            img.put_pixel(x, y, image::Rgba([to8(c[0]), to8(c[1]), to8(c[2]), 255]));
         }
     }
     img
@@ -365,6 +503,8 @@ fn seeded(scene: &Scene<f64>, k: usize) -> Scene<Dual<f64>> {
         lamp_r: Dual::constant(scene.lamp_r),
         lamp_power: Dual::constant(scene.lamp_power),
         ambient: Dual::constant(scene.ambient),
+        glass: scene.glass.iter().map(|g| Glass { shape: glass::to_dual(&g.shape), nd: Dual::constant(g.nd) }).collect(),
+        plate: scene.plate,
     }
 }
 

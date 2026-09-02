@@ -56,28 +56,6 @@ pub fn index<S: Scalar>(nd: S, lambda_um: f64) -> S {
     nd + sellmeier::<S>(lambda_um) - sellmeier::<S>(D_LINE_UM)
 }
 
-/// Unpolarized Fresnel reflectance for a ray from index `n1` into `n2`
-/// with cosines of incidence and refraction.
-fn fresnel<S: Scalar>(n1: S, n2: S, cos_i: S, cos_t: S) -> S {
-    let rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t);
-    let rp = (n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i);
-    S::HALF * (rs * rs + rp * rp)
-}
-
-/// Snell refraction of unit `d` at unit normal `n` (pointing against `d`),
-/// from index `n1` into `n2`. `None` on total internal reflection.
-fn refract<S: Scalar>(d: Vec3<S>, n: Vec3<S>, n1: S, n2: S) -> Option<(Vec3<S>, S, S)> {
-    let eta = n1 / n2;
-    let cos_i = -d.dot(&n);
-    let k = S::ONE - eta * eta * (S::ONE - cos_i * cos_i);
-    if k < S::ZERO {
-        return None;
-    }
-    let cos_t = k.sqrt();
-    let t = d * eta + n * (eta * cos_i - cos_t);
-    Some((t, cos_i, cos_t))
-}
-
 /// The caustic a glass sphere throws on the plate: irradiance per band, on a
 /// grid in plate coordinates, plus a shadow-free reference (what the plate
 /// would receive from the lamp through the same solid angle with no marble).
@@ -93,20 +71,22 @@ pub struct Caustic<S: Scalar> {
     pub tir: usize,
 }
 
-/// Trace `rays_per_band` light rays per band from the lamp through the marble
-/// to the plate. Everything in the plate frame (plate top is z = 0).
+/// Trace `rays_per_band` light rays per band from the lamp through a glass
+/// `shape` to the plate. Everything in the plate frame (plate top is z = 0).
 pub fn trace<S: Scalar>(
     lamp: Vec3<f64>,
-    centre: Vec3<f64>,
-    r: f64,
+    shape: &crate::glass::Shape<S>,
     nd: S,
     window: f64,
     cells: usize,
     rays_per_band: usize,
 ) -> Caustic<S> {
     let cell = window / cells as f64;
-    // the window is centred on where the lamp's ray through the marble's
-    // centre meets the plate, which is where the focus lands
+    let (centre_s, bound_s) = shape.bounds();
+    let centre = Vec3::new(centre_s.x.to_f64(), centre_s.y.to_f64(), centre_s.z.to_f64());
+    let bound = bound_s.to_f64();
+    // the window is centred on where the lamp's ray through the object's
+    // centre meets the plate
     let to = centre - lamp;
     let t = -lamp.z / to.z;
     let hit0 = lamp + to * t;
@@ -114,23 +94,20 @@ pub fn trace<S: Scalar>(
     let mut e = vec![vec![S::ZERO; cells * cells]; BANDS.len()];
     let (mut traced, mut tir) = (0usize, 0usize);
 
-    // rays: a uniform grid over the disc of directions that hits the sphere
+    // rays: a jittered lattice over the disc of directions that covers the
+    // object's bounding sphere
     let dist = to.norm();
     let axis = to / dist;
     let u = if axis.x.abs() < 0.9 { Vec3::x() } else { Vec3::y() };
     let e1 = axis.cross(&u).normalize();
     let e2 = axis.cross(&e1);
-    let ang = (r / dist).asin(); // half-angle of the cone subtending the sphere
+    let ang = (bound / dist).min(0.999).asin();
     let side = (rays_per_band as f64).sqrt().ceil() as usize;
-    // solid angle per ray: the cone's solid angle over the disc's ray count
     let cone_sr = std::f64::consts::TAU * (1.0 - ang.cos());
     let in_disc = (side * side) as f64 * std::f64::consts::FRAC_PI_4;
     let d_omega = cone_sr / in_disc;
     let cell_area = cell * cell;
-
     let lamp_s = Vec3::new(S::from_f64(lamp.x), S::from_f64(lamp.y), S::from_f64(lamp.z));
-    let centre_s = Vec3::new(S::from_f64(centre.x), S::from_f64(centre.y), S::from_f64(centre.z));
-    let r_s = S::from_f64(r);
 
     for (b, (lambda, _)) in BANDS.iter().enumerate() {
         let n_glass = index::<S>(nd, *lambda);
@@ -146,49 +123,35 @@ pub fn trace<S: Scalar>(
                 if a * a + c * c > 1.0 {
                     continue;
                 }
-                traced += 1;
                 let theta = ang * (a * a + c * c).sqrt();
                 let phi = c.atan2(a);
                 let dir = axis * theta.cos() + (e1 * phi.cos() + e2 * phi.sin()) * theta.sin();
                 let d = Vec3::new(S::from_f64(dir.x), S::from_f64(dir.y), S::from_f64(dir.z));
-                // entry
-                let oc = lamp_s - centre_s;
-                let bq = oc.dot(&d);
-                let disc = bq * bq - (oc.norm_sq() - r_s * r_s);
-                if disc < S::ZERO {
-                    continue;
-                }
-                let t1 = -bq - disc.sqrt();
+                let Some((t1, n1)) = shape.enter(lamp_s, d) else { continue };
+                traced += 1;
                 let p1 = lamp_s + d * t1;
-                let n1 = (p1 - centre_s) / r_s;
-                let Some((d_in, cos_i, cos_t)) = refract(d, n1, S::ONE, n_glass) else {
+                let Some((d_in, cos_i, cos_t)) = crate::glass::refract(d, n1, S::ONE, n_glass) else {
                     tir += 1;
                     continue;
                 };
-                let t_in = S::ONE - fresnel(S::ONE, n_glass, cos_i, cos_t);
-                // exit: the chord through the sphere
-                let t2 = -(p1 - centre_s).dot(&d_in) * S::TWO;
-                let p2 = p1 + d_in * t2;
-                let n2 = (centre_s - p2) / r_s; // inward normal, against d_in
-                let Some((d_out, cos_i2, cos_t2)) = refract(d_in, n2, n_glass, S::ONE) else {
+                let t_in = S::ONE - crate::glass::fresnel(S::ONE, n_glass, cos_i, cos_t);
+                let Some((p2, d_out, t_out)) = crate::glass::walk_inside(shape, p1, d_in, n_glass, S::ZERO, 4) else {
                     tir += 1;
                     continue;
                 };
-                let t_out = S::ONE - fresnel(n_glass, S::ONE, cos_i2, cos_t2);
-                // to the plate z = 0
                 if d_out.z >= S::ZERO {
                     continue;
                 }
                 let tp = -p2.z / d_out.z;
                 let hit = p2 + d_out * tp;
-                // energy: radiant intensity × solid angle × transmission, per cell area,
-                // times the cosine the plate sees
                 let cos_plate = -d_out.z;
                 let power = t_in * t_out * cos_plate * S::from_f64(d_omega / cell_area);
-                // bilinear deposit, smooth in the hit position
                 let gx = (hit.x - S::from_f64(origin[0])) / S::from_f64(cell) - S::HALF;
                 let gy = (hit.y - S::from_f64(origin[1])) / S::from_f64(cell) - S::HALF;
                 let (fx, fy) = (gx.to_f64().floor(), gy.to_f64().floor());
+                if !(fx > -2.0 && fy > -2.0 && fx < cells as f64 + 1.0 && fy < cells as f64 + 1.0) {
+                    continue;
+                }
                 let (wx, wy) = (gx - S::from_f64(fx), gy - S::from_f64(fy));
                 for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                     let (ix, iy) = (fx as i64 + dx, fy as i64 + dy);
@@ -241,8 +204,8 @@ pub fn loss<S: Scalar>(c: &Caustic<S>, target: &Caustic<f64>) -> S {
 }
 
 /// ∂loss/∂nd by one dual pass.
-pub fn loss_grad(lamp: Vec3<f64>, centre: Vec3<f64>, r: f64, nd: f64, target: &Caustic<f64>, rays: usize) -> (f64, f64) {
-    let c = trace::<Dual<f64>>(lamp, centre, r, Dual::new(nd, 1.0), target.cell * target.n as f64, target.n, rays);
+pub fn loss_grad(lamp: Vec3<f64>, shape: &crate::glass::Shape<f64>, nd: f64, target: &Caustic<f64>, rays: usize) -> (f64, f64) {
+    let c = trace::<Dual<f64>>(lamp, &crate::glass::to_dual(shape), Dual::new(nd, 1.0), target.cell * target.n as f64, target.n, rays);
     let l = loss(&c, target);
     (l.real, l.dual)
 }
