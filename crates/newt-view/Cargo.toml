@@ -7,9 +7,11 @@ description = "The window: play, scrub and inspect a newt simulation; export is 
 
 [dependencies]
 newt-spike = { path = "../newt-spike" }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+bytemuck = { version = "1", features = ["derive"] }
 egui = "0.36"
 image.workspace = true
 phyz-math.workspace = true
 tang.workspace = true
 anyhow = "1"
+log = "0.4"

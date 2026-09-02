@@ -2,22 +2,24 @@
 //!
 //! The simulation runs on its own thread and hands over a snapshot per frame.
 //! The window keeps every snapshot, so the timeline is a recording: play it,
-//! pause it, scrub it, inspect any frame. Rendering goes through the same
-//! tracer the CLI uses, at preview size while things move and at full size
-//! when you stop. Export is the CLI's render, as a button.
-//!
-//! This is the first slice of the plan: a recording-shaped viewer, native
-//! now, the same crate for the browser once the sim runs under wasm.
+//! pause it, scrub it, inspect any frame. Two renderers look at the same
+//! frame: the live tier on the GPU (`live.rs`), and the reference tracer the
+//! CLI uses, one button away, side by side with the live frame when paused.
+//! Export is the CLI's render, as a button.
+
+mod live;
 
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
-use newt_spike::pool::{self, Drop, Surface};
+use eframe::egui_wgpu;
+use newt_spike::pool::{self, Caustic, Drop, Surface};
 use newt_spike::splash::Droplet;
 use tang::Vec3 as V;
 
-/// One frame of the recording: everything the renderer needs, nothing the
+/// One frame of the recording: everything a renderer needs, nothing the
 /// solver needs.
 #[derive(Clone)]
 struct Frame {
@@ -25,6 +27,8 @@ struct Frame {
     q: Vec<f64>,
     v: Vec<f64>,
     surface: Surface,
+    caustic: Caustic,
+    melon_axis: V<f64>,
     droplets: Vec<Droplet>,
     fluid_force: V<f64>,
     particles: usize,
@@ -38,6 +42,8 @@ impl Frame {
             q: drop.state.q.as_slice().to_vec(),
             v: drop.state.v.as_slice().to_vec(),
             surface: drop.surface.clone(),
+            caustic: pool::caustic(&drop.surface, 0.01),
+            melon_axis: drop.melon().axis,
             droplets: drop.droplets.clone(),
             fluid_force: drop.fluid_force,
             particles: drop.water.as_ref().map(|w| w.count()).unwrap_or(0),
@@ -45,7 +51,11 @@ impl Frame {
         }
     }
 
-    /// A drop the renderer can read, rebuilt from the snapshot.
+    fn melon_centre(&self) -> V<f64> {
+        V::new(self.q[3], self.q[4], self.q[5])
+    }
+
+    /// A drop the reference renderer can read, rebuilt from the snapshot.
     fn to_drop(&self) -> Drop {
         let mut d = Drop::new(1.3);
         for (i, x) in self.q.iter().enumerate() {
@@ -59,6 +69,16 @@ impl Frame {
         d.droplets = self.droplets.clone();
         d.fluid_force = self.fluid_force;
         d
+    }
+
+    fn live(&self) -> Arc<live::LiveFrame> {
+        Arc::new(live::LiveFrame {
+            surface: self.surface.clone(),
+            caustic: self.caustic.clone(),
+            melon_centre: self.melon_centre(),
+            melon_axis: self.melon_axis,
+            droplets: self.droplets.clone(),
+        })
     }
 }
 
@@ -89,66 +109,92 @@ struct App {
     playing: bool,
     follow: bool,
     annotate: bool,
-    preview: bool,
     splash: bool,
-    texture: Option<egui::TextureHandle>,
-    rendered_for: Option<(usize, bool)>,
-    render_ms: u128,
+    live_on: bool,
+    camera: live::Camera,
+    orbit: (f64, f64, f64), // azimuth, elevation, distance
+    reference: Option<egui::TextureHandle>,
+    reference_for: Option<usize>,
+    reference_ms: u128,
+    reference_size: (u32, u32),
+    want_reference: bool,
+    /// `--shot=<path>`: write a window capture once frames arrive, then quit.
+    shot: Option<(std::path::PathBuf, u32)>,
+    shot_now: Option<std::path::PathBuf>,
+    live_frame: Option<(usize, Arc<live::LiveFrame>)>,
     last_tick: Instant,
     ui_fps: f32,
     export: Option<std::process::Child>,
     play_t0: f64,
     play_from: usize,
+    t_start: Instant,
 }
 
 impl App {
-    fn new(rx: mpsc::Receiver<Frame>, splash: bool) -> Self {
-        Self {
+    fn new(cc: &eframe::CreationContext<'_>, rx: mpsc::Receiver<Frame>, splash: bool) -> Self {
+        if let Some(rs) = &cc.wgpu_render_state {
+            let res = live::Resources::new(&rs.device, rs.target_format);
+            rs.renderer.write().callback_resources.insert(res);
+        }
+        let mut app = Self {
             rx,
             frames: Vec::new(),
             cursor: 0,
             playing: true,
             follow: true,
             annotate: true,
-            preview: true,
             splash,
-            texture: None,
-            rendered_for: None,
-            render_ms: 0,
+            live_on: cc.wgpu_render_state.is_some(),
+            camera: live::Camera { eye: V::new(-1.42, -1.22, 0.31), target: V::new(0.02, 0.12, -0.06), vfov: 0.9 },
+            orbit: (-2.43, 0.19, 1.9),
+            reference: None,
+            reference_for: None,
+            reference_ms: 0,
+            reference_size: (0, 0),
+            want_reference: false,
+            shot: std::env::args().find_map(|a| a.strip_prefix("--shot=").map(|v| (v.into(), 0))),
+            shot_now: None,
+            live_frame: None,
             last_tick: Instant::now(),
             ui_fps: 0.0,
             export: None,
             play_t0: 0.0,
             play_from: 0,
-        }
+            t_start: Instant::now(),
+        };
+        app.apply_orbit();
+        app
     }
 
-    fn render(&mut self, ctx: &egui::Context) {
+    fn apply_orbit(&mut self) {
+        let (az, el, dist) = self.orbit;
+        let t = self.camera.target;
+        self.camera.eye = t + V::new(dist * el.cos() * az.cos(), dist * el.cos() * az.sin(), dist * el.sin());
+    }
+
+    /// The reference tracer on the current frame, at the live camera.
+    fn render_reference(&mut self, ctx: &egui::Context, size: (u32, u32)) {
         let Some(frame) = self.frames.get(self.cursor) else { return };
-        let full = !self.playing;
-        if self.rendered_for == Some((self.cursor, full)) {
-            return;
-        }
-        let (w, h) = if full { (960, 540) } else { (480, 270) };
+        let (w, h) = (size.0.min(960).max(64), ((size.0.min(960).max(64)) as f64 * size.1 as f64 / size.0.max(1) as f64).max(36.0) as u32);
         let drop = frame.to_drop();
         let t0 = Instant::now();
-        let caustic = pool::caustic(&drop.surface, if full { 0.01 } else { 0.02 });
-        let view = pool::View { eye: V::new(-1.42, -1.22, 0.31), target: V::new(0.02, 0.12, -0.06), width: w, height: h, vfov: 0.9 };
-        let mut img = pool::render(&view, &drop, &caustic);
+        let view = self.camera.view(w, h);
+        let mut img = pool::render(&view, &drop, &frame.caustic);
         if self.annotate {
             annotate(&mut img, &view, frame);
         }
-        self.render_ms = t0.elapsed().as_millis();
+        self.reference_ms = t0.elapsed().as_millis();
         let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
-        match &mut self.texture {
+        match &mut self.reference {
             Some(t) => t.set(color, egui::TextureOptions::LINEAR),
-            None => self.texture = Some(ctx.load_texture("frame", color, egui::TextureOptions::LINEAR)),
+            None => self.reference = Some(ctx.load_texture("reference", color, egui::TextureOptions::LINEAR)),
         }
-        self.rendered_for = Some((self.cursor, full));
+        self.reference_for = Some(self.cursor);
+        self.reference_size = (w, h);
     }
 }
 
-/// Scene annotation: a marker on the melon and its numbers, drawn into the frame.
+/// Scene annotation: a marker on the melon and a stem along its velocity.
 fn annotate(img: &mut image::RgbaImage, view: &pool::View, f: &Frame) {
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
@@ -162,9 +208,8 @@ fn annotate(img: &mut image::RgbaImage, view: &pool::View, f: &Frame) {
         }
         Some(((r.dot(&right) / z) * fy + view.width as f64 / 2.0, view.height as f64 / 2.0 - (r.dot(&up) / z) * fy))
     };
-    let c = V::new(f.q[3], f.q[4], f.q[5]);
+    let c = f.melon_centre();
     if let Some((x, y)) = project(c) {
-        // a crosshair on the melon, and a stem to its velocity
         for k in -6..=6i64 {
             for (px, py) in [(x as i64 + k, y as i64), (x as i64, y as i64 + k)] {
                 if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
@@ -189,7 +234,6 @@ fn annotate(img: &mut image::RgbaImage, view: &pool::View, f: &Frame) {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _f: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        // frames from the simulation
         while let Ok(f) = self.rx.try_recv() {
             self.frames.push(f);
         }
@@ -198,7 +242,6 @@ impl eframe::App for App {
             if self.follow {
                 self.cursor = n - 1;
             } else {
-                // advance at the recording's own 30 fps against the wall clock
                 let t = ctx.input(|i| i.time);
                 let want = ((t - self.play_t0) * 30.0) as usize + self.play_from;
                 self.cursor = want.min(n - 1);
@@ -216,7 +259,6 @@ impl eframe::App for App {
                 if ui.button(if self.playing { "⏸ pause" } else { "▶ play" }).clicked() {
                     self.playing = !self.playing;
                     if self.playing {
-                        // resume from here, at the recording's rate; follow only if at the end
                         self.follow = self.cursor + 1 >= n;
                         self.play_t0 = ctx.input(|i| i.time);
                         self.play_from = self.cursor;
@@ -224,6 +266,7 @@ impl eframe::App for App {
                 }
                 ui.checkbox(&mut self.follow, "follow live");
                 ui.checkbox(&mut self.annotate, "annotate");
+                ui.checkbox(&mut self.live_on, "live tier");
                 ui.separator();
                 if n > 0 {
                     let mut c = self.cursor;
@@ -249,7 +292,7 @@ impl eframe::App for App {
 
         egui::Panel::right("inspector").default_size(300.0).show(root, |ui| {
             ui.heading("inspector");
-            ui.label(format!("ui {:.0} fps · render {} ms · {}", self.ui_fps, self.render_ms, if self.playing { "preview" } else { "full" }));
+            ui.label(format!("ui {:.0} fps · {}", self.ui_fps, if self.live_on { "live tier" } else { "live tier off" }));
             ui.label(format!("recorded {n} frames"));
             if let Some(f) = self.frames.get(self.cursor) {
                 ui.separator();
@@ -266,38 +309,124 @@ impl eframe::App for App {
                     ui.label(format!("surface {}×{} @ {:.0} mm   z {:+.3}…{:+.3}", g.nx, g.ny, g.cell * 1e3, lo, hi));
                 }
                 ui.separator();
-                ui.label("knobs (this frame)");
+                ui.label("camera: drag to orbit, scroll to zoom");
+                ui.label(format!("eye ({:+.2}, {:+.2}, {:+.2})", self.camera.eye.x, self.camera.eye.y, self.camera.eye.z));
+                ui.separator();
+                ui.label("reference tier");
+                if self.playing {
+                    ui.label("pause to render the reference");
+                } else if ui.button("render the reference beside it").clicked() {
+                    self.want_reference = true;
+                    self.reference_for = None;
+                }
+                if self.reference_for == Some(self.cursor) {
+                    ui.label(format!("reference {}×{} in {} ms", self.reference_size.0, self.reference_size.1, self.reference_ms));
+                }
+                ui.separator();
                 ui.label(format!("melon axes {:?} m", pool::MELON_AXES));
                 ui.label(format!("pool {}×{} m, {} m deep", 2.0 * pool::POOL_X, 2.0 * pool::POOL_Y, pool::DEPTH));
             }
         });
 
+        // the reference, when asked for and paused
+        if self.want_reference && !self.playing && n > 0 && self.reference_for != Some(self.cursor) {
+            let avail = ctx.content_rect().size();
+            let w = ((avail.x - 320.0) * 0.5).max(240.0) as u32;
+            let h = (w as f32 / (16.0 / 9.0)) as u32;
+            self.render_reference(&ctx, (w, h));
+        }
+        if self.playing {
+            self.want_reference = false;
+        }
+
         egui::CentralPanel::default().show(root, |ui| {
-            self.render(&ctx);
-            if let Some(t) = &self.texture {
-                let avail = ui.available_size();
-                let aspect = 16.0 / 9.0;
-                let size = if avail.x / avail.y > aspect { egui::vec2(avail.y * aspect, avail.y) } else { egui::vec2(avail.x, avail.x / aspect) };
-                ui.centered_and_justified(|ui| {
-                    ui.image((t.id(), size));
-                });
-            } else {
-                ui.centered_and_justified(|ui| ui.label("settling the water…"));
-            }
+            let avail = ui.available_size();
+            let show_ref = !self.playing && self.reference_for == Some(self.cursor) && self.reference.is_some();
+            let cols = if show_ref { 2.0 } else { 1.0 };
+            let aspect = 16.0 / 9.0;
+            let cell_w = (avail.x - 8.0 * (cols - 1.0)) / cols;
+            let size = if cell_w / avail.y > aspect { egui::vec2(avail.y * aspect, avail.y) } else { egui::vec2(cell_w, cell_w / aspect) };
+            ui.horizontal(|ui| {
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::drag());
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    self.orbit.0 -= d.x as f64 * 0.005;
+                    self.orbit.1 = (self.orbit.1 + d.y as f64 * 0.005).clamp(0.02, 1.5);
+                    self.apply_orbit();
+                    self.reference_for = None;
+                }
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if resp.hovered() && scroll.abs() > 0.0 {
+                    self.orbit.2 = (self.orbit.2 * (1.0 - scroll as f64 * 0.002)).clamp(0.4, 8.0);
+                    self.apply_orbit();
+                    self.reference_for = None;
+                }
+                if self.live_on {
+                    if let Some(frame) = self.frames.get(self.cursor) {
+                        if self.live_frame.as_ref().map(|(i, _)| *i != self.cursor).unwrap_or(true) {
+                            self.live_frame = Some((self.cursor, frame.live()));
+                        }
+                        let lf = self.live_frame.as_ref().unwrap().1.clone();
+                        let ppp = ctx.pixels_per_point();
+                        let cb = egui_wgpu::Callback::new_paint_callback(
+                            rect,
+                            live::LiveCallback {
+                                frame: lf,
+                                camera: self.camera,
+                                size: ((size.x * ppp) as u32, (size.y * ppp) as u32),
+                                time: self.t_start.elapsed().as_secs_f32(),
+                                shot: self.shot_now.take(),
+                            },
+                        );
+                        ui.painter().add(cb);
+                    } else {
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+                    }
+                } else {
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+                }
+                if show_ref {
+                    ui.add_space(8.0);
+                    if let Some(t) = &self.reference {
+                        ui.image((t.id(), size));
+                    }
+                }
+            });
         });
 
+        // headless verification: once the recording has a few frames, have
+        // the live callback write its frame to disk, then quit
+        if let Some((path, ticks)) = self.shot.as_mut() {
+            if n >= 20 {
+                *ticks += 1;
+                if *ticks == 5 {
+                    self.shot_now = Some(path.clone());
+                }
+                if *ticks == 8 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
+struct Stderr;
+impl log::Log for Stderr {
+    fn enabled(&self, m: &log::Metadata) -> bool { m.level() <= log::Level::Warn }
+    fn log(&self, r: &log::Record) { if self.enabled(r.metadata()) { eprintln!("{}: {}", r.level(), r.args()); } }
+    fn flush(&self) {}
+}
+
 fn main() -> eframe::Result<()> {
+    let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let splash = std::env::args().any(|a| a == "--splash");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || simulate(tx, splash, frames));
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 760.0]).with_title("newt view"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 800.0]).with_title("newt view"),
         ..Default::default()
     };
-    eframe::run_native("newt view", options, Box::new(move |_cc| Ok(Box::new(App::new(rx, splash)))))
+    eframe::run_native("newt view", options, Box::new(move |cc| Ok(Box::new(App::new(cc, rx, splash)))))
 }

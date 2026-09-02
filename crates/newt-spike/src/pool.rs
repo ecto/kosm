@@ -100,14 +100,14 @@ pub struct Surface {
 
 impl Surface {
     pub fn height(&self, x: f64, y: f64) -> f64 {
-        let mut h = 0.0;
-        for r in &self.rings {
-            h += r.height(x, y, self.t);
-        }
         if let Some(g) = &self.grid {
             // the fluid's surface; the sub-grid rings from landing drops are
             // baked into the grid once per frame, so this is one lookup
             return g.at(x, y);
+        }
+        let mut h = 0.0;
+        for r in &self.rings {
+            h += r.height(x, y, self.t);
         }
         // ambient ripple, 1 mm, so still water is not a mirror
         h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
@@ -426,6 +426,7 @@ impl Drop {
 
 // ---- rendering --------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct Caustic {
     pub origin: [f64; 2],
     pub cell: f64,
