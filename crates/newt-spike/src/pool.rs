@@ -255,6 +255,77 @@ fn stand_and_crowd(o: V<f64>, d: V<f64>) -> Option<(f64, [f64; 3])> {
     })
 }
 
+// ---- whitewater -------------------------------------------------------------
+
+/// A fleck of foam riding the surface: born where fast water breaks the
+/// surface, drifting with the momentum it had, gone in a couple of seconds.
+#[derive(Clone, Copy)]
+pub struct Foam {
+    pub x: f64,
+    pub y: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub age: f64,
+    pub life: f64,
+    pub size: f64,
+}
+
+/// Foam binned for the renderer: coverage at a point is the sum of the
+/// flecks within their radius, from the bins around it.
+pub struct FoamField {
+    origin: [f64; 2],
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    bins: Vec<Vec<Foam>>,
+}
+
+impl FoamField {
+    pub fn build(foam: &[Foam], half: f64) -> Self {
+        let cell = 0.1;
+        let nx = (2.0 * half / cell) as usize + 1;
+        let ny = nx;
+        let mut bins = vec![Vec::new(); nx * ny];
+        for f in foam {
+            let i = ((f.x + half) / cell).floor();
+            let j = ((f.y + half) / cell).floor();
+            if i >= 0.0 && j >= 0.0 && (i as usize) < nx && (j as usize) < ny {
+                bins[j as usize * nx + i as usize].push(*f);
+            }
+        }
+        Self { origin: [-half, -half], cell, nx, ny, bins }
+    }
+    pub fn empty() -> Self {
+        Self { origin: [0.0, 0.0], cell: 1.0, nx: 0, ny: 0, bins: Vec::new() }
+    }
+    /// Coverage in 0..1 at (x, y).
+    pub fn coverage(&self, x: f64, y: f64) -> f64 {
+        if self.nx == 0 {
+            return 0.0;
+        }
+        let gi = ((x - self.origin[0]) / self.cell).floor() as i64;
+        let gj = ((y - self.origin[1]) / self.cell).floor() as i64;
+        let mut cov = 0.0;
+        for dj in -1..=1i64 {
+            for di in -1..=1i64 {
+                let (i, j) = (gi + di, gj + dj);
+                if i < 0 || j < 0 || i >= self.nx as i64 || j >= self.ny as i64 {
+                    continue;
+                }
+                for f in &self.bins[j as usize * self.nx + i as usize] {
+                    let r2 = (x - f.x).powi(2) + (y - f.y).powi(2);
+                    let s2 = f.size * f.size;
+                    if r2 < s2 {
+                        let fade = 1.0 - (f.age / f.life).clamp(0.0, 1.0);
+                        cov += (1.0 - r2 / s2) * fade;
+                    }
+                }
+            }
+        }
+        0.85 * (1.0 - (-cov * 0.9).exp())
+    }
+}
+
 // ---- the waves --------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -466,6 +537,10 @@ pub struct Drop {
     /// The simulated water, when the splash is on.
     pub water: Option<crate::splash::Water>,
     pub droplets: Vec<crate::splash::Droplet>,
+    /// Foam on the surface.
+    pub foam: Vec<Foam>,
+    /// Last frame's fine surface, for its rate of rise.
+    surface_prev: Option<crate::splash::HeightGrid>,
     /// Last frame's fluid force on the melon, for the log.
     pub fluid_force: V<f64>,
     /// The pool beyond the box.
@@ -497,6 +572,8 @@ impl Drop {
             entered: false,
             water: None,
             droplets: Vec::new(),
+            foam: Vec::new(),
+            surface_prev: None,
             fluid_force: V::zero(),
             far: None,
         }
@@ -594,6 +671,91 @@ impl Drop {
             // rings that have died out
             self.surface.rings.retain(|r| t - r.t0 < 1.5);
             self.droplets = now;
+            // whitewater: fast water at the surface entrains air. A fleck
+            // is born where a fluid particle within a cell and a half of
+            // the surface moves faster than a metre a second, more the
+            // faster; it keeps that momentum, slowed, and lives a couple
+            // of seconds. (Ihmsen et al.'s trapped-air potential, reduced
+            // to what the downloaded particles can tell us.)
+            let frame_dt = 1.0 / fps();
+            let mut seed = (t * 1e6) as u64 | 1;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let budget = 40_000usize.saturating_sub(self.foam.len());
+            let mut born = 0;
+            let (mut fast, mut band) = (0usize, 0usize);
+            for (p, v) in w.x.iter().zip(&w.v) {
+                if born >= budget {
+                    break;
+                }
+                let speed = v.norm();
+                if speed < 0.6 {
+                    continue;
+                }
+                fast += 1;
+                let s = g.at(p.x, p.y) + off;
+                // from a cell and a half under the surface up through the crown
+                if p.z < s - 1.5 * w.h || p.z > s + 0.6 {
+                    continue;
+                }
+                band += 1;
+                let rate = 3.0 * (speed - 0.6).min(4.0) * frame_dt;
+                if rnd() < rate {
+                    self.foam.push(Foam { x: p.x, y: p.y, vx: v.x, vy: v.y, age: 0.0, life: 1.5 + 1.5 * rnd(), size: 0.02 + 0.03 * rnd() });
+                    born += 1;
+                }
+            }
+            // ...and where the surface itself breaks: rising faster than
+            // 0.4 m/s or steeper than 1 in 2, per cell of the height field
+            if let Some(prev) = &self.surface_prev {
+                if prev.nx == g.nx && prev.ny == g.ny {
+                    let mut surf_born = 0;
+                    for jy in 1..g.ny - 1 {
+                        for ix in 1..g.nx - 1 {
+                            if self.foam.len() >= 60_000 {
+                                break;
+                            }
+                            let i = jy * g.nx + ix;
+                            let rise = (g.z[i] - prev.z[i]) / frame_dt;
+                            let sx = (g.z[i + 1] - g.z[i - 1]) / (2.0 * g.cell);
+                            let sy = (g.z[i + g.nx] - g.z[i - g.nx]) / (2.0 * g.cell);
+                            let slope = sx.hypot(sy);
+                            // steepness is the better sign of breaking; a rising crown is mostly smooth
+                            let potential = (rise.abs() - 0.8).max(0.0) / 4.0 + (slope - 0.6).max(0.0) * 0.8;
+                            if potential <= 0.0 {
+                                continue;
+                            }
+                            if rnd() < potential.min(1.0) * 0.35 {
+                                let x = g.origin[0] + (ix as f64 + 0.5) * g.cell + (rnd() - 0.5) * g.cell;
+                                let y = g.origin[1] + (jy as f64 + 0.5) * g.cell + (rnd() - 0.5) * g.cell;
+                                // drift outward from the splash with the ring
+                                let r = x.hypot(y).max(0.05);
+                                let sp = 0.3 * potential.min(1.0);
+                                self.foam.push(Foam { x, y, vx: sp * x / r, vy: sp * y / r, age: 0.0, life: 1.5 + 2.0 * rnd(), size: 0.012 + 0.02 * rnd() });
+                                surf_born += 1;
+                            }
+                        }
+                    }
+                    born += surf_born;
+                }
+            }
+            self.surface_prev = Some(g.clone());
+            for f in self.foam.iter_mut() {
+                f.age += frame_dt;
+                let drag = (-2.0 * frame_dt).exp();
+                f.vx *= drag;
+                f.vy *= drag;
+                f.x += f.vx * frame_dt;
+                f.y += f.vy * frame_dt;
+            }
+            self.foam.retain(|f| f.age < f.life);
+            if std::env::var_os("NEWT_PROF").is_some() {
+                println!("foam   fast {fast}  in band {band}  born {born}  alive {}", self.foam.len());
+            }
             // bake the rings into the grid for this frame
             let mut g = g;
             if !self.surface.rings.is_empty() {
@@ -1001,6 +1163,16 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
             for k in 0..3 {
                 c[k] = r * reflected[k] + (1.0 - r) * under[k];
             }
+            // foam: a white scattering layer, lit by sun and sky
+            let a = drop.foam.coverage(p.x, p.y);
+            if a > 0.0 {
+                let lit = SUN_IRRADIANCE * n.dot(&s).max(0.0) * if sun_blocked_air(melon, p) { 0.3 } else { 1.0 };
+                let sk = sky(n);
+                for k in 0..3 {
+                    let foam = [0.93, 0.96, 1.0][k] * (0.45 * sk[k] + 0.7 * lit);
+                    c[k] = c[k] * (1.0 - a) + foam * a;
+                }
+            }
             c
         }
         3 => {
@@ -1149,11 +1321,13 @@ pub struct Scene<'a> {
     pub droplets: &'a [crate::splash::Droplet],
     /// The surface's maximum this frame (computed once: it is a grid scan).
     pub top: f64,
+    pub foam: &'a FoamField,
 }
 
 pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
-    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top: drop.surface.top() };
+    let foam = FoamField::build(&drop.foam, box_half() + 1.0);
+    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top: drop.surface.top(), foam: &foam };
     let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
@@ -1278,8 +1452,8 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                 println!("water  frame {k:3}  particle z mean {:+.1} mm (rest {:.0})  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, -BOX_DEPTH * 500.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
             }
             println!(
-                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  level {:+.1} mm  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={}  {} ms/frame",
-                drop.state.time, m.z, drop.state.v[5], drop.surface.mean_level() * 1000.0, peak_force.z, drop.water.as_ref().map(|w| w.interior_mass).unwrap_or(0.0), drop.water.as_ref().map(|w| w.interior_mass * GRAVITY).unwrap_or(0.0), drop.droplets.len(), t0.elapsed().as_millis() / (k as u128 + 1)
+                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  level {:+.1} mm  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={} foam={}  {} ms/frame",
+                drop.state.time, m.z, drop.state.v[5], drop.surface.mean_level() * 1000.0, peak_force.z, drop.water.as_ref().map(|w| w.interior_mass).unwrap_or(0.0), drop.water.as_ref().map(|w| w.interior_mass * GRAVITY).unwrap_or(0.0), drop.droplets.len(), drop.foam.len(), t0.elapsed().as_millis() / (k as u128 + 1)
             );
         }
     }
