@@ -33,6 +33,19 @@ function against the tessellation before the first step. Plate, walls and cup
 are all real colliders; the cup is a ring of box segments with a mouth facing
 uphill so it catches.
 
+### the lamp
+
+`lamp.rs` puts a point lamp in the room and changes the objective to "the
+marble's shadow lands here". The light is an analytic ray-plane projection
+with its Jacobian; the motion is the convex-contact adjoint; the chain rule
+joins them at the marble's final position. Mid-roll, `∂shadow²/∂release`
+matches central differences to four digits through the lamp and through
+rolling contact in one backward pass. After the cup collision it is one-sided,
+as documented for the contact adjoint. Two knobs solve the same target: the
+release point (grid, then the chained adjoint) and the lamp position (closed
+form: at fixed height the shadow is affine in the lamp's xy). phyz-camera
+draws no shadows, so the frame composites the projected silhouette.
+
 Two phyz bugs surfaced and were fixed in the phyz worktree this depends on:
 sphere-on-box contact points were taken from the box's degenerate face
 support (the marble fell through the plate), and the body-body adjoint froze

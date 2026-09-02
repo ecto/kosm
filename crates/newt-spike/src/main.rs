@@ -22,6 +22,7 @@
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
 mod colliders;
+mod lamp;
 
 use std::collections::HashMap;
 use std::fs;
@@ -293,6 +294,10 @@ fn verdict(model: &Model, level: &Level, traj: &[Vec3]) -> anyhow::Result<&'stat
 // ---- frame ------------------------------------------------------------------
 
 fn render(model: &Model, state: &State, path: &Path) -> anyhow::Result<()> {
+    render_with(model, state, path, None)
+}
+
+fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::Lamp, f64)>) -> anyhow::Result<()> {
     let intr = CameraIntrinsics::from_vfov(800, 600, 0.75, 0.05, 5.0);
     let mut cam = RgbdCamera::new(intr)?;
     let scene = Scene::empty();
@@ -302,8 +307,12 @@ fn render(model: &Model, state: &State, path: &Path) -> anyhow::Result<()> {
     let pose = CameraPose::look_at(target + Vec3::new(-0.05, -0.42, 0.28), target, Vec3::z());
     let frame = cam.render(&rs, &pose)?;
     let rgba = frame.color_cpu().ok_or_else(|| anyhow::anyhow!("no cpu colour buffer"))?;
-    let img = image::RgbaImage::from_raw(frame.width(), frame.height(), rgba.to_vec())
+    let mut img = image::RgbaImage::from_raw(frame.width(), frame.height(), rgba.to_vec())
         .ok_or_else(|| anyhow::anyhow!("frame size mismatch"))?;
+    if let Some((l, r)) = lamp {
+        let c = Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]);
+        lamp::draw(&mut img, &pose, &intr, l, &track_xform(model), c, r);
+    }
     img.save(path)?;
     Ok(())
 }
@@ -501,5 +510,69 @@ fn main() -> anyhow::Result<()> {
         out.join("solved/marble.loon"),
         level.with_params(&[("pitch_deg", t.pitch.to_degrees()), ("roll_deg", t.roll.to_degrees())]),
     )?;
+
+    // 5. the lamp: the objective is the marble's *shadow*. light is analytic,
+    //    motion is the adjoint, one chain rule joins them.
+    if level.params.contains_key("lamp_x") {
+        let lamp0 = lamp::Lamp {
+            pos: Vec3::new(level.p("lamp_x")? * MM, level.p("lamp_y")? * MM, 0.25 + level.p("lamp_z")? * MM),
+            target: [level.p("shadow_x")? * MM, level.p("shadow_y")? * MM],
+        };
+        let r = level.marble_r()?;
+        let sobj = lamp::objective(lamp0, xf);
+        let q0_fn = |xy: [f64; 2]| q0_for(&model, &level, xy);
+        let roll_fn = |q: DVec| rollout(&model, q, steps, &ctrl);
+        let (s0, _) = lamp::shadow(&lamp0, &xf, traj_end(&model, &q0_fn(start), steps));
+        println!(
+            "lamp   at ({:+.2}, {:+.2}, {:+.2}) m; shadow of the release run lands at ({:+.3}, {:+.3}), target ({:+.3}, {:+.3})",
+            lamp0.pos.x, lamp0.pos.y, lamp0.pos.z, s0[0], s0[1], lamp0.target[0], lamp0.target[1]
+        );
+        // adjoint check on the chained objective, at a horizon before the cup
+        // (smooth rolling, where the gradient is well defined) and at t_end.
+        for (label, n) in [("0.5 s, rolling", steps.min(500)), ("t_end, after the cup", steps)] {
+            let roll_n = |q: DVec| rollout(&model, q, n, &ctrl);
+            if let Ok(gr) = convex_adjoint_gradient(&roll_n(q0_fn(start)), &sobj) {
+                let h = 1e-5;
+                let mut fd = [0.0; 2];
+                for (k, slot) in fd.iter_mut().enumerate() {
+                    let (mut qp, mut qm) = (q0_fn(start), q0_fn(start));
+                    qp[POS + k] += h;
+                    qm[POS + k] -= h;
+                    *slot = (convex_rollout_objective(&roll_n(qp), &sobj) - convex_rollout_objective(&roll_n(qm), &sobj)) / (2.0 * h);
+                }
+                println!(
+                    "lamp   ∂shadow²/∂release at {label}: adjoint [{:+.4e} {:+.4e}]  fd [{:+.4e} {:+.4e}]",
+                    gr.d_q0[POS], gr.d_q0[POS + 1], fd[0], fd[1]
+                );
+            }
+        }
+        // knob 1: the release point, by the chained adjoint
+        let (xy, miss) = lamp::solve_release(&model, &xf, &sobj, &q0_fn, &clamp, &roll_fn, start, &|s| println!("{s}"));
+        let (traj, st) = simulate(&model, &q0_fn(xy), steps);
+        println!("lamp   release solved to ({:+.3}, {:+.3}): shadow miss {:.4} m, marble {}", xy[0], xy[1], miss, verdict(&model, &level, &traj)?);
+        let ld = lamp::out_dir(out);
+        fs::create_dir_all(&ld)?;
+        render_with(&model, &st, &ld.join("frame_release.png"), Some((&lamp0, r)))?;
+        fs::write(ld.join("marble.loon"), level.with_params(&[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)]))?;
+        // knob 2: the lamp, in closed form, for the original release
+        let c_end = traj_end(&model, &q0_fn(start), steps);
+        let moved = lamp::Lamp { pos: lamp::lamp_for(&lamp0, &xf, c_end), ..lamp0 };
+        let (s1, _) = lamp::shadow(&moved, &xf, c_end);
+        println!(
+            "lamp   or move the lamp to ({:+.3}, {:+.3}, {:+.3}) m: shadow lands at ({:+.3}, {:+.3})",
+            moved.pos.x, moved.pos.y, moved.pos.z, s1[0], s1[1]
+        );
+        let (_, st0) = simulate(&model, &q0_fn(start), steps);
+        render_with(&model, &st0, &ld.join("frame_lamp.png"), Some((&moved, r)))?;
+        fs::write(
+            ld.join("marble-lamp.loon"),
+            level.with_params(&[("lamp_x", moved.pos.x / MM), ("lamp_y", moved.pos.y / MM)]),
+        )?;
+    }
     Ok(())
+}
+
+fn traj_end(model: &Model, q0: &DVec, steps: usize) -> Vec3 {
+    let (t, _) = simulate(model, q0, steps);
+    t[t.len() - 1]
 }
