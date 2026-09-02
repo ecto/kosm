@@ -1033,16 +1033,43 @@ fn light_stage(
     };
     let close_intr = CameraIntrinsics::from_vfov(1000, 700, 0.55, 0.02, 5.0);
     let close_pose = CameraPose::look_at(Vec3::new(-0.02, -0.19, 0.11), Vec3::new(0.0, 0.0, 0.008), Vec3::z());
+    let mut plate_scene = plate_scene;
+    plate_scene.caustics = caustics.clone();
     let t0 = std::time::Instant::now();
-    let mut close = frame::render(&plate_scene, &close_pose, &close_intr);
-    let ms = t0.elapsed().as_millis();
-    let ident = SpatialTransform::identity();
-    let mut n_px = 0;
-    for c in &caustics {
-        n_px += light::composite(&mut close, c, &close_pose, &close_intr, &ident, 0.09, &plate_scene);
-    }
+    let close = frame::render(&plate_scene, &close_pose, &close_intr);
     close.save(ld.join("frame_close.png"))?;
-    println!("light  glass frame {}×{} in {ms} ms, caustics composited over {n_px} plate pixels → {}/frame_close.png", close_intr.width, close_intr.height, ld.display());
+    println!("light  glass frame {}×{} with caustics in the ray walk, {} ms → {}/frame_close.png", close_intr.width, close_intr.height, t0.elapsed().as_millis(), ld.display());
+
+    // the lamp sweeps across the tray: every frame re-traces the caustics and
+    // re-renders. NEWT_SWEEP=<frames> (0 to skip).
+    let frames: usize = std::env::var("NEWT_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if frames > 0 {
+        let sd = ld.join("sweep");
+        fs::create_dir_all(&sd)?;
+        let t0 = std::time::Instant::now();
+        for k in 0..frames {
+            let u = k as f64 / (frames - 1).max(1) as f64;
+            // an arc from the left of the tray to the right, staying low and in front
+            let ang = (-0.75 + 1.5 * u) * std::f64::consts::PI / 2.0;
+            let lamp_k = tang::Vec3::new(0.28 * ang.sin(), -0.20, 0.10 + 0.10 * (1.0 - ang.cos())) ;
+            let mut sc = plate_scene.clone();
+            sc.lamp = lamp_k;
+            sc.caustics = samples.iter().map(|(_, sh)| light::trace::<f64>(lamp_k, sh, nd_true, window, cells, rays / 2)).collect();
+            frame::render(&sc, &close_pose, &close_intr).save(sd.join(format!("frame_{k:03}.png")))?;
+        }
+        let per = t0.elapsed().as_millis() / frames as u128;
+        let mp4 = ld.join("sweep.mp4");
+        let ff = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-framerate", "30", "-i"])
+            .arg(sd.join("frame_%03d.png"))
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"])
+            .arg(&mp4)
+            .status();
+        match ff {
+            Ok(st) if st.success() => println!("light  sweep: {frames} frames at {per} ms each → {}", mp4.display()),
+            _ => println!("light  sweep: {frames} frames at {per} ms each in {} (ffmpeg not available for the mp4)", sd.display()),
+        }
+    }
     let c_t = samples[0].1.clone();
     // ∂loss/∂n_d: duals vs finite differences, against the true caustic as target
     let (_, g) = light::loss_grad(lamp_t, &c_t, 1.48, caustic, rays);

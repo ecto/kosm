@@ -59,6 +59,7 @@ pub fn index<S: Scalar>(nd: S, lambda_um: f64) -> S {
 /// The caustic a glass sphere throws on the plate: irradiance per band, on a
 /// grid in plate coordinates, plus a shadow-free reference (what the plate
 /// would receive from the lamp through the same solid angle with no marble).
+#[derive(Clone)]
 pub struct Caustic<S: Scalar> {
     /// Grid origin (plate frame, metres) and cell size.
     pub origin: [f64; 2],
@@ -165,6 +166,24 @@ pub fn trace<S: Scalar>(
         }
     }
     Caustic { origin, cell, n: cells, e, traced, tir }
+}
+
+impl Caustic<f64> {
+    /// Bilinear irradiance at a plate point for one light band, 0 outside the window.
+    pub fn at(&self, band: usize, x: f64, y: f64) -> f64 {
+        let gx = (x - self.origin[0]) / self.cell - 0.5;
+        let gy = (y - self.origin[1]) / self.cell - 0.5;
+        if gx < 0.0 || gy < 0.0 || gx >= (self.n - 1) as f64 || gy >= (self.n - 1) as f64 {
+            return 0.0;
+        }
+        let (ix, iy) = (gx.floor() as usize, gy.floor() as usize);
+        let (wx, wy) = (gx - ix as f64, gy - iy as f64);
+        let e = &self.e[band];
+        e[iy * self.n + ix] * (1.0 - wx) * (1.0 - wy)
+            + e[iy * self.n + ix + 1] * wx * (1.0 - wy)
+            + e[(iy + 1) * self.n + ix] * (1.0 - wx) * wy
+            + e[(iy + 1) * self.n + ix + 1] * wx * wy
+    }
 }
 
 impl<S: Scalar> Caustic<S> {

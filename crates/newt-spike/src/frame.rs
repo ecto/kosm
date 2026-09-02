@@ -43,7 +43,7 @@ pub struct Scene<S: Scalar> {
     boxes: Vec<OBox<S>>,
     marble: Vec3<S>,
     marble_r: S,
-    lamp: Vec3<S>,
+    pub lamp: Vec3<S>,
     lamp_r: S,
     lamp_power: S,
     ambient: S,
@@ -52,6 +52,9 @@ pub struct Scene<S: Scalar> {
     pub glass: Vec<Glass<S>>,
     /// Plate frame (world→plate), for the printed grid under the samples.
     pub plate: Option<phyz_math::SpatialTransform>,
+    /// Caustics on the plate, looked up wherever a ray lands on it, glass or
+    /// no glass in between. Light bands 650/550/450 nm feed camera bands 0/1/2.
+    pub caustics: Vec<crate::light::Caustic<f64>>,
 }
 
 /// What a primary ray landed on.
@@ -103,7 +106,23 @@ impl<S: Scalar> Scene<S> {
             ambient: S::from_f64(0.16),
             glass: Vec::new(),
             plate: None,
+            caustics: Vec::new(),
         }
+    }
+
+    /// Irradiance from every caustic at a world point on the plate, per camera band.
+    fn caustic_at(&self, p_world: Vec3<S>, band: usize) -> S {
+        if self.caustics.is_empty() {
+            return S::ZERO;
+        }
+        let Some(xf) = &self.plate else { return S::ZERO };
+        let pl = xf.world_to_body_point(phyz_math::Vec3::new(p_world.x.to_f64(), p_world.y.to_f64(), p_world.z.to_f64()));
+        let light_band = [4usize, 2, 0][band];
+        let mut e = 0.0;
+        for c in &self.caustics {
+            e += c.at(light_band, pl.x, pl.y);
+        }
+        S::from_f64(e)
     }
 
     /// Camera bands (µm) for glass: three are enough to show colour fringes.
@@ -173,7 +192,8 @@ impl<S: Scalar> Scene<S> {
                 let r2 = to.norm_sq();
                 let l = to / r2.sqrt();
                 let cos = n.dot(&l).max(S::ZERO);
-                albedo * (self.ambient + self.lamp_power * cos / r2 * self.lamp_visibility(q))
+                let caustic = if plate { self.caustic_at(p, band) * self.lamp_power } else { S::ZERO };
+                albedo * (self.ambient + self.lamp_power * cos / r2 * self.lamp_visibility(q) + caustic)
             }
             Hit::Marble => {
                 let q = p + n * S::from_f64(1e-5);
@@ -505,6 +525,7 @@ fn seeded(scene: &Scene<f64>, k: usize) -> Scene<Dual<f64>> {
         ambient: Dual::constant(scene.ambient),
         glass: scene.glass.iter().map(|g| Glass { shape: glass::to_dual(&g.shape), nd: Dual::constant(g.nd) }).collect(),
         plate: scene.plate,
+        caustics: scene.caustics.clone(),
     }
 }
 
