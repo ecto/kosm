@@ -23,6 +23,7 @@
 
 mod audio;
 mod colliders;
+mod frame;
 mod lamp;
 
 use std::collections::HashMap;
@@ -712,6 +713,53 @@ fn main() -> anyhow::Result<()> {
             ld.join("marble-lamp.loon"),
             level.with_params(&[("lamp_x", moved.pos.x / MM), ("lamp_y", moved.pos.y / MM)]),
         )?;
+
+        // 6. the frame as a solver: a ray caster generic over tang::Scalar.
+        //    f64 renders the image with real shadows; Dual differentiates it.
+        //    the objective is the brightness of the target disc *in the image*.
+        let intr = CameraIntrinsics::from_vfov(800, 600, 0.75, 0.05, 5.0);
+        let target = Vec3::new(0.0, 0.0, 0.25);
+        let pose = CameraPose::look_at(target + Vec3::new(-0.05, -0.42, 0.28), target, Vec3::z());
+        let lamp_r = level.params.get("lamp_r").copied().unwrap_or(25.0) * MM;
+        let colliders = model.bodies[TRACK].collisions.clone();
+        let scene_at = |c: Vec3| frame::Scene::<f64>::new(&xf, &colliders, tang::Vec3::new(c.x, c.y, c.z), r, lamp0.pos, lamp_r);
+        let fd = frame::out_dir(out);
+        fs::create_dir_all(&fd)?;
+        let c_end = traj_end(&model, &q0_fn(start), steps);
+        let t0 = std::time::Instant::now();
+        frame::render(&scene_at(c_end), &pose, &intr).save(fd.join("frame_release.png"))?;
+        println!("frame  ray cast {}×{} with penumbra shadows in {:.0} ms → {}/frame_release.png", intr.width, intr.height, t0.elapsed().as_secs_f64() * 1e3, fd.display());
+        let pixels = frame::target_pixels(&scene_at(c_end), &pose, &intr, &xf, lamp0.target, 0.05);
+        let points = frame::patch_points(&scene_at(c_end), &pose, &intr, &pixels);
+        let (j_far, _) = frame::visibility_and_grad(&scene_at(c_end), &points);
+        // the gradient check where the shadow overlaps the patch: the lamp-stage release
+        let c_near = traj_end(&model, &q0_fn(xy), steps);
+        let (j, g) = frame::visibility_and_grad(&scene_at(c_near), &points);
+        // duals vs central differences of the shadow pass; the penumbra is ~1 mm wide, so h is small
+        let h = 1e-6;
+        let mut fdg = [0.0; 3];
+        for k in 0..3 {
+            let mut cp = c_near;
+            let mut cm = c_near;
+            match k { 0 => { cp.x += h; cm.x -= h; } 1 => { cp.y += h; cm.y -= h; } _ => { cp.z += h; cm.z -= h; } }
+            fdg[k] = (frame::patch_visibility(&scene_at(cp), &points) - frame::patch_visibility(&scene_at(cm), &points)) / (2.0 * h);
+        }
+        println!(
+            "frame  shadow pass over {} plate points: lamp visibility {:.4} with the shadow near, {:.4} far away\nframe  ∂visibility/∂marble  dual [{:+.4e} {:+.4e} {:+.4e}]  fd [{:+.4e} {:+.4e} {:+.4e}]",
+            points.len(), j, j_far, g[0], g[1], g[2], fdg[0], fdg[1], fdg[2]
+        );
+        for gy in [-0.075, -0.05, -0.025, 0.0, 0.025] {
+            let c = traj_end(&model, &q0_fn([-0.12, gy]), steps);
+            let cl = xf.world_to_body_point(c);
+            println!("frame  grid probe: release (-0.120, {gy:+.3}) → marble ends ({:+.3}, {:+.3}), visibility {:.4}", cl.x, cl.y, frame::patch_visibility(&scene_at(c), &points));
+        }
+        // image → marble → contact → release, in one backward pass
+        let iobj = frame::shadow_objective(scene_at(c_end), points.clone());
+        let (xy_img, jimg) = lamp::solve_release(&model, &xf, &iobj, &q0_fn, &clamp, &roll_fn, start, &|s| println!("{}", s.replace("lamp   ", "frame  ").replace("shadow miss", "patch visibility")));
+        let c_img = traj_end(&model, &q0_fn(xy_img), steps);
+        frame::render(&scene_at(c_img), &pose, &intr).save(fd.join("frame_solved.png"))?;
+        println!("frame  release solved on the shadow pass to ({:+.3}, {:+.3}): patch visibility {:.4} (lit: {:.4})", xy_img[0], xy_img[1], jimg * jimg, j_far);
+        fs::write(fd.join("marble.loon"), level.with_params(&[("start_x", xy_img[0] / MM), ("start_y", xy_img[1] / MM)]))?;
     }
     Ok(())
 }

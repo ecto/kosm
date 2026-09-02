@@ -18,9 +18,11 @@
 ; a point lamp in the room (world frame, mm, relative to the table's origin)
 ; and where the marble's shadow should land at t_end (plate frame, mm).
 [defparam lamp_x 60.0]
-[defparam lamp_y -300.0]
-[defparam lamp_z 100.0]      ; low, so the shadow has a lever: a 1 cm marble under a
-                              ; 55 cm lamp casts a shadow that never leaves the marble
+[defparam lamp_y -250.0]
+[defparam lamp_z 250.0]      ; low enough that the shadow has a lever (a 1 cm marble under
+                              ; a 55 cm lamp casts a shadow that never leaves it), high
+                              ; enough that the near wall's shadow stops at the plate edge
+[defparam lamp_r 25.0]        ; lamp radius: sets the penumbra, and so the shadow's gradient
 [defparam shadow_x 149.0]     ; x is set by the end wall at t_end; y is the knob
 [defparam shadow_y -20.0]
 

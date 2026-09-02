@@ -1028,6 +1028,7 @@ dependencies = [
  "phyz-model",
  "phyz-rigid",
  "phyz-world",
+ "tang",
  "vcad",
  "vcad-eval",
  "vcad-ir",

@@ -23,6 +23,7 @@ vcad-loon.workspace = true
 vcad-kernel-export.workspace = true
 vcad-render.workspace = true
 image.workspace = true
+tang.workspace = true
 vcad-kernel-acoustics.workspace = true
 hound.workspace = true
 anyhow = "1"

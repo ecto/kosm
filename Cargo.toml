@@ -28,6 +28,7 @@ vcad-render  = { path = "/Users/cam/Developer/vcad/crates/vcad-render", default-
 vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-acoustics" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
+tang         = { path = "/Users/cam/Developer/tang/crates/tang" }
 
 # One tang. vcad builds against the sibling checkout; phyz against crates.io.
 # Unify on the checkout so tang::Scalar is one trait across the graph.
