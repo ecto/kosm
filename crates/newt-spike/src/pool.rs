@@ -42,12 +42,15 @@ pub const DEPTH: f64 = 2.0;
 /// depth. Beyond it the water is the far field (see `far`).
 pub fn box_half() -> f64 {
     static HALF: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *HALF.get_or_init(|| std::env::var("NEWT_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+    *HALF.get_or_init(|| std::env::var("NEWT_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.25))
 }
 pub const BOX_DEPTH: f64 = DEPTH; // the full depth: a floor the melon could fall through is no floor
 /// The box's outer band where the fluid's velocity is damped so waves leave
 /// instead of reflecting off a wall two metres from the splash.
 pub const SPONGE: f64 = 0.25;
+/// Width of the band, inside the sponge, over which the rendered surface
+/// fades from the fine grid to the far field.
+pub const BLEND: f64 = 0.4;
 /// Frames per second of a recording (NEWT_FPS overrides).
 pub fn fps() -> f64 {
     std::env::var("NEWT_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0)
@@ -313,13 +316,13 @@ impl Surface {
             let half = box_half();
             let inset = half - x.abs().max(y.abs());
             let far = self.far.as_ref().map(|f| f.at(x, y)).unwrap_or(0.0) + ambient;
-            if inset > SPONGE + 0.3 {
+            if inset > SPONGE + BLEND {
                 return g.at(x, y) + ambient;
             }
             if inset <= SPONGE {
                 return far;
             }
-            let u = (inset - SPONGE) / 0.3;
+            let u = (inset - SPONGE) / BLEND;
             let w = u * u * (3.0 - 2.0 * u);
             return w * (g.at(x, y) + ambient) + (1.0 - w) * far;
         }
@@ -623,7 +626,7 @@ impl Drop {
                 }
             }
             if let Some(far) = self.far.as_mut() {
-                far.force(&g, box_half() - SPONGE - 0.3, box_half() - SPONGE, t);
+                far.force(&g, box_half() - SPONGE - BLEND, box_half() - SPONGE, t);
                 self.surface.far = Some(far.grid.clone());
             }
             self.surface.grid = Some(g);
