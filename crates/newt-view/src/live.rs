@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
-use newt_spike::pool::{self, box_half, Caustic, Surface, DEPTH, MELON_AXES, POOL_X, POOL_Y};
+use newt_spike::pool::{self, box_half, Caustic, Surface, DEPTH, MELON_AXES, POOL_X, POOL_Y, STAND_RISE, STAND_ROWS, STAND_TREAD, STAND_Y0};
 use newt_spike::splash::Droplet;
 use tang::Vec3 as V;
 
@@ -614,6 +614,15 @@ fn static_geometry() -> Vec<Vertex> {
     quad(&mut v, [-hx, hy, -dp], [hx, hy, -dp], [hx, hy, COPING], [-hx, hy, COPING], [0.0, -1.0, 0.0], 1);
     // the floor
     quad(&mut v, [-hx, -hy, -dp], [hx, -hy, -dp], [hx, hy, -dp], [-hx, hy, -dp], up, 1);
+    // the grandstand: treads and risers
+    for r in 0..STAND_ROWS {
+        let y0 = (STAND_Y0 + r as f64 * STAND_TREAD) as f32;
+        let y1 = y0 + STAND_TREAD as f32;
+        let z0 = (COPING as f64 + r as f64 * STAND_RISE) as f32;
+        let z1 = z0 + STAND_RISE as f32;
+        quad(&mut v, [-hx, y0, z0], [hx, y0, z0], [hx, y0, z1], [-hx, y0, z1], [0.0, -1.0, 0.0], 0);
+        quad(&mut v, [-hx, y0, z1], [hx, y0, z1], [hx, y1, z1], [-hx, y1, z1], up, 0);
+    }
     v
 }
 

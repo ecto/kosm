@@ -68,6 +68,9 @@ pub struct Water {
     pub interior_mass: f64,
     /// The extracted surface's rest level, so still water reads as z = 0.
     pub level_offset: f64,
+    /// The settled surface, raw: subtracted per cell so the lattice's static
+    /// extraction noise cancels and only what moves shows.
+    pub rest: Option<HeightGrid>,
     /// Particle order by scatter group from the last step (see `compact`).
     order: Vec<u32>,
     /// The same solver on the GPU, when enabled; then `x`, `v`, `j` and
@@ -166,6 +169,7 @@ impl Water {
             time: 0.0,
             interior_mass: 0.0,
             level_offset: 0.0,
+            rest: None,
             order: Vec::new(),
             gpu: None,
             damp: 1.0,
@@ -517,6 +521,17 @@ impl Water {
                 xp.x = xp.x.clamp(origin.x + e, xmax);
                 xp.y = xp.y.clamp(origin.y + e, ymax);
                 xp.z = xp.z.clamp(origin.z + e, zmax);
+                // and out of the body: the grid's constraint leaks (the melon
+                // was filling with water and sank), so particles inside are
+                // put back on its surface with no inward relative velocity
+                let (d, n) = body.sdf(*xp);
+                if d < 0.0 {
+                    *xp -= n * d;
+                    let vn = (*vp - body.vel).dot(&n);
+                    if vn < 0.0 {
+                        *vp -= n * vn;
+                    }
+                }
             });
         }
         prof(4, &mut pt);
@@ -633,6 +648,7 @@ impl Water {
         // the velocities stay: they are part of the free-running state
         self.time = 0.0;
         self.level_offset = 0.0;
+        self.rest = None;
         let g = self.surface(0.02);
         let inner: Vec<f64> = (0..g.ny)
             .flat_map(|j| (0..g.nx).map(move |i| (i, j)))
@@ -640,6 +656,7 @@ impl Water {
             .map(|(i, j)| g.z[j * g.nx + i])
             .collect();
         self.level_offset = inner.iter().sum::<f64>() / inner.len().max(1) as f64;
+        self.rest = Some(g);
     }
 
     /// The free surface as a height field at `cell` resolution over the pool,
@@ -684,7 +701,7 @@ impl Water {
                     if f >= 0.5 {
                         // interpolate between this node and the one above
                         let t = if prev < 0.5 && k + 1 < self.nz { (0.5 - prev) / (f - prev).max(1e-9) } else { 0.0 };
-                        z[jy * nx + ix] = self.node_pos(gi, gj, k).z + (1.0 - t) * self.h - self.level_offset;
+                        z[jy * nx + ix] = self.node_pos(gi, gj, k).z + (1.0 - t) * self.h;
                         break;
                     }
                     prev = f;
@@ -707,6 +724,19 @@ impl Water {
                 }
             }
             out.z = s;
+        }
+        // the rest map cancels the lattice's static extraction noise
+        match &self.rest {
+            Some(r) if r.nx == nx && r.ny == ny => {
+                for (z, r) in out.z.iter_mut().zip(&r.z) {
+                    *z -= r;
+                }
+            }
+            _ => {
+                for z in out.z.iter_mut() {
+                    *z -= self.level_offset;
+                }
+            }
         }
         out
     }

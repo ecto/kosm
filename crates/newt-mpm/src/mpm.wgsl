@@ -278,8 +278,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     // FLIP keeps the particle's own velocity and adds the grid's change;
     // PIC takes the grid's velocity. The blend is the usual trade of
     // dissipation for noise.
-    let vp = ((v[p].xyz + dv) * flip + vnew * (1.0 - flip)) * P.hi.w;
-    v[p] = vec4<f32>(vp, v[p].w); // w carries the particle's original id
+    var vp = ((v[p].xyz + dv) * flip + vnew * (1.0 - flip)) * P.hi.w;
     let c0 = b0 * d_inv;
     let c1 = b1 * d_inv;
     let c2 = b2 * d_inv;
@@ -298,6 +297,14 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     // keep particles in the box
     let e = P.lo.w;
     pos = clamp(pos, P.origin_h.xyz + vec3<f32>(e), P.xmax.xyz);
+    // and out of the body (see the CPU solver)
+    let sd = body_sdf(pos);
+    if (sd.w < 0.0) {
+        pos -= sd.xyz * sd.w;
+        let vn = dot(vp - P.b_vel.xyz, sd.xyz);
+        if (vn < 0.0) { vp -= sd.xyz * vn; }
+    }
+    v[p] = vec4<f32>(vp, v[p].w); // w carries the particle's original id
     x[p] = vec4<f32>(pos, dj);
 }
 

@@ -73,6 +73,185 @@ fn sun_dir() -> V<f64> {
 const SUN_IRRADIANCE: f64 = 1.05;
 const SUN_DISC_COS: f64 = 0.99995; // an angular radius of about 0.6°
 
+// ---- the grandstand ---------------------------------------------------------
+
+/// A stand along the far long side: stepped rows from the deck, a seat every
+/// 0.6 m, most of them taken.
+pub const STAND_Y0: f64 = POOL_Y + 3.0;
+pub const STAND_ROWS: usize = 14;
+pub const STAND_RISE: f64 = 0.45;
+pub const STAND_TREAD: f64 = 0.85;
+const SEAT_PITCH: f64 = 0.6;
+
+fn hash2(i: i64, j: i64) -> f64 {
+    let mut h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    (h & 0xFFFFFF) as f64 / 16777216.0
+}
+
+/// Ray against the stand's steps (a union of boxes): distance and normal.
+fn stand_hit(o: V<f64>, d: V<f64>) -> Option<(f64, V<f64>)> {
+    let mut best: Option<(f64, V<f64>)> = None;
+    let y_back = STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD;
+    for r in 0..STAND_ROWS {
+        let lo = V::new(-POOL_X, STAND_Y0 + r as f64 * STAND_TREAD, COPING);
+        let hi = V::new(POOL_X, y_back, COPING + (r + 1) as f64 * STAND_RISE);
+        // slab test
+        let mut t0 = 1e-6f64;
+        let mut t1 = f64::INFINITY;
+        let mut n_in = V::new(0.0, 0.0, 1.0);
+        for k in 0..3 {
+            let (oo, dd, l, h) = match k { 0 => (o.x, d.x, lo.x, hi.x), 1 => (o.y, d.y, lo.y, hi.y), _ => (o.z, d.z, lo.z, hi.z) };
+            let mut axis = V::zero();
+            if dd.abs() < 1e-12 {
+                if oo < l || oo > h { t0 = f64::INFINITY; }
+                continue;
+            }
+            let (mut ta, mut tb) = ((l - oo) / dd, (h - oo) / dd);
+            let mut sign = -1.0;
+            if ta > tb { std::mem::swap(&mut ta, &mut tb); sign = 1.0; }
+            if ta > t0 {
+                t0 = ta;
+                match k { 0 => axis.x = sign, 1 => axis.y = sign, _ => axis.z = sign }
+                n_in = axis;
+            }
+            t1 = t1.min(tb);
+        }
+        if t0 < t1 && t0.is_finite() && best.is_none_or(|b| t0 < b.0) {
+            best = Some((t0, n_in));
+        }
+    }
+    best
+}
+
+/// A seated person at seat `i` of row `r`, if there is one: shirt colour,
+/// and the signed distance from `p` (capsule torso, sphere head).
+fn person_sdf(p: V<f64>, i: i64, r: i64) -> Option<(f64, [f64; 3], bool)> {
+    if r < 0 || r >= STAND_ROWS as i64 {
+        return None;
+    }
+    let h0 = hash2(i, r);
+    if h0 > 0.85 {
+        return None; // an empty seat
+    }
+    let x = -POOL_X + 0.3 + i as f64 * SEAT_PITCH + (hash2(i + 7, r) - 0.5) * 0.12;
+    if x.abs() > POOL_X - 0.3 {
+        return None;
+    }
+    let y = STAND_Y0 + r as f64 * STAND_TREAD + 0.45;
+    let z = COPING + (r + 1) as f64 * STAND_RISE;
+    let lean = (hash2(i + 3, r + 11) - 0.5) * 0.2;
+    // torso: a capsule from the seat to the shoulders
+    let a = V::new(x, y, z + 0.12);
+    let b = V::new(x + lean, y - 0.05, z + 0.72);
+    let ab = b - a;
+    let t = ((p - a).dot(&ab) / ab.norm_sq()).clamp(0.0, 1.0);
+    let d_torso = (p - (a + ab * t)).norm() - 0.19;
+    let head = V::new(x + lean * 1.2, y - 0.06, z + 0.92);
+    let d_head = (p - head).norm() - 0.11;
+    let hue = hash2(i + 101, r + 5);
+    let shirt = match (hue * 6.0) as i32 {
+        0 => [0.85, 0.20, 0.15],
+        1 => [0.95, 0.90, 0.85],
+        2 => [0.15, 0.30, 0.75],
+        3 => [0.95, 0.75, 0.15],
+        4 => [0.20, 0.55, 0.30],
+        _ => [0.25, 0.25, 0.30],
+    };
+    if d_head < d_torso { Some((d_head, [0.80, 0.60, 0.48], true)) } else { Some((d_torso, shirt, false)) }
+}
+
+fn crowd_sdf(p: V<f64>) -> (f64, [f64; 3]) {
+    let i = ((p.x + POOL_X - 0.3) / SEAT_PITCH).round() as i64;
+    let r = ((p.y - STAND_Y0 - 0.45) / STAND_TREAD).round() as i64;
+    // the nearest seat, and the row behind (heads poke up between)
+    let mut best = (1e9, [0.0; 3]);
+    for (di, dr) in [(0, 0), (-1, 0), (1, 0), (0, 1), (0, -1)] {
+        if let Some((d, c, _)) = person_sdf(p, i + di, r + dr) {
+            if d < best.0 { best = (d, c); }
+        }
+    }
+    best
+}
+
+/// Sphere-trace the crowd inside the stand's bounding box.
+fn crowd_hit(o: V<f64>, d: V<f64>, t_max: f64) -> Option<(f64, V<f64>, [f64; 3])> {
+    // the box the people occupy
+    let lo = V::new(-POOL_X, STAND_Y0, COPING);
+    let hi = V::new(POOL_X, STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD, COPING + STAND_ROWS as f64 * STAND_RISE + 1.1);
+    let mut t0 = 1e-6f64;
+    let mut t1 = t_max;
+    for k in 0..3 {
+        let (oo, dd, l, h) = match k { 0 => (o.x, d.x, lo.x, hi.x), 1 => (o.y, d.y, lo.y, hi.y), _ => (o.z, d.z, lo.z, hi.z) };
+        if dd.abs() < 1e-12 {
+            if oo < l || oo > h { return None; }
+            continue;
+        }
+        let (mut ta, mut tb) = ((l - oo) / dd, (h - oo) / dd);
+        if ta > tb { std::mem::swap(&mut ta, &mut tb); }
+        t0 = t0.max(ta);
+        t1 = t1.min(tb);
+    }
+    if t0 >= t1 {
+        return None;
+    }
+    let mut t = t0;
+    for _ in 0..200 {
+        let p = o + d * t;
+        let (dist, col) = crowd_sdf(p);
+        if dist < 0.004 {
+            let e = 0.003;
+            let n = V::new(
+                crowd_sdf(p + V::new(e, 0.0, 0.0)).0 - crowd_sdf(p - V::new(e, 0.0, 0.0)).0,
+                crowd_sdf(p + V::new(0.0, e, 0.0)).0 - crowd_sdf(p - V::new(0.0, e, 0.0)).0,
+                crowd_sdf(p + V::new(0.0, 0.0, e)).0 - crowd_sdf(p - V::new(0.0, 0.0, e)).0,
+            )
+            .normalize();
+            return Some((t, n, col));
+        }
+        t += dist.max(0.01);
+        if t > t1 {
+            return None;
+        }
+    }
+    None
+}
+
+fn shade_stand(p: V<f64>, n: V<f64>, base: [f64; 3]) -> [f64; 3] {
+    let s = sun_dir();
+    let lit = SUN_IRRADIANCE * n.dot(&s).max(0.0);
+    let sk = sky(n);
+    let mut c = [0.0; 3];
+    for k in 0..3 {
+        c[k] = base[k] * (0.35 * sk[k] + lit);
+    }
+    // haze with distance: the far end of a 50 m stand
+    let dist = (p - V::new(0.0, 0.0, 0.0)).norm();
+    let f = (-(dist / 120.0)).exp();
+    for k in 0..3 {
+        c[k] = c[k] * f + [0.66, 0.80, 0.94][k] * (1.0 - f) * 0.9;
+    }
+    c
+}
+
+/// The grandstand and its crowd along a ray: steps first, then people.
+fn stand_and_crowd(o: V<f64>, d: V<f64>) -> Option<(f64, [f64; 3])> {
+    let steps = stand_hit(o, d);
+    let t_lim = steps.map(|(t, _)| t).unwrap_or(f64::INFINITY);
+    if let Some((t, n, col)) = crowd_hit(o, d, t_lim.min(400.0)) {
+        let p = o + d * t;
+        return Some((t, shade_stand(p, n, col)));
+    }
+    steps.map(|(t, n)| {
+        let p = o + d * t;
+        // concrete steps, with a tread/riser contrast
+        let base = if n.z > 0.5 { [0.62, 0.60, 0.56] } else { [0.48, 0.47, 0.45] };
+        (t, shade_stand(p, n, base))
+    })
+}
+
 // ---- the waves --------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -743,9 +922,14 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
             }
         }
     }
-    // pick the nearest of melon / water / wall / deck / drop
+    // the grandstand, only for rays heading its way
+    let t_stand = if d.y > 0.0 && o.y < STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD { stand_and_crowd(o, d) } else { None };
+    // pick the nearest of melon / water / wall / deck / drop / stand
     let mut best_t = f64::INFINITY;
     let mut what = 0; // 0 sky
+    if let Some((t, _)) = t_stand {
+        if t < best_t { best_t = t; what = 6; }
+    }
     if let Some((t, _, _)) = t_drop {
         if t < best_t { best_t = t; what = 5; }
     }
@@ -829,15 +1013,21 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
             for k in 0..3 { c[k] = a * bead[k] + (1.0 - a) * behind[k]; }
             c
         }
+        6 => t_stand.unwrap().1,
         _ => sky(d),
     }
 }
 
-/// A reflected ray from the water surface: melon or sky.
+/// A reflected ray from the water surface: melon, the stand, or sky.
 fn radiance_above(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
     if let Some((t, n)) = melon.hit(o, d) {
         let p = o + d * t;
         return shade_melon(p, n, d, melon, drop, caustic, true);
+    }
+    if d.y > 0.0 {
+        if let Some((_, c)) = stand_and_crowd(o, d) {
+            return c;
+        }
     }
     sky(d)
 }
