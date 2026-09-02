@@ -114,6 +114,11 @@ impl Surface {
         h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
             + 0.0005 * ((11.0 * x - 4.0 * y + 1.7 * self.t).sin())
     }
+    /// The highest the surface gets this frame, plus a margin for the rings.
+    pub fn top(&self) -> f64 {
+        let grid = self.grid.as_ref().map(|g| g.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0);
+        grid + 0.02
+    }
     pub fn normal(&self, x: f64, y: f64) -> V<f64> {
         let e = 1e-3;
         let dx = (self.height(x + e, y) - self.height(x - e, y)) / (2.0 * e);
@@ -607,9 +612,12 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
     let inside_pool = |p: V<f64>| p.x.abs() < POOL_X && p.y.abs() < POOL_Y;
     // where the ray enters the pool column (z < COPING and inside), march for the surface
     let mut t_water = None;
-    if d.z < 0.0 || o.z < COPING {
-        // start marching at the deck plane if above it, else from the origin
-        let t_start = if o.z > COPING { ((COPING - o.z) / d.z).max(0.0) } else { 0.0 };
+    // the march starts where the ray drops below the highest water, which
+    // is the deck line for a still pool and the crown's tip in a splash
+    let top = drop.surface.top().max(COPING);
+    if d.z < 0.0 || o.z < top {
+        // start marching at that plane if above it, else from the origin
+        let t_start = if o.z > top { ((top - o.z) / d.z).max(0.0) } else { 0.0 };
         let p0 = o + d * t_start;
         // only if the ray is over the pool at the water line
         let t_line = if d.z != 0.0 { (0.06 - o.z) / d.z } else { 0.0 };
