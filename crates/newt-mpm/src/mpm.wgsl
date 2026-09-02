@@ -13,9 +13,9 @@ struct Params {
     k: vec4<f32>,          // dt, inv_h, mass, vol0
     k2: vec4<f32>,         // bulk, flip, gravity, d_inv
     lo: vec4<f32>,         // wall lo.xyz, e (clamp margin)
-    hi: vec4<f32>,         // wall hi.xyz, 0
-    misc: vec4<u32>,       // slot, 0, 0, 0
-    xmax: vec4<f32>,       // clamp max xyz
+    hi: vec4<f32>,         // wall hi.xyz, velocity damping per substep
+    misc: vec4<u32>,       // slot, nbx, nby, nbz (blocks per axis)
+    xmax: vec4<f32>,       // clamp max xyz, J relax share
     b_centre: vec4<f32>,
     b_a: vec4<f32>,
     b_b: vec4<f32>,
@@ -26,13 +26,28 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read_write> x: array<vec4<f32>>;      // xyz, J-1 (J itself loses the per-step increment in f32)
-@group(0) @binding(2) var<storage, read_write> v: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> v: array<vec4<f32>>;      // xyz, original particle id (the sort permutes)
 @group(0) @binding(3) var<storage, read_write> c: array<vec4<f32>>;      // 3 columns per particle
 @group(0) @binding(4) var<storage, read_write> gm: array<atomic<i32>>;   // grid mass (fixed point)
 @group(0) @binding(5) var<storage, read_write> gmom: array<atomic<i32>>; // grid momentum ×3 (fixed point)
 @group(0) @binding(6) var<storage, read_write> gvel: array<vec4<f32>>;   // vel.xyz, mass
-@group(0) @binding(7) var<storage, read_write> gvold: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> gvold: array<vec4<f32>>;  // vel.xyz, blurred mass
 @group(0) @binding(8) var<storage, read_write> react: array<atomic<i32>>; // 4 per slot: fx fy fz interior
+// the sort: particles binned into 4x4x4-cell blocks each substep
+@group(0) @binding(9) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(10) var<storage, read_write> offsets: array<u32>;
+@group(0) @binding(11) var<storage, read_write> fill: array<atomic<u32>>;
+@group(0) @binding(12) var<storage, read_write> perm: array<u32>;
+@group(0) @binding(13) var<storage, read_write> xo: array<vec4<f32>>;
+@group(0) @binding(14) var<storage, read_write> vo: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> co: array<vec4<f32>>;
+
+const BLK: i32 = 4;      // cells per block per axis
+const TN: i32 = 7;       // nodes a block's particles touch per axis: [4b-1, 4b+5]
+const TILE: u32 = 343u;  // TN^3
+var<workgroup> tile_m: array<atomic<i32>, 343>;
+var<workgroup> tile_p: array<atomic<i32>, 1029>;
+var<workgroup> partial: array<u32, 256>;
 
 const MASS_SCALE: f32 = 1048576.0; // 2^20
 const MOM_SCALE: f32 = 65536.0;    // 2^16
@@ -221,6 +236,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     var b0 = vec3<f32>(0.0);
     var b1 = vec3<f32>(0.0);
     var b2 = vec3<f32>(0.0);
+    var rho = 0.0;
     let bi = i32(base.x);
     let bj = i32(base.y);
     let bk = i32(base.z);
@@ -244,26 +260,213 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 b0 += a * dpos.x;
                 b1 += a * dpos.y;
                 b2 += a * dpos.z;
+                rho += wt * gvold[g].w;
             }
         }
     }
     // FLIP keeps the particle's own velocity and adds the grid's change;
     // PIC takes the grid's velocity. The blend is the usual trade of
     // dissipation for noise.
-    let vp = (v[p].xyz + dv) * flip + vnew * (1.0 - flip);
-    v[p] = vec4<f32>(vp, 0.0);
+    let vp = ((v[p].xyz + dv) * flip + vnew * (1.0 - flip)) * P.hi.w;
+    v[p] = vec4<f32>(vp, v[p].w); // w carries the particle's original id
     let c0 = b0 * d_inv;
     let c1 = b1 * d_inv;
     let c2 = b2 * d_inv;
     c[3u * p] = vec4<f32>(c0, 0.0);
     c[3u * p + 1u] = vec4<f32>(c1, 0.0);
     c[3u * p + 2u] = vec4<f32>(c2, 0.0);
-    // volume from the trace of the velocity gradient
-    var dj = xp.w + (1.0 + xp.w) * dt * (c0.x + c1.y + c2.z);
-    dj = clamp(dj, -0.5, 1.0);
+    // volume from the mass around the particle (see the CPU solver)
+    // rest node mass is rho0 h^3 = particle mass * h^3 / vol0
+    let full = P.k.z * h * h * h / P.k.w;
+    // J from the (blurred) mass around the particle: see the CPU solver
+    // integrated J relaxed toward the mass density: see the CPU solver
+    let dj_int = xp.w + (1.0 + xp.w) * dt * (c0.x + c1.y + c2.z);
+    let dj_mass = full / max(rho, 1e-12) - 1.0;
+    let dj = clamp(dj_int + (dj_mass - dj_int) * P.xmax.w, -0.5, 1.0);
     var pos = xp.xyz + vnew * dt;
     // keep particles in the box
     let e = P.lo.w;
     pos = clamp(pos, P.origin_h.xyz + vec3<f32>(e), P.xmax.xyz);
     x[p] = vec4<f32>(pos, dj);
+}
+
+fn block_of(xp: vec3<f32>) -> u32 {
+    let rel = (xp - P.origin_h.xyz) * P.k.y;
+    let cell = clamp(vec3<i32>(floor(rel)), vec3<i32>(0), vec3<i32>(P.n.xyz) - vec3<i32>(1));
+    let b = cell / BLK;
+    return u32((b.z * i32(P.misc.z) + b.y) * i32(P.misc.y) + b.x);
+}
+
+fn nblocks() -> u32 {
+    return P.misc.y * P.misc.z * P.misc.w;
+}
+
+@compute @workgroup_size(256)
+fn sort_zero(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let b = linear_id(gid, nwg);
+    if (b >= nblocks()) { return; }
+    atomicStore(&counts[b], 0u);
+    atomicStore(&fill[b], 0u);
+}
+
+@compute @workgroup_size(256)
+fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let p = linear_id(gid, nwg);
+    if (p >= P.n.w) { return; }
+    atomicAdd(&counts[block_of(x[p].xyz)], 1u);
+}
+
+// exclusive prefix sum of the block counts, one workgroup
+@compute @workgroup_size(256)
+fn sort_scan(@builtin(local_invocation_index) t: u32) {
+    let nb = nblocks();
+    let chunk = (nb + 255u) / 256u;
+    let lo = t * chunk;
+    let hi = min(lo + chunk, nb);
+    var sum = 0u;
+    for (var b = lo; b < hi; b++) {
+        sum += atomicLoad(&counts[b]);
+    }
+    partial[t] = sum;
+    workgroupBarrier();
+    if (t == 0u) {
+        var acc = 0u;
+        for (var i = 0u; i < 256u; i++) {
+            let c = partial[i];
+            partial[i] = acc;
+            acc += c;
+        }
+        offsets[nb] = acc;
+    }
+    workgroupBarrier();
+    var run = partial[t];
+    for (var b = lo; b < hi; b++) {
+        offsets[b] = run;
+        run += atomicLoad(&counts[b]);
+    }
+}
+
+@compute @workgroup_size(256)
+fn sort_scatter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let p = linear_id(gid, nwg);
+    if (p >= P.n.w) { return; }
+    let b = block_of(x[p].xyz);
+    let i = atomicAdd(&fill[b], 1u);
+    perm[offsets[b] + i] = p;
+}
+
+@compute @workgroup_size(256)
+fn permute(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = linear_id(gid, nwg);
+    if (i >= P.n.w) { return; }
+    let p = perm[i];
+    xo[i] = x[p];
+    vo[i] = v[p];
+    co[3u * i] = c[3u * p];
+    co[3u * i + 1u] = c[3u * p + 1u];
+    co[3u * i + 2u] = c[3u * p + 2u];
+}
+
+// P2G by block: one workgroup per 4x4x4-cell block, its particles contiguous
+// after the sort; contributions accumulate in a 7^3 tile of workgroup
+// atomics and are flushed to the grid once
+@compute @workgroup_size(256)
+fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let b = wg.x + wg.y * nwg.x;
+    if (b >= nblocks()) { return; }
+    for (var i = t; i < TILE; i += 256u) {
+        atomicStore(&tile_m[i], 0);
+        atomicStore(&tile_p[3u * i], 0);
+        atomicStore(&tile_p[3u * i + 1u], 0);
+        atomicStore(&tile_p[3u * i + 2u], 0);
+    }
+    workgroupBarrier();
+    let nbx = i32(P.misc.y);
+    let nby = i32(P.misc.z);
+    let bi = i32(b);
+    let bx = bi % nbx;
+    let by = (bi / nbx) % nby;
+    let bz = bi / (nbx * nby);
+    let node0 = vec3<i32>(bx, by, bz) * BLK - vec3<i32>(1);
+    let start = offsets[b];
+    let end = offsets[b + 1u];
+    let h = P.origin_h.w;
+    let inv_h = P.k.y;
+    let dt = P.k.x;
+    let mass = P.k.z;
+    let vol0 = P.k.w;
+    let bulk = P.k2.x;
+    let d_inv = P.k2.w;
+    for (var p = start + t; p < end; p += 256u) {
+        let xp = x[p];
+        let rel = (xp.xyz - P.origin_h.xyz) * inv_h;
+        let base = floor(rel - vec3<f32>(0.5));
+        let fx = rel - base;
+        let wx = w1(fx.x);
+        let wy = w1(fx.y);
+        let wz = w1(fx.z);
+        let dj = xp.w;
+        let jp = 1.0 + dj;
+        let pressure = max(-bulk * dj / jp, 0.0);
+        let s = pressure * dt * vol0 * jp * d_inv / mass;
+        let c0 = c[3u * p].xyz;
+        let c1 = c[3u * p + 1u].xyz;
+        let c2 = c[3u * p + 2u].xyz;
+        let vp = v[p].xyz;
+        let lb = vec3<i32>(base) - node0; // tile-local base, in [0, 4]
+        for (var di = 0; di < 3; di++) {
+            for (var dj2 = 0; dj2 < 3; dj2++) {
+                for (var dk = 0; dk < 3; dk++) {
+                    let l = lb + vec3<i32>(di, dj2, dk);
+                    let dpos = (vec3<f32>(f32(di), f32(dj2), f32(dk)) - fx) * h;
+                    let wt = wx[di] * wy[dj2] * wz[dk];
+                    let ti = u32((l.z * TN + l.y) * TN + l.x);
+                    let mom = (vp + s * dpos + c0 * dpos.x + c1 * dpos.y + c2 * dpos.z) * wt;
+                    atomicAdd(&tile_m[ti], i32(round(wt * MASS_SCALE)));
+                    atomicAdd(&tile_p[3u * ti], i32(round(mom.x * MOM_SCALE)));
+                    atomicAdd(&tile_p[3u * ti + 1u], i32(round(mom.y * MOM_SCALE)));
+                    atomicAdd(&tile_p[3u * ti + 2u], i32(round(mom.z * MOM_SCALE)));
+                }
+            }
+        }
+    }
+    workgroupBarrier();
+    for (var i = t; i < TILE; i += 256u) {
+        let m = atomicLoad(&tile_m[i]);
+        if (m == 0) { continue; }
+        let ii = i32(i);
+        let l = vec3<i32>(ii % TN, (ii / TN) % TN, ii / (TN * TN));
+        let g = node0 + l;
+        if (g.x < 0 || g.y < 0 || g.z < 0 || g.x >= i32(P.n.x) || g.y >= i32(P.n.y) || g.z >= i32(P.n.z)) { continue; }
+        let gi = u32(node_index(g.x, g.y, g.z));
+        atomicAdd(&gm[gi], m);
+        atomicAdd(&gmom[3u * gi], atomicLoad(&tile_p[3u * i]));
+        atomicAdd(&gmom[3u * gi + 1u], atomicLoad(&tile_p[3u * i + 1u]));
+        atomicAdd(&gmom[3u * gi + 2u], atomicLoad(&tile_p[3u * i + 2u]));
+    }
+}
+
+// 3x3x3 box blur of the node mass into gvold.w, between the grid pass and G2P
+@compute @workgroup_size(256)
+fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let g = linear_id(gid, nwg);
+    let nn = P.n.x * P.n.y * P.n.z;
+    if (g >= nn) { return; }
+    let i = i32(g % P.n.x);
+    let j = i32((g / P.n.x) % P.n.y);
+    let k = i32(g / (P.n.x * P.n.y));
+    var acc = 0.0;
+    for (var dk = -1; dk <= 1; dk++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var di = -1; di <= 1; di++) {
+                let a = i + di;
+                let b = j + dj;
+                let cc = k + dk;
+                if (a < 0 || b < 0 || cc < 0 || a >= i32(P.n.x) || b >= i32(P.n.y) || cc >= i32(P.n.z)) { continue; }
+                acc += gvel[u32(node_index(a, b, cc))].w;
+            }
+        }
+    }
+    let old = gvold[g];
+    gvold[g] = vec4<f32>(old.xyz, acc / 27.0);
 }

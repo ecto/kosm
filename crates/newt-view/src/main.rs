@@ -87,7 +87,7 @@ fn simulate(tx: mpsc::Sender<Frame>, splash: bool, frames: usize) {
     if splash {
         drop = drop.with_water(0.03);
     }
-    let steps_per_frame = (1.0 / 30.0 / drop.model.dt).round() as usize;
+    let steps_per_frame = (1.0 / pool::fps() / drop.model.dt).round() as usize;
     for _ in 0..frames {
         let t0 = Instant::now();
         for _ in 0..steps_per_frame {

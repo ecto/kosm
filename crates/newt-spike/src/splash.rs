@@ -17,6 +17,9 @@
 
 use phyz_math::{GRAVITY, Mat3, Vec3};
 use rayon::prelude::*;
+
+/// Per-substep share of the mass-based J blended into the integrated J.
+pub const J_RELAX: f64 = 0.02;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Nanoseconds spent per phase of `Water::step` since the last `take_prof`:
@@ -68,6 +71,8 @@ pub struct Water {
     /// The same solver on the GPU, when enabled; then `x`, `v`, `j` and
     /// `g_mass` are mirrors refreshed by `sync_from_gpu`.
     pub gpu: Option<newt_mpm::GpuMpm>,
+    /// Per-substep velocity factor; 1 except while settling.
+    pub damp: f64,
 }
 
 /// The collider the water feels: an ellipsoid with a velocity.
@@ -116,21 +121,26 @@ impl Water {
             seed ^= seed << 5;
             (seed as f64 / u32::MAX as f64) - 0.5
         };
-        let mut px = -POOL_X + h * 0.5;
-        while px < POOL_X - h * 0.25 {
-            let mut py = -POOL_Y + h * 0.5;
-            while py < POOL_Y - h * 0.25 {
-                let mut pz = -DEPTH + h * 0.5;
-                while pz < -h * 0.25 {
-                    x.push(Vec3::new(px + rnd() * h * 0.6, py + rnd() * h * 0.6, pz + rnd() * h * 0.6));
-                    pz += h;
+        // NEWT_PPC particles per cell along each axis (default 2, so 8 per
+        // cell): one per cell makes the density estimate too noisy and the
+        // water boils
+        let ppa: usize = std::env::var("NEWT_PPC").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let sp = h / ppa as f64;
+        let mut px = -POOL_X + sp * 0.5;
+        while px < POOL_X - sp * 0.25 {
+            let mut py = -POOL_Y + sp * 0.5;
+            while py < POOL_Y - sp * 0.25 {
+                let mut pz = -DEPTH + sp * 0.5;
+                while pz < -sp * 0.25 {
+                    x.push(Vec3::new(px + rnd() * sp * 0.6, py + rnd() * sp * 0.6, pz + rnd() * sp * 0.6));
+                    pz += sp;
                 }
-                py += h;
+                py += sp;
             }
-            px += h;
+            px += sp;
         }
         let n = x.len();
-        let vol0 = h * h * h;
+        let vol0 = sp * sp * sp;
         Self {
             h,
             dt,
@@ -154,6 +164,7 @@ impl Water {
             level_offset: 0.0,
             order: Vec::new(),
             gpu: None,
+            damp: 1.0,
         }
     }
 
@@ -360,13 +371,39 @@ impl Water {
             })
             .reduce(|| (Vec3::zeros(), 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
         prof(3, &mut pt);
+        // ---- blurred node mass, for the density the pressure sees ----
+        // the raw node mass is too noisy an estimate (the water boils); a
+        // 3x3x3 box blur is not, and unlike integrating the divergence it
+        // cannot drift from the positions
+        let g_blur: Vec<f64> = (0..nx * ny * nz)
+            .into_par_iter()
+            .map(|g| {
+                let (i, jj, k) = (g % nx, (g / nx) % ny, g / (nx * ny));
+                let mut acc = 0.0;
+                for dk in -1i64..=1 {
+                    for dj in -1i64..=1 {
+                        for di in -1i64..=1 {
+                            let (a, b, cc) = (i as i64 + di, jj as i64 + dj, k as i64 + dk);
+                            if a < 0 || b < 0 || cc < 0 || a >= nx as i64 || b >= ny as i64 || cc >= nz as i64 {
+                                continue;
+                            }
+                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
+                        }
+                    }
+                }
+                acc / 27.0
+            })
+            .collect();
         // ---- G2P (APIC) ----  (parallel over particles, grid read-only)
         let flip = self.flip;
+        let damp = self.damp;
+        // a node's mass when the water around it is at rest density
+        let full = 1000.0 * h * h * h;
         let e = 1.5 * h;
         let (xmax, ymax, zmax) = (origin.x + (nx - 1) as f64 * h - e, origin.y + (ny - 1) as f64 * h - e, origin.z + (nz - 1) as f64 * h - e);
         {
             let Water { x, v, c, j, g_mass, g_mom, g_vel_old, .. } = &mut *self;
-            let (g_mass, g_mom, g_vel_old) = (&*g_mass, &*g_mom, &*g_vel_old);
+            let (g_mass, g_mom, g_vel_old, g_blur) = (&*g_mass, &*g_mom, &*g_vel_old, &g_blur);
             x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).for_each(|(((xp, vp), cp), jp)| {
                 let base = ((*xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
                 let fx = (*xp - origin) * inv_h - base;
@@ -374,6 +411,7 @@ impl Water {
                 let mut vnew = Vec3::zeros();
                 let mut dv = Vec3::zeros();
                 let mut b = zero3();
+                let mut rho = 0.0;
                 let bi = base.x as i64;
                 let bj = base.y as i64;
                 let bk = base.z as i64;
@@ -395,17 +433,32 @@ impl Water {
                             vnew += gv * wt;
                             dv += (gv - g_vel_old[g]) * wt;
                             b = b + outer(gv * wt, dpos);
+                            rho += wt * g_blur[g];
                         }
                     }
                 }
                 // FLIP keeps the particle's own velocity and adds the grid's change;
                 // PIC takes the grid's velocity. The blend is the usual trade of
                 // dissipation for noise.
-                *vp = (*vp + dv) * flip + vnew * (1.0 - flip);
+                *vp = ((*vp + dv) * flip + vnew * (1.0 - flip)) * damp;
                 *cp = b * d_inv;
-                // volume from the trace of the velocity gradient
-                *jp *= 1.0 + dt * (cp[(0, 0)] + cp[(1, 1)] + cp[(2, 2)]);
-                *jp = jp.clamp(0.5, 2.0);
+                // volume from the mass around the particle, not from
+                // integrating the divergence: the integral drifts from the
+                // real density and the column then packs down with no
+                // pressure to stop it (60% denser after a 0.6 s settle)
+                // integrate J from the divergence (calm), but relax it toward
+                // the mass density (true) so the two cannot drift apart: pure
+                // integration packed the column 60% denser; pure mass boils
+                // integrate J from the divergence, relaxed toward the mass
+                // density at J_RELAX per substep. Tried and rejected: pure
+                // integration (drifts, the column packed 60% and "drained"),
+                // instantaneous mass density (boils, raw or blurred), a
+                // moving average of the mass density (lags the pressure and
+                // explodes). This is calm and does not drift; it does hold
+                // the column ~15% denser than rest, an open item.
+                let j_int = *jp * (1.0 + dt * (cp[(0, 0)] + cp[(1, 1)] + cp[(2, 2)]));
+                let j_mass = full / rho.max(1e-12);
+                *jp = (j_int + (j_mass - j_int) * J_RELAX).clamp(0.5, 2.0);
                 *xp += vnew * dt;
                 // keep particles in the box
                 xp.x = xp.x.clamp(origin.x + e, xmax);
@@ -428,7 +481,7 @@ impl Water {
         let f = |v: &Vec3| [v.x as f32, v.y as f32, v.z as f32];
         let particles = newt_mpm::Particles {
             x: self.x.iter().zip(&self.j).map(|(x, j)| [x.x as f32, x.y as f32, x.z as f32, (*j - 1.0) as f32]).collect(),
-            v: self.v.iter().map(|v| { let a = f(v); [a[0], a[1], a[2], 0.0] }).collect(),
+            v: self.v.iter().enumerate().map(|(i, v)| { let a = f(v); [a[0], a[1], a[2], i as f32] }).collect(),
             c: self.c.iter().flat_map(|c| (0..3).map(move |k| [c[(0, k)] as f32, c[(1, k)] as f32, c[(2, k)] as f32, 0.0])).collect(),
         };
         let params = newt_mpm::Params {
@@ -441,6 +494,7 @@ impl Water {
             bulk: self.bulk as f32,
             flip: self.flip as f32,
             gravity: GRAVITY as f32,
+            j_relax: J_RELAX as f32,
         };
         self.gpu = Some(newt_mpm::GpuMpm::new(params, &particles, max_subs)?);
         Ok(())
@@ -454,6 +508,7 @@ impl Water {
     /// `subs` substeps against one body pose; the mean force on the body.
     pub fn step_block(&mut self, body: &Body, subs: usize) -> Vec3 {
         if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_damp(self.damp as f32);
             let reactions = gpu.step(&Self::gpu_body(body), subs as u32);
             let mut f = Vec3::zeros();
             let mut interior = 0.0;
@@ -478,7 +533,8 @@ impl Water {
     pub fn sync_from_gpu(&mut self) {
         let Some(gpu) = self.gpu.as_ref() else { return };
         let (x, v) = gpu.download();
-        for (i, (xp, vp)) in x.iter().zip(&v).enumerate() {
+        for (xp, vp) in x.iter().zip(&v) {
+            let i = vp[3] as usize; // the GPU sorts; ids come back in v.w
             self.x[i] = Vec3::new(xp[0] as f64, xp[1] as f64, xp[2] as f64);
             self.j[i] = 1.0 + xp[3] as f64;
             self.v[i] = Vec3::new(vp[0] as f64, vp[1] as f64, vp[2] as f64);
@@ -490,28 +546,37 @@ impl Water {
 
     pub fn settle(&mut self, seconds: f64) {
         let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+        // the jittered lattice is far from equilibrium under real pressure;
+        // relax it quasi-statically, with the velocity damped every substep,
+        // so it packs to the state it will actually hold once released
+        // (killing the velocity in bursts left a state that sank 3 cm on release)
+        // first half damped, to pack without spraying; second half free,
+        // so the state is the one free-running water actually holds (the
+        // damped and the free packings differ by ~4%, and a damped start
+        // sank 3 cm in the first half second)
         let n = (seconds / self.dt) as usize;
+        // ... and a lightly damped tail to take the spray off the free phase
+        let (a, b) = (n * 2 / 5, n * 2 / 5);
+        for (damp, steps) in [(0.98, a), (1.0, b), (0.995, n - a - b)] {
+            self.damp = damp;
+            if self.gpu.is_some() {
+                let mut left = steps;
+                while left > 0 {
+                    let block = left.min(256);
+                    self.step_block(&far, block);
+                    left -= block;
+                }
+            } else {
+                for _ in 0..steps {
+                    self.step(&far);
+                }
+            }
+        }
+        self.damp = 1.0;
         if self.gpu.is_some() {
-            let mut left = n;
-            while left > 0 {
-                let block = left.min(256);
-                self.step_block(&far, block);
-                left -= block;
-            }
-            self.gpu.as_mut().unwrap().still();
             self.sync_from_gpu();
-        } else {
-            for _ in 0..n {
-                self.step(&far);
-            }
         }
-        // damp the settling out
-        for v in self.v.iter_mut() {
-            *v = Vec3::zeros();
-        }
-        for c in self.c.iter_mut() {
-            *c = zero3();
-        }
+        // the velocities stay: they are part of the free-running state
         self.time = 0.0;
         self.level_offset = 0.0;
         let g = self.surface(0.02);

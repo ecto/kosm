@@ -26,6 +26,8 @@ pub struct Params {
     pub bulk: f32,
     pub flip: f32,
     pub gravity: f32,
+    /// Per-substep share of the mass-based J blended into the integrated J.
+    pub j_relax: f32,
 }
 
 /// The rigid body the water couples to: an ellipsoid with a pose.
@@ -68,6 +70,7 @@ struct GpuParams {
 pub struct Particles {
     /// xyz and J−1.
     pub x: Vec<[f32; 4]>,
+    /// xyz and the particle's id, which survives the per-substep sort.
     pub v: Vec<[f32; 4]>,
     /// Three columns per particle.
     pub c: Vec<[f32; 4]>,
@@ -81,21 +84,30 @@ pub struct GpuMpm {
     nodes: u32,
     max_subs: u32,
     params_buf: wgpu::Buffer,
-    x: wgpu::Buffer,
-    v: wgpu::Buffer,
-    c: wgpu::Buffer,
     gm: wgpu::Buffer,
     gmom: wgpu::Buffer,
     gvel: wgpu::Buffer,
     gvold: wgpu::Buffer,
     react: wgpu::Buffer,
     react_stage: wgpu::Buffer,
-    bind: wgpu::BindGroup,
+    /// Particle buffers ping-pong through the sort: [cur] holds the particles.
+    bufs: [(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer); 2],
+    cur: usize,
+    binds: [wgpu::BindGroup; 2],
+    nblocks: u32,
+    nb: [u32; 3],
     clear: wgpu::ComputePipeline,
+    sort_zero: wgpu::ComputePipeline,
+    sort_count: wgpu::ComputePipeline,
+    sort_scan: wgpu::ComputePipeline,
+    sort_scatter: wgpu::ComputePipeline,
+    permute: wgpu::ComputePipeline,
     p2g: wgpu::ComputePipeline,
     grid: wgpu::ComputePipeline,
+    blur: wgpu::ComputePipeline,
     g2p: wgpu::ComputePipeline,
     pub time: f64,
+    damp: f32,
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -155,11 +167,20 @@ impl GpuMpm {
         let x = storage("x", bytemuck::cast_slice(&particles.x));
         let v = storage("v", bytemuck::cast_slice(&particles.v));
         let c = storage("c", bytemuck::cast_slice(&particles.c));
+        let x2 = empty("x2", 16 * n as u64);
+        let v2 = empty("v2", 16 * n as u64);
+        let c2 = empty("c2", 48 * n as u64);
         let gm = empty("gm", 4 * nodes as u64);
         let gmom = empty("gmom", 12 * nodes as u64);
         let gvel = empty("gvel", 16 * nodes as u64);
         let gvold = empty("gvold", 16 * nodes as u64);
         let react = empty("react", 16 * max_subs as u64);
+        let nb = [params.n[0].div_ceil(4), params.n[1].div_ceil(4), params.n[2].div_ceil(4)];
+        let nblocks = nb[0] * nb[1] * nb[2];
+        let counts = empty("counts", 4 * (nblocks + 1) as u64);
+        let offsets = empty("offsets", 4 * (nblocks + 1) as u64);
+        let fill = empty("fill", 4 * (nblocks + 1) as u64);
+        let perm = empty("perm", 4 * n as u64);
         let react_stage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("react stage"),
             size: 16 * max_subs as u64,
@@ -174,38 +195,39 @@ impl GpuMpm {
         });
         let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let rw = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mpm"),
-            entries: &[
-                entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None }),
-                entry(1, rw),
-                entry(2, rw),
-                entry(3, rw),
-                entry(4, rw),
-                entry(5, rw),
-                entry(6, rw),
-                entry(7, rw),
-                entry(8, rw),
-            ],
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mpm"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &params_buf, offset: 0, size: Some(std::num::NonZeroU64::new(std::mem::size_of::<GpuParams>() as u64).unwrap()) }),
-                },
-                wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: v.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: c.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: gm.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: gmom.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: gvel.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: gvold.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: react.as_entire_binding() },
-            ],
-        });
+        let mut entries = vec![entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None })];
+        for b in 1..16 {
+            entries.push(entry(b, rw));
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mpm"), entries: &entries });
+        let make_bind = |xin: &wgpu::Buffer, vin: &wgpu::Buffer, cin: &wgpu::Buffer, xout: &wgpu::Buffer, vout: &wgpu::Buffer, cout: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mpm"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &params_buf, offset: 0, size: Some(std::num::NonZeroU64::new(std::mem::size_of::<GpuParams>() as u64).unwrap()) }),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: xin.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: vin.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: cin.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: gm.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: gmom.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: gvel.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: gvold.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: react.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: counts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: offsets.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: fill.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: perm.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: xout.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: vout.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: cout.as_entire_binding() },
+                ],
+            })
+        };
+        let binds = [make_bind(&x, &v, &c, &x2, &v2, &c2), make_bind(&x2, &v2, &c2, &x, &v, &c)];
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mpm"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let pipe = |name: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -219,8 +241,14 @@ impl GpuMpm {
         };
         Ok(Self {
             clear: pipe("clear"),
-            p2g: pipe("p2g"),
+            sort_zero: pipe("sort_zero"),
+            sort_count: pipe("sort_count"),
+            sort_scan: pipe("sort_scan"),
+            sort_scatter: pipe("sort_scatter"),
+            permute: pipe("permute"),
+            p2g: pipe("p2g_block"),
             grid: pipe("grid"),
+            blur: pipe("blur"),
             g2p: pipe("g2p"),
             device,
             queue,
@@ -229,18 +257,25 @@ impl GpuMpm {
             nodes,
             max_subs,
             params_buf,
-            x,
-            v,
-            c,
+            bufs: [(x, v, c), (x2, v2, c2)],
+            cur: 0,
+            binds,
+            nblocks,
+            nb,
             gm,
             gmom,
             gvel,
             gvold,
             react,
             react_stage,
-            bind,
             time: 0.0,
+            damp: 1.0,
         })
+    }
+
+    /// Per-substep velocity factor (1 = none); used while settling.
+    pub fn set_damp(&mut self, damp: f32) {
+        self.damp = damp;
     }
 
     pub fn count(&self) -> usize {
@@ -262,9 +297,9 @@ impl GpuMpm {
             k: [p.dt, 1.0 / h, p.mass, p.vol0],
             k2: [p.bulk, p.flip, p.gravity, 4.0 / (h * h)],
             lo: [o[0] + 2.0 * h, o[1] + 2.0 * h, o[2] + 2.0 * h, e],
-            hi: [o[0] + (n[0] - 3) as f32 * h, o[1] + (n[1] - 3) as f32 * h, o[2] + (n[2] - 3) as f32 * h, 0.0],
-            misc: [slot, 0, 0, 0],
-            xmax: [o[0] + (n[0] - 1) as f32 * h - e, o[1] + (n[1] - 1) as f32 * h - e, o[2] + (n[2] - 1) as f32 * h - e, 0.0],
+            hi: [o[0] + (n[0] - 3) as f32 * h, o[1] + (n[1] - 3) as f32 * h, o[2] + (n[2] - 3) as f32 * h, self.damp],
+            misc: [slot, self.nb[0], self.nb[1], self.nb[2]],
+            xmax: [o[0] + (n[0] - 1) as f32 * h - e, o[1] + (n[1] - 1) as f32 * h - e, o[2] + (n[2] - 1) as f32 * h - e, p.j_relax],
             b_centre: v4(body.centre, 0.0),
             b_a: v4(a, 0.0),
             b_b: v4(b, 0.0),
@@ -296,14 +331,32 @@ impl GpuMpm {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             let (pg, pgy) = Self::groups(self.n);
             let (ng, ngy) = Self::groups(self.nodes);
+            let (bg, bgy) = Self::groups(self.nblocks);
+            let (wg, wgy) = if self.nblocks <= 65535 { (self.nblocks, 1) } else { (65535, self.nblocks.div_ceil(65535)) };
             for s in 0..subs {
                 let off = (s as u64 * PARAMS_STRIDE) as u32;
-                pass.set_bind_group(0, &self.bind, &[off]);
+                // sort the particles by block, from bufs[cur] into bufs[1 - cur]
+                pass.set_bind_group(0, &self.binds[self.cur], &[off]);
+                pass.set_pipeline(&self.sort_zero);
+                pass.dispatch_workgroups(bg, bgy, 1);
+                pass.set_pipeline(&self.sort_count);
+                pass.dispatch_workgroups(pg, pgy, 1);
+                pass.set_pipeline(&self.sort_scan);
+                pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&self.sort_scatter);
+                pass.dispatch_workgroups(pg, pgy, 1);
+                pass.set_pipeline(&self.permute);
+                pass.dispatch_workgroups(pg, pgy, 1);
+                // the physics, on the sorted buffers
+                self.cur = 1 - self.cur;
+                pass.set_bind_group(0, &self.binds[self.cur], &[off]);
                 pass.set_pipeline(&self.clear);
                 pass.dispatch_workgroups(ng, ngy, 1);
                 pass.set_pipeline(&self.p2g);
-                pass.dispatch_workgroups(pg, pgy, 1);
+                pass.dispatch_workgroups(wg, wgy, 1);
                 pass.set_pipeline(&self.grid);
+                pass.dispatch_workgroups(ng, ngy, 1);
+                pass.set_pipeline(&self.blur);
                 pass.dispatch_workgroups(ng, ngy, 1);
                 pass.set_pipeline(&self.g2p);
                 pass.dispatch_workgroups(pg, pgy, 1);
@@ -351,10 +404,12 @@ impl GpuMpm {
         out
     }
 
-    /// Particle positions (xyz, J−1) and velocities.
+    /// Particle positions (xyz, J−1) and velocities (xyz, original id), in
+    /// the GPU's current (sorted) order.
     pub fn download(&self) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
-        let x = self.read_f32(&self.x, 16 * self.n as u64);
-        let v = self.read_f32(&self.v, 16 * self.n as u64);
+        let (x, v, _) = &self.bufs[self.cur];
+        let x = self.read_f32(x, 16 * self.n as u64);
+        let v = self.read_f32(v, 16 * self.n as u64);
         (bytemuck::cast_slice(&x).to_vec(), bytemuck::cast_slice(&v).to_vec())
     }
 
@@ -364,9 +419,4 @@ impl GpuMpm {
         g.chunks(4).map(|c| c[3]).collect()
     }
 
-    /// Zero the particle velocities and affine states (after settling).
-    pub fn still(&mut self) {
-        self.queue.write_buffer(&self.v, 0, &vec![0u8; 16 * self.n as usize]);
-        self.queue.write_buffer(&self.c, 0, &vec![0u8; 48 * self.n as usize]);
-    }
 }

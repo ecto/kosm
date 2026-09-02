@@ -48,8 +48,8 @@ fn settle_and_droplets() {
     let mut cpu = Water::fill(h, dt, air, bulk);
     let mut gpu = Water::fill(h, dt, air, bulk);
     gpu.enable_gpu(256).expect("gpu");
-    cpu.settle(0.6);
-    gpu.settle(0.6);
+    cpu.settle(1.0);
+    gpu.settle(1.0);
     let (xr, xm) = rms(&cpu.x, &gpu.x);
     println!("after settle: dx rms {xr:.2e} max {xm:.2e}  level cpu {:.4} gpu {:.4}", cpu.level_offset, gpu.level_offset);
     let (vr, _) = rms(&cpu.v, &gpu.v);
@@ -59,6 +59,17 @@ fn settle_and_droplets() {
     let (zr, zm) = rms(&gc.z.iter().map(|z| Vec3::new(*z, 0.0, 0.0)).collect::<Vec<_>>(), &gg.z.iter().map(|z| Vec3::new(*z, 0.0, 0.0)).collect::<Vec<_>>());
     println!("surface z rms diff {zr:.2e} max {zm:.2e}");
     println!("droplets cpu {} gpu {}", cpu.droplets(&gc, 0.02, 250).len(), gpu.droplets(&gg, 0.02, 250).len());
+    for (name, w) in [("cpu", &cpu), ("gpu", &gpu)] {
+        let jm = w.j.iter().sum::<f64>() / w.j.len() as f64;
+        let jmin = w.j.iter().cloned().fold(f64::MAX, f64::min);
+        let zmax = w.x.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let zmean = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
+        // the top of the bulk: 99th percentile of z
+        let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
+        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let z99 = zs[(zs.len() as f64 * 0.99) as usize];
+        println!("{name}: J mean {jm:.4} min {jmin:.4}   z mean {zmean:.4} (rest -0.35)  z99 {z99:.4}  zmax {zmax:.4}  level_offset {:.4}", w.level_offset);
+    }
     let gm: f64 = gpu.g_mass.iter().sum();
     let cm: f64 = cpu.g_mass.iter().sum();
     println!("grid mass cpu {cm:.5} gpu {gm:.5}");

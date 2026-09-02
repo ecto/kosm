@@ -37,6 +37,10 @@ use crate::glass::{fresnel, refract, reflect};
 pub const POOL_X: f64 = 1.2; // half-lengths of the water
 pub const POOL_Y: f64 = 0.8;
 pub const DEPTH: f64 = 0.7;
+/// Frames per second of a recording (NEWT_FPS overrides).
+pub fn fps() -> f64 {
+    std::env::var("NEWT_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0)
+}
 const COPING: f64 = 0.06; // deck height above the water line
 const N_WATER: f64 = 1.333;
 /// Absorption per metre, RGB: red goes first, which is why deep water is blue.
@@ -113,6 +117,19 @@ impl Surface {
         // ambient ripple, 1 mm, so still water is not a mirror
         h + 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos())
             + 0.0005 * ((11.0 * x - 4.0 * y + 1.7 * self.t).sin())
+    }
+    /// Mean height of the fluid surface over the pool's interior (0 = rest).
+    pub fn mean_level(&self) -> f64 {
+        let Some(g) = &self.grid else { return 0.0 };
+        let mut s = 0.0;
+        let mut n = 0.0f64;
+        for jy in 3..g.ny.saturating_sub(3) {
+            for ix in 3..g.nx.saturating_sub(3) {
+                s += g.z[jy * g.nx + ix];
+                n += 1.0;
+            }
+        }
+        s / n.max(1.0)
     }
     /// The highest the surface gets this frame, plus a margin for the rings.
     pub fn top(&self) -> f64 {
@@ -284,7 +301,7 @@ impl Drop {
             }
         }
         // pack the fill down before anything arrives, and take the rest level
-        water.settle(0.6);
+        water.settle(2.0);
         self.water = Some(water);
         self
     }
@@ -614,7 +631,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
     let mut t_water = None;
     // the march starts where the ray drops below the highest water, which
     // is the deck line for a still pool and the crown's tip in a splash
-    let top = drop.surface.top().max(COPING);
+    let top = drop.top.max(COPING);
     if d.z < 0.0 || o.z < top {
         // start marching at that plane if above it, else from the origin
         let t_start = if o.z > top { ((top - o.z) / d.z).max(0.0) } else { 0.0 };
@@ -859,11 +876,13 @@ fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Scene, cau
 pub struct Scene<'a> {
     pub surface: &'a Surface,
     pub droplets: &'a [crate::splash::Droplet],
+    /// The surface's maximum this frame (computed once: it is a grid scan).
+    pub top: f64,
 }
 
 pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
-    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets };
+    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top: drop.surface.top() };
     let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
@@ -893,9 +912,16 @@ pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     img
 }
 
+fn drop_h_mm() -> u32 {
+    (std::env::var("NEWT_H").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.025) * 1000.0).round() as u32
+}
+
 /// The whole thing: drop the melon, render `frames` at 30 fps, encode.
 pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> anyhow::Result<()> {
-    let dir = out.join(if splash { "splash" } else { "pool" });
+    let tag = if splash { format!("splash_{}mm", (drop_h_mm())) } else { "pool".to_string() };
+    let dir = out.join(&tag);
+    // stale frames from another run would be swept into the encode
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut drop = Drop::new(1.3);
     if splash {
@@ -906,7 +932,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     // from the deck corner, low, so the far water reflects the sky and the near
     // water shows the tiles
     let view = View { eye: V::new(-1.42, -1.22, 0.31), target: V::new(0.02, 0.12, -0.06), width, height, vfov: 0.9 };
-    let steps_per_frame = (1.0 / 30.0 / drop.model.dt).round() as usize;
+    let steps_per_frame = (1.0 / fps() / drop.model.dt).round() as usize;
     let t0 = std::time::Instant::now();
     let mut lowest = f64::INFINITY;
     for k in 0..frames {
@@ -935,19 +961,25 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
             let w = crate::splash::take_prof().map(|ns| ns / 1_000_000);
             println!("prof   frame {k:3}  step {:5} ms (zero {} bin {} p2g {} grid {} g2p {})  read_water {:5} ms  caustic {:5} ms  render {:5} ms  save {:4} ms", ms[0], w[0], w[1], w[2], w[3], w[4], ms[1], ms[2], ms[3], ms[4]);
         }
-        if k == 0 || k % 5 == 0 || k + 1 == frames {
+        if k == 0 || k % 5 == 0 || k + 1 == frames || std::env::var_os("NEWT_PROF").is_some() {
             let m = drop.centre();
+            if let Some(w) = &drop.water {
+                let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
+                zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = zs.iter().sum::<f64>() / zs.len() as f64;
+                println!("water  frame {k:3}  particle z mean {:+.1} mm (rest -350)  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
+            }
             println!(
-                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={}  {} ms/frame",
-                drop.state.time, m.z, drop.state.v[5], peak_force.z, drop.water.as_ref().map(|w| w.interior_mass).unwrap_or(0.0), drop.water.as_ref().map(|w| w.interior_mass * GRAVITY).unwrap_or(0.0), drop.droplets.len(), t0.elapsed().as_millis() / (k as u128 + 1)
+                "pool   frame {k:3}  t={:.2} s  melon z={:+.3} m  vz={:+.2} m/s  level {:+.1} mm  fluid force z={:+.0} N  water inside {:.1} kg (weight {:.0} N)  drops={}  {} ms/frame",
+                drop.state.time, m.z, drop.state.v[5], drop.surface.mean_level() * 1000.0, peak_force.z, drop.water.as_ref().map(|w| w.interior_mass).unwrap_or(0.0), drop.water.as_ref().map(|w| w.interior_mass * GRAVITY).unwrap_or(0.0), drop.droplets.len(), t0.elapsed().as_millis() / (k as u128 + 1)
             );
         }
     }
     let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
     println!("pool   the melon went {:.2} m under and floats with {:.0}% of its radius above the line", -(lowest - r), (drop.centre().z / r) * 100.0);
-    let mp4 = out.join(if splash { "splash.mp4" } else { "pool.mp4" });
+    let mp4 = out.join(format!("{tag}.mp4"));
     let st = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-framerate", "30", "-i"])
+        .args(["-y", "-loglevel", "error", "-framerate", &format!("{}", fps()), "-i"])
         .arg(dir.join("frame_%03d.png"))
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "17"])
         .arg(&mp4)
