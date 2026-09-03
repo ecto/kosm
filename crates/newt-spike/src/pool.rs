@@ -32,6 +32,13 @@ use tang::Vec3 as V;
 
 use crate::glass::{fresnel, refract, reflect};
 
+mod config;
+mod scene;
+mod snapshot;
+pub use config::WaterConfig;
+pub use scene::{DEFAULT_POOL_SCENE, PoolScene};
+pub use snapshot::PoolSnapshot;
+
 // ---- the pool ---------------------------------------------------------------
 
 // An Olympic pool: 50 m by 25 m; FINA's minimum depth is 2 m.
@@ -491,6 +498,7 @@ pub struct Melon {
     pub centre: V<f64>,
     /// Long axis heading (unit, horizontal-ish).
     pub axis: V<f64>,
+    pub axes: [f64; 3],
 }
 
 impl Melon {
@@ -505,8 +513,8 @@ impl Melon {
     fn hit(&self, o: V<f64>, d: V<f64>) -> Option<(f64, V<f64>)> {
         let (a, b, c) = self.frame();
         let rel = o - self.centre;
-        let ol = V::new(rel.dot(&a) / MELON_AXES[0], rel.dot(&b) / MELON_AXES[1], rel.dot(&c) / MELON_AXES[2]);
-        let dl = V::new(d.dot(&a) / MELON_AXES[0], d.dot(&b) / MELON_AXES[1], d.dot(&c) / MELON_AXES[2]);
+        let ol = V::new(rel.dot(&a) / self.axes[0], rel.dot(&b) / self.axes[1], rel.dot(&c) / self.axes[2]);
+        let dl = V::new(d.dot(&a) / self.axes[0], d.dot(&b) / self.axes[1], d.dot(&c) / self.axes[2]);
         let aa = dl.norm_sq();
         let bb = ol.dot(&dl);
         let cc = ol.norm_sq() - 1.0;
@@ -520,7 +528,7 @@ impl Melon {
         }
         let pl = ol + dl * t;
         // normal: gradient of the ellipsoid, back in world
-        let nl = V::new(pl.x / MELON_AXES[0], pl.y / MELON_AXES[1], pl.z / MELON_AXES[2]);
+        let nl = V::new(pl.x / self.axes[0], pl.y / self.axes[1], pl.z / self.axes[2]);
         let n = (a * nl.x + b * nl.y + c * nl.z).normalize();
         Some((t, n))
     }
@@ -529,7 +537,7 @@ impl Melon {
     fn albedo(&self, p: V<f64>) -> [f64; 3] {
         let (a, b, c) = self.frame();
         let rel = p - self.centre;
-        let (u, v, w) = (rel.dot(&a) / MELON_AXES[0], rel.dot(&b) / MELON_AXES[1], rel.dot(&c) / MELON_AXES[2]);
+        let (u, v, w) = (rel.dot(&a) / self.axes[0], rel.dot(&b) / self.axes[1], rel.dot(&c) / self.axes[2]);
         let phi = w.atan2(v);
         let wobble = 0.35 * (6.0 * u + 2.0 * phi).sin() + 0.2 * (13.0 * u).sin();
         let stripe = (9.0 * phi + wobble).sin();
@@ -551,7 +559,7 @@ impl Melon {
 
 // ---- physics ----------------------------------------------------------------
 
-pub struct Drop {
+pub struct PoolSimulation {
     pub model: Model,
     pub state: State,
     pub sim: Simulator,
@@ -569,13 +577,32 @@ pub struct Drop {
     pub fluid_force: V<f64>,
     /// The pool beyond the box.
     pub far: Option<crate::far::Far>,
+    melon_axes: [f64; 3],
+    recording_fps: f64,
 }
 
-impl Drop {
+/// Compatibility name for existing experiments. New code should use
+/// `PoolSimulation`, which describes the type's ownership and lifecycle.
+pub type Drop = PoolSimulation;
+
+impl PoolSimulation {
     pub fn new(height: f64) -> Self {
-        let vol = 4.0 / 3.0 * std::f64::consts::PI * MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2];
-        let m = melon_density() * vol;
-        let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
+        Self::with_melon(height, MELON_AXES, melon_density(), fps())
+    }
+
+    pub fn from_scene(scene: &PoolScene) -> Self {
+        Self::with_melon(
+            scene.drop_height,
+            scene.melon_axes,
+            scene.melon_density,
+            scene.fps,
+        )
+    }
+
+    fn with_melon(height: f64, axes: [f64; 3], density: f64, recording_fps: f64) -> Self {
+        let vol = 4.0 / 3.0 * std::f64::consts::PI * axes[0] * axes[1] * axes[2];
+        let m = density * vol;
+        let r = (axes[0] * axes[1] * axes[2]).cbrt();
         let i = 0.4 * m * r * r;
         let mut model = ModelBuilder::new()
             .gravity(Vec3::new(0.0, 0.0, -GRAVITY))
@@ -600,21 +627,27 @@ impl Drop {
             surface_prev: None,
             fluid_force: V::zero(),
             far: None,
+            melon_axes: axes,
+            recording_fps,
         }
     }
 
     /// Turn the water on: a dense MPM in the box around the melon, a wave
     /// field over the rest of the pool.
-    pub fn with_water(mut self, h: f64) -> Self {
+    pub fn with_water(self, h: f64) -> Self {
+        self.with_water_config(WaterConfig { cell_size: h, ..WaterConfig::from_env(h) })
+    }
+
+    pub fn with_water_config(mut self, config: WaterConfig) -> Self {
         // speed of sound ~ 45 m/s: at 5 m/s the impact pressure compresses the
         // water under a percent, which is what stops a melon instead of
         // letting it plough through
-        let bulk = 2.0e6;
+        let h = config.cell_size;
+        let bulk = config.bulk_modulus;
         let cs = (bulk / 1000.0f64).sqrt();
         let dt = 0.35 * h / cs;
-        let mut water = crate::splash::Water::fill(h, dt, 1.0, bulk);
-        // NEWT_GPU=0 keeps the solver on the CPU
-        if std::env::var("NEWT_GPU").map(|v| v != "0").unwrap_or(true) {
+        let mut water = crate::splash::Water::fill(h, dt, config.air_above, bulk);
+        if config.use_gpu {
             let subs = (self.model.dt / dt).ceil() as u32;
             match water.enable_gpu(subs.max(256)) {
                 Ok(()) => println!("splash  water on the GPU"),
@@ -622,7 +655,7 @@ impl Drop {
             }
         }
         // pack the fill down before anything arrives, and take the rest level
-        water.settle(2.0);
+        water.settle(config.settle_seconds);
         self.water = Some(water);
         self.far = Some(crate::far::Far::new(0.1));
         self
@@ -709,7 +742,7 @@ impl Drop {
             // to what the picked candidates can tell us -- which is all of
             // the fast near-surface water, because that is what the picker
             // is asked for.)
-            let frame_dt = 1.0 / fps();
+            let frame_dt = 1.0 / self.recording_fps;
             let mut seed = (t * 1e6) as u64 | 1;
             let mut rnd = || {
                 seed ^= seed << 13;
@@ -867,16 +900,45 @@ impl Drop {
         V::new(self.state.q[3], self.state.q[4], self.state.q[5])
     }
 
+    pub fn timestep(&self) -> f64 {
+        self.model.dt
+    }
+
+    pub fn recording_fps(&self) -> f64 {
+        self.recording_fps
+    }
+
+    pub fn water_particle_count(&self) -> usize {
+        self.water.as_ref().map(|water| water.count()).unwrap_or(0)
+    }
+
     pub fn melon(&self) -> Melon {
         // it lands long-axis-first-ish and settles horizontal; a slow yaw for life
         let yaw = 0.6 + 0.15 * self.state.time;
-        Melon { centre: self.centre(), axis: V::new(yaw.cos(), yaw.sin(), 0.0) }
+        Melon {
+            centre: self.centre(),
+            axis: V::new(yaw.cos(), yaw.sin(), 0.0),
+            axes: self.melon_axes,
+        }
+    }
+
+    /// Copy the observable world state, without solver or GPU resources.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot::capture(self)
+    }
+
+    /// End a presentation frame: copy its observable state and reset
+    /// frame-local diagnostics without exposing mutable solver fields.
+    pub fn take_snapshot(&mut self) -> PoolSnapshot {
+        let snapshot = self.snapshot();
+        self.fluid_force = V::zero();
+        snapshot
     }
 
     /// Submerged volume of the equivalent sphere below the local water height.
     fn submerged(&self) -> (f64, f64) {
         let c = self.centre();
-        let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
+        let r = (self.melon_axes[0] * self.melon_axes[1] * self.melon_axes[2]).cbrt();
         let eta = self.surface.height(c.x, c.y);
         let h = (eta - (c.z - r)).clamp(0.0, 2.0 * r); // submerged cap height
         let v = std::f64::consts::PI * h * h * (3.0 * r - h) / 3.0;
@@ -890,7 +952,7 @@ impl Drop {
         self.surface.t = self.state.time;
         let (v_sub, frac) = self.submerged();
         let vel = V::new(self.state.v[3], self.state.v[4], self.state.v[5]);
-        let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
+        let r = (self.melon_axes[0] * self.melon_axes[1] * self.melon_axes[2]).cbrt();
         // buoyancy up, drag against motion through the submerged share of the
         // frontal area, and a little added-mass damping of the bob
         let buoy = WATER_DENSITY * GRAVITY * v_sub;
@@ -1425,16 +1487,33 @@ pub struct Scene<'a> {
     pub foam: &'a FoamField,
 }
 
-pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
+pub fn render(view: &View, drop: &PoolSimulation, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
+    render_frame(view, &melon, &drop.surface, &drop.droplets, &drop.foam, caustic)
+}
+
+/// Render an immutable simulation observation. This is the viewer/replay seam:
+/// reference rendering no longer reconstructs a mutable `PoolSimulation`.
+pub fn render_snapshot(view: &View, snapshot: &PoolSnapshot, caustic: &Caustic) -> image::RgbaImage {
+    render_frame(view, &snapshot.melon, &snapshot.surface, &snapshot.droplets, &snapshot.foam, caustic)
+}
+
+fn render_frame(
+    view: &View,
+    melon: &Melon,
+    surface: &Surface,
+    droplets: &[crate::splash::Droplet],
+    foam: &[Foam],
+    caustic: &Caustic,
+) -> image::RgbaImage {
     let t_foam = std::time::Instant::now();
-    let foam = FoamField::build(&drop.foam, box_half() + 1.0);
-    let top = drop.surface.top();
+    let foam = FoamField::build(foam, box_half() + 1.0);
+    let top = surface.top();
     if std::env::var_os("NEWT_PROF").is_some() {
         println!("render prep: foam field {} ms, top {:.3} m", t_foam.elapsed().as_millis(), top);
     }
-    let top_far = drop.surface.far.as_ref().map(|f| f.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0) + 0.02;
-    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top, top_far, foam: &foam };
+    let top_far = surface.far.as_ref().map(|f| f.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0) + 0.02;
+    let scene = Scene { surface, droplets, top, top_far, foam: &foam };
     let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
@@ -1454,7 +1533,7 @@ pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
                 let px = (x as f64 + 0.5 - view.width as f64 / 2.0) / fy;
                 let py = (view.height as f64 / 2.0 - y as f64 - 0.5) / fy;
                 let d = (fwd + right * px + up * py).normalize();
-                let c = radiance(view.eye, d, drop, &melon, caustic, 1);
+                let c = radiance(view.eye, d, drop, melon, caustic, 1);
                 row.extend_from_slice(&[to8(c[0]), to8(c[1]), to8(c[2]), 255]);
             }
             row
@@ -1464,27 +1543,29 @@ pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     img
 }
 
-fn drop_h_mm() -> u32 {
-    (std::env::var("NEWT_H").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.025) * 1000.0).round() as u32
-}
-
 /// The whole thing: drop the melon, render `frames` at 30 fps, encode.
 pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> anyhow::Result<()> {
-    let tag = if splash { format!("splash_{}mm", (drop_h_mm())) } else { "pool".to_string() };
+    let scene = PoolScene::reference()?.with_env_overrides();
+    for warning in &scene.authored.warnings {
+        println!("scene  {warning}");
+    }
+    let water_config = scene.water;
+    let recording_fps = scene.fps;
+    let tag = if splash { format!("splash_{}mm", (water_config.cell_size * 1000.0).round() as u32) } else { "pool".to_string() };
     let dir = out.join(&tag);
     // stale frames from another run would be swept into the encode
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let mut drop = Drop::new(1.3);
+    let mut drop = PoolSimulation::from_scene(&scene);
     if splash {
-        drop = drop.with_water(std::env::var("NEWT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.025));
+        drop = drop.with_water_config(water_config);
         let w = drop.water.as_ref().unwrap();
         println!("splash {} water particles on a {}×{}×{} grid at {} cm, dt {:.2e} s ({} substeps per ms)", w.count(), w.nx, w.ny, w.nz, w.h * 100.0, w.dt, (drop.model.dt / w.dt).ceil());
     }
     // from the deck corner, low, so the far water reflects the sky and the near
     // water shows the tiles
     let view = View { eye: V::new(-3.2, -2.6, 0.9), target: V::new(0.0, 0.1, -0.1), width, height, vfov: 0.9 };
-    let steps_per_frame = (1.0 / fps() / drop.model.dt).round() as usize;
+    let steps_per_frame = (1.0 / recording_fps / drop.model.dt).round() as usize;
     // NEWT_GPU_RENDER=0 keeps the caustic on the CPU, for comparison
     let mut cgpu = if std::env::var("NEWT_GPU_RENDER").map(|v| v != "0").unwrap_or(true) {
         match newt_mpm::GpuCaustic::new() {
@@ -1589,11 +1670,12 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
             );
         }
     }
-    let r = (MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2]).cbrt();
+    let axes = drop.melon().axes;
+    let r = (axes[0] * axes[1] * axes[2]).cbrt();
     println!("pool   the melon went {:.2} m under and floats with {:.0}% of its radius above the line", -(lowest - r), (drop.centre().z / r) * 100.0);
     let mp4 = out.join(format!("{tag}.mp4"));
     let st = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-framerate", &format!("{}", fps()), "-i"])
+        .args(["-y", "-loglevel", "error", "-framerate", &format!("{recording_fps}"), "-i"])
         .arg(dir.join("frame_%03d.png"))
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "17"])
         .arg(&mp4)

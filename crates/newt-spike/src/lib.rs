@@ -10,4 +10,5 @@ pub mod lamp;
 pub mod light;
 pub mod pool;
 pub mod room;
+pub mod scene;
 pub mod splash;

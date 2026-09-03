@@ -6,6 +6,11 @@ simulator, and every knob has a gradient. Built on
 (differentiable multi-physics), [tang](https://github.com/ecto/tang) (one scalar,
 one IR) and loon (scripting).
 
+`AuthoredScene` is the narrow shared boundary: it evaluates a Loon/vcad source,
+resolves its parameters, converts authored millimetres at the computation edge,
+and can write solved parameters back. Marble and pool then attach different
+computations to that source; they do not share an artificial simulation loop.
+
 ## the marble (`crates/newt-spike`)
 
 The first spike. The level is [`levels/marble.loon`](levels/marble.loon):
@@ -100,7 +105,11 @@ for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 
 ### the pool
 
-`newt-spike --pool [frames]` drops a watermelon into a pool (`pool.rs`). The
+`newt-spike --pool [frames]` drops a watermelon into the authored scene
+[`levels/pool.loon`](levels/pool.loon) (`pool.rs`). Drop height, melon geometry
+and density, water parameters, and recording cadence come from that scene. The
+legacy ray tracer still requires the reference 50 m × 25 m × 2 m basin and
+rejects divergent authored dimensions until its geometry is derived from vcad. The
 melon is a phyz rigid body with Archimedes buoyancy and quadratic drag applied
 as generalized forces, so it plunges, slows and floats. The water surface is a
 wave field driven by the impact (deep-water dispersion, spreading and decaying

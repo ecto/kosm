@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
-use newt_spike::pool::{self, box_half, Caustic, Surface, DEPTH, MELON_AXES, POOL_X, POOL_Y, STAND_RISE, STAND_ROWS, STAND_TREAD, STAND_Y0};
+use newt_spike::pool::{self, box_half, Caustic, Surface, DEPTH, POOL_X, POOL_Y, STAND_RISE, STAND_ROWS, STAND_TREAD, STAND_Y0};
 use newt_spike::splash::Droplet;
 use tang::Vec3 as V;
 
@@ -99,6 +99,7 @@ pub struct LiveFrame {
     pub caustic: Caustic,
     pub melon_centre: V<f64>,
     pub melon_axis: V<f64>,
+    pub melon_axes: [f64; 3],
     pub droplets: Vec<Droplet>,
 }
 
@@ -441,7 +442,7 @@ impl CallbackTrait for LiveCallback {
             pool: [POOL_X as f32, POOL_Y as f32, DEPTH as f32, COPING],
             melon_centre: [f.melon_centre.x as f32, f.melon_centre.y as f32, f.melon_centre.z as f32, 0.0],
             melon_axis: [f.melon_axis.x as f32, f.melon_axis.y as f32, f.melon_axis.z as f32, 0.0],
-            melon_semi: [MELON_AXES[0] as f32, MELON_AXES[1] as f32, MELON_AXES[2] as f32, 0.0],
+            melon_semi: [f.melon_axes[0] as f32, f.melon_axes[1] as f32, f.melon_axes[2] as f32, 0.0],
             caustic: [f.caustic.origin[0] as f32, f.caustic.origin[1] as f32, f.caustic.cell as f32, 0.0],
         };
         queue.write_buffer(&res.uniforms, 0, bytemuck::bytes_of(&u));
@@ -491,8 +492,8 @@ impl CallbackTrait for LiveCallback {
             .iter()
             .map(|v| {
                 let l = V::new(v.pos[0] as f64, v.pos[1] as f64, v.pos[2] as f64);
-                let p = f.melon_centre + a * (l.x * MELON_AXES[0]) + b * (l.y * MELON_AXES[1]) + c * (l.z * MELON_AXES[2]);
-                let nl = V::new(l.x / MELON_AXES[0], l.y / MELON_AXES[1], l.z / MELON_AXES[2]);
+                let p = f.melon_centre + a * (l.x * f.melon_axes[0]) + b * (l.y * f.melon_axes[1]) + c * (l.z * f.melon_axes[2]);
+                let nl = V::new(l.x / f.melon_axes[0], l.y / f.melon_axes[1], l.z / f.melon_axes[2]);
                 let n = (a * nl.x + b * nl.y + c * nl.z).normalize();
                 Vertex { pos: [p.x as f32, p.y as f32, p.z as f32], nrm: [n.x as f32, n.y as f32, n.z as f32], aux: v.pos, mat: 3 }
             })
