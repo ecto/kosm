@@ -100,7 +100,12 @@ fn far_field_conserves_energy() {
         }
     }
     println!("worst relative energy error over 10 s: {worst:.2e}   ({:.1} ms per step incl. energy)", t0.elapsed().as_millis() as f64 / 600.0);
-    assert!(worst < 1e-6, "linear spectral step must conserve H to roundoff");
+    if std::env::var("NEWT_FAR_NL").map(|v| v == "1").unwrap_or(false) {
+        // second-order terms, Strang split with Heun: 7.6e-5 measured
+        assert!(worst < 1e-3, "nonlinear far field must conserve H₂ + H₃ to the split's order");
+    } else {
+        assert!(worst < 1e-6, "linear spectral step must conserve H to roundoff");
+    }
 }
 
 #[test]

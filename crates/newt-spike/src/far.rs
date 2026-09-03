@@ -148,7 +148,28 @@ impl Far {
             }
         }
         // Parseval: Σ|f_k|² = N Σ|f|², and each cell is cell² of area
-        0.5 * e / norm * cell * cell
+        let mut h = 0.5 * e / norm * cell * cell;
+        if self.nonlinear {
+            // the cubic term, H₃ = ½ ∫ η (|∇ψ|² − (G[ψ])²) dA, which is what
+            // the second-order equations conserve together with the quadratic
+            let i = Complex::new(0.0, 1.0);
+            let mut dpx = vec![Complex::new(0.0, 0.0); px * py];
+            let mut dpy = vec![Complex::new(0.0, 0.0); px * py];
+            for m in 0..px * py {
+                let g = self.gk[m];
+                let psik = if g > 1e-9 { vk[m] / g } else { Complex::new(0.0, 0.0) };
+                dpx[m] = i * self.kx[m] * psik;
+                dpy[m] = i * self.ky[m] * psik;
+            }
+            let psi_x = self.to_physical(dpx);
+            let psi_y = self.to_physical(dpy);
+            let mut h3 = 0.0;
+            for q in 0..self.grid.z.len() {
+                h3 += self.grid.z[q] * (psi_x[q] * psi_x[q] + psi_y[q] * psi_y[q] - self.v[q] * self.v[q]);
+            }
+            h += 0.5 * h3 * cell * cell;
+        }
+        h
     }
 
     fn fft2(&self, a: &mut [Complex<f64>], inverse: bool) {
@@ -194,45 +215,10 @@ impl Far {
         self.fft2(&mut hk, false);
         self.fft2(&mut vk, false);
         if self.nonlinear {
-            // second-order Zakharov terms, one explicit Euler step of them
-            // before the exact linear step (a Strang split would be tidier):
-            //   η̇ += −∇·(η ∇ψ) − G[η G[ψ]]
-            //   ψ̇ += −½|∇ψ|² + ½ (G[ψ])²
-            // with ψ_k = v_k / G_k and G[ψ] = v.
-            let (px, py, nx, ny) = (self.px, self.py, self.grid.nx, self.grid.ny);
-            let mut psik = vec![Complex::new(0.0, 0.0); px * py];
-            let mut dpx = vec![Complex::new(0.0, 0.0); px * py];
-            let mut dpy = vec![Complex::new(0.0, 0.0); px * py];
-            for m in 0..px * py {
-                let g = self.gk[m];
-                if g > 1e-9 {
-                    psik[m] = vk[m] / g;
-                }
-                let i = Complex::new(0.0, 1.0);
-                dpx[m] = i * self.kx[m] * psik[m];
-                dpy[m] = i * self.ky[m] * psik[m];
-            }
-            let psi_x = self.to_physical(dpx);
-            let psi_y = self.to_physical(dpy);
-            let eta = &self.grid.z;
-            let gpsi = &self.v;
-            // fluxes η ∇ψ and the product η G[ψ], back to spectral for their derivatives
-            let fx: Vec<f64> = (0..nx * ny).map(|q| eta[q] * psi_x[q]).collect();
-            let fy: Vec<f64> = (0..nx * ny).map(|q| eta[q] * psi_y[q]).collect();
-            let eg: Vec<f64> = (0..nx * ny).map(|q| eta[q] * gpsi[q]).collect();
-            let dpsi: Vec<f64> = (0..nx * ny).map(|q| -0.5 * (psi_x[q] * psi_x[q] + psi_y[q] * psi_y[q]) + 0.5 * gpsi[q] * gpsi[q]).collect();
-            let fxk = self.to_spectral(&fx);
-            let fyk = self.to_spectral(&fy);
-            let egk = self.to_spectral(&eg);
-            let dpsik = self.to_spectral(&dpsi);
-            let i = Complex::new(0.0, 1.0);
-            for m in 0..px * py {
-                let div = i * self.kx[m] * fxk[m] + i * self.ky[m] * fyk[m];
-                let deta = -div - self.gk[m] * egk[m];
-                // η += dt·deta; ψ += dt·dpsi, and v = G ψ
-                hk[m] += deta * dt;
-                vk[m] += self.gk[m] * dpsik[m] * dt;
-            }
+            // Strang split: half a nonlinear step (Heun), the exact linear
+            // step, half a nonlinear step. Explicit Euler drifted 8e-3 in
+            // 10 s; this is second order in dt.
+            self.nonlinear_half(&mut hk, &mut vk, 0.5 * dt);
         }
         let damping = (-0.05 * dt).exp(); // per second: viscosity, the lane ropes
         for m in 0..px * py {
@@ -244,6 +230,9 @@ impl Far {
                 vk[m] = (v * c - h * (w * s)) * damping;
             }
         }
+        if self.nonlinear {
+            self.nonlinear_half(&mut hk, &mut vk, 0.5 * dt);
+        }
         self.fft2(&mut hk, true);
         self.fft2(&mut vk, true);
         for j in 0..ny {
@@ -253,6 +242,56 @@ impl Far {
             }
         }
         self.time += dt;
+    }
+
+    /// The second-order Zakharov terms as a rate in spectral space:
+    ///   η̇ = −∇·(η ∇ψ) − G[η G[ψ]],   ψ̇ = −½|∇ψ|² + ½ (G[ψ])²,
+    /// with ψ_k = v_k / G_k and G[ψ] = v. Returns (dη_k/dt, dv_k/dt).
+    fn nonlinear_rate(&self, hk: &[Complex<f64>], vk: &[Complex<f64>]) -> (Vec<Complex<f64>>, Vec<Complex<f64>>) {
+        let (px, py) = (self.px, self.py);
+        let n = px * py;
+        let i = Complex::new(0.0, 1.0);
+        let mut dpx = vec![Complex::new(0.0, 0.0); n];
+        let mut dpy = vec![Complex::new(0.0, 0.0); n];
+        for m in 0..n {
+            let g = self.gk[m];
+            let psik = if g > 1e-9 { vk[m] / g } else { Complex::new(0.0, 0.0) };
+            dpx[m] = i * self.kx[m] * psik;
+            dpy[m] = i * self.ky[m] * psik;
+        }
+        let eta = self.to_physical(hk.to_vec());
+        let gpsi = self.to_physical(vk.to_vec());
+        let psi_x = self.to_physical(dpx);
+        let psi_y = self.to_physical(dpy);
+        let q = eta.len();
+        let fx: Vec<f64> = (0..q).map(|a| eta[a] * psi_x[a]).collect();
+        let fy: Vec<f64> = (0..q).map(|a| eta[a] * psi_y[a]).collect();
+        let eg: Vec<f64> = (0..q).map(|a| eta[a] * gpsi[a]).collect();
+        let dpsi: Vec<f64> = (0..q).map(|a| -0.5 * (psi_x[a] * psi_x[a] + psi_y[a] * psi_y[a]) + 0.5 * gpsi[a] * gpsi[a]).collect();
+        let fxk = self.to_spectral(&fx);
+        let fyk = self.to_spectral(&fy);
+        let egk = self.to_spectral(&eg);
+        let dpsik = self.to_spectral(&dpsi);
+        let mut dh = vec![Complex::new(0.0, 0.0); n];
+        let mut dv = vec![Complex::new(0.0, 0.0); n];
+        for m in 0..n {
+            let div = i * self.kx[m] * fxk[m] + i * self.ky[m] * fyk[m];
+            dh[m] = -div - self.gk[m] * egk[m];
+            dv[m] = self.gk[m] * dpsik[m];
+        }
+        (dh, dv)
+    }
+
+    /// Heun's step of the nonlinear terms over `dt`, in place.
+    fn nonlinear_half(&self, hk: &mut [Complex<f64>], vk: &mut [Complex<f64>], dt: f64) {
+        let (dh1, dv1) = self.nonlinear_rate(hk, vk);
+        let h1: Vec<Complex<f64>> = hk.iter().zip(&dh1).map(|(h, d)| h + d * dt).collect();
+        let v1: Vec<Complex<f64>> = vk.iter().zip(&dv1).map(|(v, d)| v + d * dt).collect();
+        let (dh2, dv2) = self.nonlinear_rate(&h1, &v1);
+        for m in 0..hk.len() {
+            hk[m] += (dh1[m] + dh2[m]) * (0.5 * dt);
+            vk[m] += (dv1[m] + dv2[m]) * (0.5 * dt);
+        }
     }
 
     /// Nudge the far field toward the fine surface: fully inside `inner`,
