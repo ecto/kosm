@@ -1512,6 +1512,9 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                         }
                     }
                     println!("far    frame {k:3}  max |h| at 1.5-3 m: {:.1} mm  slope max {:.4}  caustic there {:.2}..{:.2}  in the box {:.2}..{:.2}", amp * 1000.0, slope, cmin, cmax, cin_min, cin_max);
+                    if let Some(f) = &drop.far {
+                        println!("far    frame {k:3}  wave energy {:.3} J  injected by the nudge so far {:.3} J", 1000.0 * f.energy(), 1000.0 * f.injected);
+                    }
                 }
                 println!("water  frame {k:3}  particle z mean {:+.1} mm (rest {:.0})  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, -BOX_DEPTH * 500.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
             }

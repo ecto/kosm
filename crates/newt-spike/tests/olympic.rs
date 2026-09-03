@@ -67,3 +67,55 @@ fn seam_profile_at_impact() {
         x += 0.05;
     }
 }
+
+#[test]
+fn far_field_conserves_energy() {
+    use newt_spike::far::Far;
+    let mut far = Far::new(0.1);
+    // a Gaussian bump, 2 cm high, 30 cm wide, released from rest
+    let (nx, cell) = (far.grid.nx, far.grid.cell);
+    for j in 0..far.grid.ny {
+        for i in 0..nx {
+            let x = far.grid.origin[0] + (i as f64 + 0.5) * cell;
+            let y = far.grid.origin[1] + (j as f64 + 0.5) * cell;
+            far.grid.z[j * nx + i] = 0.02 * (-(x * x + y * y) / (2.0 * 0.3 * 0.3)).exp();
+        }
+    }
+    // zero mean: the k=0 mode is not a wave, is not damped, and would sit in H as a constant
+    let mean = far.grid.z.iter().sum::<f64>() / far.grid.z.len() as f64;
+    for z in far.grid.z.iter_mut() {
+        *z -= mean;
+    }
+    let e0 = far.energy();
+    let t0 = std::time::Instant::now();
+    let mut worst: f64 = 0.0;
+    for k in 0..600 {
+        far.step(1.0 / 60.0);
+        let e = far.energy();
+        // the step has a 0.05/s damping; undo it for the comparison
+        let expect = e0 * (-0.1 * far.time).exp();
+        worst = worst.max((e - expect).abs() / e0);
+        if k % 120 == 0 {
+            println!("t={:5.2} s  H={:.6e}  expected {:.6e}  rel err {:.2e}", far.time, e, expect, (e - expect).abs() / e0);
+        }
+    }
+    println!("worst relative energy error over 10 s: {worst:.2e}   ({:.1} ms per step incl. energy)", t0.elapsed().as_millis() as f64 / 600.0);
+    assert!(worst < 1e-6, "linear spectral step must conserve H to roundoff");
+}
+
+#[test]
+fn far_fft_speed() {
+    use newt_spike::far::Far;
+    let mut far = Far::new(0.1);
+    far.grid.z[1000] = 0.01;
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        far.step(1.0 / 60.0);
+    }
+    println!("step only: {:.1} ms", t.elapsed().as_millis() as f64 / 20.0);
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        let _ = far.energy();
+    }
+    println!("energy only: {:.1} ms", t.elapsed().as_millis() as f64 / 20.0);
+}
