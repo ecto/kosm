@@ -389,6 +389,7 @@ impl Water {
         // wall lesson, again): centre index and radius² in cells
         let ic = ((0.0 - origin.x) / h).round() as i64;
         let jc = ((0.0 - origin.y) / h).round() as i64;
+        let rcells = (box_half() / h) as f32;
         let r2 = (box_half() / h).powi(2);
         let outside = move |i: usize, j: usize| -> bool {
             let (di, dj) = (i as i64 - ic, j as i64 - jc);
@@ -538,13 +539,21 @@ impl Water {
                             // above. Without this the region's edge read thin,
                             // felt no pressure, and the disc flowed outward into
                             // a pile against its own wall.
-                            if outside(a as usize, b as usize) {
-                                if xi.z < 0.0 {
-                                    acc += full_node;
-                                }
+                            // beyond the region: zero gradient, as at the walls —
+                            // read the nearest node inside the circle along the
+                            // radius (a fixed rest density there pushed on water
+                            // that packs a few percent denser than rest)
+                            let (a, b) = if outside(a as usize, b as usize) {
+                                let (di, dj) = ((a - ic) as f32, (b - jc) as f32);
+                                let d = (di * di + dj * dj).sqrt().max(1.0);
+                                let sc = (rcells - 1.0) / d;
+                                (ic + (di * sc).round() as i64, jc + (dj * sc).round() as i64)
                             } else {
-                                acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
-                            }
+                                (a, b)
+                            };
+                            let a = a.clamp(0, nx as i64 - 1);
+                            let b = b.clamp(0, ny as i64 - 1);
+                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
                         }
                     }
                 }

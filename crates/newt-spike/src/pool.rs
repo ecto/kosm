@@ -749,6 +749,11 @@ impl Drop {
                                 break;
                             }
                             let i = jy * g.nx + ix;
+                            // wet cells with wet neighbours only: the step from
+                            // water to a dry column beyond the disc is not a wave
+                            if g.z[i] < -1.0 || g.z[i + 1] < -1.0 || g.z[i - 1] < -1.0 || g.z[i + g.nx] < -1.0 || g.z[i - g.nx] < -1.0 {
+                                continue;
+                            }
                             let rise = (g.z[i] - prev.z[i]) / frame_dt;
                             let sx = (g.z[i + 1] - g.z[i - 1]) / (2.0 * g.cell);
                             let sy = (g.z[i + g.nx] - g.z[i - g.nx]) / (2.0 * g.cell);
@@ -804,16 +809,24 @@ impl Drop {
             // extraction); joined to a far field at zero that is a dish
             // four metres wide, and a dish that wide is a lens
             {
+                // over the wet cells only: the dry corners of the square
+                // beyond the disc report the floor, and averaging them in
+                // lifted the whole disc a third of a metre
                 let (mut sum, mut n) = (0.0, 0.0f64);
                 for jy in 3..g.ny.saturating_sub(3) {
                     for ix in 3..g.nx.saturating_sub(3) {
-                        sum += g.z[jy * g.nx + ix];
-                        n += 1.0;
+                        let z = g.z[jy * g.nx + ix];
+                        if z > -1.0 {
+                            sum += z;
+                            n += 1.0;
+                        }
                     }
                 }
                 let mean = sum / n.max(1.0);
                 for z in g.z.iter_mut() {
-                    *z -= mean;
+                    if *z > -1.0 {
+                        *z -= mean;
+                    }
                 }
             }
             if let Some(far) = self.far.as_mut() {

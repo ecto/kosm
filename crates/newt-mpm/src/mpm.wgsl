@@ -680,12 +680,22 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 // an inactive neighbour is empty; the dilation guarantees every
                 // node with mass, and every mirror target of one, is in an active block
                 // beyond the region: the far field's water, at rest (see the CPU solver)
+                // beyond the region: zero gradient, the nearest node inside the
+                // circle along the radius (see the CPU solver)
+                var a2 = aa; var b2 = bb;
                 if (outside_region(aa, bb)) {
-                    if (xn.z < 0.0) { acc += full_node; }
-                } else {
-                    let gn = node_index(aa, bb, ccc);
-                    if (gn >= 0) { acc += gvel[u32(gn)].w; }
+                    let inv_h = P.k.y;
+                    let ic = i32(round((P.lo.x - P.origin_h.x) * inv_h));
+                    let jc = i32(round((P.lo.y - P.origin_h.y) * inv_h));
+                    let di = f32(aa - ic);
+                    let dj = f32(bb - jc);
+                    let d = max(sqrt(di * di + dj * dj), 1.0);
+                    let sc = (P.hi.x * inv_h - 1.0) / d;
+                    a2 = clamp(ic + i32(round(di * sc)), 0, i32(P.n.x) - 1);
+                    b2 = clamp(jc + i32(round(dj * sc)), 0, i32(P.n.y) - 1);
                 }
+                let gn = node_index(a2, b2, ccc);
+                if (gn >= 0) { acc += gvel[u32(gn)].w; }
             }
         }
     }
