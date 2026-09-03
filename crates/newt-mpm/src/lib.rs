@@ -39,6 +39,11 @@
 //! sixth for the splash (`NEWT_MAX_BLOCKS` overrides), and `step` panics with
 //! the numbers if the water ever outgrows it.
 
+pub mod caustic;
+pub mod surface;
+pub use caustic::{CausticCfg, GpuCaustic, Grid};
+pub use surface::Candidates;
+
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
@@ -154,6 +159,8 @@ pub struct GpuMpm {
     active: u32,
     damp: f32,
     sponge: f32,
+    /// The surface-extraction pass, built on first use.
+    surf: Option<surface::Surf>,
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -369,6 +376,7 @@ impl GpuMpm {
             active: 0,
             damp: 1.0,
             sponge: 0.0,
+            surf: None,
         })
     }
 

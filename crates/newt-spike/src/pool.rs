@@ -646,15 +646,24 @@ impl Drop {
     /// grid is too coarse to show a 1 cm drop's ripple; the ring model is
     /// the sub-grid physics for it, scaled by the drop's speed.
     pub fn read_water(&mut self) {
-        if let Some(w) = self.water.as_mut() {
-            w.sync_from_gpu();
-        }
-        if let Some(w) = &self.water {
-            let g = w.surface(0.02);
-            let now = w.droplets(&g, 0.02, 250);
+        // the surface and the drop/foam candidates come off the GPU together;
+        // the pool itself never crosses the bus (see splash::candidates)
+        let picked = self.water.as_mut().map(|w| w.candidates(0.02, 0.02, 0.6, 1.5, 0.6));
+        if let (Some((g, cand)), Some(w)) = (picked, &self.water) {
+            let off = w.level_offset;
+            // the drops: the highest 250 of the candidates over the surface
+            let mut up: Vec<(f64, crate::splash::Droplet)> = cand
+                .iter()
+                .filter_map(|d| {
+                    let s = g.at(d.pos.x, d.pos.y) + off;
+                    if d.pos.z <= s + 0.02 { None } else { Some((d.pos.z - s, *d)) }
+                })
+                .collect();
+            up.sort_by(|a, b| b.0.total_cmp(&a.0));
+            up.truncate(250);
+            let now: Vec<crate::splash::Droplet> = up.into_iter().map(|(_, d)| d).collect();
             let t = self.state.time;
             let mut landed = 0;
-            let off = w.level_offset;
             for d in &self.droplets {
                 let z_here = g.at(d.pos.x, d.pos.y) + off;
                 let still_up = now.iter().any(|n| (n.pos - d.pos).norm() < 0.05 && n.pos.z > z_here + 0.02);
@@ -673,7 +682,9 @@ impl Drop {
             // the surface moves faster than a metre a second, more the
             // faster; it keeps that momentum, slowed, and lives a couple
             // of seconds. (Ihmsen et al.'s trapped-air potential, reduced
-            // to what the downloaded particles can tell us.)
+            // to what the picked candidates can tell us -- which is all of
+            // the fast near-surface water, because that is what the picker
+            // is asked for.)
             let frame_dt = 1.0 / fps();
             let mut seed = (t * 1e6) as u64 | 1;
             let mut rnd = || {
@@ -685,7 +696,8 @@ impl Drop {
             let budget = 40_000usize.saturating_sub(self.foam.len());
             let mut born = 0;
             let (mut fast, mut band) = (0usize, 0usize);
-            for (p, v) in w.x.iter().zip(&w.v) {
+            for d in &cand {
+                let (p, v) = (&d.pos, &d.vel);
                 if born >= budget {
                     break;
                 }
@@ -960,6 +972,37 @@ pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
             },
         );
     Caustic { origin, cell, nx, ny, e }
+}
+
+/// The same caustic, traced on the GPU: three million rays, the composed
+/// surface evaluated in WGSL, deposited through fixed-point atomics. The CPU
+/// version above stays the reference; `NEWT_GPU_RENDER=0` selects it.
+pub fn caustic_gpu(gpu: &mut newt_mpm::GpuCaustic, surface: &Surface, cell: f64) -> Option<Caustic> {
+    let g = surface.grid.as_ref()?;
+    let half = box_half() + 3.0;
+    let fz: Vec<f32> = g.z.iter().map(|z| *z as f32).collect();
+    // no far field yet (the first frames, or the ring model): a flat pool
+    let zero = crate::splash::HeightGrid { origin: [-POOL_X, -POOL_Y], cell: POOL_X, nx: 2, ny: 2, z: vec![0.0; 4] };
+    let f = surface.far.as_ref().unwrap_or(&zero);
+    let rz: Vec<f32> = f.z.iter().map(|z| *z as f32).collect();
+    let d = -sun_dir();
+    let cfg = newt_mpm::CausticCfg {
+        cell: cell as f32,
+        half: half as f32,
+        margin: 1.5,
+        sub: 3,
+        depth: DEPTH as f32,
+        n_water: N_WATER as f32,
+        dir: [d.x as f32, d.y as f32, d.z as f32],
+        t: surface.t as f32,
+        box_half: box_half() as f32,
+        sponge: SPONGE as f32,
+        blend: BLEND as f32,
+    };
+    let fine = newt_mpm::Grid { origin: [g.origin[0] as f32, g.origin[1] as f32], cell: g.cell as f32, nx: g.nx as u32, ny: g.ny as u32, z: &fz };
+    let far = newt_mpm::Grid { origin: [f.origin[0] as f32, f.origin[1] as f32], cell: f.cell as f32, nx: f.nx as u32, ny: f.ny as u32, z: &rz };
+    let (nx, ny, e) = gpu.trace(&cfg, &fine, &far);
+    Some(Caustic { origin: [-half, -half], cell, nx, ny, e: e.into_iter().map(|v| v as f64).collect() })
 }
 
 pub struct View {
@@ -1377,6 +1420,21 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     // water shows the tiles
     let view = View { eye: V::new(-3.2, -2.6, 0.9), target: V::new(0.0, 0.1, -0.1), width, height, vfov: 0.9 };
     let steps_per_frame = (1.0 / fps() / drop.model.dt).round() as usize;
+    // NEWT_GPU_RENDER=0 keeps the caustic on the CPU, for comparison
+    let mut cgpu = if std::env::var("NEWT_GPU_RENDER").map(|v| v != "0").unwrap_or(true) {
+        match newt_mpm::GpuCaustic::new() {
+            Ok(g) => {
+                println!("pool   caustic on the GPU");
+                Some(g)
+            }
+            Err(e) => {
+                println!("pool   caustic on the CPU ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let t0 = std::time::Instant::now();
     let mut lowest = f64::INFINITY;
     for k in 0..frames {
@@ -1393,7 +1451,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
         lowest = lowest.min(drop.centre().z);
         drop.read_water();
         tick(1, &mut lap);
-        let c = caustic(&drop.surface, 0.02);
+        let c = cgpu.as_mut().and_then(|g| caustic_gpu(g, &drop.surface, 0.02)).unwrap_or_else(|| caustic(&drop.surface, 0.02));
         tick(2, &mut lap);
         let peak_force = drop.fluid_force;
         drop.fluid_force = V::zero();
@@ -1407,7 +1465,14 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
         }
         if k == 0 || k % 5 == 0 || k + 1 == frames || std::env::var_os("NEWT_PROF").is_some() {
             let m = drop.centre();
-            if let Some(w) = &drop.water {
+            // these read every particle, so they cost a full download: they
+            // are diagnostics, not the frame, and only run when asked for
+            if std::env::var_os("NEWT_WATER_STATS").is_some() {
+                if let Some(w) = drop.water.as_mut() {
+                    w.sync_from_gpu();
+                }
+            }
+            if let (Some(w), true) = (&drop.water, std::env::var_os("NEWT_WATER_STATS").is_some()) {
                 let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
                 zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let mean = zs.iter().sum::<f64>() / zs.len() as f64;
@@ -1447,6 +1512,9 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                         }
                     }
                     println!("far    frame {k:3}  max |h| at 1.5-3 m: {:.1} mm  slope max {:.4}  caustic there {:.2}..{:.2}  in the box {:.2}..{:.2}", amp * 1000.0, slope, cmin, cmax, cin_min, cin_max);
+                    if let Some(f) = &drop.far {
+                        println!("far    frame {k:3}  wave energy {:.3} J  injected by the nudge so far {:.3} J", 1000.0 * f.energy(), 1000.0 * f.injected);
+                    }
                 }
                 println!("water  frame {k:3}  particle z mean {:+.1} mm (rest {:.0})  z50 {:+.1}  z90 {:+.1}  z99 {:+.1} mm", mean * 1000.0, -BOX_DEPTH * 500.0, zs[zs.len() / 2] * 1000.0, zs[zs.len() * 9 / 10] * 1000.0, zs[zs.len() * 99 / 100] * 1000.0);
             }

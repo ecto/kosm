@@ -19,6 +19,11 @@ use phyz_math::{GRAVITY, Mat3, Vec3};
 use rayon::prelude::*;
 
 /// Per-substep share of the mass-based J blended into the integrated J.
+/// How many drop/foam candidates the GPU picker may hand back per frame.
+pub fn cand_cap() -> u32 {
+    std::env::var("NEWT_CAND").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000)
+}
+
 pub fn j_relax() -> f64 {
     std::env::var("NEWT_JRELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02)
 }
@@ -164,7 +169,10 @@ impl Water {
             g_mass: vec![0.0; nx * ny * nz],
             g_mom: vec![Vec3::zeros(); nx * ny * nz],
             g_vel_old: vec![Vec3::zeros(); nx * ny * nz],
-            flip: std::env::var("NEWT_FLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9),
+            // 0.9 carried a hundred times the kinetic noise of 0.5 in a settled
+            // pool (548 J vs 5 J at 5 cm) with the same packing; see
+            // tests/olympic.rs settled_water_energy_is_steady
+            flip: std::env::var("NEWT_FLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
             bulk,
             time: 0.0,
             interior_mass: 0.0,
@@ -209,6 +217,23 @@ impl Water {
             }
         }
         (raw / full, blur / full)
+    }
+
+    /// The water's energy (J): kinetic, gravitational (relative to z = 0),
+    /// and the internal energy the equation of state stores in compression,
+    /// which for p = K(1/J − 1) is K·vol0·(J − 1 − ln J) per particle. This
+    /// is the fine side of the ledger the far field keeps in `Far::energy`.
+    pub fn energy(&self) -> (f64, f64, f64) {
+        let m = self.mass;
+        let mut kin = 0.0;
+        let mut pot = 0.0;
+        let mut int = 0.0;
+        for ((x, v), j) in self.x.iter().zip(&self.v).zip(&self.j) {
+            kin += 0.5 * m * v.norm_squared();
+            pot += m * GRAVITY * x.z;
+            int += self.bulk * self.vol0 * (j - 1.0 - j.ln());
+        }
+        (kin, pot, int)
     }
 
     pub fn count(&self) -> usize {
@@ -407,8 +432,21 @@ impl Water {
                             let new = body.vel;
                             reaction += (new - vel) * m;
                             vel = new;
-                        } else if d < 0.5 * h {
-                            // the shell: no approach through the surface, free slip along it
+                        } else if d < h {
+                            // the shell: no approach through the surface, free
+                            // slip along it. A full cell, not half of one: the
+                            // band is a seal, not a fattening of the melon.
+                            // Widening it from h/2 to h moves the hydrostatic
+                            // force by 8% at 2.5 cm — a half cell of extra
+                            // displaced volume would have moved it by 65% — and
+                            // it moves it *down* at 5 cm, where the leak is
+                            // worst. What half a cell left open was a quadratic
+                            // B-spline's reach across the interface: a particle
+                            // a cell outside still writes momentum to nodes the
+                            // melon covers, and unbraced those nodes let the
+                            // pressure through. The leak was a few percent of
+                            // Archimedes, which is more than the whole net
+                            // buoyancy of a melon at 950 kg/m^3.
                             let rel = vel - body.vel;
                             let vn = rel.dot(&nrm);
                             if vn < 0.0 {
@@ -428,7 +466,6 @@ impl Water {
         // the raw node mass is too noisy an estimate (the water boils); a
         // 3x3x3 box blur is not, and unlike integrating the divergence it
         // cannot drift from the positions
-        let full_node = 1000.0 * h * h * h;
         let g_blur: Vec<f64> = (0..nx * ny * nz)
             .into_par_iter()
             .map(|g| {
@@ -444,16 +481,32 @@ impl Water {
                             let a = (i as i64 + di).clamp(2, nx as i64 - 3);
                             let b = (jj as i64 + dj).clamp(2, ny as i64 - 3);
                             let cc = (k as i64 + dk).clamp(2, nz as i64 - 3);
-                            // inside the body the water continues at rest
-                            // density, as at the walls: otherwise the fluid
-                            // next to the melon reads thin, builds no
-                            // pressure, and the melon feels no buoyancy
+                            // inside the body the water continues, as at the
+                            // walls: otherwise the fluid next to the melon
+                            // reads thin, builds no pressure, and the melon
+                            // feels no buoyancy. "Continues" has to mean the
+                            // same thing it means at the walls — copy the
+                            // nearest fluid node across the surface — not
+                            // "rest density". Rest density is zero pressure,
+                            // and the water down here is under three metres
+                            // of head; pinning the ghost at zero dragged the
+                            // pressure down on the melon's underside and cost
+                            // a few percent of Archimedes, which is all the
+                            // net buoyancy a 950 kg/m^3 melon has.
                             let xi = origin + Vec3::new(a as f64, b as f64, cc as f64) * h;
-                            if body.sdf(xi).0 < 0.0 {
-                                acc += full_node;
+                            let (sd, sn) = body.sdf(xi);
+                            let (a, b, cc) = if sd < 0.0 {
+                                // a cell clear of the surface, along the normal
+                                let q = (xi + sn * (h - sd) - origin) * inv_h;
+                                (
+                                    (q.x.round() as i64).clamp(2, nx as i64 - 3),
+                                    (q.y.round() as i64).clamp(2, ny as i64 - 3),
+                                    (q.z.round() as i64).clamp(2, nz as i64 - 3),
+                                )
                             } else {
-                                acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
-                            }
+                                (a, b, cc)
+                            };
+                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
                         }
                     }
                 }
@@ -469,10 +522,10 @@ impl Water {
         // half a cell beyond it was a band that packed 2x
         let e = 2.0 * h;
         let (xmax, ymax, zmax) = (origin.x + (nx - 1) as f64 * h - e, origin.y + (ny - 1) as f64 * h - e, origin.z + (nz - 1) as f64 * h - e);
-        {
+        let proj = {
             let Water { x, v, c, j, g_mass, g_mom, g_vel_old, .. } = &mut *self;
             let (g_mass, g_mom, g_vel_old, g_blur) = (&*g_mass, &*g_mom, &*g_vel_old, &g_blur);
-            x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).for_each(|(((xp, vp), cp), jp)| {
+            x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).map(|(((xp, vp), cp), jp)| {
                 let base = ((*xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
                 let fx = (*xp - origin) * inv_h - base;
                 let w = weights(fx);
@@ -538,6 +591,7 @@ impl Water {
                 // was filling with water and sank), so particles inside are
                 // put back on its surface with no inward relative velocity
                 let (d, n) = body.sdf(*xp);
+                let mut kick = Vec3::zeros();
                 if d < 0.0 {
                     // a quarter cell clear of the surface, so the next
                     // substep's pressure does not put it straight back
@@ -545,15 +599,22 @@ impl Water {
                     let vn = (*vp - body.vel).dot(&n);
                     if vn < 0.0 {
                         *vp -= n * vn;
+                        // this is the body pushing on the water just as the
+                        // grid constraint is, and it goes in the same ledger:
+                        // unbooked, the melon feels every impulse it hands out
+                        // here for free, and the free ones are the ones that
+                        // would have held it up
+                        kick = -n * vn * mass;
                     }
                 }
-            });
-        }
+                kick
+            }).reduce(Vec3::zeros, |a, b| a + b)
+        };
         prof(4, &mut pt);
         self.time += dt;
         self.interior_mass = interior;
         // the force on the body is minus what the fluid gained, per unit time
-        -reaction / dt
+        -(reaction + proj) / dt
     }
 
     /// Let the fill pack down under gravity with nothing in the pool, then
@@ -672,6 +733,7 @@ impl Water {
             .collect();
         self.level_offset = inner.iter().sum::<f64>() / inner.len().max(1) as f64;
         self.rest = Some(g);
+        self.upload_rest();
     }
 
     /// The free surface as a height field at `cell` resolution over the pool,
@@ -755,6 +817,87 @@ impl Water {
             }
         }
         out
+    }
+
+    /// The free surface, extracted by the GPU from the grid mass it already
+    /// holds, with exactly the semantics of `surface`: the same blur, the
+    /// same half-crossing scan, the same four smooths, the same rest map.
+    /// Only the height field comes back.
+    ///
+    /// The `pick_*` arguments ride along: while the height field is still on
+    /// the device, a compaction kernel marks the particles the CPU still
+    /// wants, so `gpu_candidates` can fetch a few thousand instead of six
+    /// million.
+    pub fn surface_gpu(&mut self, cell: f64, above: f64, speed: f64, below: f64, up: f64) -> Option<HeightGrid> {
+        let (h, off, cap) = (self.h, self.level_offset, cand_cap());
+        let gpu = self.gpu.as_mut()?;
+        let bx = box_half();
+        let z = gpu.surface(cell as f32, bx as f32, -BOX_DEPTH as f32, off as f32, above as f32, speed as f32, (below * h) as f32, up as f32, cap);
+        let nx = ((2.0 * bx) / cell) as usize;
+        let ny = ((2.0 * bx) / cell) as usize;
+        Some(HeightGrid { origin: [-bx, -bx], cell, nx, ny, z: z.iter().map(|v| *v as f64).collect() })
+    }
+
+    /// What the last `surface_gpu` picked out, as drops.
+    pub fn gpu_candidates(&self) -> Vec<Droplet> {
+        let Some(gpu) = self.gpu.as_ref() else { return Vec::new() };
+        let c = gpu.candidates();
+        if c.found > c.x.len() as u32 && std::env::var_os("NEWT_PROF").is_some() {
+            println!("pick   {} candidates found, {} kept (raise NEWT_CAND)", c.found, c.x.len());
+        }
+        c.x.iter()
+            .zip(&c.v)
+            .map(|(x, v)| Droplet { pos: Vec3::new(x[0] as f64, x[1] as f64, x[2] as f64), vel: Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64), crowd: x[3] as f64 })
+            .collect()
+    }
+
+    /// Hand the GPU the rest map the settle just captured, so its extraction
+    /// cancels the same lattice noise the CPU's does.
+    pub fn upload_rest(&mut self) {
+        if self.gpu.is_none() {
+            return;
+        }
+        // one throwaway extraction to build the pass, then the map itself
+        let _ = self.surface_gpu(0.02, 0.02, 0.6, 1.5, 0.6);
+        let Some(r) = self.rest.as_ref().map(|r| r.z.iter().map(|z| *z as f32).collect::<Vec<f32>>()) else { return };
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_rest(&r);
+        }
+    }
+
+    /// The surface and the particles worth looking at this frame: the drops
+    /// more than `above` over it, and the water faster than `speed` in the
+    /// band from `below` cells under it to `up` metres over it. On the GPU
+    /// both come off the device already reduced; on the CPU it is the same
+    /// filter over the mirrors, so the two paths pick the same set.
+    pub fn candidates(&mut self, cell: f64, above: f64, speed: f64, below: f64, up: f64) -> (HeightGrid, Vec<Droplet>) {
+        if self.gpu.is_some() && std::env::var("NEWT_GPU_SURFACE").map(|v| v != "0").unwrap_or(true) {
+            if let Some(g) = self.surface_gpu(cell, above, speed, below, up) {
+                let c = self.gpu_candidates();
+                return (g, c);
+            }
+        }
+        self.sync_from_gpu();
+        let g = self.surface(cell);
+        let (off, h, full) = (self.level_offset, self.h, 1000.0 * self.h * self.h * self.h);
+        let c = self
+            .x
+            .par_iter()
+            .zip(&self.v)
+            .filter_map(|(p, v)| {
+                let s = g.at(p.x, p.y) + off;
+                let drop = p.z > s + above;
+                let foam = v.norm() >= speed && p.z >= s - below * h && p.z <= s + up;
+                if !drop && !foam {
+                    return None;
+                }
+                let gi = (((p.x - self.origin.x) / h).round() as i64).clamp(0, self.nx as i64 - 1) as usize;
+                let gj = (((p.y - self.origin.y) / h).round() as i64).clamp(0, self.ny as i64 - 1) as usize;
+                let gk = (((p.z - self.origin.z) / h).round() as i64).clamp(0, self.nz as i64 - 1) as usize;
+                Some(Droplet { pos: *p, vel: *v, crowd: (self.g_mass[self.idx(gi, gj, gk)] / full).min(1.0) })
+            })
+            .collect();
+        (g, c)
     }
 
     /// Particles flying above the local surface: the drops, with their

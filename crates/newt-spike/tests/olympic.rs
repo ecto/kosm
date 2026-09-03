@@ -67,3 +67,100 @@ fn seam_profile_at_impact() {
         x += 0.05;
     }
 }
+
+#[test]
+fn far_field_conserves_energy() {
+    use newt_spike::far::Far;
+    let mut far = Far::new(0.1);
+    // a Gaussian bump, 2 cm high, 30 cm wide, released from rest
+    let (nx, cell) = (far.grid.nx, far.grid.cell);
+    for j in 0..far.grid.ny {
+        for i in 0..nx {
+            let x = far.grid.origin[0] + (i as f64 + 0.5) * cell;
+            let y = far.grid.origin[1] + (j as f64 + 0.5) * cell;
+            far.grid.z[j * nx + i] = 0.02 * (-(x * x + y * y) / (2.0 * 0.3 * 0.3)).exp();
+        }
+    }
+    // zero mean: the k=0 mode is not a wave, is not damped, and would sit in H as a constant
+    let mean = far.grid.z.iter().sum::<f64>() / far.grid.z.len() as f64;
+    for z in far.grid.z.iter_mut() {
+        *z -= mean;
+    }
+    let e0 = far.energy();
+    let t0 = std::time::Instant::now();
+    let mut worst: f64 = 0.0;
+    for k in 0..600 {
+        far.step(1.0 / 60.0);
+        let e = far.energy();
+        // the step has a 0.05/s damping; undo it for the comparison
+        let expect = e0 * (-0.1 * far.time).exp();
+        worst = worst.max((e - expect).abs() / e0);
+        if k % 120 == 0 {
+            println!("t={:5.2} s  H={:.6e}  expected {:.6e}  rel err {:.2e}", far.time, e, expect, (e - expect).abs() / e0);
+        }
+    }
+    println!("worst relative energy error over 10 s: {worst:.2e}   ({:.1} ms per step incl. energy)", t0.elapsed().as_millis() as f64 / 600.0);
+    if std::env::var("NEWT_FAR_NL").map(|v| v == "1").unwrap_or(false) {
+        // second-order terms, Strang split with Heun: 7.6e-5 measured
+        assert!(worst < 1e-3, "nonlinear far field must conserve H₂ + H₃ to the split's order");
+    } else {
+        assert!(worst < 1e-6, "linear spectral step must conserve H to roundoff");
+    }
+}
+
+#[test]
+fn far_fft_speed() {
+    use newt_spike::far::Far;
+    let mut far = Far::new(0.1);
+    far.grid.z[1000] = 0.01;
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        far.step(1.0 / 60.0);
+    }
+    println!("step only: {:.1} ms", t.elapsed().as_millis() as f64 / 20.0);
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        let _ = far.energy();
+    }
+    println!("energy only: {:.1} ms", t.elapsed().as_millis() as f64 / 20.0);
+}
+
+#[test]
+fn settled_water_energy_is_steady() {
+    use newt_spike::splash::{Body, Water};
+    use phyz_math::Vec3;
+    let h = 0.05;
+    let bulk = 2.0e6;
+    let dt = 0.35 * h / (bulk / 1000.0f64).sqrt();
+    let mut w = Water::fill(h, dt, 0.5, bulk);
+    w.enable_gpu(256).expect("gpu");
+    w.settle(2.0);
+    w.sync_from_gpu();
+    let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+    let (k0, p0, i0) = w.energy();
+    let zmean = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
+    let jmean = w.j.iter().sum::<f64>() / w.j.len() as f64;
+    println!("settled (flip {} relax {}): kinetic {k0:.2} J  potential {p0:.1} J  internal {i0:.2} J  z mean {zmean:.3} (rest -1.0)  J mean {jmean:.4}", w.flip, newt_spike::splash::j_relax());
+    let mut worst: f64 = 0.0;
+    for n in 1..=10 {
+        w.step_block(&far, 256);
+        w.sync_from_gpu();
+        let (k, p, i) = w.energy();
+        let d = (k + p + i) - (k0 + p0 + i0);
+        worst = worst.max(d.abs());
+        let zm = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
+        println!("+{:4} substeps: kinetic {k:.2}  potential {p:.1}  internal {i:.2}  total drift {d:+.2} J  z mean {zm:.3}", n * 256);
+    }
+    let scale = p0.abs();
+    println!("worst total drift {worst:.2} J of {scale:.0} J potential ({:.2e} relative)", worst / scale);
+    // Measured 2026-09-02 at 5 cm, 2.6 k substeps after a 2 s settle, drift as a share of |potential|:
+    //   FLIP 0.9 relax 0.02: kinetic 548 J at rest, drift +1.5e-2
+    //   FLIP 0.5 relax 0.02: kinetic   5 J,         drift +1.2e-2
+    //   FLIP 0   relax 0.02: kinetic   3 J,         drift -3.2e-2
+    //   FLIP 0   relax 0   : kinetic   5 J, packing 6% (best), internal energy 168 kJ and growing (J drifts)
+    //   FLIP 0   relax 1.0 : kinetic 45 -> 269 J,  drift -7.8e-2
+    // The drift is in the EOS term: J is not derived from the positions, so
+    // the strain energy it books is partly fictitious. Until J is honest the
+    // MPM energy is a diagnostic, not an invariant; this asserts the loose bound.
+    assert!(worst / scale < 5e-2);
+}

@@ -243,7 +243,7 @@ fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         // fully the body's velocity inside (see the CPU solver)
         dv = P.b_vel.xyz - vel;
         vel = P.b_vel.xyz;
-    } else if (d < 0.5 * h) {
+    } else if (d < h) {  // a full cell of seal, not half of one (see the CPU solver)
         let rel = vel - P.b_vel.xyz;
         let vn = dot(rel, nrm);
         if (vn < 0.0) {
@@ -353,7 +353,16 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     if (sd.w < 0.0) {
         pos -= sd.xyz * (sd.w - 0.25 * h);
         let vn = dot(vp - P.b_vel.xyz, sd.xyz);
-        if (vn < 0.0) { vp -= sd.xyz * vn; }
+        if (vn < 0.0) {
+            vp -= sd.xyz * vn;
+            // booked into the same ledger as the grid constraint: this is the
+            // body pushing on the water too (see the CPU solver)
+            let slot = 4u * P.misc.x;
+            let r = -sd.xyz * vn * REACT_SCALE;
+            atomicAdd(&react[slot], i32(round(r.x)));
+            atomicAdd(&react[slot + 1u], i32(round(r.y)));
+            atomicAdd(&react[slot + 2u], i32(round(r.z)));
+        }
     }
     v[p] = vec4<f32>(vp, v[p].w); // w carries the particle's original id
     x[p] = vec4<f32>(pos, dj);
@@ -615,7 +624,6 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let j = ijk.y;
     let k = ijk.z;
     let hh = P.origin_h.w;
-    let full_node = P.k.z * hh * hh * hh / P.k.w;
     var acc = 0.0;
     for (var dk = -1; dk <= 1; dk++) {
         for (var dj = -1; dj <= 1; dj++) {
@@ -624,17 +632,22 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 let a = clamp(i + di, 2, i32(P.n.x) - 3);
                 let b = clamp(j + dj, 2, i32(P.n.y) - 3);
                 let cc = clamp(k + dk, 2, i32(P.n.z) - 3);
-                // inside the body: rest density (see the CPU solver)
+                // inside the body: the nearest fluid node across the
+                // surface, the same Neumann extension the walls get from the
+                // clamp above (see the CPU solver)
                 let xn = P.origin_h.xyz + vec3<f32>(f32(a), f32(b), f32(cc)) * P.origin_h.w;
-                if (body_sdf(xn).w < 0.0) {
-                    acc += full_node;
-                } else {
-                    // an inactive neighbour is empty; the dilation guarantees
-                    // every node with mass, and every wall mirror of one, is
-                    // in an active block
-                    let gn = node_index(a, b, cc);
-                    if (gn >= 0) { acc += gvel[u32(gn)].w; }
+                let sd = body_sdf(xn);
+                var aa = a; var bb = b; var ccc = cc;
+                if (sd.w < 0.0) {
+                    let q = (xn + sd.xyz * (hh - sd.w) - P.origin_h.xyz) * P.k.y;
+                    aa = clamp(i32(round(q.x)), 2, i32(P.n.x) - 3);
+                    bb = clamp(i32(round(q.y)), 2, i32(P.n.y) - 3);
+                    ccc = clamp(i32(round(q.z)), 2, i32(P.n.z) - 3);
                 }
+                // an inactive neighbour is empty; the dilation guarantees every
+                // node with mass, and every mirror target of one, is in an active block
+                let gn = node_index(aa, bb, ccc);
+                if (gn >= 0) { acc += gvel[u32(gn)].w; }
             }
         }
     }
