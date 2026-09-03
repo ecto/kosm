@@ -407,8 +407,21 @@ impl Water {
                             let new = body.vel;
                             reaction += (new - vel) * m;
                             vel = new;
-                        } else if d < 0.5 * h {
-                            // the shell: no approach through the surface, free slip along it
+                        } else if d < h {
+                            // the shell: no approach through the surface, free
+                            // slip along it. A full cell, not half of one: the
+                            // band is a seal, not a fattening of the melon.
+                            // Widening it from h/2 to h moves the hydrostatic
+                            // force by 8% at 2.5 cm — a half cell of extra
+                            // displaced volume would have moved it by 65% — and
+                            // it moves it *down* at 5 cm, where the leak is
+                            // worst. What half a cell left open was a quadratic
+                            // B-spline's reach across the interface: a particle
+                            // a cell outside still writes momentum to nodes the
+                            // melon covers, and unbraced those nodes let the
+                            // pressure through. The leak was a few percent of
+                            // Archimedes, which is more than the whole net
+                            // buoyancy of a melon at 950 kg/m^3.
                             let rel = vel - body.vel;
                             let vn = rel.dot(&nrm);
                             if vn < 0.0 {
@@ -428,7 +441,6 @@ impl Water {
         // the raw node mass is too noisy an estimate (the water boils); a
         // 3x3x3 box blur is not, and unlike integrating the divergence it
         // cannot drift from the positions
-        let full_node = 1000.0 * h * h * h;
         let g_blur: Vec<f64> = (0..nx * ny * nz)
             .into_par_iter()
             .map(|g| {
@@ -444,16 +456,32 @@ impl Water {
                             let a = (i as i64 + di).clamp(2, nx as i64 - 3);
                             let b = (jj as i64 + dj).clamp(2, ny as i64 - 3);
                             let cc = (k as i64 + dk).clamp(2, nz as i64 - 3);
-                            // inside the body the water continues at rest
-                            // density, as at the walls: otherwise the fluid
-                            // next to the melon reads thin, builds no
-                            // pressure, and the melon feels no buoyancy
+                            // inside the body the water continues, as at the
+                            // walls: otherwise the fluid next to the melon
+                            // reads thin, builds no pressure, and the melon
+                            // feels no buoyancy. "Continues" has to mean the
+                            // same thing it means at the walls — copy the
+                            // nearest fluid node across the surface — not
+                            // "rest density". Rest density is zero pressure,
+                            // and the water down here is under three metres
+                            // of head; pinning the ghost at zero dragged the
+                            // pressure down on the melon's underside and cost
+                            // a few percent of Archimedes, which is all the
+                            // net buoyancy a 950 kg/m^3 melon has.
                             let xi = origin + Vec3::new(a as f64, b as f64, cc as f64) * h;
-                            if body.sdf(xi).0 < 0.0 {
-                                acc += full_node;
+                            let (sd, sn) = body.sdf(xi);
+                            let (a, b, cc) = if sd < 0.0 {
+                                // a cell clear of the surface, along the normal
+                                let q = (xi + sn * (h - sd) - origin) * inv_h;
+                                (
+                                    (q.x.round() as i64).clamp(2, nx as i64 - 3),
+                                    (q.y.round() as i64).clamp(2, ny as i64 - 3),
+                                    (q.z.round() as i64).clamp(2, nz as i64 - 3),
+                                )
                             } else {
-                                acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
-                            }
+                                (a, b, cc)
+                            };
+                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
                         }
                     }
                 }
@@ -469,10 +497,10 @@ impl Water {
         // half a cell beyond it was a band that packed 2x
         let e = 2.0 * h;
         let (xmax, ymax, zmax) = (origin.x + (nx - 1) as f64 * h - e, origin.y + (ny - 1) as f64 * h - e, origin.z + (nz - 1) as f64 * h - e);
-        {
+        let proj = {
             let Water { x, v, c, j, g_mass, g_mom, g_vel_old, .. } = &mut *self;
             let (g_mass, g_mom, g_vel_old, g_blur) = (&*g_mass, &*g_mom, &*g_vel_old, &g_blur);
-            x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).for_each(|(((xp, vp), cp), jp)| {
+            x.par_iter_mut().zip(v.par_iter_mut()).zip(c.par_iter_mut()).zip(j.par_iter_mut()).map(|(((xp, vp), cp), jp)| {
                 let base = ((*xp - origin) * inv_h - Vec3::new(0.5, 0.5, 0.5)).map_floor();
                 let fx = (*xp - origin) * inv_h - base;
                 let w = weights(fx);
@@ -538,6 +566,7 @@ impl Water {
                 // was filling with water and sank), so particles inside are
                 // put back on its surface with no inward relative velocity
                 let (d, n) = body.sdf(*xp);
+                let mut kick = Vec3::zeros();
                 if d < 0.0 {
                     // a quarter cell clear of the surface, so the next
                     // substep's pressure does not put it straight back
@@ -545,15 +574,22 @@ impl Water {
                     let vn = (*vp - body.vel).dot(&n);
                     if vn < 0.0 {
                         *vp -= n * vn;
+                        // this is the body pushing on the water just as the
+                        // grid constraint is, and it goes in the same ledger:
+                        // unbooked, the melon feels every impulse it hands out
+                        // here for free, and the free ones are the ones that
+                        // would have held it up
+                        kick = -n * vn * mass;
                     }
                 }
-            });
-        }
+                kick
+            }).reduce(Vec3::zeros, |a, b| a + b)
+        };
         prof(4, &mut pt);
         self.time += dt;
         self.interior_mass = interior;
         // the force on the body is minus what the fluid gained, per unit time
-        -reaction / dt
+        -(reaction + proj) / dt
     }
 
     /// Let the fill pack down under gravity with nothing in the pool, then
