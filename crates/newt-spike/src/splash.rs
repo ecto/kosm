@@ -19,6 +19,11 @@ use phyz_math::{GRAVITY, Mat3, Vec3};
 use rayon::prelude::*;
 
 /// Per-substep share of the mass-based J blended into the integrated J.
+/// How many drop/foam candidates the GPU picker may hand back per frame.
+pub fn cand_cap() -> u32 {
+    std::env::var("NEWT_CAND").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000)
+}
+
 pub fn j_relax() -> f64 {
     std::env::var("NEWT_JRELAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02)
 }
@@ -672,6 +677,7 @@ impl Water {
             .collect();
         self.level_offset = inner.iter().sum::<f64>() / inner.len().max(1) as f64;
         self.rest = Some(g);
+        self.upload_rest();
     }
 
     /// The free surface as a height field at `cell` resolution over the pool,
@@ -755,6 +761,87 @@ impl Water {
             }
         }
         out
+    }
+
+    /// The free surface, extracted by the GPU from the grid mass it already
+    /// holds, with exactly the semantics of `surface`: the same blur, the
+    /// same half-crossing scan, the same four smooths, the same rest map.
+    /// Only the height field comes back.
+    ///
+    /// The `pick_*` arguments ride along: while the height field is still on
+    /// the device, a compaction kernel marks the particles the CPU still
+    /// wants, so `gpu_candidates` can fetch a few thousand instead of six
+    /// million.
+    pub fn surface_gpu(&mut self, cell: f64, above: f64, speed: f64, below: f64, up: f64) -> Option<HeightGrid> {
+        let (h, off, cap) = (self.h, self.level_offset, cand_cap());
+        let gpu = self.gpu.as_mut()?;
+        let bx = box_half();
+        let z = gpu.surface(cell as f32, bx as f32, -BOX_DEPTH as f32, off as f32, above as f32, speed as f32, (below * h) as f32, up as f32, cap);
+        let nx = ((2.0 * bx) / cell) as usize;
+        let ny = ((2.0 * bx) / cell) as usize;
+        Some(HeightGrid { origin: [-bx, -bx], cell, nx, ny, z: z.iter().map(|v| *v as f64).collect() })
+    }
+
+    /// What the last `surface_gpu` picked out, as drops.
+    pub fn gpu_candidates(&self) -> Vec<Droplet> {
+        let Some(gpu) = self.gpu.as_ref() else { return Vec::new() };
+        let c = gpu.candidates();
+        if c.found > c.x.len() as u32 && std::env::var_os("NEWT_PROF").is_some() {
+            println!("pick   {} candidates found, {} kept (raise NEWT_CAND)", c.found, c.x.len());
+        }
+        c.x.iter()
+            .zip(&c.v)
+            .map(|(x, v)| Droplet { pos: Vec3::new(x[0] as f64, x[1] as f64, x[2] as f64), vel: Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64), crowd: x[3] as f64 })
+            .collect()
+    }
+
+    /// Hand the GPU the rest map the settle just captured, so its extraction
+    /// cancels the same lattice noise the CPU's does.
+    pub fn upload_rest(&mut self) {
+        if self.gpu.is_none() {
+            return;
+        }
+        // one throwaway extraction to build the pass, then the map itself
+        let _ = self.surface_gpu(0.02, 0.02, 0.6, 1.5, 0.6);
+        let Some(r) = self.rest.as_ref().map(|r| r.z.iter().map(|z| *z as f32).collect::<Vec<f32>>()) else { return };
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_rest(&r);
+        }
+    }
+
+    /// The surface and the particles worth looking at this frame: the drops
+    /// more than `above` over it, and the water faster than `speed` in the
+    /// band from `below` cells under it to `up` metres over it. On the GPU
+    /// both come off the device already reduced; on the CPU it is the same
+    /// filter over the mirrors, so the two paths pick the same set.
+    pub fn candidates(&mut self, cell: f64, above: f64, speed: f64, below: f64, up: f64) -> (HeightGrid, Vec<Droplet>) {
+        if self.gpu.is_some() && std::env::var("NEWT_GPU_SURFACE").map(|v| v != "0").unwrap_or(true) {
+            if let Some(g) = self.surface_gpu(cell, above, speed, below, up) {
+                let c = self.gpu_candidates();
+                return (g, c);
+            }
+        }
+        self.sync_from_gpu();
+        let g = self.surface(cell);
+        let (off, h, full) = (self.level_offset, self.h, 1000.0 * self.h * self.h * self.h);
+        let c = self
+            .x
+            .par_iter()
+            .zip(&self.v)
+            .filter_map(|(p, v)| {
+                let s = g.at(p.x, p.y) + off;
+                let drop = p.z > s + above;
+                let foam = v.norm() >= speed && p.z >= s - below * h && p.z <= s + up;
+                if !drop && !foam {
+                    return None;
+                }
+                let gi = (((p.x - self.origin.x) / h).round() as i64).clamp(0, self.nx as i64 - 1) as usize;
+                let gj = (((p.y - self.origin.y) / h).round() as i64).clamp(0, self.ny as i64 - 1) as usize;
+                let gk = (((p.z - self.origin.z) / h).round() as i64).clamp(0, self.nz as i64 - 1) as usize;
+                Some(Droplet { pos: *p, vel: *v, crowd: (self.g_mass[self.idx(gi, gj, gk)] / full).min(1.0) })
+            })
+            .collect();
+        (g, c)
     }
 
     /// Particles flying above the local surface: the drops, with their

@@ -6,6 +6,11 @@
 //! fixed-point accumulators cannot overflow across a block). Particles and
 //! grid mass are downloaded once a frame for surface extraction.
 
+pub mod caustic;
+pub mod surface;
+pub use caustic::{CausticCfg, GpuCaustic, Grid};
+pub use surface::Candidates;
+
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
@@ -109,6 +114,8 @@ pub struct GpuMpm {
     pub time: f64,
     damp: f32,
     sponge: f32,
+    /// The surface-extraction pass, built on first use.
+    surf: Option<surface::Surf>,
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -272,6 +279,7 @@ impl GpuMpm {
             time: 0.0,
             damp: 1.0,
             sponge: 0.0,
+            surf: None,
         })
     }
 
