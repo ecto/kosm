@@ -59,10 +59,14 @@ pub struct Far {
 
 impl Far {
     pub fn new(cell: f64) -> Self {
-        let nx = ((2.0 * POOL_X) / cell) as usize;
-        let ny = ((2.0 * POOL_Y) / cell) as usize;
-        // exact sizes: zero padding would let waves leak into the pad and be
-        // truncated every step, which is neither periodic nor conserving
+        // power-of-two sizes for the transforms, and the cell snapped so the
+        // grid covers the pool exactly (its 2:1 aspect makes both axes fit):
+        // zero padding would let waves leak into the pad and be truncated
+        // every step, which is neither periodic nor conserving
+        let nx = (((2.0 * POOL_X) / cell) as usize).next_power_of_two();
+        let ny = (((2.0 * POOL_Y) / cell) as usize).next_power_of_two();
+        let cell = 2.0 * POOL_X / nx as f64;
+        assert!((2.0 * POOL_Y / ny as f64 - cell).abs() < 1e-9, "the far grid needs the pool's 2:1 aspect");
         let px = nx;
         let py = ny;
         let mut planner = FftPlanner::new();
@@ -148,26 +152,31 @@ impl Far {
     }
 
     fn fft2(&self, a: &mut [Complex<f64>], inverse: bool) {
+        use rayon::prelude::*;
         let (px, py) = (self.px, self.py);
         let (fx, fy) = if inverse { (&self.inv_x, &self.inv_y) } else { (&self.fwd_x, &self.fwd_y) };
-        for row in a.chunks_mut(px) {
-            fx.process(row);
-        }
-        let mut col = vec![Complex::new(0.0, 0.0); py];
-        for i in 0..px {
+        // rows in parallel, each with its own scratch
+        a.par_chunks_mut(px).for_each(|row| {
+            let mut scratch = vec![Complex::new(0.0, 0.0); fx.get_inplace_scratch_len()];
+            fx.process_with_scratch(row, &mut scratch);
+        });
+        // columns: gather into a transposed copy, transform rows of that, scatter back
+        let mut t = vec![Complex::new(0.0, 0.0); px * py];
+        t.par_chunks_mut(py).enumerate().for_each(|(i, col)| {
             for j in 0..py {
                 col[j] = a[j * px + i];
             }
-            fy.process(&mut col);
-            for j in 0..py {
-                a[j * px + i] = col[j];
+            let mut scratch = vec![Complex::new(0.0, 0.0); fy.get_inplace_scratch_len()];
+            fy.process_with_scratch(col, &mut scratch);
+        });
+        a.par_chunks_mut(px).enumerate().for_each(|(j, row)| {
+            for i in 0..px {
+                row[i] = t[i * py + j];
             }
-        }
+        });
         if inverse {
             let s = 1.0 / (px * py) as f64;
-            for v in a.iter_mut() {
-                *v *= s;
-            }
+            a.par_iter_mut().for_each(|v| *v *= s);
         }
     }
 
