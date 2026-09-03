@@ -99,6 +99,7 @@ struct GpuParams {
     b_vel: [f32; 4],
     semi: [f32; 4],
     misc2: [u32; 4],
+    bdim: [u32; 4],
 }
 
 /// Particle state as the GPU holds it.
@@ -133,6 +134,9 @@ pub struct GpuMpm {
     nb: [u32; 3],
     /// Node slots the compact grid arrays are sized for; one slot is 4^3 nodes.
     max_slots: u32,
+    /// The working box of blocks the per-substep block kernels cover: first block and size.
+    bb0: [u32; 3],
+    bbn: [u32; 3],
     btab: wgpu::Buffer,
     alist: wgpu::Buffer,
     nact: wgpu::Buffer,
@@ -204,6 +208,26 @@ impl GpuMpm {
         // splash: that is the whole point of the exercise, memory that scales
         // with the water and not with the box. Never more than the box holds.
         let max_slots = Self::slot_budget(&params, particles, nb, nblocks);
+        // the working box: the fill's blocks, dilated by two blocks and by a
+        // metre in x and y for what a splash throws, the full height
+        let (bb0, bbn) = {
+            let h = params.h;
+            let mut lo = [u32::MAX; 3];
+            let mut hi = [0u32; 3];
+            for p in &particles.x {
+                for a in 0..3 {
+                    let c = (((p[a] - params.origin[a]) / h).floor().max(0.0) as u32 / 4).min(nb[a] - 1);
+                    lo[a] = lo[a].min(c);
+                    hi[a] = hi[a].max(c);
+                }
+            }
+            let m = (1.0 / (4.0 * h)).ceil() as u32 + 2;
+            let x0 = lo[0].saturating_sub(m);
+            let y0 = lo[1].saturating_sub(m);
+            let x1 = (hi[0] + m).min(nb[0] - 1);
+            let y1 = (hi[1] + m).min(nb[1] - 1);
+            ([x0, y0, 0], [x1 - x0 + 1, y1 - y0 + 1, nb[2]])
+        };
         let snodes = 64 * max_slots as u64;
         // Said before anything is allocated, so a fill that will not fit says
         // how big it was on the way out.
@@ -250,7 +274,9 @@ impl GpuMpm {
         let gmom = empty("gmom", 12 * snodes);
         let gvel = empty("gvel", 16 * snodes);
         let gvold = empty("gvold", 16 * snodes);
-        let btab = empty("btab", 4 * nblocks as u64);
+        // NONE everywhere to start: blocks outside the working box are never
+        // written again, and a NONE entry reads as empty
+        let btab = storage("btab", &vec![0xffu8; 4 * nblocks as usize]);
         let alist = empty("alist", 4 * max_slots as u64);
         let nact = empty("nact", 16);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
@@ -361,6 +387,8 @@ impl GpuMpm {
             nblocks,
             nb,
             max_slots,
+            bb0,
+            bbn,
             btab,
             alist,
             nact,
@@ -466,7 +494,8 @@ impl GpuMpm {
             b_c: v4(cc, 0.0),
             b_vel: v4(body.vel, 0.0),
             semi: v4(body.semi, self.sponge),
-            misc2: [self.max_slots, 0, 0, 0],
+            misc2: [self.max_slots, self.bb0[0], self.bb0[1], self.bb0[2]],
+            bdim: [self.bbn[0], self.bbn[1], self.bbn[2], self.bbn[0] * self.bbn[1] * self.bbn[2]],
         }
     }
 
@@ -492,7 +521,7 @@ impl GpuMpm {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             let (pg, pgy) = Self::groups(self.n);
-            let (bg, bgy) = Self::groups(self.nblocks);
+            let (bg, bgy) = Self::groups(self.bbn[0] * self.bbn[1] * self.bbn[2]);
             let (wg, wgy) = if self.nblocks <= 65535 { (self.nblocks, 1) } else { (65535, self.nblocks.div_ceil(65535)) };
             for s in 0..subs {
                 let off = (s as u64 * PARAMS_STRIDE) as u32;

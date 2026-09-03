@@ -22,7 +22,8 @@ struct Params {
     b_c: vec4<f32>,
     b_vel: vec4<f32>,
     semi: vec4<f32>,       // ellipsoid semi-axes, sponge width
-    misc2: vec4<u32>,      // max active slots, 0, 0, 0
+    misc2: vec4<u32>,      // max active slots, then the working box's first block bx, by, bz
+    bdim: vec4<u32>,       // the working box's blocks per axis, and its block count
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -396,16 +397,47 @@ fn outside_region(i: i32, j: i32) -> bool {
     return f32(di * di + dj * dj) > r * r;
 }
 
+// The per-substep block work runs over a working box of blocks around the
+// region, not the pool's whole table: zeroing, marking and scanning four
+// million blocks a substep was three seconds a frame. Blocks outside the box
+// stay NONE forever (the table is initialised so); the box carries a margin
+// so a scatter mark from an occupied block never lands outside it.
+fn bb_count() -> u32 {
+    return P.bdim.w;
+}
+fn bb_block(idx: u32) -> u32 {
+    let lx = idx % P.bdim.x;
+    let ly = (idx / P.bdim.x) % P.bdim.y;
+    let lz = idx / (P.bdim.x * P.bdim.y);
+    return ((P.misc2.w + lz) * P.misc.z + (P.misc2.z + ly)) * P.misc.y + (P.misc2.y + lx);
+}
+
+// Working-box-local index of a global block, clamped into the box: the sort's
+// counts, fills and offsets are indexed this way so its prefix scan covers
+// the box, not the pool.
+fn bb_local(b: u32) -> u32 {
+    let nbx = P.misc.y;
+    let nby = P.misc.z;
+    let bx = b % nbx;
+    let by = (b / nbx) % nby;
+    let bz = b / (nbx * nby);
+    let lx = clamp(i32(bx) - i32(P.misc2.y), 0, i32(P.bdim.x) - 1);
+    let ly = clamp(i32(by) - i32(P.misc2.z), 0, i32(P.bdim.y) - 1);
+    let lz = clamp(i32(bz) - i32(P.misc2.w), 0, i32(P.bdim.z) - 1);
+    return (u32(lz) * P.bdim.y + u32(ly)) * P.bdim.x + u32(lx);
+}
+
 fn nblocks() -> u32 {
     return P.misc.y * P.misc.z * P.misc.w;
 }
 
 @compute @workgroup_size(256)
 fn sort_zero(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let b = linear_id(gid, nwg);
-    if (b >= nblocks()) { return; }
-    atomicStore(&counts[b], 0u);
-    atomicStore(&fill[b], 0u);
+    let idx = linear_id(gid, nwg);
+    if (idx >= bb_count()) { return; }
+    let b = bb_block(idx);
+    atomicStore(&counts[idx], 0u);
+    atomicStore(&fill[idx], 0u);
     btab[b] = 0u; // the marks start clean each substep
 }
 
@@ -413,13 +445,13 @@ fn sort_zero(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let p = linear_id(gid, nwg);
     if (p >= P.n.w) { return; }
-    atomicAdd(&counts[block_of(x[p].xyz)], 1u);
+    atomicAdd(&counts[bb_local(block_of(x[p].xyz))], 1u);
 }
 
 // exclusive prefix sum of the block counts, one workgroup
 @compute @workgroup_size(256)
 fn sort_scan(@builtin(local_invocation_index) t: u32) {
-    let nb = nblocks();
+    let nb = bb_count();
     let chunk = (nb + 255u) / 256u;
     let lo = t * chunk;
     let hi = min(lo + chunk, nb);
@@ -460,9 +492,10 @@ fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     // a scatter from the blocks that hold particles to their 27 neighbours:
     // over a table that spans the pool almost every block is empty, and a
     // gather of 27 counts per block was the cost that made that table dear
-    let b = linear_id(gid, nwg);
-    if (b >= nblocks()) { return; }
-    if (atomicLoad(&counts[b]) == 0u) { return; }
+    let idx = linear_id(gid, nwg);
+    if (idx >= bb_count()) { return; }
+    let b = bb_block(idx);
+    if (atomicLoad(&counts[idx]) == 0u) { return; }
     let nbx = i32(P.misc.y);
     let nby = i32(P.misc.z);
     let nbz = i32(P.misc.w);
@@ -490,13 +523,13 @@ fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 // the true total is left in nact[1] for the host to shout about.
 @compute @workgroup_size(256)
 fn blk_scan(@builtin(local_invocation_index) t: u32) {
-    let nb = nblocks();
+    let nb = bb_count();
     let chunk = (nb + 255u) / 256u;
     let lo = t * chunk;
     let hi = min(lo + chunk, nb);
     var sum = 0u;
-    for (var b = lo; b < hi; b++) {
-        sum += btab[b];
+    for (var i = lo; i < hi; i++) {
+        sum += btab[bb_block(i)];
     }
     partial[t] = sum;
     workgroupBarrier();
@@ -522,7 +555,8 @@ fn blk_scan(@builtin(local_invocation_index) t: u32) {
     }
     workgroupBarrier();
     var run = partial[t];
-    for (var b = lo; b < hi; b++) {
+    for (var i = lo; i < hi; i++) {
+        let b = bb_block(i);
         if (btab[b] == 0u) {
             btab[b] = NONE;
         } else if (run < P.misc2.x) {
@@ -540,7 +574,7 @@ fn blk_scan(@builtin(local_invocation_index) t: u32) {
 fn sort_scatter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let p = linear_id(gid, nwg);
     if (p >= P.n.w) { return; }
-    let b = block_of(x[p].xyz);
+    let b = bb_local(block_of(x[p].xyz));
     let i = atomicAdd(&fill[b], 1u);
     perm[offsets[b] + i] = p;
 }
@@ -568,9 +602,10 @@ fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg:
     let slot = wg.x + wg.y * nwg.x;
     if (slot >= atomicLoad(&nact[0])) { return; }
     let b = alist[slot];
+    let lb = bb_local(b);
     // an empty block has nothing to scatter, and skipping it here saves
     // zeroing and scanning the 7^3 tile for most of the box
-    if (offsets[b] == offsets[b + 1u]) { return; }
+    if (offsets[lb] == offsets[lb + 1u]) { return; }
     for (var i = t; i < TILE; i += 256u) {
         atomicStore(&tile_m[i], 0);
         atomicStore(&tile_p[3u * i], 0);
@@ -585,8 +620,8 @@ fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg:
     let by = (bi / nbx) % nby;
     let bz = bi / (nbx * nby);
     let node0 = vec3<i32>(bx, by, bz) * BLK - vec3<i32>(1);
-    let start = offsets[b];
-    let end = offsets[b + 1u];
+    let start = offsets[lb];
+    let end = offsets[lb + 1u];
     let h = P.origin_h.w;
     let inv_h = P.k.y;
     let dt = P.k.x;

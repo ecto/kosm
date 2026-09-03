@@ -418,8 +418,12 @@ impl Surface {
         let mut n = 0.0f64;
         for jy in 3..g.ny.saturating_sub(3) {
             for ix in 3..g.nx.saturating_sub(3) {
-                s += g.z[jy * g.nx + ix];
-                n += 1.0;
+                let z = g.z[jy * g.nx + ix];
+                if z > -1.0 {
+                    // wet cells only; the dry corners beyond the disc report the floor
+                    s += z;
+                    n += 1.0;
+                }
             }
         }
         s / n.max(1.0)
