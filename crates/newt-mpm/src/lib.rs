@@ -5,6 +5,29 @@
 //! block is the body's reaction force (one 16-byte slot per substep, so the
 //! fixed-point accumulators cannot overflow across a block). Particles and
 //! grid mass are downloaded once a frame for surface extraction.
+//!
+//! The grid is block-sparse. The box around the melon is mostly air — two
+//! metres of water under one of headroom — and a dense grid pays for all of
+//! it, every substep, forever. So the node arrays are cut into blocks of
+//! 4x4x4 nodes and only the blocks the water is in are stored.
+//!
+//! The bookkeeping is deliberately cheap, because there is nothing to be
+//! gained by being clever about fifty thousand blocks. A dense table over the
+//! box, one u32 per block, maps a block to its slot in the compact node
+//! arrays or to NONE. The counting sort that bins particles into blocks
+//! every substep already knows which blocks hold particles; a block is
+//! active if any of its 27 neighbours does. That dilation is exactly right:
+//! a particle in cell block b writes to nodes 4b-1 through 4b+5, the mass
+//! blur reads one node further, and 4b-2 through 4b+6 is still inside the
+//! blocks b-1, b and b+1. A single-workgroup prefix sum over the marks hands
+//! out slots and writes the indirect dispatch the node kernels run under, so
+//! the host never has to learn how many blocks there are. Node data lives at
+//! slot*64 + local, and an inactive node reads as empty — which is what the
+//! dense grid held there anyway.
+//!
+//! The slot budget is fixed at startup from the fill's own footprint plus a
+//! sixth for the splash (`NEWT_MAX_BLOCKS` overrides), and `step` panics with
+//! the numbers if the water ever outgrows it.
 
 use std::sync::mpsc;
 
@@ -64,6 +87,7 @@ struct GpuParams {
     b_c: [f32; 4],
     b_vel: [f32; 4],
     semi: [f32; 4],
+    misc2: [u32; 4],
 }
 
 /// Particle state as the GPU holds it.
@@ -96,6 +120,15 @@ pub struct GpuMpm {
     binds: [wgpu::BindGroup; 2],
     nblocks: u32,
     nb: [u32; 3],
+    /// Node slots the compact grid arrays are sized for; one slot is 4^3 nodes.
+    max_slots: u32,
+    btab: wgpu::Buffer,
+    nact: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    small_stage: wgpu::Buffer,
+    blk_mark: wgpu::ComputePipeline,
+    blk_scan: wgpu::ComputePipeline,
+    bind_indirect: wgpu::BindGroup,
     clear: wgpu::ComputePipeline,
     sort_zero: wgpu::ComputePipeline,
     sort_count: wgpu::ComputePipeline,
@@ -107,6 +140,8 @@ pub struct GpuMpm {
     blur: wgpu::ComputePipeline,
     g2p: wgpu::ComputePipeline,
     pub time: f64,
+    /// Active slots after the last submitted substep.
+    active: u32,
     damp: f32,
     sponge: f32,
 }
@@ -171,13 +206,42 @@ impl GpuMpm {
         let x2 = empty("x2", 16 * n as u64);
         let v2 = empty("v2", 16 * n as u64);
         let c2 = empty("c2", 48 * n as u64);
-        let gm = empty("gm", 4 * nodes as u64);
-        let gmom = empty("gmom", 12 * nodes as u64);
-        let gvel = empty("gvel", 16 * nodes as u64);
-        let gvold = empty("gvold", 16 * nodes as u64);
         let react = empty("react", 16 * max_subs as u64);
         let nb = [params.n[0].div_ceil(4), params.n[1].div_ceil(4), params.n[2].div_ceil(4)];
         let nblocks = nb[0] * nb[1] * nb[2];
+        // How many block slots the node arrays get. The water's own footprint,
+        // dilated the way the marking kernel dilates it, plus a sixth for the
+        // splash: that is the whole point of the exercise, memory that scales
+        // with the water and not with the box. Never more than the box holds.
+        let max_slots = Self::slot_budget(&params, particles, nb, nblocks);
+        let snodes = 64 * max_slots as u64;
+        if std::env::var_os("NEWT_PROF").is_some() {
+            println!(
+                "mpm    sparse grid {max_slots} of {nblocks} blocks, {snodes} of {nodes} nodes ({:.0}%), node buffers {:.0} MB of {:.0} MB dense",
+                100.0 * snodes as f64 / nodes as f64,
+                48.0 * snodes as f64 / 1e6,
+                48.0 * nodes as f64 / 1e6
+            );
+        }
+        let gm = empty("gm", 4 * snodes);
+        let gmom = empty("gmom", 12 * snodes);
+        let gvel = empty("gvel", 16 * snodes);
+        let gvold = empty("gvold", 16 * snodes);
+        let btab = empty("btab", 4 * nblocks as u64);
+        let alist = empty("alist", 4 * max_slots as u64);
+        let nact = empty("nact", 16);
+        let indirect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("indirect"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let small_stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("small stage"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         let counts = empty("counts", 4 * (nblocks + 1) as u64);
         let offsets = empty("offsets", 4 * (nblocks + 1) as u64);
         let fill = empty("fill", 4 * (nblocks + 1) as u64);
@@ -197,10 +261,12 @@ impl GpuMpm {
         let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let rw = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
         let mut entries = vec![entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None })];
-        for b in 1..16 {
+        for b in 1..19 {
             entries.push(entry(b, rw));
         }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mpm"), entries: &entries });
+        let layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("indirect"), entries: &[entry(0, rw)] });
+        let bind_indirect = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("indirect"), layout: &layout1, entries: &[wgpu::BindGroupEntry { binding: 0, resource: indirect.as_entire_binding() }] });
         let make_bind = |xin: &wgpu::Buffer, vin: &wgpu::Buffer, cin: &wgpu::Buffer, xout: &wgpu::Buffer, vout: &wgpu::Buffer, cout: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mpm"),
@@ -225,27 +291,35 @@ impl GpuMpm {
                     wgpu::BindGroupEntry { binding: 13, resource: xout.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 14, resource: vout.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 15, resource: cout.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 16, resource: btab.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 17, resource: alist.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 18, resource: nact.as_entire_binding() },
                 ],
             })
         };
         let binds = [make_bind(&x, &v, &c, &x2, &v2, &c2), make_bind(&x2, &v2, &c2, &x, &v, &c)];
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mpm"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipe = |name: &str| {
+        let pl_scan = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mpm blk_scan"), bind_group_layouts: &[Some(&layout), Some(&layout1)], immediate_size: 0 });
+        let pipe_with = |name: &str, l: &wgpu::PipelineLayout| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
-                layout: Some(&pl),
+                layout: Some(l),
                 module: &shader,
                 entry_point: Some(name),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
+        let pipe = |name: &str| pipe_with(name, &pl);
         Ok(Self {
             clear: pipe("clear"),
             sort_zero: pipe("sort_zero"),
             sort_count: pipe("sort_count"),
             sort_scan: pipe("sort_scan"),
             sort_scatter: pipe("sort_scatter"),
+            blk_mark: pipe("blk_mark"),
+            blk_scan: pipe_with("blk_scan", &pl_scan),
+            bind_indirect,
             permute: pipe("permute"),
             p2g: pipe("p2g_block"),
             grid: pipe("grid"),
@@ -263,6 +337,11 @@ impl GpuMpm {
             binds,
             nblocks,
             nb,
+            max_slots,
+            btab,
+            nact,
+            indirect,
+            small_stage,
             gm,
             gmom,
             gvel,
@@ -270,9 +349,50 @@ impl GpuMpm {
             react,
             react_stage,
             time: 0.0,
+            active: 0,
             damp: 1.0,
             sponge: 0.0,
         })
+    }
+
+    /// The slot budget: mark the blocks the fill's particles sit in, dilate
+    /// them by one block the way `blk_mark` does, and add a sixth for the
+    /// splash. Capped at the box, since the dense grid is the worst case.
+    fn slot_budget(params: &Params, particles: &Particles, nb: [u32; 3], nblocks: u32) -> u32 {
+        let inv_h = 1.0 / params.h;
+        let mut seen = vec![false; nblocks as usize];
+        for p in &particles.x {
+            let idx = |a: f32, o: f32, n: u32| (((a - o) * inv_h) as i32).clamp(0, n as i32 - 1) as u32 / 4;
+            let (bx, by, bz) = (idx(p[0], params.origin[0], params.n[0]), idx(p[1], params.origin[1], params.n[1]), idx(p[2], params.origin[2], params.n[2]));
+            seen[(((bz * nb[1]) + by) * nb[0] + bx) as usize] = true;
+        }
+        let mut n = 0u32;
+        for bz in 0..nb[2] {
+            for by in 0..nb[1] {
+                for bx in 0..nb[0] {
+                    let mut any = false;
+                    for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let (a, b, c) = (bx as i32 + dx, by as i32 + dy, bz as i32 + dz);
+                                if a < 0 || b < 0 || c < 0 || a >= nb[0] as i32 || b >= nb[1] as i32 || c >= nb[2] as i32 {
+                                    continue;
+                                }
+                                any |= seen[((c as u32 * nb[1] + b as u32) * nb[0] + a as u32) as usize];
+                            }
+                        }
+                    }
+                    n += any as u32;
+                }
+            }
+        }
+        let budget = std::env::var("NEWT_MAX_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(n + n / 6 + 1024);
+        budget.min(nblocks).max(1)
+    }
+
+    /// Active block slots the node arrays are sized for, and the box's total.
+    pub fn slots(&self) -> (u32, u32) {
+        (self.max_slots, self.nblocks)
     }
 
     /// Width of the damping band along the side walls (0 = none).
@@ -313,6 +433,7 @@ impl GpuMpm {
             b_c: v4(cc, 0.0),
             b_vel: v4(body.vel, 0.0),
             semi: v4(body.semi, self.sponge),
+            misc2: [self.max_slots, 0, 0, 0],
         }
     }
 
@@ -333,11 +454,11 @@ impl GpuMpm {
         }
         self.queue.write_buffer(&self.params_buf, 0, &raw);
         self.queue.write_buffer(&self.react, 0, &vec![0u8; 16 * subs as usize]);
+        self.queue.write_buffer(&self.nact, 0, &[0u8; 16]);
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             let (pg, pgy) = Self::groups(self.n);
-            let (ng, ngy) = Self::groups(self.nodes);
             let (bg, bgy) = Self::groups(self.nblocks);
             let (wg, wgy) = if self.nblocks <= 65535 { (self.nblocks, 1) } else { (65535, self.nblocks.div_ceil(65535)) };
             for s in 0..subs {
@@ -350,6 +471,12 @@ impl GpuMpm {
                 pass.dispatch_workgroups(pg, pgy, 1);
                 pass.set_pipeline(&self.sort_scan);
                 pass.dispatch_workgroups(1, 1, 1);
+                // the block counts also say which blocks the grid needs
+                pass.set_pipeline(&self.blk_mark);
+                pass.dispatch_workgroups(bg, bgy, 1);
+                pass.set_pipeline(&self.blk_scan);
+                pass.set_bind_group(1, &self.bind_indirect, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
                 pass.set_pipeline(&self.sort_scatter);
                 pass.dispatch_workgroups(pg, pgy, 1);
                 pass.set_pipeline(&self.permute);
@@ -357,21 +484,33 @@ impl GpuMpm {
                 // the physics, on the sorted buffers
                 self.cur = 1 - self.cur;
                 pass.set_bind_group(0, &self.binds[self.cur], &[off]);
+                // the node kernels run over the active slots only; how many
+                // that is is a GPU-side number, so the dispatch is indirect
                 pass.set_pipeline(&self.clear);
-                pass.dispatch_workgroups(ng, ngy, 1);
+                pass.dispatch_workgroups_indirect(&self.indirect, 0);
                 pass.set_pipeline(&self.p2g);
                 pass.dispatch_workgroups(wg, wgy, 1);
                 pass.set_pipeline(&self.grid);
-                pass.dispatch_workgroups(ng, ngy, 1);
+                pass.dispatch_workgroups_indirect(&self.indirect, 0);
                 pass.set_pipeline(&self.blur);
-                pass.dispatch_workgroups(ng, ngy, 1);
+                pass.dispatch_workgroups_indirect(&self.indirect, 0);
                 pass.set_pipeline(&self.g2p);
                 pass.dispatch_workgroups(pg, pgy, 1);
             }
         }
         enc.copy_buffer_to_buffer(&self.react, 0, &self.react_stage, 0, 16 * subs as u64);
+        enc.copy_buffer_to_buffer(&self.nact, 0, &self.small_stage, 0, 16);
         self.queue.submit([enc.finish()]);
         let words: Vec<i32> = self.read_i32(&self.react_stage, 4 * subs as usize);
+        let a = self.read_i32(&self.small_stage, 4);
+        self.active = a[0] as u32;
+        assert!(
+            a[1] as u32 <= self.max_slots,
+            "block-sparse grid overflowed: {} active blocks of {} budgeted ({} in the box). Raise NEWT_MAX_BLOCKS.",
+            a[1],
+            self.max_slots,
+            self.nblocks
+        );
         self.time += subs as f64 * self.params.dt as f64;
         (0..subs as usize)
             .map(|s| Reaction {
@@ -420,10 +559,38 @@ impl GpuMpm {
         (bytemuck::cast_slice(&x).to_vec(), bytemuck::cast_slice(&v).to_vec())
     }
 
-    /// Grid mass per node after the last substep.
+    /// Active blocks after the last submitted substep, and the nodes they hold.
+    pub fn active(&self) -> (u32, u32) {
+        (self.active, self.active * 64)
+    }
+
+    /// Grid mass per node after the last substep, dense over the box: the
+    /// compact slots scattered back through the block table, everything else
+    /// zero (which is what an inactive node holds).
     pub fn grid_mass(&self) -> Vec<f32> {
-        let g = self.read_f32(&self.gvel, 16 * self.nodes as u64);
-        g.chunks(4).map(|c| c[3]).collect()
+        let g = self.read_f32(&self.gvel, 16 * 64 * self.max_slots as u64);
+        let tab = self.read_f32(&self.btab, 4 * self.nblocks as u64);
+        let tab: &[u32] = bytemuck::cast_slice(&tab);
+        let mut out = vec![0.0f32; self.nodes as usize];
+        let (nx, ny, nz) = (self.params.n[0], self.params.n[1], self.params.n[2]);
+        for bz in 0..self.nb[2] {
+            for by in 0..self.nb[1] {
+                for bx in 0..self.nb[0] {
+                    let slot = tab[((bz * self.nb[1] + by) * self.nb[0] + bx) as usize];
+                    if slot == u32::MAX {
+                        continue;
+                    }
+                    for l in 0..64u32 {
+                        let (i, j, k) = (4 * bx + (l & 3), 4 * by + ((l >> 2) & 3), 4 * bz + ((l >> 4) & 3));
+                        if i >= nx || j >= ny || k >= nz {
+                            continue;
+                        }
+                        out[(((k * ny) + j) * nx + i) as usize] = g[(4 * (slot * 64 + l) + 3) as usize];
+                    }
+                }
+            }
+        }
+        out
     }
 
 }

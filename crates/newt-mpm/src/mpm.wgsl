@@ -22,6 +22,7 @@ struct Params {
     b_c: vec4<f32>,
     b_vel: vec4<f32>,
     semi: vec4<f32>,       // ellipsoid semi-axes, sponge width
+    misc2: vec4<u32>,      // max active slots, 0, 0, 0
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -41,6 +42,16 @@ struct Params {
 @group(0) @binding(13) var<storage, read_write> xo: array<vec4<f32>>;
 @group(0) @binding(14) var<storage, read_write> vo: array<vec4<f32>>;
 @group(0) @binding(15) var<storage, read_write> co: array<vec4<f32>>;
+// the block-sparse grid: a dense table over the box mapping a 4^3-node block
+// to its slot in the compact node arrays, the slot->block list, the counter,
+// and the indirect dispatch args the node kernels run under
+@group(0) @binding(16) var<storage, read_write> btab: array<u32>;
+@group(0) @binding(17) var<storage, read_write> alist: array<u32>;
+@group(0) @binding(18) var<storage, read_write> nact: array<atomic<u32>>;
+// its own group: a buffer cannot be a storage binding and the source of an
+// indirect dispatch in the same dispatch's usage scope, so only blk_scan,
+// which writes it, has it bound
+@group(1) @binding(0) var<storage, read_write> indirect: array<u32>;
 
 const BLK: i32 = 4;      // cells per block per axis
 const TN: i32 = 7;       // nodes a block's particles touch per axis: [4b-1, 4b+5]
@@ -59,8 +70,34 @@ fn linear_id(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
     return gid.x + gid.y * nwg.x * WG;
 }
 
+const NONE: u32 = 0xffffffffu;
+
+// A node's place in the compact arrays: slot*64 + local, or -1 when the
+// node's block is not active this substep. An inactive node reads as empty
+// (zero mass, zero velocity), which is exactly what the dense grid held
+// there: a block is active whenever any particle's 3x3x3 stencil, dilated by
+// the blur's own 3x3x3, can reach into it.
 fn node_index(i: i32, j: i32, k: i32) -> i32 {
-    return (k * i32(P.n.y) + j) * i32(P.n.x) + i;
+    let b = ((k / BLK) * i32(P.misc.z) + (j / BLK)) * i32(P.misc.y) + (i / BLK);
+    let s = btab[u32(b)];
+    if (s == NONE) { return -1; }
+    return i32(s) * 64 + (((k & 3) * 4 + (j & 3)) * 4 + (i & 3));
+}
+
+// The node (i,j,k) a compact index belongs to. Slots run 0..nact and every
+// slot names a block through alist.
+fn node_of(g: u32) -> vec3<i32> {
+    let slot = g / 64u;
+    let l = i32(g % 64u);
+    let b = i32(alist[slot]);
+    let nbx = i32(P.misc.y);
+    let nby = i32(P.misc.z);
+    let blk = vec3<i32>(b % nbx, (b / nbx) % nby, b / (nbx * nby));
+    return blk * BLK + vec3<i32>(l & 3, (l >> 2) & 3, (l >> 4) & 3);
+}
+
+fn active_nodes() -> u32 {
+    return atomicLoad(&nact[0]) * 64u;
 }
 
 fn w1(f: f32) -> vec3<f32> {
@@ -70,8 +107,7 @@ fn w1(f: f32) -> vec3<f32> {
 @compute @workgroup_size(256)
 fn clear(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let g = linear_id(gid, nwg);
-    let nn = P.n.x * P.n.y * P.n.z;
-    if (g >= nn) { return; }
+    if (g >= active_nodes()) { return; }
     atomicStore(&gm[g], 0);
     atomicStore(&gmom[3u * g], 0);
     atomicStore(&gmom[3u * g + 1u], 0);
@@ -117,9 +153,11 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 let j = bj + dj;
                 let k = bk + dk;
                 if (i < 0 || j < 0 || k < 0 || i >= i32(P.n.x) || j >= i32(P.n.y) || k >= i32(P.n.z)) { continue; }
+                let gs = node_index(i, j, k);
+                if (gs < 0) { continue; }
                 let dpos = (vec3<f32>(f32(di), f32(dj), f32(dk)) - fx) * h;
                 let wt = wx[di] * wy[dj] * wz[dk];
-                let g = u32(node_index(i, j, k));
+                let g = u32(gs);
                 // momentum per unit particle mass: v + (s I + C) dpos
                 let mom = (vp + s * dpos + c0 * dpos.x + c1 * dpos.y + c2 * dpos.z) * wt;
                 atomicAdd(&gm[g], i32(round(wt * MASS_SCALE)));
@@ -152,8 +190,10 @@ fn body_sdf(p: vec3<f32>) -> vec4<f32> {
 @compute @workgroup_size(256)
 fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let g = linear_id(gid, nwg);
-    let nn = P.n.x * P.n.y * P.n.z;
-    if (g >= nn) { return; }
+    if (g >= active_nodes()) { return; }
+    let ijk = node_of(g);
+    // a block on the far edge of the box can hang off the end of the grid
+    if (ijk.x >= i32(P.n.x) || ijk.y >= i32(P.n.y) || ijk.z >= i32(P.n.z)) { return; }
     let mass = P.k.z;
     let h = P.origin_h.w;
     let dt = P.k.x;
@@ -169,9 +209,9 @@ fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     var vel = mom / m_units;
     gvold[g] = vec4<f32>(vel, m);
     vel.z -= P.k2.z * dt;
-    let i = i32(g % P.n.x);
-    let j = i32((g / P.n.x) % P.n.y);
-    let k = i32(g / (P.n.x * P.n.y));
+    let i = ijk.x;
+    let j = ijk.y;
+    let k = ijk.z;
     let xi = P.origin_h.xyz + vec3<f32>(f32(i), f32(j), f32(k)) * h;
     // the pool: floor and walls, free-slip. By index, not position: the CPU
     // tests x_i < origin + 2h, which is i < 2 exactly, and an f32 sum can
@@ -255,11 +295,13 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 let j = bj + dj;
                 let k = bk + dk;
                 if (i < 0 || j < 0 || k < 0 || i >= i32(P.n.x) || j >= i32(P.n.y) || k >= i32(P.n.z)) { continue; }
-                let g = u32(node_index(i, j, k));
+                let gs = node_index(i, j, k);
                 let wt = wx[di] * wy[dj] * wz[dk];
                 // the density the pressure sees, mirrored at the walls
-                let gr = u32(node_index(clamp(i, 2, i32(P.n.x) - 3), clamp(j, 2, i32(P.n.y) - 3), clamp(k, 2, i32(P.n.z) - 3)));
-                rho += wt * gvold[gr].w;
+                let gr = node_index(clamp(i, 2, i32(P.n.x) - 3), clamp(j, 2, i32(P.n.y) - 3), clamp(k, 2, i32(P.n.z) - 3));
+                if (gr >= 0) { rho += wt * gvold[u32(gr)].w; }
+                if (gs < 0) { continue; }
+                let g = u32(gs);
                 let gv4 = gvel[g];
                 if (gv4.w <= 0.0) { continue; }
                 let dpos = (vec3<f32>(f32(di), f32(dj), f32(dk)) - fx) * h;
@@ -363,6 +405,90 @@ fn sort_scan(@builtin(local_invocation_index) t: u32) {
     }
 }
 
+// The block table, rebuilt every substep from the sort's block counts.
+//
+// A particle in a 4^3-cell block writes to nodes 4b-1 .. 4b+5, which is the
+// node blocks b-1, b and b+1; the mass blur then reads one node further, and
+// 4b-2 .. 4b+6 still falls inside those same three blocks. So the set of
+// blocks anything touches is exactly the blocks holding particles dilated by
+// one block in each direction, and that is what these two kernels build:
+// mark (a gather over the 27 neighbours, so no races), then a single-
+// workgroup prefix sum that hands out compact slots.
+@compute @workgroup_size(256)
+fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let b = linear_id(gid, nwg);
+    if (b >= nblocks()) { return; }
+    let nbx = i32(P.misc.y);
+    let nby = i32(P.misc.z);
+    let nbz = i32(P.misc.w);
+    let bi = i32(b);
+    let bx = bi % nbx;
+    let by = (bi / nbx) % nby;
+    let bz = bi / (nbx * nby);
+    var any = 0u;
+    for (var dz = -1; dz <= 1; dz++) {
+        let z = bz + dz;
+        if (z < 0 || z >= nbz) { continue; }
+        for (var dy = -1; dy <= 1; dy++) {
+            let y = by + dy;
+            if (y < 0 || y >= nby) { continue; }
+            for (var dx = -1; dx <= 1; dx++) {
+                let xx = bx + dx;
+                if (xx < 0 || xx >= nbx) { continue; }
+                if (atomicLoad(&counts[u32((z * nby + y) * nbx + xx)]) > 0u) { any = 1u; }
+            }
+        }
+    }
+    btab[b] = any; // a flag for now; blk_scan turns it into a slot
+}
+
+// Exclusive prefix sum over the marks: block -> slot, slot -> block, and the
+// node kernels' indirect dispatch. Blocks past the slot budget get NONE and
+// the true total is left in nact[1] for the host to shout about.
+@compute @workgroup_size(256)
+fn blk_scan(@builtin(local_invocation_index) t: u32) {
+    let nb = nblocks();
+    let chunk = (nb + 255u) / 256u;
+    let lo = t * chunk;
+    let hi = min(lo + chunk, nb);
+    var sum = 0u;
+    for (var b = lo; b < hi; b++) {
+        sum += btab[b];
+    }
+    partial[t] = sum;
+    workgroupBarrier();
+    if (t == 0u) {
+        var acc = 0u;
+        for (var i = 0u; i < 256u; i++) {
+            let c = partial[i];
+            partial[i] = acc;
+            acc += c;
+        }
+        let used = min(acc, P.misc2.x);
+        atomicStore(&nact[0], used);
+        atomicMax(&nact[1], acc);
+        // ceil(used*64 / 256) workgroups, folded into 2D past the 65535 limit
+        let g = (used * 64u + 255u) / 256u;
+        indirect[0] = min(g, 65535u);
+        indirect[1] = (g + 65534u) / 65535u;
+        indirect[2] = 1u;
+    }
+    workgroupBarrier();
+    var run = partial[t];
+    for (var b = lo; b < hi; b++) {
+        if (btab[b] == 0u) {
+            btab[b] = NONE;
+        } else if (run < P.misc2.x) {
+            btab[b] = run;
+            alist[run] = b;
+            run += 1u;
+        } else {
+            btab[b] = NONE;
+            run += 1u;
+        }
+    }
+}
+
 @compute @workgroup_size(256)
 fn sort_scatter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let p = linear_id(gid, nwg);
@@ -391,6 +517,9 @@ fn permute(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
 fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let b = wg.x + wg.y * nwg.x;
     if (b >= nblocks()) { return; }
+    // an empty block has nothing to scatter, and skipping it here saves
+    // zeroing and scanning the 7^3 tile for most of the box
+    if (offsets[b] == offsets[b + 1u]) { return; }
     for (var i = t; i < TILE; i += 256u) {
         atomicStore(&tile_m[i], 0);
         atomicStore(&tile_p[3u * i], 0);
@@ -455,7 +584,9 @@ fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg:
         let l = vec3<i32>(ii % TN, (ii / TN) % TN, ii / (TN * TN));
         let g = node0 + l;
         if (g.x < 0 || g.y < 0 || g.z < 0 || g.x >= i32(P.n.x) || g.y >= i32(P.n.y) || g.z >= i32(P.n.z)) { continue; }
-        let gi = u32(node_index(g.x, g.y, g.z));
+        let gs = node_index(g.x, g.y, g.z);
+        if (gs < 0) { continue; }
+        let gi = u32(gs);
         atomicAdd(&gm[gi], m);
         atomicAdd(&gmom[3u * gi], atomicLoad(&tile_p[3u * i]));
         atomicAdd(&gmom[3u * gi + 1u], atomicLoad(&tile_p[3u * i + 1u]));
@@ -467,11 +598,12 @@ fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg:
 @compute @workgroup_size(256)
 fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let g = linear_id(gid, nwg);
-    let nn = P.n.x * P.n.y * P.n.z;
-    if (g >= nn) { return; }
-    let i = i32(g % P.n.x);
-    let j = i32((g / P.n.x) % P.n.y);
-    let k = i32(g / (P.n.x * P.n.y));
+    if (g >= active_nodes()) { return; }
+    let ijk = node_of(g);
+    if (ijk.x >= i32(P.n.x) || ijk.y >= i32(P.n.y) || ijk.z >= i32(P.n.z)) { return; }
+    let i = ijk.x;
+    let j = ijk.y;
+    let k = ijk.z;
     let hh = P.origin_h.w;
     let full_node = P.k.z * hh * hh * hh / P.k.w;
     var acc = 0.0;
@@ -487,7 +619,11 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 if (body_sdf(xn).w < 0.0) {
                     acc += full_node;
                 } else {
-                    acc += gvel[u32(node_index(a, b, cc))].w;
+                    // an inactive neighbour is empty; the dilation guarantees
+                    // every node with mass, and every wall mirror of one, is
+                    // in an active block
+                    let gn = node_index(a, b, cc);
+                    if (gn >= 0) { acc += gvel[u32(gn)].w; }
                 }
             }
         }
