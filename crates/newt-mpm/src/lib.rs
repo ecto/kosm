@@ -174,13 +174,34 @@ impl GpuMpm {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("newt-mpm"),
-                required_limits: limits,
+                required_limits: limits.clone(),
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("no device: {e}"))?;
         let n = particles.x.len() as u32;
         let nodes = params.n[0] * params.n[1] * params.n[2];
+        let nb = [params.n[0].div_ceil(4), params.n[1].div_ceil(4), params.n[2].div_ceil(4)];
+        let nblocks = nb[0] * nb[1] * nb[2];
+        // How many block slots the node arrays get. The water's own footprint,
+        // dilated the way the marking kernel dilates it, plus a sixth for the
+        // splash: that is the whole point of the exercise, memory that scales
+        // with the water and not with the box. Never more than the box holds.
+        let max_slots = Self::slot_budget(&params, particles, nb, nblocks);
+        let snodes = 64 * max_slots as u64;
+        // Said before anything is allocated, so a fill that will not fit says
+        // how big it was on the way out.
+        if std::env::var_os("NEWT_PROF").is_some() {
+            println!(
+                "mpm    {n} particles; sparse grid {max_slots} of {nblocks} blocks, {snodes} of {nodes} nodes ({:.0}%), node buffers {:.0} MB of {:.0} MB dense, particle buffers {:.0} MB (largest {:.0} MB, limit {:.0} MB)",
+                100.0 * snodes as f64 / nodes as f64,
+                48.0 * snodes as f64 / 1e6,
+                48.0 * nodes as f64 / 1e6,
+                164.0 * n as f64 / 1e6,
+                48.0 * n as f64 / 1e6,
+                limits.max_buffer_size as f64 / 1e6,
+            );
+        }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mpm"),
             source: wgpu::ShaderSource::Wgsl(include_str!("mpm.wgsl").into()),
@@ -209,20 +230,6 @@ impl GpuMpm {
         let react = empty("react", 16 * max_subs as u64);
         let nb = [params.n[0].div_ceil(4), params.n[1].div_ceil(4), params.n[2].div_ceil(4)];
         let nblocks = nb[0] * nb[1] * nb[2];
-        // How many block slots the node arrays get. The water's own footprint,
-        // dilated the way the marking kernel dilates it, plus a sixth for the
-        // splash: that is the whole point of the exercise, memory that scales
-        // with the water and not with the box. Never more than the box holds.
-        let max_slots = Self::slot_budget(&params, particles, nb, nblocks);
-        let snodes = 64 * max_slots as u64;
-        if std::env::var_os("NEWT_PROF").is_some() {
-            println!(
-                "mpm    sparse grid {max_slots} of {nblocks} blocks, {snodes} of {nodes} nodes ({:.0}%), node buffers {:.0} MB of {:.0} MB dense",
-                100.0 * snodes as f64 / nodes as f64,
-                48.0 * snodes as f64 / 1e6,
-                48.0 * nodes as f64 / 1e6
-            );
-        }
         let gm = empty("gm", 4 * snodes);
         let gmom = empty("gmom", 12 * snodes);
         let gvel = empty("gvel", 16 * snodes);

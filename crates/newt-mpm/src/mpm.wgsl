@@ -288,6 +288,13 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     let bi = i32(base.x);
     let bj = i32(base.y);
     let bk = i32(base.z);
+    // Away from the two-node wall band the mirrored node is the node itself,
+    // so one table read does for both. (Caching the eight blocks the 27 nodes
+    // can span is tempting and is a loss: a dynamically indexed local array
+    // lands in thread-private memory, which is slower than re-reading a table
+    // the neighbouring threads are all hitting anyway.)
+    let ilo = 2;
+    let ihi = vec3<i32>(i32(P.n.x), i32(P.n.y), i32(P.n.z)) - vec3<i32>(3);
     for (var di = 0; di < 3; di++) {
         for (var dj = 0; dj < 3; dj++) {
             for (var dk = 0; dk < 3; dk++) {
@@ -298,7 +305,10 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
                 let gs = node_index(i, j, k);
                 let wt = wx[di] * wy[dj] * wz[dk];
                 // the density the pressure sees, mirrored at the walls
-                let gr = node_index(clamp(i, 2, i32(P.n.x) - 3), clamp(j, 2, i32(P.n.y) - 3), clamp(k, 2, i32(P.n.z) - 3));
+                var gr = gs;
+                if (i < ilo || j < ilo || k < ilo || i > ihi.x || j > ihi.y || k > ihi.z) {
+                    gr = node_index(clamp(i, ilo, ihi.x), clamp(j, ilo, ihi.y), clamp(k, ilo, ihi.z));
+                }
                 if (gr >= 0) { rho += wt * gvold[u32(gr)].w; }
                 if (gs < 0) { continue; }
                 let g = u32(gs);
