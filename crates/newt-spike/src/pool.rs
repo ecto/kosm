@@ -726,6 +726,9 @@ impl Drop {
                     continue;
                 }
                 fast += 1;
+                if region_inset(p.x, p.y) < SPONGE + 0.1 {
+                    continue;
+                }
                 let s = g.at(p.x, p.y) + off;
                 // from a cell and a half under the surface up through the crown
                 if p.z < s - 1.5 * w.h || p.z > s + 0.6 {
@@ -749,8 +752,16 @@ impl Drop {
                                 break;
                             }
                             let i = jy * g.nx + ix;
-                            // wet cells with wet neighbours only: the step from
-                            // water to a dry column beyond the disc is not a wave
+                            // only where the fine surface is the one rendered:
+                            // in the sponge band the extraction's edge has a
+                            // slope and a jitter that read as breaking, and
+                            // spawned a ring of foam that was not there
+                            let cx = g.origin[0] + (ix as f64 + 0.5) * g.cell;
+                            let cy = g.origin[1] + (jy as f64 + 0.5) * g.cell;
+                            if region_inset(cx, cy) < SPONGE + 0.1 {
+                                continue;
+                            }
+                            // wet cells with wet neighbours only
                             if g.z[i] < -1.0 || g.z[i + 1] < -1.0 || g.z[i - 1] < -1.0 || g.z[i + g.nx] < -1.0 || g.z[i - g.nx] < -1.0 {
                                 continue;
                             }
@@ -788,7 +799,16 @@ impl Drop {
             }
             self.foam.retain(|f| f.age < f.life);
             if std::env::var_os("NEWT_PROF").is_some() {
-                println!("foam   fast {fast}  in band {band}  born {born}  alive {}", self.foam.len());
+                let n = self.foam.len();
+                let born_now = &self.foam[n.saturating_sub(born)..];
+                let (mut rmax, mut rsum) = (0.0f64, 0.0);
+                for f in born_now {
+                    let r = f.x.hypot(f.y);
+                    rmax = rmax.max(r);
+                    rsum += r;
+                }
+                let alive_far = self.foam.iter().filter(|f| f.x.hypot(f.y) > box_half()).count();
+                println!("foam   fast {fast}  in band {band}  born {born} (mean r {:.2}, max r {:.2})  alive {n} ({alive_far} beyond the region)", rsum / born.max(1) as f64, rmax);
             }
             // bake the rings into the grid for this frame
             let mut g = g;
