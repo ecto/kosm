@@ -82,19 +82,34 @@ impl Frame {
     }
 }
 
-fn simulate(tx: mpsc::Sender<Frame>, splash: bool, frames: usize) {
+/// What the simulation thread is doing, for the window to show.
+type Status = std::sync::Arc<std::sync::Mutex<String>>;
+
+fn simulate(tx: mpsc::Sender<Frame>, status: Status, splash: bool, frames: usize) {
+    let set = |s: String| {
+        if let Ok(mut g) = status.lock() {
+            *g = s;
+        }
+    };
     let mut drop = Drop::new(1.3);
     if splash {
-        drop = drop.with_water(0.03);
+        let h = std::env::var("NEWT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
+        let t0 = Instant::now();
+        set(format!("filling the water at {:.0} mm and settling it for 2 s of sim time — about a minute on the GPU", h * 1000.0));
+        drop = drop.with_water(h);
+        let w = drop.water.as_ref().unwrap();
+        set(format!("settled {} particles in {:.0} s; simulating", w.count(), t0.elapsed().as_secs_f64()));
     }
     let steps_per_frame = (1.0 / pool::fps() / drop.model.dt).round() as usize;
-    for _ in 0..frames {
+    for k in 0..frames {
         let t0 = Instant::now();
         for _ in 0..steps_per_frame {
             drop.step();
         }
         drop.read_water();
-        let f = Frame::take(&drop, t0.elapsed().as_millis());
+        let ms = t0.elapsed().as_millis();
+        set(format!("frame {k} of {frames} · {ms} ms per frame · melon z {:+.2} m", drop.centre().z));
+        let f = Frame::take(&drop, ms);
         drop.fluid_force = V::zero();
         if tx.send(f).is_err() {
             break;
@@ -104,6 +119,7 @@ fn simulate(tx: mpsc::Sender<Frame>, splash: bool, frames: usize) {
 
 struct App {
     rx: mpsc::Receiver<Frame>,
+    status: Status,
     frames: Vec<Frame>,
     cursor: usize,
     playing: bool,
@@ -131,13 +147,14 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, rx: mpsc::Receiver<Frame>, splash: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, rx: mpsc::Receiver<Frame>, status: Status, splash: bool) -> Self {
         if let Some(rs) = &cc.wgpu_render_state {
             let res = live::Resources::new(&rs.device, rs.target_format);
             rs.renderer.write().callback_resources.insert(res);
         }
         let mut app = Self {
             rx,
+            status,
             frames: Vec::new(),
             cursor: 0,
             playing: true,
@@ -294,6 +311,9 @@ impl eframe::App for App {
             ui.heading("inspector");
             ui.label(format!("ui {:.0} fps · {}", self.ui_fps, if self.live_on { "live tier" } else { "live tier off" }));
             ui.label(format!("recorded {n} frames"));
+            if let Ok(st) = self.status.lock() {
+                ui.label(st.as_str());
+            }
             if let Some(f) = self.frames.get(self.cursor) {
                 ui.separator();
                 ui.label(format!("t = {:.3} s   sim {} ms/frame", f.t, f.sim_ms));
@@ -381,6 +401,8 @@ impl eframe::App for App {
                         ui.painter().add(cb);
                     } else {
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+                        let msg = self.status.lock().map(|s| s.clone()).unwrap_or_default();
+                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(18.0), egui::Color32::from_gray(170));
                     }
                 } else {
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(20));
@@ -423,10 +445,12 @@ fn main() -> eframe::Result<()> {
     let splash = std::env::args().any(|a| a == "--splash");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || simulate(tx, splash, frames));
+    let status: Status = Default::default();
+    let status_ui = status.clone();
+    std::thread::spawn(move || simulate(tx, status, splash, frames));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 800.0]).with_title("newt view"),
         ..Default::default()
     };
-    eframe::run_native("newt view", options, Box::new(move |cc| Ok(Box::new(App::new(cc, rx, splash)))))
+    eframe::run_native("newt view", options, Box::new(move |cc| Ok(Box::new(App::new(cc, rx, status_ui, splash)))))
 }
