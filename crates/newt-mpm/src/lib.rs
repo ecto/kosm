@@ -134,6 +134,7 @@ pub struct GpuMpm {
     /// Node slots the compact grid arrays are sized for; one slot is 4^3 nodes.
     max_slots: u32,
     btab: wgpu::Buffer,
+    alist: wgpu::Buffer,
     nact: wgpu::Buffer,
     indirect: wgpu::Buffer,
     small_stage: wgpu::Buffer,
@@ -155,6 +156,8 @@ pub struct GpuMpm {
     active: u32,
     damp: f32,
     sponge: f32,
+    /// The fine region: centre and radius; the sponge is its outer band.
+    region: ([f32; 2], f32),
     /// The surface-extraction pass, built on first use.
     surf: Option<surface::Surf>,
 }
@@ -252,7 +255,7 @@ impl GpuMpm {
         let nact = empty("nact", 16);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -359,6 +362,7 @@ impl GpuMpm {
             nb,
             max_slots,
             btab,
+            alist,
             nact,
             indirect,
             small_stage,
@@ -372,6 +376,7 @@ impl GpuMpm {
             active: 0,
             damp: 1.0,
             sponge: 0.0,
+            region: ([0.0, 0.0], 1e9),
             surf: None,
         })
     }
@@ -417,13 +422,19 @@ impl GpuMpm {
     }
 
     /// Width of the damping band along the side walls (0 = none).
-    pub fn set_sponge(&mut self, w: f32) {
+    pub fn set_sponge(&mut self, w: f32, centre: [f32; 2], radius: f32) {
         self.sponge = w;
+        self.region = (centre, radius);
     }
 
     /// Per-substep velocity factor (1 = none); used while settling.
     pub fn set_damp(&mut self, damp: f32) {
         self.damp = damp;
+    }
+
+    /// The solver's grid parameters (the grid spans the pool; see the caller).
+    pub fn params(&self) -> &Params {
+        &self.params
     }
 
     pub fn count(&self) -> usize {
@@ -444,8 +455,9 @@ impl GpuMpm {
             n: [n[0], n[1], n[2], self.n],
             k: [p.dt, 1.0 / h, p.mass, p.vol0],
             k2: [p.bulk, p.flip, p.gravity, 4.0 / (h * h)],
-            lo: [o[0] + 2.0 * h, o[1] + 2.0 * h, o[2] + 2.0 * h, e],
-            hi: [o[0] + (n[0] - 3) as f32 * h, o[1] + (n[1] - 3) as f32 * h, o[2] + (n[2] - 3) as f32 * h, self.damp],
+            // lo.xy: the region's centre, hi.x: its radius (walls are by node index)
+            lo: [self.region.0[0], self.region.0[1], 0.0, e],
+            hi: [self.region.1, 0.0, 0.0, self.damp],
             misc: [slot, self.nb[0], self.nb[1], self.nb[2]],
             xmax: [o[0] + (n[0] - 1) as f32 * h - e, o[1] + (n[1] - 1) as f32 * h - e, o[2] + (n[2] - 1) as f32 * h - e, p.j_relax],
             b_centre: v4(body.centre, 0.0),
@@ -510,7 +522,7 @@ impl GpuMpm {
                 pass.set_pipeline(&self.clear);
                 pass.dispatch_workgroups_indirect(&self.indirect, 0);
                 pass.set_pipeline(&self.p2g);
-                pass.dispatch_workgroups(wg, wgy, 1);
+                pass.dispatch_workgroups_indirect(&self.indirect, 16);
                 pass.set_pipeline(&self.grid);
                 pass.dispatch_workgroups_indirect(&self.indirect, 0);
                 pass.set_pipeline(&self.blur);

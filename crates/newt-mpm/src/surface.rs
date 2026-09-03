@@ -18,6 +18,7 @@ pub(crate) struct SurfParams {
     geom: [f32; 4],
     k: [f32; 4],
     band: [f32; 4],
+    blocks: [u32; 4],
 }
 
 /// What the surface pass needs beyond the solver's own buffers.
@@ -76,7 +77,8 @@ impl GpuMpm {
             })
         };
         let cells = (nx * ny) as u64;
-        let frac = store("frac", 4 * self.nodes as u64);
+        // per active slot, like the grid itself
+        let frac = store("frac", 4 * 64 * self.max_slots as u64);
         let ha = store("ha", 4 * cells);
         let hb = store("hb", 4 * cells);
         let rest = store("rest", 4 * cells);
@@ -101,7 +103,7 @@ impl GpuMpm {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         }];
-        for (b, ro) in [(1u32, true), (2, false), (3, false), (4, false), (5, true), (6, true), (7, true), (8, false), (9, false), (10, false)] {
+        for (b, ro) in [(1u32, true), (2, false), (3, false), (4, false), (5, true), (6, true), (7, true), (8, false), (9, false), (10, false), (11, true), (12, true), (13, true)] {
             entries.push(ent(b, ro));
         }
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("surface"), entries: &entries });
@@ -121,6 +123,9 @@ impl GpuMpm {
                     wgpu::BindGroupEntry { binding: 8, resource: cnt.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: cx.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: cv.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: self.btab.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: self.alist.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: self.nact.as_entire_binding() },
                 ],
             })
         };
@@ -190,12 +195,13 @@ impl GpuMpm {
             geom: [-half, -half, cell, floor],
             k: [1000.0 * self.params.h.powi(3), level, pick_above, pick_speed],
             band: [pick_below, pick_up, 0.0, 0.0],
+            blocks: [self.nb[0], self.nb[1], self.nb[2], self.max_slots],
         };
         self.queue.write_buffer(&s.params, 0, bytemuck::bytes_of(&p));
         self.queue.write_buffer(&s.cnt, 0, &[0u8; 4]);
         let cells = s.nx * s.ny;
         let (cg, cgy) = Self::groups(cells);
-        let (ng, ngy) = Self::groups(self.nodes);
+        let (ng, ngy) = Self::groups(64 * self.max_slots);
         let (pg, pgy) = Self::groups(self.n);
         let mut enc = self.device.create_command_encoder(&Default::default());
         {

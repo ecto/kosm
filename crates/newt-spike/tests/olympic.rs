@@ -56,6 +56,22 @@ fn seam_profile_at_impact() {
     }
     let half = pool::box_half();
     println!("box half {half}  sponge {}  blend {}", pool::SPONGE, pool::BLEND);
+    {
+        let w = d.water.as_ref().unwrap();
+        let mean = |g: &newt_spike::splash::HeightGrid| g.z.iter().sum::<f64>() / g.z.len() as f64;
+        println!("level_offset {:.4}  rest map: {}  fine grid mean {:.4}  fine at centre {:.4}  cpu-extracted (synced) at centre {:.4}",
+            w.level_offset,
+            w.rest.as_ref().map(|r| format!("{}x{} mean {:.4}", r.nx, r.ny, mean(r))).unwrap_or("none".into()),
+            d.surface.grid.as_ref().map(mean).unwrap_or(f64::NAN),
+            d.surface.grid.as_ref().map(|g| g.at(0.0, 0.0)).unwrap_or(f64::NAN),
+            f64::NAN);
+    }
+    {
+        let w = d.water.as_mut().unwrap();
+        w.sync_from_gpu();
+        let g = w.surface(0.02);
+        println!("cpu extraction from synced grid: at centre {:.4}  mean {:.4}  (raw, before rest subtraction rest is applied inside surface())", g.at(0.0, 0.0), g.z.iter().sum::<f64>() / g.z.len() as f64);
+    }
     let mut x = 0.0;
     while x < half + 0.6 {
         let y = if std::env::var_os("NEWT_TEST_DIAG").is_some() { x } else { 0.0 };

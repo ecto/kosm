@@ -12,8 +12,8 @@ struct Params {
     n: vec4<u32>,          // nx, ny, nz, particle count
     k: vec4<f32>,          // dt, inv_h, mass, vol0
     k2: vec4<f32>,         // bulk, flip, gravity, d_inv
-    lo: vec4<f32>,         // wall lo.xyz, e (clamp margin)
-    hi: vec4<f32>,         // wall hi.xyz, velocity damping per substep
+    lo: vec4<f32>,         // region centre.xy, 0, e (clamp margin)
+    hi: vec4<f32>,         // region radius, 0, 0, velocity damping per substep
     misc: vec4<u32>,       // slot, nbx, nby, nbz (blocks per axis)
     xmax: vec4<f32>,       // clamp max xyz, J relax share
     b_centre: vec4<f32>,
@@ -222,10 +222,19 @@ fn grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (j > i32(P.n.y) - 3 && vel.y > 0.0) { vel.y = 0.0; }
     if (k < 2 && vel.z < 0.0) { vel.z = 0.0; }
     if (k > i32(P.n.z) - 3 && vel.z > 0.0) { vel.z = 0.0; }
-    // the sponge: the box's outer band damps the motion (see the CPU solver)
+    // the region's edge: beyond the radius the water is the far field's, at
+    // rest, so no outflow crosses it (a free-slip cylinder, the wall the box
+    // had); inside, the sponge band damps the motion (see the CPU solver)
     let sw = P.semi.w;
     if (sw > 0.0) {
-        let inset = min(min(xi.x - P.lo.x, P.hi.x - xi.x), min(xi.y - P.lo.y, P.hi.y - xi.y));
+        let rv = xi.xy - P.lo.xy;
+        let dist = length(rv);
+        let inset = P.hi.x - dist; // the region is a disc
+        if (outside_region(i, j) && dist > 1e-6) {
+            let nrm2 = rv / dist;
+            let out = dot(vel.xy, nrm2);
+            if (out > 0.0) { vel = vec3<f32>(vel.xy - nrm2 * out, vel.z); }
+        }
         if (inset < sw) {
             let r = 1.0 - max(inset / sw, 0.0);
             vel = vel * (1.0 - 0.03 * r * r);
@@ -375,6 +384,18 @@ fn block_of(xp: vec3<f32>) -> u32 {
     return u32((b.z * i32(P.misc.z) + b.y) * i32(P.misc.y) + b.x);
 }
 
+// The region's circle on node indices (see the CPU solver): centre index
+// from the centre coordinate, radius² in cells.
+fn outside_region(i: i32, j: i32) -> bool {
+    let inv_h = P.k.y;
+    let ic = i32(round((P.lo.x - P.origin_h.x) * inv_h));
+    let jc = i32(round((P.lo.y - P.origin_h.y) * inv_h));
+    let di = i - ic;
+    let dj = j - jc;
+    let r = P.hi.x * inv_h;
+    return f32(di * di + dj * dj) > r * r;
+}
+
 fn nblocks() -> u32 {
     return P.misc.y * P.misc.z * P.misc.w;
 }
@@ -385,6 +406,7 @@ fn sort_zero(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     if (b >= nblocks()) { return; }
     atomicStore(&counts[b], 0u);
     atomicStore(&fill[b], 0u);
+    btab[b] = 0u; // the marks start clean each substep
 }
 
 @compute @workgroup_size(256)
@@ -435,8 +457,12 @@ fn sort_scan(@builtin(local_invocation_index) t: u32) {
 // workgroup prefix sum that hands out compact slots.
 @compute @workgroup_size(256)
 fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    // a scatter from the blocks that hold particles to their 27 neighbours:
+    // over a table that spans the pool almost every block is empty, and a
+    // gather of 27 counts per block was the cost that made that table dear
     let b = linear_id(gid, nwg);
     if (b >= nblocks()) { return; }
+    if (atomicLoad(&counts[b]) == 0u) { return; }
     let nbx = i32(P.misc.y);
     let nby = i32(P.misc.z);
     let nbz = i32(P.misc.w);
@@ -444,7 +470,6 @@ fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     let bx = bi % nbx;
     let by = (bi / nbx) % nby;
     let bz = bi / (nbx * nby);
-    var any = 0u;
     for (var dz = -1; dz <= 1; dz++) {
         let z = bz + dz;
         if (z < 0 || z >= nbz) { continue; }
@@ -454,11 +479,10 @@ fn blk_mark(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
             for (var dx = -1; dx <= 1; dx++) {
                 let xx = bx + dx;
                 if (xx < 0 || xx >= nbx) { continue; }
-                if (atomicLoad(&counts[u32((z * nby + y) * nbx + xx)]) > 0u) { any = 1u; }
+                btab[u32((z * nby + y) * nbx + xx)] = 1u; // a flag; blk_scan makes it a slot
             }
         }
     }
-    btab[b] = any; // a flag for now; blk_scan turns it into a slot
 }
 
 // Exclusive prefix sum over the marks: block -> slot, slot -> block, and the
@@ -491,6 +515,10 @@ fn blk_scan(@builtin(local_invocation_index) t: u32) {
         indirect[0] = min(g, 65535u);
         indirect[1] = (g + 65534u) / 65535u;
         indirect[2] = 1u;
+        // and one workgroup per active block for the scatter (offset 16 bytes)
+        indirect[4] = min(used, 65535u);
+        indirect[5] = (used + 65534u) / 65535u;
+        indirect[6] = 1u;
     }
     workgroupBarrier();
     var run = partial[t];
@@ -534,8 +562,12 @@ fn permute(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
 // atomics and are flushed to the grid once
 @compute @workgroup_size(256)
 fn p2g_block(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-    let b = wg.x + wg.y * nwg.x;
-    if (b >= nblocks()) { return; }
+    // one workgroup per ACTIVE block (dispatched indirectly from blk_scan):
+    // over a table that spans the pool, launching a workgroup per block to
+    // have it return was most of the substep
+    let slot = wg.x + wg.y * nwg.x;
+    if (slot >= atomicLoad(&nact[0])) { return; }
+    let b = alist[slot];
     // an empty block has nothing to scatter, and skipping it here saves
     // zeroing and scanning the 7^3 tile for most of the box
     if (offsets[b] == offsets[b + 1u]) { return; }
@@ -624,6 +656,7 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let j = ijk.y;
     let k = ijk.z;
     let hh = P.origin_h.w;
+    let full_node = P.k.z * hh * hh * hh / P.k.w; // a node's mass at rest density
     var acc = 0.0;
     for (var dk = -1; dk <= 1; dk++) {
         for (var dj = -1; dj <= 1; dj++) {
@@ -646,8 +679,13 @@ fn blur(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 }
                 // an inactive neighbour is empty; the dilation guarantees every
                 // node with mass, and every mirror target of one, is in an active block
-                let gn = node_index(aa, bb, ccc);
-                if (gn >= 0) { acc += gvel[u32(gn)].w; }
+                // beyond the region: the far field's water, at rest (see the CPU solver)
+                if (outside_region(aa, bb)) {
+                    if (xn.z < 0.0) { acc += full_node; }
+                } else {
+                    let gn = node_index(aa, bb, ccc);
+                    if (gn >= 0) { acc += gvel[u32(gn)].w; }
+                }
             }
         }
     }

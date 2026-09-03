@@ -311,7 +311,7 @@ impl Far {
             for i in 0..nx {
                 let x = self.grid.origin[0] + (i as f64 + 0.5) * cell;
                 let y = self.grid.origin[1] + (j as f64 + 0.5) * cell;
-                let m = x.abs().max(y.abs());
+                let m = x.hypot(y); // the region is a disc
                 if m >= outer {
                     continue;
                 }

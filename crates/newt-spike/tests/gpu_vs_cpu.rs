@@ -33,6 +33,18 @@ fn one_and_many_substeps() {
         let (xr, xm) = rms(&cpu.x, &gpu.x);
         let vscale = (cpu.v.iter().map(|v| v.norm_squared()).sum::<f64>() / cpu.v.len() as f64).sqrt();
         println!("after +{n:4} steps: |v| rms {vscale:.4}  dv rms {vr:.2e} max {vm:.2e}   dx rms {xr:.2e} max {xm:.2e}");
+        // where the worst particle is: radius from the region centre, depth
+        let (mut worst, mut wi) = (0.0, 0usize);
+        for (i, (a, b)) in cpu.v.iter().zip(&gpu.v).enumerate() {
+            let d = (*a - *b).norm();
+            if d > worst { worst = d; wi = i; }
+        }
+        let p = cpu.x[wi];
+        let (mut far_cnt, mut far_sum) = (0usize, 0.0);
+        for (a, b, x) in cpu.v.iter().zip(&gpu.v).zip(&cpu.x).map(|((a, b), x)| (a, b, x)) {
+            if x.x.hypot(x.y) > newt_spike::pool::box_half() - 0.15 { far_cnt += 1; far_sum += (*a - *b).norm_squared(); }
+        }
+        println!("      worst particle at r={:.3} z={:.3}; rms dv within 15 cm of the edge {:.2e} ({far_cnt} particles)", p.x.hypot(p.y), p.z, (far_sum / far_cnt.max(1) as f64).sqrt());
         let gm: f64 = gpu.g_mass.iter().sum();
         let cm: f64 = cpu.g_mass.iter().sum();
         println!("                 grid mass cpu {cm:.5} gpu {gm:.5}");

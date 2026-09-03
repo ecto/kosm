@@ -59,7 +59,7 @@ fn height(x: f32, y: f32) -> f32 {
     let t = C.launch.w;
     let ambient = 0.0008 * (sin(7.0 * x + 3.0 * t) * cos(5.0 * y - 2.0 * t)) + 0.0005 * sin(11.0 * x - 4.0 * y + 1.7 * t);
     if (C.far.w == 0.0) { return ambient; }
-    let inset = C.band.x - max(abs(x), abs(y));
+    let inset = C.band.x - length(vec2<f32>(x, y)); // the region is a disc
     let f = grid_at(1u, C.fine_n.z, C.fine_n.w, C.far.x, C.far.y, C.far.z, x, y) + ambient;
     if (inset <= C.band.y) { return f; }
     let g = grid_at(0u, C.fine_n.x, C.fine_n.y, C.fine.x, C.fine.y, C.fine.z, x, y) + ambient;

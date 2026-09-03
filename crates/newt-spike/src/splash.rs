@@ -40,7 +40,7 @@ pub fn take_prof() -> [u64; 5] {
     std::array::from_fn(|i| PROF[i].swap(0, Ordering::Relaxed))
 }
 
-use crate::pool::{BOX_DEPTH, MELON_AXES, SPONGE, box_half};
+use crate::pool::{BOX_DEPTH, MELON_AXES, POOL_X, POOL_Y, SPONGE, box_half};
 
 pub struct Water {
     pub h: f64,
@@ -119,8 +119,11 @@ impl Body {
 impl Water {
     /// Fill the pool: one particle per cell, jittered, `depth` deep.
     pub fn fill(h: f64, dt: f64, air_above: f64, bulk: f64) -> Self {
-        // the box around the melon, not the pool: see pool::box_half
-        let (bx, by, depth) = (box_half(), box_half(), BOX_DEPTH);
+        // the CPU grid is a dense box around the region (the reference for
+        // the parity tests); the GPU grid spans the pool, see enable_gpu
+        // ...and a margin wider than the disc, so the box walls' density
+        // mirror (three cells) never reaches the water the GPU sees walls-free
+        let (bx, by, depth) = (box_half() + 4.0 * h, box_half() + 4.0 * h, BOX_DEPTH);
         let origin = Vec3::new(-bx - 2.0 * h, -by - 2.0 * h, -depth - 2.0 * h);
         let nx = ((2.0 * bx + 4.0 * h) / h).ceil() as usize + 1;
         let ny = ((2.0 * by + 4.0 * h) / h).ceil() as usize + 1;
@@ -142,10 +145,13 @@ impl Water {
         while px < bx - sp * 0.25 {
             let mut py = -by + sp * 0.5;
             while py < by - sp * 0.25 {
-                let mut pz = -depth + sp * 0.5;
-                while pz < -sp * 0.25 {
-                    x.push(Vec3::new(px + rnd() * sp * 0.6, py + rnd() * sp * 0.6, pz + rnd() * sp * 0.6));
-                    pz += sp;
+                // a disc, not a square: the region has no corners to leak from
+                if px.hypot(py) <= box_half() {
+                    let mut pz = -depth + sp * 0.5;
+                    while pz < -sp * 0.25 {
+                        x.push(Vec3::new(px + rnd() * sp * 0.6, py + rnd() * sp * 0.6, pz + rnd() * sp * 0.6));
+                        pz += sp;
+                    }
                 }
                 py += sp;
             }
@@ -378,6 +384,16 @@ impl Water {
             }
         }
         prof(2, &mut pt);
+        // the region's circle, tested on node indices so the CPU and the GPU
+        // agree to the node about which side a node is on (yesterday's f32
+        // wall lesson, again): centre index and radius² in cells
+        let ic = ((0.0 - origin.x) / h).round() as i64;
+        let jc = ((0.0 - origin.y) / h).round() as i64;
+        let r2 = (box_half() / h).powi(2);
+        let outside = move |i: usize, j: usize| -> bool {
+            let (di, dj) = (i as i64 - ic, j as i64 - jc);
+            ((di * di + dj * dj) as f64) > r2
+        };
         // ---- grid: gravity, walls, the body ----  (parallel over rows)
         let (lo, hi) = (origin + Vec3::new(2.0, 2.0, 2.0) * h, origin + Vec3::new((nx - 3) as f64, (ny - 3) as f64, (nz - 3) as f64) * h);
         let (reaction, interior) = self
@@ -410,7 +426,17 @@ impl Water {
                         if xi.z > hi.z && vel.z > 0.0 { vel.z = 0.0; }
                         // the sponge: the box's outer band damps the motion so
                         // waves leave for the far field instead of reflecting
-                        let inset = (xi.x - lo.x).min(hi.x - xi.x).min(xi.y - lo.y).min(hi.y - xi.y);
+                        let inset = crate::pool::region_inset(xi.x, xi.y);
+                        // the region's edge: no outflow across it (see the GPU kernel)
+                        let dist = xi.x.hypot(xi.y);
+                        if outside(i, jj) && dist > 1e-6 {
+                            let (nx_, ny_) = (xi.x / dist, xi.y / dist);
+                            let out = vel.x * nx_ + vel.y * ny_;
+                            if out > 0.0 {
+                                vel.x -= nx_ * out;
+                                vel.y -= ny_ * out;
+                            }
+                        }
                         if inset < SPONGE {
                             let r = 1.0 - (inset / SPONGE).max(0.0);
                             vel = vel * (1.0 - 0.03 * r * r);
@@ -466,6 +492,7 @@ impl Water {
         // the raw node mass is too noisy an estimate (the water boils); a
         // 3x3x3 box blur is not, and unlike integrating the divergence it
         // cannot drift from the positions
+        let full_node = 1000.0 * h * h * h; // a node's mass at rest density
         let g_blur: Vec<f64> = (0..nx * ny * nz)
             .into_par_iter()
             .map(|g| {
@@ -506,7 +533,18 @@ impl Water {
                             } else {
                                 (a, b, cc)
                             };
-                            acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
+                            // beyond the region the water is the far field's,
+                            // at rest: rest density below the water line, air
+                            // above. Without this the region's edge read thin,
+                            // felt no pressure, and the disc flowed outward into
+                            // a pile against its own wall.
+                            if outside(a as usize, b as usize) {
+                                if xi.z < 0.0 {
+                                    acc += full_node;
+                                }
+                            } else {
+                                acc += self.g_mass[(cc as usize * ny + b as usize) * nx + a as usize];
+                            }
                         }
                     }
                 }
@@ -631,8 +669,10 @@ impl Water {
         let params = newt_mpm::Params {
             h: self.h as f32,
             dt: self.dt as f32,
-            origin: f(&self.origin),
-            n: [self.nx as u32, self.ny as u32, self.nz as u32],
+            // the GPU grid spans the whole pool; the block-sparse storage only
+            // allocates where the particles are, so this costs a block table
+            origin: [(-POOL_X - 2.0 * self.h) as f32, (-POOL_Y - 2.0 * self.h) as f32, self.origin.z as f32],
+            n: [((2.0 * POOL_X + 4.0 * self.h) / self.h).ceil() as u32 + 1, ((2.0 * POOL_Y + 4.0 * self.h) / self.h).ceil() as u32 + 1, self.nz as u32],
             mass: self.mass as f32,
             vol0: self.vol0 as f32,
             bulk: self.bulk as f32,
@@ -653,7 +693,7 @@ impl Water {
     pub fn step_block(&mut self, body: &Body, subs: usize) -> Vec3 {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_damp(self.damp as f32);
-            gpu.set_sponge(SPONGE as f32);
+            gpu.set_sponge(SPONGE as f32, [0.0, 0.0], box_half() as f32);
             let reactions = gpu.step(&Self::gpu_body(body), subs as u32);
             let mut f = Vec3::zeros();
             let mut interior = 0.0;
@@ -684,8 +724,24 @@ impl Water {
             self.j[i] = 1.0 + xp[3] as f64;
             self.v[i] = Vec3::new(vp[0] as f64, vp[1] as f64, vp[2] as f64);
         }
-        for (dst, m) in self.g_mass.iter_mut().zip(gpu.grid_mass()) {
-            *dst = m as f64;
+        // the GPU grid spans the pool; the CPU grid is a box around the
+        // region, so copy the box's window out of it
+        let gm = gpu.grid_mass();
+        let gp = gpu.params();
+        let off = [
+            ((self.origin.x - gp.origin[0] as f64) / self.h).round() as i64,
+            ((self.origin.y - gp.origin[1] as f64) / self.h).round() as i64,
+            ((self.origin.z - gp.origin[2] as f64) / self.h).round() as i64,
+        ];
+        let (gnx, gny, gnz) = (gp.n[0] as i64, gp.n[1] as i64, gp.n[2] as i64);
+        for k in 0..self.nz {
+            for j in 0..self.ny {
+                for i in 0..self.nx {
+                    let (gi, gj, gk) = (i as i64 + off[0], j as i64 + off[1], k as i64 + off[2]);
+                    let m = if gi < 0 || gj < 0 || gk < 0 || gi >= gnx || gj >= gny || gk >= gnz { 0.0 } else { gm[((gk * gny + gj) * gnx + gi) as usize] as f64 };
+                    self.g_mass[(k * self.ny + j) * self.nx + i] = m;
+                }
+            }
         }
     }
 
@@ -726,10 +782,13 @@ impl Water {
         self.level_offset = 0.0;
         self.rest = None;
         let g = self.surface(0.02);
+        // the rest level is the mean over the wet cells (the disc), not the
+        // dry corners of the square, which report the floor
         let inner: Vec<f64> = (0..g.ny)
             .flat_map(|j| (0..g.nx).map(move |i| (i, j)))
             .filter(|(i, j)| *i > 2 && *j > 2 && *i + 3 < g.nx && *j + 3 < g.ny)
             .map(|(i, j)| g.z[j * g.nx + i])
+            .filter(|z| *z > -BOX_DEPTH + 0.05)
             .collect();
         self.level_offset = inner.iter().sum::<f64>() / inner.len().max(1) as f64;
         self.rest = Some(g);
@@ -806,8 +865,9 @@ impl Water {
         // the rest map cancels the lattice's static extraction noise
         match &self.rest {
             Some(r) if r.nx == nx && r.ny == ny => {
+                // only where the rest map recorded water (see surf_finish)
                 for (z, r) in out.z.iter_mut().zip(&r.z) {
-                    *z -= r;
+                    *z -= if *r > -BOX_DEPTH + 0.05 { *r } else { self.level_offset };
                 }
             }
             _ => {

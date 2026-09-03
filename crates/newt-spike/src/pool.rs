@@ -38,11 +38,20 @@ use crate::glass::{fresnel, refract, reflect};
 pub const POOL_X: f64 = 25.0; // half-lengths of the water
 pub const POOL_Y: f64 = 12.5;
 pub const DEPTH: f64 = 2.0;
-/// The fine MPM box around the melon: half-width (NEWT_BOX overrides) and
-/// depth. Beyond it the water is the far field (see `far`).
+/// The fine MPM region: a disc of this radius (NEWT_BOX overrides) around
+/// the region's centre, which is the pool's centre for now. Beyond it the
+/// water is the far field (see `far`). The GPU grid spans the whole pool;
+/// only the blocks the particles touch are allocated, so the region is a set
+/// of particles, not a box — the first step toward water that appears where
+/// something happens and leaves when it is over.
 pub fn box_half() -> f64 {
     static HALF: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *HALF.get_or_init(|| std::env::var("NEWT_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.25))
+}
+/// Distance from the region's edge, positive inside: the same measure the
+/// sponge, the render blend and the far field's nudge all use.
+pub fn region_inset(x: f64, y: f64) -> f64 {
+    box_half() - x.hypot(y)
 }
 pub const BOX_DEPTH: f64 = DEPTH; // the full depth: a floor the melon could fall through is no floor
 /// The box's outer band where the fluid's velocity is damped so waves leave
@@ -384,8 +393,7 @@ impl Surface {
             // ...and the blend must be wide and C1: a 10 cm linear blend
             // between two surfaces a millimetre apart is a ring of curvature,
             // and a ring of curvature is a lens (the caustic showed a frame)
-            let half = box_half();
-            let inset = half - x.abs().max(y.abs());
+            let inset = region_inset(x, y);
             let far = self.far.as_ref().map(|f| f.at(x, y)).unwrap_or(0.0) + ambient;
             if inset > SPONGE + BLEND {
                 return g.at(x, y) + ambient;
@@ -428,7 +436,7 @@ impl Surface {
         V::new(-dx, -dy, 1.0).normalize()
     }
     /// Where a ray meets the surface, by marching then bisection.
-    fn hit(&self, o: V<f64>, d: V<f64>, t_max: f64) -> Option<f64> {
+    fn hit(&self, o: V<f64>, d: V<f64>, t_max: f64, top_fine: f64, top_far: f64) -> Option<f64> {
         let f = |t: f64| {
             let p = o + d * t;
             p.z - self.height(p.x, p.y)
@@ -438,7 +446,19 @@ impl Surface {
         while t < t_max {
             // 4 mm steps up close, where the splash is; coarser with distance,
             // where the far field is smooth and the pool is fifty metres long
-            let step = 0.004 + 0.012 * t;
+            let mut step = 0.004 + 0.012 * t;
+            // and, above the highest water this ray could meet, stride down
+            // to it: the crown's tip sets the fine bound only inside the
+            // region, the far field is millimetres everywhere else
+            let p = o + d * t;
+            let bound = if region_inset(p.x, p.y) > -0.5 { top_fine } else { top_far };
+            let clearance = p.z - bound;
+            if clearance > 0.02 {
+                if d.z >= 0.0 {
+                    return None; // climbing away from any water
+                }
+                step = step.max(0.5 * clearance / -d.z);
+            }
             let tn = (t + step).min(t_max);
             let cur = f(tn);
             if (prev > 0.0) != (cur > 0.0) {
@@ -1104,7 +1124,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
         let t_line = if d.z != 0.0 { (0.06 - o.z) / d.z } else { 0.0 };
         let p_line = o + d * t_line.max(0.0);
         if inside_pool(p0) || inside_pool(p_line) {
-            t_water = drop.surface.hit(p0, d, 80.0).map(|t| t + t_start);
+            t_water = drop.surface.hit(p0, d, 80.0, drop.top, drop.top_far).map(|t| t + t_start);
         }
     }
     // pool walls seen from above the water (the tiled inside faces above z=0)
@@ -1361,15 +1381,23 @@ fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Scene, cau
 pub struct Scene<'a> {
     pub surface: &'a Surface,
     pub droplets: &'a [crate::splash::Droplet],
-    /// The surface's maximum this frame (computed once: it is a grid scan).
+    /// The surface's maximum this frame (computed once: it is a grid scan)...
     pub top: f64,
+    /// ...and the far field's, for rays that never cross the region.
+    pub top_far: f64,
     pub foam: &'a FoamField,
 }
 
 pub fn render(view: &View, drop: &Drop, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
+    let t_foam = std::time::Instant::now();
     let foam = FoamField::build(&drop.foam, box_half() + 1.0);
-    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top: drop.surface.top(), foam: &foam };
+    let top = drop.surface.top();
+    if std::env::var_os("NEWT_PROF").is_some() {
+        println!("render prep: foam field {} ms, top {:.3} m", t_foam.elapsed().as_millis(), top);
+    }
+    let top_far = drop.surface.far.as_ref().map(|f| f.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0) + 0.02;
+    let scene = Scene { surface: &drop.surface, droplets: &drop.droplets, top, top_far, foam: &foam };
     let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
