@@ -119,3 +119,43 @@ fn far_fft_speed() {
     }
     println!("energy only: {:.1} ms", t.elapsed().as_millis() as f64 / 20.0);
 }
+
+#[test]
+fn settled_water_energy_is_steady() {
+    use newt_spike::splash::{Body, Water};
+    use phyz_math::Vec3;
+    let h = 0.05;
+    let bulk = 2.0e6;
+    let dt = 0.35 * h / (bulk / 1000.0f64).sqrt();
+    let mut w = Water::fill(h, dt, 0.5, bulk);
+    w.enable_gpu(256).expect("gpu");
+    w.settle(2.0);
+    w.sync_from_gpu();
+    let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+    let (k0, p0, i0) = w.energy();
+    let zmean = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
+    let jmean = w.j.iter().sum::<f64>() / w.j.len() as f64;
+    println!("settled (flip {} relax {}): kinetic {k0:.2} J  potential {p0:.1} J  internal {i0:.2} J  z mean {zmean:.3} (rest -1.0)  J mean {jmean:.4}", w.flip, newt_spike::splash::j_relax());
+    let mut worst: f64 = 0.0;
+    for n in 1..=10 {
+        w.step_block(&far, 256);
+        w.sync_from_gpu();
+        let (k, p, i) = w.energy();
+        let d = (k + p + i) - (k0 + p0 + i0);
+        worst = worst.max(d.abs());
+        let zm = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
+        println!("+{:4} substeps: kinetic {k:.2}  potential {p:.1}  internal {i:.2}  total drift {d:+.2} J  z mean {zm:.3}", n * 256);
+    }
+    let scale = p0.abs();
+    println!("worst total drift {worst:.2} J of {scale:.0} J potential ({:.2e} relative)", worst / scale);
+    // Measured 2026-09-02 at 5 cm, 2.6 k substeps after a 2 s settle, drift as a share of |potential|:
+    //   FLIP 0.9 relax 0.02: kinetic 548 J at rest, drift +1.5e-2
+    //   FLIP 0.5 relax 0.02: kinetic   5 J,         drift +1.2e-2
+    //   FLIP 0   relax 0.02: kinetic   3 J,         drift -3.2e-2
+    //   FLIP 0   relax 0   : kinetic   5 J, packing 6% (best), internal energy 168 kJ and growing (J drifts)
+    //   FLIP 0   relax 1.0 : kinetic 45 -> 269 J,  drift -7.8e-2
+    // The drift is in the EOS term: J is not derived from the positions, so
+    // the strain energy it books is partly fictitious. Until J is honest the
+    // MPM energy is a diagnostic, not an invariant; this asserts the loose bound.
+    assert!(worst / scale < 5e-2);
+}

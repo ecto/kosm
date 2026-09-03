@@ -43,7 +43,7 @@ Five consequences, each a design rule:
 | rule | in newt today | gap |
 |---|---|---|
 | coarse state is the world | spectral far field in (η, ψ) with H conserved to 1e-13, optional 2nd-order Zakharov terms; rigid melon; height-field surface | fine region is a box, not a residual |
-| ports | nudging in a blend band with its energy booked (Far::injected); sponge; reaction booked at grid incl. projection impulses; hydrostatic force 1.03× Archimedes at 2.5 cm | the nudge is not power-conserving; no MPM energy yet; melon neutral, not afloat (dynamic dissipation) |
+| ports | nudging in a blend band with its energy booked (Far::injected); sponge; reaction booked at grid incl. projection impulses; hydrostatic force 1.03× Archimedes at 2.5 cm | the nudge is not power-conserving; Water::energy exists but its EOS term is fictitious while J is not derived from positions (drift 1e-2 of potential per 0.4 s in every variant measured); melon neutral, not afloat (dynamic dissipation) |
 | reconstruction | particles spawn from the far field with J=1; rest map | no generative reconstruction; no caching of samples |
 | question chooses level | none (box is fixed) | need the adjoint of render/decision w.r.t. model choice |
 | one autodiff | tang through phyz (marble adjoint), reference renderer differentiable in principle | MPM step has no adjoint yet; live tier not differentiable |

@@ -169,7 +169,10 @@ impl Water {
             g_mass: vec![0.0; nx * ny * nz],
             g_mom: vec![Vec3::zeros(); nx * ny * nz],
             g_vel_old: vec![Vec3::zeros(); nx * ny * nz],
-            flip: std::env::var("NEWT_FLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9),
+            // 0.9 carried a hundred times the kinetic noise of 0.5 in a settled
+            // pool (548 J vs 5 J at 5 cm) with the same packing; see
+            // tests/olympic.rs settled_water_energy_is_steady
+            flip: std::env::var("NEWT_FLIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
             bulk,
             time: 0.0,
             interior_mass: 0.0,
@@ -214,6 +217,23 @@ impl Water {
             }
         }
         (raw / full, blur / full)
+    }
+
+    /// The water's energy (J): kinetic, gravitational (relative to z = 0),
+    /// and the internal energy the equation of state stores in compression,
+    /// which for p = K(1/J − 1) is K·vol0·(J − 1 − ln J) per particle. This
+    /// is the fine side of the ledger the far field keeps in `Far::energy`.
+    pub fn energy(&self) -> (f64, f64, f64) {
+        let m = self.mass;
+        let mut kin = 0.0;
+        let mut pot = 0.0;
+        let mut int = 0.0;
+        for ((x, v), j) in self.x.iter().zip(&self.v).zip(&self.j) {
+            kin += 0.5 * m * v.norm_squared();
+            pot += m * GRAVITY * x.z;
+            int += self.bulk * self.vol0 * (j - 1.0 - j.ln());
+        }
+        (kin, pot, int)
     }
 
     pub fn count(&self) -> usize {
