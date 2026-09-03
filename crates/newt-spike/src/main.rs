@@ -21,11 +21,14 @@
 //!   - **tilt**: hold the release point, rotate the plate. Two scalars, central
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
+mod cli;
+mod level;
 
-use newt_spike::{audio, colliders, frame, garage, glass, lamp, light, pool, room, splash};
-use std::collections::HashMap;
+use newt_spike::{audio, colliders, frame, garage, glass, lamp, light, pool, room};
 use std::fs;
 use std::path::Path;
+
+use level::{DT, Level, MM, MarbleLevel, Tilt, tilted};
 
 use phyz::Simulator;
 use phyz_camera::{CameraPose, RenderScene, RgbdCamera, SceneOptions};
@@ -37,123 +40,14 @@ use phyz_math::{DVec, GRAVITY, Mat3, SpatialInertia, SpatialTransform, SpatialTr
 use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 use phyz_world::{CameraIntrinsics, Scene, SensorContext};
-use vcad_ir::{CsgOp, Document, Node};
+use vcad_ir::Document;
 
-const DT: f64 = 1e-3;
 const MARBLE: usize = 0;
 const TRACK: usize = 1;
 /// Free-joint q is [wx, wy, wz, x, y, z]; the marble is joint 0.
 const POS: usize = 3;
-const MM: f64 = 1e-3;
-
-// ---- the level --------------------------------------------------------------
-
-/// A `.loon` level: its document plus the knobs it declared.
-struct Level {
-    source: String,
-    doc: Document,
-    params: HashMap<String, f64>,
-}
-
-impl Level {
-    fn load(path: &Path) -> anyhow::Result<Self> {
-        let source = fs::read_to_string(path)?;
-        // Provenance recovery re-evaluates the program 2n+2 times to learn which
-        // geometry each knob drives; half these knobs are game state, not
-        // geometry, so skip it.
-        // SAFETY: single-threaded at this point; nothing else reads the environment.
-        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
-        let (doc, warnings) = vcad_loon::eval_vcad_parametric(&source, path.parent(), None)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for w in warnings {
-            println!("level  {w}");
-        }
-        let params = vcad_ir::resolve_parameters(&doc.parameters).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        Ok(Self { source, doc, params })
-    }
-
-    fn p(&self, name: &str) -> anyhow::Result<f64> {
-        self.params.get(name).copied().ok_or_else(|| anyhow::anyhow!("level has no `{name}`"))
-    }
-
-    fn tilt(&self) -> anyhow::Result<Tilt> {
-        Ok(Tilt { pitch: self.p("pitch_deg")?.to_radians(), roll: self.p("roll_deg")?.to_radians() })
-    }
-
-    /// Release point in the plate frame, metres.
-    fn start(&self) -> anyhow::Result<[f64; 2]> {
-        Ok([self.p("start_x")? * MM, self.p("start_y")? * MM])
-    }
-
-    fn marble_r(&self) -> anyhow::Result<f64> {
-        Ok(self.p("marble_r")? * MM)
-    }
-
-    fn steps(&self) -> anyhow::Result<usize> {
-        Ok((self.p("t_end")? / DT).round() as usize)
-    }
-
-    /// The same file with some `defparam`s given new values.
-    fn with_params(&self, updates: &[(&str, f64)]) -> String {
-        let mut out = String::with_capacity(self.source.len());
-        for line in self.source.lines() {
-            let mut replaced = None;
-            for (name, value) in updates {
-                let head = format!("[defparam {name} ");
-                if let Some(rest) = line.strip_prefix(&head) {
-                    let tail = rest.find(']').map(|i| &rest[i..]).unwrap_or("]");
-                    replaced = Some(format!("{head}{value:.4}{tail}"));
-                }
-            }
-            out.push_str(&replaced.unwrap_or_else(|| line.to_string()));
-            out.push('\n');
-        }
-        out
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Tilt {
-    /// About the plate's y axis (radians). Positive lowers the +x end.
-    pitch: f64,
-    /// About the plate's x axis (radians). Positive lowers the −y end.
-    roll: f64,
-}
-
-impl Tilt {
-    /// Plate-frame → world rotation.
-    fn rotation(self) -> Mat3 {
-        Mat3::rotation_y(self.pitch) * Mat3::rotation_x(self.roll)
-    }
-    /// The track body's pose. `SpatialTransform::rot` is world→body.
-    fn pose(self) -> SpatialTransform {
-        SpatialTransform::new(self.rotation().transpose(), Vec3::new(0.0, 0.0, 0.25))
-    }
-}
 
 // ---- CAD --------------------------------------------------------------------
-
-/// The document with every root wrapped in a `Rotate`, for the tilted view.
-fn tilted(doc: &Document, t: Tilt) -> Document {
-    let mut d = doc.clone();
-    let mut next = d.nodes.keys().copied().max().unwrap_or(0) + 1;
-    for root in &mut d.roots {
-        d.nodes.insert(
-            next,
-            Node {
-                id: next,
-                name: Some("tilt".into()),
-                op: CsgOp::Rotate {
-                    child: root.root,
-                    angles: vcad_ir::Vec3::new(t.roll.to_degrees(), t.pitch.to_degrees(), 0.0),
-                },
-            },
-        );
-        root.root = next;
-        next += 1;
-    }
-    d
-}
 
 /// `track.stl` (flat, printable) and `track.svg` (at the tilt), from the document.
 fn export_track(doc: &Document, t: Tilt, out: &Path) -> anyhow::Result<()> {
@@ -300,7 +194,7 @@ fn verdict(model: &Model, level: &Level, traj: &[Vec3]) -> anyhow::Result<&'stat
 /// level's `defparam`s where it declares them and from `audio`'s documented
 /// defaults where it does not.
 fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
-    let m = |name: &str, fallback: f64| level.params.get(name).copied().unwrap_or(fallback);
+    let m = |name: &str, fallback: f64| level.parameters.get(name).copied().unwrap_or(fallback);
     let track_mat = audio::Material {
         rho: m("track_density", audio::PLA.rho),
         e: m("track_e", audio::PLA.e),
@@ -333,8 +227,8 @@ fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
 /// Everything but the absorption coefficients is millimetres in the level.
 fn room_spec(level: &Level) -> room::RoomSpec {
     let d = room::RoomSpec::default();
-    let mm = |name: &str, fallback: f64| level.params.get(name).copied().map(|v| v * MM).unwrap_or(fallback);
-    let raw = |name: &str, fallback: f64| level.params.get(name).copied().unwrap_or(fallback);
+    let mm = |name: &str, fallback: f64| level.parameters.get(name).copied().map(|v| v * MM).unwrap_or(fallback);
+    let raw = |name: &str, fallback: f64| level.parameters.get(name).copied().unwrap_or(fallback);
     room::RoomSpec {
         dims: [mm("room_x", d.dims[0]), mm("room_y", d.dims[1]), mm("room_z", d.dims[2])],
         table: [mm("table_x", d.table[0]), mm("table_y", d.table[1]), mm("table_z", d.table[2])],
@@ -472,50 +366,49 @@ fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::L
 // ---- main -------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
-    // `newt-spike --pool [frames]` drops a watermelon into a pool and exits.
-    if std::env::args().nth(1).as_deref() == Some("--pool") {
-        let frames = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(150);
-        return pool::run(Path::new("out"), frames, 1280, 720, false);
+    // Scene adapters resolve roles explicitly; provenance recovery would
+    // re-evaluate large scenes once per parameter. This is before any threads.
+    unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
+    match cli::Command::from_env()? {
+        cli::Command::Pool { frames } => return pool::run(Path::new("out"), frames, 1280, 720, false),
+        cli::Command::Splash { frames } => return pool::run(Path::new("out"), frames, 1280, 720, true),
+        cli::Command::Splat { ply } => return garage::survey_splat(&ply, Path::new("out/splat"), 960, 720),
+        cli::Command::Marble { level } => run_marble(&level),
     }
-    // `newt-spike --splash [frames]`: the same drop with the water simulated.
-    if std::env::args().nth(1).as_deref() == Some("--splash") {
-        let frames = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(150);
-        return pool::run(Path::new("out"), frames, 1280, 720, true);
-    }
-    // `newt-spike --splat some.ply` surveys a splat and exits.
-    if std::env::args().nth(1).as_deref() == Some("--splat") {
-        let ply = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("--splat needs a .ply"))?;
-        return garage::survey_splat(Path::new(&ply), Path::new("out/splat"), 960, 720);
-    }
-    let level_path = std::env::args().nth(1).unwrap_or_else(|| "levels/marble.loon".into());
+}
+
+fn run_marble(level_path: &Path) -> anyhow::Result<()> {
     let out = Path::new("out");
     let ctrl = |_: usize| DVec::zeros(6);
 
     // 1. the level: one loon file → document → STL, SVG, colliders
-    let level = Level::load(Path::new(&level_path))?;
+    let level = Level::load(level_path)?;
+    for warning in &level.warnings {
+        println!("level  {warning}");
+    }
     let tilt = level.tilt()?;
     let start = level.start()?;
     let steps = level.steps()?;
     println!(
         "level  {} → {} IR nodes, {} knobs; pitch {:+.2}° roll {:+.2}°, release ({:+.3}, {:+.3}), t_end {:.2} s",
-        level_path,
-        level.doc.nodes.len(),
-        level.params.len(),
+        level_path.display(),
+        level.document.nodes.len(),
+        level.parameters.len(),
         tilt.pitch.to_degrees(),
         tilt.roll.to_degrees(),
         start[0],
         start[1],
         steps as f64 * DT
     );
-    export_track(&level.doc, tilt, out)?;
-    let derived = colliders::colliders_from_document(&level.doc)?;
+    export_track(&level.document, tilt, out)?;
+    let derived = colliders::colliders_from_document(&level.document)?;
     for w in &derived.warnings {
         println!("warn   {w}");
     }
     for n in &derived.notes {
         println!("derive {n}");
     }
-    let worst = colliders::verify_against_mesh(&level.doc, &derived)?;
+    let worst = colliders::verify_against_mesh(&level.document, &derived)?;
     println!(
         "derive {} colliders; support functions agree with the tessellation to {:.3} mm",
         derived.colliders.len(),
@@ -645,7 +538,7 @@ fn main() -> anyhow::Result<()> {
     ];
     let air = room_spec(&level);
     let rt60 = air.rt60();
-    let roughness = level.params.get("track_roughness_mm").copied().unwrap_or(0.2) * MM;
+    let roughness = level.parameters.get("track_roughness_mm").copied().unwrap_or(0.2) * MM;
     let dry = audio::render_dry(
         &spec,
         &banks,
@@ -750,7 +643,7 @@ fn main() -> anyhow::Result<()> {
     let (traj, solved_state) = simulate(&solved, &q0_for(&solved, &level, start), steps);
     println!("tilt   final: {}", verdict(&solved, &level, &traj)?);
     render(&solved, &solved_state, &out.join("frame_tilted.png"))?;
-    export_track(&level.doc, t, &out.join("solved"))?;
+    export_track(&level.document, t, &out.join("solved"))?;
     fs::write(
         out.join("solved/marble.loon"),
         level.with_params(&[("pitch_deg", t.pitch.to_degrees()), ("roll_deg", t.roll.to_degrees())]),
@@ -758,7 +651,7 @@ fn main() -> anyhow::Result<()> {
 
     // 5. the lamp: the objective is the marble's *shadow*. light is analytic,
     //    motion is the adjoint, one chain rule joins them.
-    if level.params.contains_key("lamp_x") {
+    if level.parameters.contains_key("lamp_x") {
         let lamp0 = lamp::Lamp {
             pos: Vec3::new(level.p("lamp_x")? * MM, level.p("lamp_y")? * MM, 0.25 + level.p("lamp_z")? * MM),
             target: [level.p("shadow_x")? * MM, level.p("shadow_y")? * MM],
@@ -820,7 +713,7 @@ fn main() -> anyhow::Result<()> {
         let intr = CameraIntrinsics::from_vfov(800, 600, 0.75, 0.05, 5.0);
         let target = Vec3::new(0.0, 0.0, 0.25);
         let pose = CameraPose::look_at(target + Vec3::new(-0.05, -0.42, 0.28), target, Vec3::z());
-        let lamp_r = level.params.get("lamp_r").copied().unwrap_or(25.0) * MM;
+        let lamp_r = level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM;
         let colliders = model.bodies[TRACK].collisions.clone();
         let scene_at = |c: Vec3| frame::Scene::<f64>::new(&xf, &colliders, tang::Vec3::new(c.x, c.y, c.z), r, lamp0.pos, lamp_r);
         let fd = frame::out_dir(out);
@@ -987,17 +880,17 @@ fn light_stage(
     // the generic Sellmeier against vcad-kernel-optics' N-BK7: one glass, two crates
     let bk7 = vcad_kernel_optics::glass::Glass::n_bk7();
     let worst = [0.45, 0.5876, 0.65].iter().map(|&l| (light::sellmeier::<f64>(l) - bk7.index(l)).abs()).fold(0.0, f64::max);
-    let nd_true = level.params.get("marble_nd").copied().unwrap_or(1.5168);
+    let nd_true = level.parameters.get("marble_nd").copied().unwrap_or(1.5168);
     println!("light  N-BK7 Sellmeier agrees with vcad-kernel-optics to {worst:.1e}; marble n_d = {nd_true} (n(450 nm) − n(650 nm) = {:+.4})", light::index::<f64>(nd_true, 0.45) - light::index::<f64>(nd_true, 0.65));
 
     // three glass samples on the tray: a marble, a cube, a pyramid. sizes are
     // the level's, so they can be set to the real ones.
     let lamp_local = xf.world_to_body_point(lamp0.pos);
     let lamp_t = tang::Vec3::new(lamp_local.x, lamp_local.y, lamp_local.z);
-    let cube_a = level.params.get("cube_mm").copied().unwrap_or(20.0) * MM;
-    let pyr_a = level.params.get("pyramid_mm").copied().unwrap_or(25.0) * MM;
-    let pyr_h = level.params.get("pyramid_h_mm").copied().unwrap_or(20.0) * MM;
-    let yaw = level.params.get("sample_yaw_deg").copied().unwrap_or(25.0).to_radians();
+    let cube_a = level.parameters.get("cube_mm").copied().unwrap_or(20.0) * MM;
+    let pyr_a = level.parameters.get("pyramid_mm").copied().unwrap_or(25.0) * MM;
+    let pyr_h = level.parameters.get("pyramid_h_mm").copied().unwrap_or(20.0) * MM;
+    let yaw = level.parameters.get("sample_yaw_deg").copied().unwrap_or(25.0).to_radians();
     let samples: Vec<(&str, glass::Shape<f64>)> = vec![
         ("marble", glass::Shape::Sphere { centre: tang::Vec3::new(-0.05, 0.0, r), r }),
         ("cube", glass::Shape::cube(0.0, 0.0, cube_a, yaw)),
@@ -1114,5 +1007,5 @@ fn light_stage(
 }
 
 fn lamp0_r(level: &Level) -> f64 {
-    level.params.get("lamp_r").copied().unwrap_or(25.0) * MM
+    level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM
 }

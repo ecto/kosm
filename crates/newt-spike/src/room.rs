@@ -322,7 +322,7 @@ pub fn rir(room: &RoomSpec, src: [f64; 3], sr: f64) -> ([Vec<f64>; 2], RirStats)
         // level-matched to the last 10 ms of the image sum so the decay is
         // continuous rather than a step.
         let mut tail = vec![0.0; n];
-        let mut rng = Rng(0x51ed_2701 ^ (e as u64 + 1) * 0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng(0x51ed_2701 ^ (e as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
         // Faded in over 20 ms rather than switched on, because the handover is
         // a blur and not an event: on either side of it the same diffuse field
         // is being described twice, once as taps and once as noise.
@@ -615,5 +615,4 @@ mod tests {
         }
     }
 }
-
 

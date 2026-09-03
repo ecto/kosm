@@ -15,60 +15,27 @@ use std::time::Instant;
 
 use eframe::egui;
 use eframe::egui_wgpu;
-use newt_spike::pool::{self, Caustic, Drop, Surface};
-use newt_spike::splash::Droplet;
+use newt_spike::pool::{self, Caustic, PoolScene, PoolSimulation, PoolSnapshot};
 use tang::Vec3 as V;
 
 /// One frame of the recording: everything a renderer needs, nothing the
 /// solver needs.
 #[derive(Clone)]
 struct Frame {
-    t: f64,
-    q: Vec<f64>,
-    v: Vec<f64>,
-    surface: Surface,
+    snapshot: PoolSnapshot,
     caustic: Caustic,
-    melon_axis: V<f64>,
-    droplets: Vec<Droplet>,
-    fluid_force: V<f64>,
-    particles: usize,
     sim_ms: u128,
 }
 
 impl Frame {
-    fn take(drop: &Drop, sim_ms: u128) -> Self {
-        Self {
-            t: drop.state.time,
-            q: drop.state.q.as_slice().to_vec(),
-            v: drop.state.v.as_slice().to_vec(),
-            surface: drop.surface.clone(),
-            caustic: pool::caustic(&drop.surface, 0.01),
-            melon_axis: drop.melon().axis,
-            droplets: drop.droplets.clone(),
-            fluid_force: drop.fluid_force,
-            particles: drop.water.as_ref().map(|w| w.count()).unwrap_or(0),
-            sim_ms,
-        }
+    fn take(simulation: &mut PoolSimulation, sim_ms: u128) -> Self {
+        let snapshot = simulation.take_snapshot();
+        let caustic = pool::caustic(&snapshot.surface, 0.01);
+        Self { snapshot, caustic, sim_ms }
     }
 
     fn melon_centre(&self) -> V<f64> {
-        V::new(self.q[3], self.q[4], self.q[5])
-    }
-
-    /// A drop the reference renderer can read, rebuilt from the snapshot.
-    fn to_drop(&self) -> Drop {
-        let mut d = Drop::new(1.3);
-        for (i, x) in self.q.iter().enumerate() {
-            d.state.q[i] = *x;
-        }
-        for (i, x) in self.v.iter().enumerate() {
-            d.state.v[i] = *x;
-        }
-        d.state.time = self.t;
-        d.surface = self.surface.clone();
-        d.droplets = self.droplets.clone();
-        d.fluid_force = self.fluid_force;
-        d
+        self.melon.centre
     }
 
     fn live(&self) -> Arc<live::LiveFrame> {
@@ -76,9 +43,18 @@ impl Frame {
             surface: self.surface.clone(),
             caustic: self.caustic.clone(),
             melon_centre: self.melon_centre(),
-            melon_axis: self.melon_axis,
+            melon_axis: self.melon.axis,
+            melon_axes: self.melon.axes,
             droplets: self.droplets.clone(),
         })
+    }
+}
+
+impl std::ops::Deref for Frame {
+    type Target = PoolSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
     }
 }
 
@@ -91,16 +67,27 @@ fn simulate(tx: mpsc::Sender<Frame>, status: Status, splash: bool, frames: usize
             *g = s;
         }
     };
-    let mut drop = Drop::new(1.3);
+    let scene = match PoolScene::reference().map(PoolScene::with_env_overrides) {
+        Ok(scene) => scene,
+        Err(error) => {
+            set(format!("could not load the pool scene: {error}"));
+            return;
+        }
+    };
+    let mut drop = PoolSimulation::from_scene(&scene);
     if splash {
-        let h = std::env::var("NEWT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
+        let water = scene.water;
+        let h = water.cell_size;
         let t0 = Instant::now();
-        set(format!("filling the water at {:.0} mm and settling it for 2 s of sim time — about a minute on the GPU", h * 1000.0));
-        drop = drop.with_water(h);
-        let w = drop.water.as_ref().unwrap();
-        set(format!("settled {} particles in {:.0} s; simulating", w.count(), t0.elapsed().as_secs_f64()));
+        set(format!(
+            "filling the water at {:.0} mm and settling it for {} s of sim time — about a minute on the GPU",
+            h * 1000.0,
+            water.settle_seconds
+        ));
+        drop = drop.with_water_config(water);
+        set(format!("settled {} particles in {:.0} s; simulating", drop.water_particle_count(), t0.elapsed().as_secs_f64()));
     }
-    let steps_per_frame = (1.0 / pool::fps() / drop.model.dt).round() as usize;
+    let steps_per_frame = (1.0 / drop.recording_fps() / drop.timestep()).round() as usize;
     for k in 0..frames {
         let t0 = Instant::now();
         for _ in 0..steps_per_frame {
@@ -109,8 +96,7 @@ fn simulate(tx: mpsc::Sender<Frame>, status: Status, splash: bool, frames: usize
         drop.read_water();
         let ms = t0.elapsed().as_millis();
         set(format!("frame {k} of {frames} · {ms} ms per frame · melon z {:+.2} m", drop.centre().z));
-        let f = Frame::take(&drop, ms);
-        drop.fluid_force = V::zero();
+        let f = Frame::take(&mut drop, ms);
         if tx.send(f).is_err() {
             break;
         }
@@ -193,10 +179,9 @@ impl App {
     fn render_reference(&mut self, ctx: &egui::Context, size: (u32, u32)) {
         let Some(frame) = self.frames.get(self.cursor) else { return };
         let (w, h) = (size.0.min(960).max(64), ((size.0.min(960).max(64)) as f64 * size.1 as f64 / size.0.max(1) as f64).max(36.0) as u32);
-        let drop = frame.to_drop();
         let t0 = Instant::now();
         let view = self.camera.view(w, h);
-        let mut img = pool::render(&view, &drop, &frame.caustic);
+        let mut img = pool::render_snapshot(&view, frame, &frame.caustic);
         if self.annotate {
             annotate(&mut img, &view, frame);
         }
@@ -234,7 +219,7 @@ fn annotate(img: &mut image::RgbaImage, view: &pool::View, f: &Frame) {
                 }
             }
         }
-        let vel = V::new(f.v[3], f.v[4], f.v[5]);
+        let vel = f.melon_velocity;
         if let Some((x2, y2)) = project(c + vel * 0.15) {
             let n = 40;
             for i in 0..=n {
@@ -316,13 +301,13 @@ impl eframe::App for App {
             }
             if let Some(f) = self.frames.get(self.cursor) {
                 ui.separator();
-                ui.label(format!("t = {:.3} s   sim {} ms/frame", f.t, f.sim_ms));
-                ui.label(format!("melon  z {:+.3} m   vz {:+.2} m/s", f.q[5], f.v[5]));
-                ui.label(format!("       x {:+.3}  y {:+.3}", f.q[3], f.q[4]));
+                ui.label(format!("t = {:.3} s   sim {} ms/frame", f.time, f.sim_ms));
+                ui.label(format!("melon  z {:+.3} m   vz {:+.2} m/s", f.melon.centre.z, f.melon_velocity.z));
+                ui.label(format!("       x {:+.3}  y {:+.3}", f.melon.centre.x, f.melon.centre.y));
                 ui.label(format!("fluid force  ({:+.0}, {:+.0}, {:+.0}) N", f.fluid_force.x, f.fluid_force.y, f.fluid_force.z));
                 ui.label(format!("rings {}   drops {}", f.surface.rings.len(), f.droplets.len()));
-                if f.particles > 0 {
-                    ui.label(format!("water particles {}", f.particles));
+                if f.water_particles > 0 {
+                    ui.label(format!("water particles {}", f.water_particles));
                 }
                 if let Some(g) = &f.surface.grid {
                     let (lo, hi) = g.z.iter().fold((f64::MAX, f64::MIN), |a, z| (a.0.min(*z), a.1.max(*z)));
@@ -343,7 +328,7 @@ impl eframe::App for App {
                     ui.label(format!("reference {}×{} in {} ms", self.reference_size.0, self.reference_size.1, self.reference_ms));
                 }
                 ui.separator();
-                ui.label(format!("melon axes {:?} m", pool::MELON_AXES));
+                ui.label(format!("melon axes {:?} m", f.melon.axes));
                 ui.label(format!("pool {}×{} m, {} m deep", 2.0 * pool::POOL_X, 2.0 * pool::POOL_Y, pool::DEPTH));
             }
         });
@@ -441,6 +426,8 @@ impl log::Log for Stderr {
 }
 
 fn main() -> eframe::Result<()> {
+    // Set before the simulation or UI threads exist.
+    unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let splash = std::env::args().any(|a| a == "--splash");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
