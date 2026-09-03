@@ -25,19 +25,15 @@
 //! slot*64 + local, and an inactive node reads as empty — which is what the
 //! dense grid held there anyway.
 //!
-//! TODO: the wall-clock verdict is still open. At 2.5 cm the box is 69%
-//! water, so the grid kernels save about a third of their work while every
-//! particle in p2g and g2p pays an extra dependent load through the table.
-//! Interleaved 6-frame runs put the sparse step anywhere from level with the
-//! dense one to 1.4x slower, but the machine was carrying a load average of
-//! 200 throughout and the same binary varied by 2.2x between runs, so none of
-//! it is trustworthy. Re-measure on a quiet machine before optimising: if the
-//! table read is really the cost, the fix is to give p2g_block and g2p their
-//! block's slot once per workgroup rather than per node.
-//!
-//! The slot budget is fixed at startup from the fill's own footprint plus a
-//! sixth for the splash (`NEWT_MAX_BLOCKS` overrides), and `step` panics with
-//! the numbers if the water ever outgrows it.
+//! Measured 2026-09-03 on a quiet machine (load ~5), 2.5 cm, 6.4M particles,
+//! interleaved 14-frame runs: dense step median 1100 / 1075 ms, sparse 1216 ms.
+//! So the sparse grid costs about 11% when the box is 92% water — the table
+//! lookup with nothing to skip. Two variants were tried and lost: G2P as one
+//! workgroup per block with the 27 neighbour slots in shared memory (+40%,
+//! register pressure), and the same table for the P2G flush alone (no gain).
+//! The sparse grid is kept because it is what the residual water needs: fine
+//! particles anywhere in a 50 m pool, with a block table over the pool and
+//! almost all of it empty.
 
 pub mod caustic;
 pub mod surface;
