@@ -96,16 +96,195 @@
 [root pole "steel"]
 [root arm "steel"]
 
-; ---- the gym, for the light ------------------------------------------------
-; walls a little outside the slab, a ceiling, and rows of light panels in it.
+; ---- the gym ----------------------------------------------------------------
+; The room is geometry, not a background: four walls, a ceiling, and the floor
+; the slab is let into. There are no textures in the picture, so anything you
+; can see is a root with a material.
+;
+; The camera lives at cam_y_mm = −5.6 m, so the margin has to keep the south
+; wall behind it: gym_margin_mm ≥ 6 m puts the wall at y = −8.5 m.
 [defparam gym_h_mm 9000.0]
 [defparam gym_margin_mm 6000.0]
+[defparam wall_t_mm 200.0]
 [defparam light_rows 2.0]        ; along y
 [defparam light_cols 5.0]        ; along x
 [defparam light_w_mm 1200.0]
 [defparam light_l_mm 600.0]
 [defparam light_radiance 18.0]   ; what a panel looks like straight on
 [defparam exposure 1.0]
+
+[let court-hx [/ court_x_mm 2.0]]
+[let court-hy [/ court_y_mm 2.0]]
+[let gym-hx [+ court-hx gym_margin_mm]]   ; inner face of the ±x walls
+[let gym-hy [+ court-hy gym_margin_mm]]   ; inner face of the ±y walls
+[let wall-hz [/ gym_h_mm 2.0]]
+[let wall-off-x [+ gym-hx [/ wall_t_mm 2.0]]]
+[let wall-off-y [+ gym-hy [/ wall_t_mm 2.0]]]
+[let room-x [+ [* 2.0 gym-hx] [* 2.0 wall_t_mm]]]
+[let room-y [+ [* 2.0 gym-hy] [* 2.0 wall_t_mm]]]
+
+; the four walls — a ball can hit them, so they are colliders like the slab
+[let wall-side [box-c wall_t_mm room-y gym_h_mm]]
+[let wall-end [box-c [* 2.0 gym-hx] wall_t_mm gym_h_mm]]
+[let walls
+  [union [translate wall-off-x 0.0 wall-hz wall-side]
+  [union [translate [* -1.0 wall-off-x] 0.0 wall-hz wall-side]
+  [union [translate 0.0 wall-off-y wall-hz wall-end]
+         [translate 0.0 [* -1.0 wall-off-y] wall-hz wall-end]]]]]
+
+[let ceiling
+  [translate 0.0 0.0 [+ gym_h_mm [/ wall_t_mm 2.0]] [box-c room-x room-y wall_t_mm]]]
+
+; the floor outside the slab: four strips of the slab's own thickness, so the
+; top is exactly z = 0 and a ball rolling off the maple does not step.
+[let floor-z [/ court_t_mm -2.0]]
+[let floor-margin-x [+ court-hx [/ gym_margin_mm 2.0]]]
+[let floor-margin-y [+ court-hy [/ gym_margin_mm 2.0]]]
+[let floor-strip-x [box-c gym_margin_mm [* 2.0 gym-hy] court_t_mm]]
+[let floor-strip-y [box-c [* 2.0 court-hx] gym_margin_mm court_t_mm]]
+[let floor
+  [union [translate floor-margin-x 0.0 floor-z floor-strip-x]
+  [union [translate [* -1.0 floor-margin-x] 0.0 floor-z floor-strip-x]
+  [union [translate 0.0 floor-margin-y floor-z floor-strip-y]
+         [translate 0.0 [* -1.0 floor-margin-y] floor-z floor-strip-y]]]]]
+
+; the baseline wall, padded: a row of thick pads on the inside of the +x wall,
+; behind the hoop, where a driving player arrives.
+[defparam pad_n 8.0]
+[defparam pad_w_mm 1800.0]
+[defparam pad_h_mm 1800.0]
+[defparam pad_t_mm 100.0]
+[defparam pad_gap_mm 40.0]
+[let pad-pitch [+ pad_w_mm pad_gap_mm]]
+[let pad0
+  [translate [- gym-hx [/ pad_t_mm 2.0]] [* -0.5 [* pad-pitch [- pad_n 1.0]]] [/ pad_h_mm 2.0]
+    [box-c pad_t_mm pad_w_mm pad_h_mm]]]
+[let pads [linear-pattern 0.0 1.0 0.0 pad_n pad-pitch pad0]]
+
+; a window band high on the two long walls: thin panes set against the inner
+; face, above everything a ball can reach, so they are appearance only.
+[defparam window_n 8.0]
+[defparam window_w_mm 1800.0]
+[defparam window_h_mm 1400.0]
+[defparam window_t_mm 20.0]
+[defparam window_sill_mm 6200.0]
+[let window-pitch [/ [* 2.0 gym-hx] window_n]]
+[let window-x0 [+ [* -1.0 gym-hx] [/ window-pitch 2.0]]]
+[let window-z [+ window_sill_mm [/ window_h_mm 2.0]]]
+[let window-y [- gym-hy [/ window_t_mm 2.0]]]
+[let pane [box-c window_w_mm window_t_mm window_h_mm]]
+[let windows
+  [union
+    [linear-pattern 1.0 0.0 0.0 window_n window-pitch
+      [translate window-x0 window-y window-z pane]]
+    [linear-pattern 1.0 0.0 0.0 window_n window-pitch
+      [translate window-x0 [* -1.0 window-y] window-z pane]]]]
+
+; a small bleacher along the +y side: rows stepping up towards the wall. Real
+; benches — they collide, you can stand on them.
+[defparam bleacher_rows 5.0]
+[defparam bleacher_rise_mm 400.0]
+[defparam bleacher_run_mm 800.0]
+[defparam bleacher_len_mm 14000.0]
+[let bleacher-pitch
+  [sqrt [+ [* bleacher_run_mm bleacher_run_mm] [* bleacher_rise_mm bleacher_rise_mm]]]]
+[let bleacher-y0
+  [+ [- gym-hy [* bleacher_rows bleacher_run_mm]] [/ bleacher_run_mm 2.0]]]
+[let bleachers
+  [linear-pattern 0.0 bleacher_run_mm bleacher_rise_mm bleacher_rows bleacher-pitch
+    [translate 0.0 bleacher-y0 [/ bleacher_rise_mm 2.0]
+      [box-c bleacher_len_mm bleacher_run_mm bleacher_rise_mm]]]]
+
+[root walls "wall"]
+[root ceiling "ceiling"]
+[root floor "floor"]
+[root pads "pad"]
+[root windows "window"]
+[root bleachers "oak"]
+
+; ---- the markings -----------------------------------------------------------
+; Painted lines are thin solids standing on the slab (z = 0 to paint_t_mm), not
+; a texture. Everything is measured off the hoop knobs, so moving the board
+; moves the whole court with it and it stays regulation.
+;
+; Arcs are patterns of short bars, the way the rim is a pattern of rod
+; segments. A bar is cut to the *arc* length of its step rather than the
+; chord — loon has no sin — which is long by step²/24 (0.16% at 11°) and is
+; taken up by the 3% overlap the bars already carry.
+[defparam line_w_mm 50.0]
+[defparam paint_t_mm 1.0]        ; a line stands this proud of the slab
+[defparam key_t_mm 0.5]          ; the lane's colour, under the lines
+[defparam baseline_off_mm 1219.0] ; 4 ft: the baseline behind the board face
+[defparam lane_w_mm 4877.0]      ; 16 ft
+[defparam lane_len_mm 5791.0]    ; 19 ft, baseline to the free-throw line
+[defparam ft_circle_r_mm 1829.0] ; 6 ft
+[defparam ft_circle_n 32.0]
+[defparam three_r_mm 7239.0]     ; 23 ft 9 in about the rim centre
+[defparam three_n 24.0]
+; The corner straights begin at |y| = 6706 mm (22 ft) from the basket, which is
+; off this 5 m slab entirely, so the arc is swept only as far as the slab is
+; wide: the 24 bars span 36.4°, ending at y = ±2.26 m, inside the maple. Widen
+; court_y_mm and this opens with it.
+[defparam three_sweep_deg 38.0]
+
+[let baseline-x [+ board_x_mm baseline_off_mm]]
+[let ft-x [- baseline-x lane_len_mm]]
+[let lane-mid-x [/ [+ ft-x baseline-x] 2.0]]
+[let paint-z [/ paint_t_mm 2.0]]
+[let bar [fn [x y lx ly] [translate x y paint-z [box-c lx ly paint_t_mm]]]]
+[let arc-chord [fn [r step-deg] [* 1.03 [* r [* step-deg 0.0174532925]]]]]
+
+[let ft-step [/ 360.0 ft_circle_n]]
+[let ft-circle
+  [translate ft-x 0.0 0.0
+    [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 ft_circle_n 360.0
+      [bar ft_circle_r_mm 0.0 line_w_mm [arc-chord ft_circle_r_mm ft-step]]]]]
+
+[let three-step [/ three_sweep_deg three_n]]
+[let three-arc
+  [translate rim-cx 0.0 0.0
+    [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 three_n three_sweep_deg
+      [rotate 0.0 0.0 [* -0.5 [* three-step [- three_n 1.0]]]
+        [bar [* -1.0 three_r_mm] 0.0 line_w_mm [arc-chord three_r_mm three-step]]]]]]
+
+[let markings
+  [union [bar baseline-x 0.0 line_w_mm court_y_mm]
+  [union [bar lane-mid-x [/ lane_w_mm 2.0] lane_len_mm line_w_mm]
+  [union [bar lane-mid-x [/ lane_w_mm -2.0] lane_len_mm line_w_mm]
+  [union [bar ft-x 0.0 line_w_mm lane_w_mm]
+  [union ft-circle three-arc]]]]]]
+
+[let key-fill
+  [translate lane-mid-x 0.0 [/ key_t_mm 2.0] [box-c lane_len_mm lane_w_mm key_t_mm]]]
+
+[root markings "paint"]
+[root key-fill "key"]
+
+; ---- the ball ---------------------------------------------------------------
+; The ball's appearance, at the origin: the renderer places one copy at each
+; ball's pose. Two roots, because a root carries one material — the rubber
+; sphere, and the seams as four thin rings straddling its surface. Rings
+; rather than cut channels: a `difference` on a sphere is a convex
+; decomposition every time the colliders are derived, and four unioned tori
+; cost nothing.
+;
+; The classic eight-panel pattern: one ring round the equator, one round a
+; meridian, and two parallel to that meridian at ±0.62 r — whose radius on the
+; sphere is r·√(1 − 0.62²).
+[defparam ball_seam_mm 6.0]
+[defparam ball_seam_off 0.62]    ; as a fraction of the radius
+[let seam-off-mm [* ball_r_mm ball_seam_off]]
+[let seam-r [* ball_r_mm [sqrt [- 1.0 [* ball_seam_off ball_seam_off]]]]]
+[let meridian [rotate 90.0 0.0 0.0 [torus ball_r_mm ball_seam_mm]]]
+[let seam-ring [rotate 90.0 0.0 0.0 [torus seam-r ball_seam_mm]]]
+[let seams
+  [union [torus ball_r_mm ball_seam_mm]
+  [union meridian
+  [union [translate 0.0 seam-off-mm 0.0 seam-ring]
+         [translate 0.0 [* -1.0 seam-off-mm] 0.0 seam-ring]]]]]
+
+[root [sphere ball_r_mm] "ball"]
+[root seams "ball-seams"]
 
 ; ---- the recording's picture ------------------------------------------------
 [defparam render_w 960.0]
