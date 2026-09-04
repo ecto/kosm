@@ -1,4 +1,4 @@
-; the marble — a newt level.
+; the marble — a Kosm level.
 ;
 ; This file is the level. The printer, the physics, the renderer and the hint
 ; button all read this and nothing else. Geometry is vcad (Z-up, mm, degrees,

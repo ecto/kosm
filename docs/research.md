@@ -96,7 +96,7 @@ others. The composition is the work.
 
 - Fei et al., *Principles towards Real-Time Simulation of MPM on Modern
   GPUs*, [2111.00699](https://arxiv.org/abs/2111.00699). Block-sorted P2G,
-  shared-memory tiles, multi-GPU. Landed in newt-mpm as p2g_block.
+  shared-memory tiles, multi-GPU. Landed in kosm-mpm as p2g_block.
 - Zhao et al., *Unified sparse framework for large-scale MPM*,
   [2605.28525](https://arxiv.org/abs/2605.28525). Hash/scan sparse grids.
 - Bird et al., *Implicit octree-based adaptive MPM*,
