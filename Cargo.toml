@@ -27,6 +27,9 @@ vcad-kernel-export = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-expo
 vcad-render  = { path = "/Users/cam/Developer/vcad/crates/vcad-render", default-features = false }
 vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-acoustics" }
 vcad-kernel-optics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-optics" }
+vcad-kernel-raytrace = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-raytrace" }
+vcad-kernel-math = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-math" }
+vcad-kernel-primitives = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-primitives" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
 tang         = { path = "/Users/cam/Developer/tang/crates/tang" }

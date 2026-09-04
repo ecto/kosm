@@ -25,6 +25,7 @@ use phyz_rigid::forward_kinematics;
 use crate::colliders;
 use crate::scene::{AuthoredScene, MM};
 
+pub mod parts;
 pub mod render;
 
 pub const DEFAULT_COURT_SCENE: &str = "court.loon";
@@ -214,9 +215,12 @@ pub struct Court {
 
 impl Court {
     pub fn from_scene(scene: &CourtScene) -> anyhow::Result<Self> {
-        let derived = colliders::colliders_from_document(&scene.authored.document)?;
+        // only the roots that are meant to be stood on; see `parts::collides`
+        let mut doc = scene.authored.document.clone();
+        doc.roots.retain(|root| parts::collides(&root.material));
+        let derived = colliders::colliders_from_document(&doc)?;
         anyhow::ensure!(!derived.colliders.is_empty(), "the court scene has no geometry to stand on");
-        let worst = colliders::verify_against_mesh(&scene.authored.document, &derived)?;
+        let worst = colliders::verify_against_mesh(&doc, &derived)?;
         anyhow::ensure!(worst < 0.5 * MM, "court colliders disagree with the CAD by {:.3} mm", worst / MM);
 
         let (r, m) = (scene.ball_r, scene.ball_mass);

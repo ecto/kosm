@@ -1559,7 +1559,10 @@ dependencies = [
  "vcad-kernel",
  "vcad-kernel-acoustics",
  "vcad-kernel-export",
+ "vcad-kernel-math",
  "vcad-kernel-optics",
+ "vcad-kernel-primitives",
+ "vcad-kernel-raytrace",
  "vcad-loon",
  "vcad-render",
 ]
