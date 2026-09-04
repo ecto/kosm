@@ -204,6 +204,33 @@ each ball's pose: a sphere, and its eight-panel seams as four thin rings.
 Which of them the physics stands on is one list, `court::parts::collides` —
 `ball`, `paint`, `key`, `window` and friends are appearance, and a root that
 says nothing collides.
+The shot has a gradient too. `court/aim.rs` is the marble's release-point hint
+pointed at the hoop: the horizon `aim_t` is the moment the ball's centre falls
+back through the rim plane — ballistic, 0.995 s, 995 steps — and
+`J = |centre(T) − rim centre|²` is the miss there, squared. The adjoint problem
+is the shot alone on the court (`Court::from_scene_shot_only`), one free body
+against the same derived colliders. One backward pass gives `dJ/d(release
+point)` and `dJ/d(release velocity)` together; on the 927 steps of free flight
+before the ball first touches the rim, both agree with central differences to
+1.3e-6 relative. Carried all the way to the horizon they do not: the ball is
+rattling on the rod by then, and while `x` and `z` still match to every digit
+printed, the `y` lane has the adjoint at −1.3e-9 (zero, by symmetry) against a
+difference quotient of −14.2, because a micron of sideways nudge changes which
+of the 24 rod segments the ball catches. The adjoint is right and the
+difference quotient is not a derivative there — which is the whole reason to
+have one.
+
+The solve turns `dJ/dv₀` into the two knobs the level spells, `shot_speed` and
+`shot_elev_deg`, and descends with backtracking. Elevation is stepped as
+`θ · speed`, because those two columns of `∂v₀/∂(knobs)` are orthogonal and
+that scaling makes them the same length, so the direction points at the answer
+instead of down a valley. The level's own 7.40 m/s at 52° already goes in, but
+its centre is 85 mm off the rim's middle at the horizon; two iterations take it
+to 7.319 m/s at 51.77° and 23.5 mm, through at 1.00 s, and the knobs go back to
+`out/hinted/court.loon`. Off target, `shot_speed 6.8` is a plain miss; the same
+solve returns 7.128 m/s at 47.94° in two iterations and it drops at 0.86 s. The
+whole thing is about 15 s, and `aim 0` in the level turns it off for the
+render-only path. `tests/aim.rs` gates both halves.
 
 The picture is `court/render.rs`, a path tracer: the same derived colliders
 the physics stands on (the rim drawn as the torus its segments approximate),
@@ -222,6 +249,7 @@ in the simulator.
 cargo run --release -p kosm-spike -- --court          # out/court.mp4, out/court_still.png
 KOSM_SPP=4 cargo run --release -p kosm-spike -- --court 30   # a quick look
 cargo run --release -p kosm-spike --example court_trace      # one ball, height and speed through each impact
+diff levels/court.loon out/hinted/court.loon                 # the aimed shot, written back
 ```
 
 The balls did not bounce until phyz did. Its soft contact is a resting-contact

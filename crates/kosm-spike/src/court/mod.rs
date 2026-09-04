@@ -26,6 +26,7 @@ use crate::colliders;
 use crate::scene::{AuthoredScene, MM};
 
 pub mod net;
+pub mod aim;
 pub mod parts;
 pub mod render;
 
@@ -218,7 +219,19 @@ pub struct Court {
 }
 
 impl Court {
+    /// The whole level: the dropped balls and the shot.
     pub fn from_scene(scene: &CourtScene) -> anyhow::Result<Self> {
+        Self::build(scene, scene.n_balls)
+    }
+
+    /// The shot alone on the court. The adjoint problem is one free body
+    /// instead of four, which is what `aim.rs` differentiates.
+    pub fn from_scene_shot_only(scene: &CourtScene) -> anyhow::Result<Self> {
+        anyhow::ensure!(scene.shot.is_some(), "the court scene has no shot to aim");
+        Self::build(scene, 0)
+    }
+
+    fn build(scene: &CourtScene, n_drop: usize) -> anyhow::Result<Self> {
         // only the roots that are meant to be stood on; see `parts::collides`
         let mut doc = scene.authored.document.clone();
         doc.roots.retain(|root| parts::collides(&root.material));
@@ -233,7 +246,8 @@ impl Court {
         let ball_inertia = SpatialInertia::new(m, Vec3::zeros(), Mat3::from_diagonal(&Vec3::new(i, i, i)));
         let static_inertia = SpatialInertia::new(1.0, Vec3::zeros(), Mat3::identity() * 0.01);
 
-        let n = scene.bodies();
+        let n = n_drop + scene.shot.is_some() as usize;
+        anyhow::ensure!(n > 0, "the court has no balls");
         let mut builder = ModelBuilder::new().gravity(Vec3::new(0.0, 0.0, -GRAVITY)).dt(scene.dt);
         for k in 0..n {
             builder = builder.add_free_body(&format!("ball{k}"), -1, SpatialTransform::identity(), ball_inertia);
@@ -251,14 +265,14 @@ impl Court {
         let v_lin: Vec<usize> = (0..n).map(|k| model.v_offsets[model.bodies[k].joint_idx] + 3).collect();
 
         let mut state = model.default_state();
-        for k in 0..scene.n_balls {
+        for k in 0..n_drop {
             let p = scene.release(k);
             state.q[q_pos[k]] = p.x;
             state.q[q_pos[k] + 1] = p.y;
             state.q[q_pos[k] + 2] = p.z;
         }
         let shot = scene.shot.map(|shot| {
-            let k = scene.n_balls;
+            let k = n_drop;
             let (p, v, w) = (shot.release, shot.velocity(), shot.angular_velocity());
             let (p, v, w) = (p.as_array(), v.as_array(), w.as_array());
             for i in 0..3 {
@@ -313,6 +327,16 @@ impl Court {
     /// Every ball, the shot included.
     pub fn bodies(&self) -> usize {
         self.n_balls
+    }
+
+    /// Index into `state.q` of ball `k`'s position (the free joint's x).
+    pub fn q_pos(&self, ball: usize) -> usize {
+        self.q_pos[ball]
+    }
+
+    /// Index into `state.v` of ball `k`'s linear velocity.
+    pub fn v_lin(&self, ball: usize) -> usize {
+        self.v_lin[ball]
     }
 
     /// World→body rotation of a ball, from the free joint's exponential coordinates.
@@ -458,6 +482,18 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
             net.lowest(),
             net.worst_stretch() * 100.0
         );
+    }
+    if aim::enabled(&scene) {
+        let t0 = std::time::Instant::now();
+        match aim::hint(&scene) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("aim    {line}");
+                }
+                println!("aim    {:.1} s", t0.elapsed().as_secs_f64());
+            }
+            Err(e) => println!("aim    refused: {e}"),
+        }
     }
     if let Some(k) = court.shot {
         let c = court.centre(k);
