@@ -264,15 +264,29 @@ rung through a 100 µs contact.
 
 ## the window
 
-`cargo run --release -p kosm-view [-- --splash] [--frames=N]` opens the pool
-(or the splash) in a window. The simulation runs on its own thread and hands
-over a snapshot per frame; the window keeps every snapshot, so the timeline
+`cargo run --release -p kosm-view [-- --splash | --court] [--frames=N]`
+opens the pool (or the splash, or the court) in a window. The simulation runs
+on its own thread and hands over a snapshot per frame; the window keeps every snapshot, so the timeline
 is a recording: play, pause, scrub, follow live, and an inspector for the
 frame under the cursor (melon state, fluid force, rings, drops, particles,
 surface extents), with the melon annotated in the frame. Rendering is the
 same CPU tracer the CLI uses, preview size while playing and full size when
 paused; "export mp4" runs the CLI's render. First slice of the viewer plan:
 recording-shaped now, wgpu live rendering and wasm next.
+
+`--court` opens the court in the same shape — sim thread, timeline, and an
+inspector giving each ball's position and speed and whether the shot went
+through the hoop — but the picture is not written by the viewer. The level's
+roots are evaluated once by `vcad-eval` into BRep solids, each gets a
+`vcad-kernel-raytrace` BVH, and every frame is a `pathtrace::Scene`: those
+solids as placed objects with a material per root name, the ball's solid
+placed at each ball's pose, and the level's ceiling panels as the only
+lights. It is the CPU path tracer, run small (320×180 by default) on a
+worker thread and accumulated pass by pass while paused —
+`vcad-kernel-raytrace`'s `gpu` feature pins wgpu 23 and eframe 0.36 is on
+wgpu 30, so that tracer cannot be handed egui's device.
+`--court --shot=out/view_court.png` runs the same frame producer with no
+window, which is how the picture is checked.
 
 ## building
 

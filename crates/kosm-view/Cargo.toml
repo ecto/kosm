@@ -15,3 +15,7 @@ phyz-math.workspace = true
 tang.workspace = true
 anyhow = "1"
 log = "0.4"
+vcad-kernel-raytrace.workspace = true
+vcad-kernel-math.workspace = true
+vcad-kernel.workspace = true
+vcad-eval.workspace = true
