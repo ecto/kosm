@@ -40,7 +40,7 @@ pub fn take_prof() -> [u64; 5] {
     std::array::from_fn(|i| PROF[i].swap(0, Ordering::Relaxed))
 }
 
-use crate::pool::{BOX_DEPTH, MELON_AXES, POOL_X, POOL_Y, SPONGE, box_half};
+use crate::pool::{BOX_DEPTH, POOL_X, POOL_Y, SPONGE, box_half};
 
 pub struct Water {
     pub h: f64,
@@ -91,6 +91,7 @@ pub struct Body {
     pub centre: Vec3,
     pub axis: Vec3,
     pub vel: Vec3,
+    pub semi: [f64; 3],
 }
 
 impl Body {
@@ -105,12 +106,12 @@ impl Body {
     pub fn sdf(&self, p: Vec3) -> (f64, Vec3) {
         let (a, b, c) = self.frame();
         let rel = p - self.centre;
-        let l = Vec3::new(rel.dot(&a) / MELON_AXES[0], rel.dot(&b) / MELON_AXES[1], rel.dot(&c) / MELON_AXES[2]);
+        let l = Vec3::new(rel.dot(&a) / self.semi[0], rel.dot(&b) / self.semi[1], rel.dot(&c) / self.semi[2]);
         let k0 = l.norm();
-        let l2 = Vec3::new(l.x / MELON_AXES[0], l.y / MELON_AXES[1], l.z / MELON_AXES[2]);
+        let l2 = Vec3::new(l.x / self.semi[0], l.y / self.semi[1], l.z / self.semi[2]);
         let k1 = l2.norm().max(1e-9);
         let d = k0 * (k0 - 1.0) / k1;
-        let nl = Vec3::new(l.x / MELON_AXES[0], l.y / MELON_AXES[1], l.z / MELON_AXES[2]);
+        let nl = Vec3::new(l.x / self.semi[0], l.y / self.semi[1], l.z / self.semi[2]);
         let n = (a * nl.x + b * nl.y + c * nl.z).normalize();
         (d, n)
     }
@@ -695,7 +696,12 @@ impl Water {
 
     fn gpu_body(body: &Body) -> kosm_mpm::Body {
         let f = |v: &Vec3| [v.x as f32, v.y as f32, v.z as f32];
-        kosm_mpm::Body { centre: f(&body.centre), axis: f(&body.axis), vel: f(&body.vel), semi: [MELON_AXES[0] as f32, MELON_AXES[1] as f32, MELON_AXES[2] as f32] }
+        kosm_mpm::Body {
+            centre: f(&body.centre),
+            axis: f(&body.axis),
+            vel: f(&body.vel),
+            semi: [body.semi[0] as f32, body.semi[1] as f32, body.semi[2] as f32],
+        }
     }
 
     /// `subs` substeps against one body pose; the mean force on the body.
@@ -755,7 +761,12 @@ impl Water {
     }
 
     pub fn settle(&mut self, seconds: f64) {
-        let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+        let far = Body {
+            centre: Vec3::new(0.0, 0.0, 50.0),
+            axis: Vec3::new(1.0, 0.0, 0.0),
+            vel: Vec3::zeros(),
+            semi: [0.15, 0.105, 0.105],
+        };
         // the jittered lattice is far from equilibrium under real pressure;
         // relax it quasi-statically, with the velocity damped every substep,
         // so it packs to the state it will actually hold once released
@@ -1048,5 +1059,27 @@ trait MapFloor {
 impl MapFloor for Vec3 {
     fn map_floor(self) -> Vec3 {
         Vec3::new(self.x.floor(), self.y.floor(), self.z.floor())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_geometry_reaches_cpu_and_gpu_colliders() {
+        let body = Body {
+            centre: Vec3::new(1.0, 2.0, 3.0),
+            axis: Vec3::new(1.0, 0.0, 0.0),
+            vel: Vec3::zeros(),
+            semi: [0.2, 0.1, 0.08],
+        };
+
+        let (distance, normal) = body.sdf(body.centre + body.axis * body.semi[0]);
+        assert!(distance.abs() < 1e-12);
+        assert!((normal - body.axis).norm() < 1e-12);
+
+        let gpu = Water::gpu_body(&body);
+        assert_eq!(gpu.semi, [0.2, 0.1, 0.08]);
     }
 }

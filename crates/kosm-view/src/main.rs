@@ -30,7 +30,7 @@ struct Frame {
 impl Frame {
     fn take(simulation: &mut PoolSimulation, sim_ms: u128) -> Self {
         let snapshot = simulation.take_snapshot();
-        let caustic = pool::caustic(&snapshot.surface, 0.01);
+        let caustic = pool::caustic_for_geometry(&snapshot.surface, snapshot.geometry, 0.01);
         Self { snapshot, caustic, sim_ms }
     }
 
@@ -40,6 +40,7 @@ impl Frame {
 
     fn live(&self) -> Arc<live::LiveFrame> {
         Arc::new(live::LiveFrame {
+            geometry: self.geometry,
             surface: self.surface.clone(),
             caustic: self.caustic.clone(),
             melon_centre: self.melon_centre(),
@@ -84,7 +85,13 @@ fn simulate(tx: mpsc::Sender<Frame>, status: Status, splash: bool, frames: usize
             h * 1000.0,
             water.settle_seconds
         ));
-        drop = drop.with_water_config(water);
+        drop = match drop.with_water_config(water) {
+            Ok(drop) => drop,
+            Err(error) => {
+                set(format!("could not start the fine-water solver: {error}"));
+                return;
+            }
+        };
         set(format!("settled {} particles in {:.0} s; simulating", drop.water_particle_count(), t0.elapsed().as_secs_f64()));
     }
     let steps_per_frame = (1.0 / drop.recording_fps() / drop.timestep()).round() as usize;
@@ -329,7 +336,12 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label(format!("melon axes {:?} m", f.melon.axes));
-                ui.label(format!("pool {}×{} m, {} m deep", 2.0 * pool::POOL_X, 2.0 * pool::POOL_Y, pool::DEPTH));
+                ui.label(format!(
+                    "pool {}×{} m, {} m deep",
+                    2.0 * f.geometry.half_extents[0],
+                    2.0 * f.geometry.half_extents[1],
+                    f.geometry.depth
+                ));
             }
         });
 

@@ -3,13 +3,14 @@
 //! A snapshot deliberately contains no solver, GPU resources, or phyz state.
 //! Renderers and viewers can retain it without retaining the mutable world.
 
-use super::{Foam, Melon, PoolSimulation, Surface};
+use super::{Foam, Melon, PoolGeometry, PoolSimulation, Surface};
 use crate::splash::Droplet;
 use tang::Vec3 as V;
 
 #[derive(Clone)]
 pub struct PoolSnapshot {
     pub time: f64,
+    pub geometry: PoolGeometry,
     pub melon: Melon,
     pub melon_velocity: V<f64>,
     pub surface: Surface,
@@ -23,6 +24,7 @@ impl PoolSnapshot {
     pub fn capture(simulation: &PoolSimulation) -> Self {
         Self {
             time: simulation.state.time,
+            geometry: simulation.geometry(),
             melon: simulation.melon(),
             melon_velocity: V::new(
                 simulation.state.v[3],

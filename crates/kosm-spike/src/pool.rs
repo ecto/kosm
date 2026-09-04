@@ -36,12 +36,13 @@ mod config;
 mod scene;
 mod snapshot;
 pub use config::WaterConfig;
-pub use scene::{DEFAULT_POOL_SCENE, PoolScene};
+pub use scene::{DEFAULT_POOL_SCENE, PoolGeometry, PoolScene};
 pub use snapshot::PoolSnapshot;
 
 // ---- the pool ---------------------------------------------------------------
 
-// An Olympic pool: 50 m by 25 m; FINA's minimum depth is 2 m.
+// Reference dimensions for the fine-water solver. Coarse pool computations and
+// renderers carry `PoolGeometry` from the authored scene instead.
 pub const POOL_X: f64 = 25.0; // half-lengths of the water
 pub const POOL_Y: f64 = 12.5;
 pub const DEPTH: f64 = 2.0;
@@ -96,7 +97,6 @@ const SUN_DISC_COS: f64 = 0.99995; // an angular radius of about 0.6°
 
 /// A stand along the far long side: stepped rows from the deck, a seat every
 /// 0.6 m, most of them taken.
-pub const STAND_Y0: f64 = POOL_Y + 3.0;
 pub const STAND_ROWS: usize = 14;
 pub const STAND_RISE: f64 = 0.45;
 pub const STAND_TREAD: f64 = 0.85;
@@ -111,12 +111,14 @@ fn hash2(i: i64, j: i64) -> f64 {
 }
 
 /// Ray against the stand's steps (a union of boxes): distance and normal.
-fn stand_hit(o: V<f64>, d: V<f64>) -> Option<(f64, V<f64>)> {
+fn stand_hit(o: V<f64>, d: V<f64>, geometry: PoolGeometry) -> Option<(f64, V<f64>)> {
     let mut best: Option<(f64, V<f64>)> = None;
-    let y_back = STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD;
+    let [pool_x, _] = geometry.half_extents;
+    let stand_y0 = geometry.stand_y0();
+    let y_back = stand_y0 + STAND_ROWS as f64 * STAND_TREAD;
     for r in 0..STAND_ROWS {
-        let lo = V::new(-POOL_X, STAND_Y0 + r as f64 * STAND_TREAD, COPING);
-        let hi = V::new(POOL_X, y_back, COPING + (r + 1) as f64 * STAND_RISE);
+        let lo = V::new(-pool_x, stand_y0 + r as f64 * STAND_TREAD, COPING);
+        let hi = V::new(pool_x, y_back, COPING + (r + 1) as f64 * STAND_RISE);
         // slab test
         let mut t0 = 1e-6f64;
         let mut t1 = f64::INFINITY;
@@ -147,7 +149,7 @@ fn stand_hit(o: V<f64>, d: V<f64>) -> Option<(f64, V<f64>)> {
 
 /// A seated person at seat `i` of row `r`, if there is one: shirt colour,
 /// and the signed distance from `p` (capsule torso, sphere head).
-fn person_sdf(p: V<f64>, i: i64, r: i64) -> Option<(f64, [f64; 3], bool)> {
+fn person_sdf(p: V<f64>, i: i64, r: i64, geometry: PoolGeometry) -> Option<(f64, [f64; 3], bool)> {
     if r < 0 || r >= STAND_ROWS as i64 {
         return None;
     }
@@ -155,11 +157,12 @@ fn person_sdf(p: V<f64>, i: i64, r: i64) -> Option<(f64, [f64; 3], bool)> {
     if h0 > 0.85 {
         return None; // an empty seat
     }
-    let x = -POOL_X + 0.3 + i as f64 * SEAT_PITCH + (hash2(i + 7, r) - 0.5) * 0.12;
-    if x.abs() > POOL_X - 0.3 {
+    let pool_x = geometry.half_extents[0];
+    let x = -pool_x + 0.3 + i as f64 * SEAT_PITCH + (hash2(i + 7, r) - 0.5) * 0.12;
+    if x.abs() > pool_x - 0.3 {
         return None;
     }
-    let y = STAND_Y0 + r as f64 * STAND_TREAD + 0.45;
+    let y = geometry.stand_y0() + r as f64 * STAND_TREAD + 0.45;
     let z = COPING + (r + 1) as f64 * STAND_RISE;
     let lean = (hash2(i + 3, r + 11) - 0.5) * 0.2;
     // torso: a capsule from the seat to the shoulders
@@ -182,13 +185,13 @@ fn person_sdf(p: V<f64>, i: i64, r: i64) -> Option<(f64, [f64; 3], bool)> {
     if d_head < d_torso { Some((d_head, [0.80, 0.60, 0.48], true)) } else { Some((d_torso, shirt, false)) }
 }
 
-fn crowd_sdf(p: V<f64>) -> (f64, [f64; 3]) {
-    let i = ((p.x + POOL_X - 0.3) / SEAT_PITCH).round() as i64;
-    let r = ((p.y - STAND_Y0 - 0.45) / STAND_TREAD).round() as i64;
+fn crowd_sdf(p: V<f64>, geometry: PoolGeometry) -> (f64, [f64; 3]) {
+    let i = ((p.x + geometry.half_extents[0] - 0.3) / SEAT_PITCH).round() as i64;
+    let r = ((p.y - geometry.stand_y0() - 0.45) / STAND_TREAD).round() as i64;
     // the nearest seat, and the row behind (heads poke up between)
     let mut best = (1e9, [0.0; 3]);
     for (di, dr) in [(0, 0), (-1, 0), (1, 0), (0, 1), (0, -1)] {
-        if let Some((d, c, _)) = person_sdf(p, i + di, r + dr) {
+        if let Some((d, c, _)) = person_sdf(p, i + di, r + dr, geometry) {
             if d < best.0 { best = (d, c); }
         }
     }
@@ -196,10 +199,12 @@ fn crowd_sdf(p: V<f64>) -> (f64, [f64; 3]) {
 }
 
 /// Sphere-trace the crowd inside the stand's bounding box.
-fn crowd_hit(o: V<f64>, d: V<f64>, t_max: f64) -> Option<(f64, V<f64>, [f64; 3])> {
+fn crowd_hit(o: V<f64>, d: V<f64>, t_max: f64, geometry: PoolGeometry) -> Option<(f64, V<f64>, [f64; 3])> {
     // the box the people occupy
-    let lo = V::new(-POOL_X, STAND_Y0, COPING);
-    let hi = V::new(POOL_X, STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD, COPING + STAND_ROWS as f64 * STAND_RISE + 1.1);
+    let pool_x = geometry.half_extents[0];
+    let stand_y0 = geometry.stand_y0();
+    let lo = V::new(-pool_x, stand_y0, COPING);
+    let hi = V::new(pool_x, stand_y0 + STAND_ROWS as f64 * STAND_TREAD, COPING + STAND_ROWS as f64 * STAND_RISE + 1.1);
     let mut t0 = 1e-6f64;
     let mut t1 = t_max;
     for k in 0..3 {
@@ -219,13 +224,13 @@ fn crowd_hit(o: V<f64>, d: V<f64>, t_max: f64) -> Option<(f64, V<f64>, [f64; 3])
     let mut t = t0;
     for _ in 0..200 {
         let p = o + d * t;
-        let (dist, col) = crowd_sdf(p);
+        let (dist, col) = crowd_sdf(p, geometry);
         if dist < 0.004 {
             let e = 0.003;
             let n = V::new(
-                crowd_sdf(p + V::new(e, 0.0, 0.0)).0 - crowd_sdf(p - V::new(e, 0.0, 0.0)).0,
-                crowd_sdf(p + V::new(0.0, e, 0.0)).0 - crowd_sdf(p - V::new(0.0, e, 0.0)).0,
-                crowd_sdf(p + V::new(0.0, 0.0, e)).0 - crowd_sdf(p - V::new(0.0, 0.0, e)).0,
+                crowd_sdf(p + V::new(e, 0.0, 0.0), geometry).0 - crowd_sdf(p - V::new(e, 0.0, 0.0), geometry).0,
+                crowd_sdf(p + V::new(0.0, e, 0.0), geometry).0 - crowd_sdf(p - V::new(0.0, e, 0.0), geometry).0,
+                crowd_sdf(p + V::new(0.0, 0.0, e), geometry).0 - crowd_sdf(p - V::new(0.0, 0.0, e), geometry).0,
             )
             .normalize();
             return Some((t, n, col));
@@ -256,10 +261,10 @@ fn shade_stand(p: V<f64>, n: V<f64>, base: [f64; 3]) -> [f64; 3] {
 }
 
 /// The grandstand and its crowd along a ray: steps first, then people.
-fn stand_and_crowd(o: V<f64>, d: V<f64>) -> Option<(f64, [f64; 3])> {
-    let steps = stand_hit(o, d);
+fn stand_and_crowd(o: V<f64>, d: V<f64>, geometry: PoolGeometry) -> Option<(f64, [f64; 3])> {
+    let steps = stand_hit(o, d, geometry);
     let t_lim = steps.map(|(t, _)| t).unwrap_or(f64::INFINITY);
-    if let Some((t, n, col)) = crowd_hit(o, d, t_lim.min(400.0)) {
+    if let Some((t, n, col)) = crowd_hit(o, d, t_lim.min(400.0), geometry) {
         let p = o + d * t;
         return Some((t, shade_stand(p, n, col)));
     }
@@ -577,6 +582,7 @@ pub struct PoolSimulation {
     pub fluid_force: V<f64>,
     /// The pool beyond the box.
     pub far: Option<crate::far::Far>,
+    geometry: PoolGeometry,
     melon_axes: [f64; 3],
     recording_fps: f64,
 }
@@ -587,11 +593,18 @@ pub type Drop = PoolSimulation;
 
 impl PoolSimulation {
     pub fn new(height: f64) -> Self {
-        Self::with_melon(height, MELON_AXES, melon_density(), fps())
+        Self::with_melon(
+            PoolGeometry::reference(),
+            height,
+            MELON_AXES,
+            melon_density(),
+            fps(),
+        )
     }
 
     pub fn from_scene(scene: &PoolScene) -> Self {
         Self::with_melon(
+            scene.geometry,
             scene.drop_height,
             scene.melon_axes,
             scene.melon_density,
@@ -599,7 +612,13 @@ impl PoolSimulation {
         )
     }
 
-    fn with_melon(height: f64, axes: [f64; 3], density: f64, recording_fps: f64) -> Self {
+    fn with_melon(
+        geometry: PoolGeometry,
+        height: f64,
+        axes: [f64; 3],
+        density: f64,
+        recording_fps: f64,
+    ) -> Self {
         let vol = 4.0 / 3.0 * std::f64::consts::PI * axes[0] * axes[1] * axes[2];
         let m = density * vol;
         let r = (axes[0] * axes[1] * axes[2]).cbrt();
@@ -627,6 +646,7 @@ impl PoolSimulation {
             surface_prev: None,
             fluid_force: V::zero(),
             far: None,
+            geometry,
             melon_axes: axes,
             recording_fps,
         }
@@ -636,9 +656,15 @@ impl PoolSimulation {
     /// field over the rest of the pool.
     pub fn with_water(self, h: f64) -> Self {
         self.with_water_config(WaterConfig { cell_size: h, ..WaterConfig::from_env(h) })
+            .expect("reference geometry for the fine-water solver")
     }
 
-    pub fn with_water_config(mut self, config: WaterConfig) -> Self {
+    pub fn with_water_config(mut self, config: WaterConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.geometry == PoolGeometry::reference(),
+            "the fine-water solver still requires the reference pool geometry; got {:?}",
+            self.geometry
+        );
         // speed of sound ~ 45 m/s: at 5 m/s the impact pressure compresses the
         // water under a percent, which is what stops a melon instead of
         // letting it plough through
@@ -658,21 +684,16 @@ impl PoolSimulation {
         water.settle(config.settle_seconds);
         self.water = Some(water);
         self.far = Some(crate::far::Far::new(0.1));
-        self
+        Ok(self)
     }
 
     /// One 1 ms physics step when the water is simulated: the fluid pushes
     /// on the melon through the grid, phyz moves the melon.
     fn step_with_water(&mut self) {
-        let melon = self.melon();
         let vel = V::new(self.state.v[3], self.state.v[4], self.state.v[5]);
+        let body = self.fluid_body(vel);
         let water = self.water.as_mut().expect("water");
         let subs = (self.model.dt / water.dt).ceil() as usize;
-        let body = crate::splash::Body {
-            centre: Vec3::new(melon.centre.x, melon.centre.y, melon.centre.z),
-            axis: Vec3::new(melon.axis.x, melon.axis.y, melon.axis.z),
-            vel: Vec3::new(vel.x, vel.y, vel.z),
-        };
         let f = water.step_block(&body, subs);
         let fv = V::new(f.x, f.y, f.z);
         if fv.norm() > self.fluid_force.norm() { self.fluid_force = fv; }
@@ -691,7 +712,12 @@ impl PoolSimulation {
         self.state.v[0] = 0.0;
         self.state.v[1] = 0.0;
         self.state.v[2] = 0.0;
-        self.sim.step_with_contacts(&self.model, &mut self.state, -DEPTH, &Default::default());
+        self.sim.step_with_contacts(
+            &self.model,
+            &mut self.state,
+            -self.geometry.depth,
+            &Default::default(),
+        );
         self.state.q[0] = 0.0;
         self.state.q[1] = 0.0;
         self.state.q[2] = 0.0;
@@ -908,6 +934,10 @@ impl PoolSimulation {
         self.recording_fps
     }
 
+    pub fn geometry(&self) -> PoolGeometry {
+        self.geometry
+    }
+
     pub fn water_particle_count(&self) -> usize {
         self.water.as_ref().map(|water| water.count()).unwrap_or(0)
     }
@@ -919,6 +949,17 @@ impl PoolSimulation {
             centre: self.centre(),
             axis: V::new(yaw.cos(), yaw.sin(), 0.0),
             axes: self.melon_axes,
+        }
+    }
+
+    /// The scene-authored actor as seen by the fine-water computation.
+    fn fluid_body(&self, velocity: V<f64>) -> crate::splash::Body {
+        let melon = self.melon();
+        crate::splash::Body {
+            centre: Vec3::new(melon.centre.x, melon.centre.y, melon.centre.z),
+            axis: Vec3::new(melon.axis.x, melon.axis.y, melon.axis.z),
+            vel: Vec3::new(velocity.x, velocity.y, velocity.z),
+            semi: melon.axes,
         }
     }
 
@@ -970,7 +1011,12 @@ impl PoolSimulation {
         self.state.v[1] = 0.0;
         self.state.v[2] = 0.0;
         // the floor of the pool is the ground plane
-        self.sim.step_with_contacts(&self.model, &mut self.state, -DEPTH, &Default::default());
+        self.sim.step_with_contacts(
+            &self.model,
+            &mut self.state,
+            -self.geometry.depth,
+            &Default::default(),
+        );
         self.state.q[0] = 0.0;
         self.state.q[1] = 0.0;
         self.state.q[2] = 0.0;
@@ -1021,6 +1067,14 @@ impl Caustic {
 /// Sunlight through the surface onto the floor: irradiance relative to what a
 /// flat surface would pass, so still water reads as 1 and ripples focus it.
 pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
+    caustic_for_geometry(surface, PoolGeometry::reference(), cell)
+}
+
+pub fn caustic_for_geometry(
+    surface: &Surface,
+    geometry: PoolGeometry,
+    cell: f64,
+) -> Caustic {
     // over the box and a margin: the sun's refracted rays land a metre
     // sideways over two metres of depth, and beyond the map the floor reads 1
     let half = box_half() + 3.0;
@@ -1054,14 +1108,14 @@ pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
                     // send to this floor cell, so the reference is uniform
                     let fx = l_origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
                     let fy = l_origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
-                    let back = DEPTH / flat_cos;
+                    let back = geometry.depth / flat_cos;
                     let sx = fx - d_flat.x * back;
                     let sy = fy - d_flat.y * back;
                     let n = surface.normal(sx, sy);
                     let Some((dr, ci, ct)) = refract(d, n, 1.0, N_WATER) else { continue };
                     let tr = 1.0 - fresnel(1.0, N_WATER, ci, ct);
                     let z0 = surface.height(sx, sy);
-                    let tt = (z0 + DEPTH) / -dr.z;
+                    let tt = (z0 + geometry.depth) / -dr.z;
                     let hx = sx + dr.x * tt;
                     let hy = sy + dr.y * tt;
                     let w = per_ray * (tr / t_flat) * (-dr.z / flat_cos);
@@ -1097,6 +1151,15 @@ pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
 /// surface evaluated in WGSL, deposited through fixed-point atomics. The CPU
 /// version above stays the reference; `KOSM_GPU_RENDER=0` selects it.
 pub fn caustic_gpu(gpu: &mut kosm_mpm::GpuCaustic, surface: &Surface, cell: f64) -> Option<Caustic> {
+    caustic_gpu_for_geometry(gpu, surface, PoolGeometry::reference(), cell)
+}
+
+pub fn caustic_gpu_for_geometry(
+    gpu: &mut kosm_mpm::GpuCaustic,
+    surface: &Surface,
+    geometry: PoolGeometry,
+    cell: f64,
+) -> Option<Caustic> {
     let g = surface.grid.as_ref()?;
     let half = box_half() + 3.0;
     let fz: Vec<f32> = g.z.iter().map(|z| *z as f32).collect();
@@ -1110,7 +1173,7 @@ pub fn caustic_gpu(gpu: &mut kosm_mpm::GpuCaustic, surface: &Surface, cell: f64)
         half: half as f32,
         margin: 1.5,
         sub: 3,
-        depth: DEPTH as f32,
+        depth: geometry.depth as f32,
         n_water: N_WATER as f32,
         dir: [d.x as f32, d.y as f32, d.z as f32],
         t: surface.t as f32,
@@ -1151,12 +1214,13 @@ fn sky(d: V<f64>) -> [f64; 3] {
     c
 }
 
-fn tile(x: f64, y: f64) -> [f64; 3] {
+fn tile(x: f64, y: f64, geometry: PoolGeometry) -> [f64; 3] {
     // lane lines: ten lanes of 2.5 m across the width, a 25 cm dark line
     // along the length of each, with the T two metres from the end walls
-    let lane = ((y + POOL_Y) / 2.5).floor() * 2.5 - POOL_Y + 1.25;
+    let [pool_x, pool_y] = geometry.half_extents;
+    let lane = ((y + pool_y) / 2.5).floor() * 2.5 - pool_y + 1.25;
     let on_line = (y - lane).abs() < 0.125;
-    let on_t = (x.abs() - (POOL_X - 2.0)).abs() < 0.125 && (y - lane).abs() < 0.5;
+    let on_t = (x.abs() - (pool_x - 2.0)).abs() < 0.125 && (y - lane).abs() < 0.5;
     if on_line || on_t {
         return [0.05, 0.09, 0.18];
     }
@@ -1209,7 +1273,8 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
     let t_melon = melon.hit(o, d).map(|(t, n)| (t, n));
     // the deck: a plane at z = COPING outside the pool
     let t_deck = if d.z < 0.0 { Some((COPING - o.z) / d.z) } else { None };
-    let inside_pool = |p: V<f64>| p.x.abs() < POOL_X && p.y.abs() < POOL_Y;
+    let [pool_x, pool_y] = drop.geometry.half_extents;
+    let inside_pool = |p: V<f64>| p.x.abs() < pool_x && p.y.abs() < pool_y;
     // where the ray enters the pool column (z < COPING and inside), march for the surface
     let mut t_water = None;
     // the march starts where the ray drops below the highest water, which
@@ -1229,7 +1294,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
     // pool walls seen from above the water (the tiled inside faces above z=0)
     let t_wall = {
         let mut best: Option<(f64, V<f64>)> = None;
-        for (n, dd) in [(V::new(1.0, 0.0, 0.0), POOL_X), (V::new(-1.0, 0.0, 0.0), POOL_X), (V::new(0.0, 1.0, 0.0), POOL_Y), (V::new(0.0, -1.0, 0.0), POOL_Y)] {
+        for (n, dd) in [(V::new(1.0, 0.0, 0.0), pool_x), (V::new(-1.0, 0.0, 0.0), pool_x), (V::new(0.0, 1.0, 0.0), pool_y), (V::new(0.0, -1.0, 0.0), pool_y)] {
             let denom = n.dot(&d);
             if denom.abs() < 1e-9 {
                 continue;
@@ -1274,7 +1339,11 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
         }
     }
     // the grandstand, only for rays heading its way
-    let t_stand = if d.y > 0.0 && o.y < STAND_Y0 + STAND_ROWS as f64 * STAND_TREAD { stand_and_crowd(o, d) } else { None };
+    let t_stand = if d.y > 0.0 && o.y < drop.geometry.stand_y0() + STAND_ROWS as f64 * STAND_TREAD {
+        stand_and_crowd(o, d, drop.geometry)
+    } else {
+        None
+    };
     // pick the nearest of melon / water / wall / deck / drop / stand
     let mut best_t = f64::INFINITY;
     let mut what = 0; // 0 sky
@@ -1339,7 +1408,7 @@ pub fn radiance(view_o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic:
         3 => {
             let (t, n) = t_wall.unwrap();
             let p = o + d * t;
-            let base = tile(p.x + p.z, p.y + p.z);
+            let base = tile(p.x + p.z, p.y + p.z, drop.geometry);
             let lit = SUN_IRRADIANCE * n.dot(&s).max(0.0) * if sun_blocked_air(melon, p) { 0.0 } else { 1.0 };
             let amb = 0.35;
             let mut c = [0.0; 3];
@@ -1386,7 +1455,7 @@ fn radiance_above(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &C
         return shade_melon(p, n, d, melon, drop, caustic, true);
     }
     if d.y > 0.0 {
-        if let Some((_, c)) = stand_and_crowd(o, d) {
+        if let Some((_, c)) = stand_and_crowd(o, d, drop.geometry) {
             return c;
         }
     }
@@ -1395,7 +1464,8 @@ fn radiance_above(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &C
 
 /// A ray inside the water: absorb along the way, hit melon, walls, or the floor.
 fn underwater(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caustic) -> [f64; 3] {
-    let inside_pool = |p: V<f64>| p.x.abs() < POOL_X + 1e-3 && p.y.abs() < POOL_Y + 1e-3;
+    let [pool_x, pool_y] = drop.geometry.half_extents;
+    let inside_pool = |p: V<f64>| p.x.abs() < pool_x + 1e-3 && p.y.abs() < pool_y + 1e-3;
     let mut best_t = f64::INFINITY;
     let mut what = 0;
     let mut n_hit = V::new(0.0, 0.0, 1.0);
@@ -1403,10 +1473,10 @@ fn underwater(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caust
         best_t = t; what = 1; n_hit = n;
     }
     if d.z < 0.0 {
-        let t = (-DEPTH - o.z) / d.z;
+        let t = (-drop.geometry.depth - o.z) / d.z;
         if t < best_t { best_t = t; what = 2; n_hit = V::new(0.0, 0.0, 1.0); }
     }
-    for (n, dd) in [(V::new(1.0, 0.0, 0.0), POOL_X), (V::new(-1.0, 0.0, 0.0), POOL_X), (V::new(0.0, 1.0, 0.0), POOL_Y), (V::new(0.0, -1.0, 0.0), POOL_Y)] {
+    for (n, dd) in [(V::new(1.0, 0.0, 0.0), pool_x), (V::new(-1.0, 0.0, 0.0), pool_x), (V::new(0.0, 1.0, 0.0), pool_y), (V::new(0.0, -1.0, 0.0), pool_y)] {
         let denom = n.dot(&d);
         if denom <= 1e-9 { continue; }
         let t = (dd - n.dot(&o)) / denom;
@@ -1420,7 +1490,7 @@ fn underwater(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caust
     let mut c = match what {
         1 => shade_melon(p, n_hit, d, melon, drop, caustic, false),
         2 => {
-            let base = tile(p.x, p.y);
+            let base = tile(p.x, p.y, drop.geometry);
             let shadow = if sun_blocked_underwater(melon, &drop.surface, p) { 0.12 } else { 1.0 };
             let lit = SUN_IRRADIANCE * 0.92 * caustic.at(p.x, p.y) * shadow;
             let mut c = [0.0; 3];
@@ -1428,7 +1498,7 @@ fn underwater(o: V<f64>, d: V<f64>, drop: &Scene, melon: &Melon, caustic: &Caust
             c
         }
         _ => {
-            let base = tile(p.x + p.z, p.y + p.z);
+            let base = tile(p.x + p.z, p.y + p.z, drop.geometry);
             let lit = SUN_IRRADIANCE * 0.5 * n_hit.dot(&sun_dir()).max(0.0);
             let mut c = [0.0; 3];
             for k in 0..3 { c[k] = base[k] * (0.30 + lit); }
@@ -1478,6 +1548,7 @@ fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Scene, cau
 /// rendering can run across threads without the simulator.
 #[derive(Clone, Copy)]
 pub struct Scene<'a> {
+    pub geometry: PoolGeometry,
     pub surface: &'a Surface,
     pub droplets: &'a [crate::splash::Droplet],
     /// The surface's maximum this frame (computed once: it is a grid scan)...
@@ -1489,17 +1560,18 @@ pub struct Scene<'a> {
 
 pub fn render(view: &View, drop: &PoolSimulation, caustic: &Caustic) -> image::RgbaImage {
     let melon = drop.melon();
-    render_frame(view, &melon, &drop.surface, &drop.droplets, &drop.foam, caustic)
+    render_frame(view, drop.geometry, &melon, &drop.surface, &drop.droplets, &drop.foam, caustic)
 }
 
 /// Render an immutable simulation observation. This is the viewer/replay seam:
 /// reference rendering no longer reconstructs a mutable `PoolSimulation`.
 pub fn render_snapshot(view: &View, snapshot: &PoolSnapshot, caustic: &Caustic) -> image::RgbaImage {
-    render_frame(view, &snapshot.melon, &snapshot.surface, &snapshot.droplets, &snapshot.foam, caustic)
+    render_frame(view, snapshot.geometry, &snapshot.melon, &snapshot.surface, &snapshot.droplets, &snapshot.foam, caustic)
 }
 
 fn render_frame(
     view: &View,
+    geometry: PoolGeometry,
     melon: &Melon,
     surface: &Surface,
     droplets: &[crate::splash::Droplet],
@@ -1513,7 +1585,7 @@ fn render_frame(
         println!("render prep: foam field {} ms, top {:.3} m", t_foam.elapsed().as_millis(), top);
     }
     let top_far = surface.far.as_ref().map(|f| f.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0) + 0.02;
-    let scene = Scene { surface, droplets, top, top_far, foam: &foam };
+    let scene = Scene { geometry, surface, droplets, top, top_far, foam: &foam };
     let drop = &scene;
     let fwd = (view.target - view.eye).normalize();
     let right = fwd.cross(&V::new(0.0, 0.0, 1.0)).normalize();
@@ -1558,7 +1630,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     std::fs::create_dir_all(&dir)?;
     let mut drop = PoolSimulation::from_scene(&scene);
     if splash {
-        drop = drop.with_water_config(water_config);
+        drop = drop.with_water_config(water_config)?;
         let w = drop.water.as_ref().unwrap();
         println!("splash {} water particles on a {}×{}×{} grid at {} cm, dt {:.2e} s ({} substeps per ms)", w.count(), w.nx, w.ny, w.nz, w.h * 100.0, w.dt, (drop.model.dt / w.dt).ceil());
     }
@@ -1597,7 +1669,10 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
         lowest = lowest.min(drop.centre().z);
         drop.read_water();
         tick(1, &mut lap);
-        let c = cgpu.as_mut().and_then(|g| caustic_gpu(g, &drop.surface, 0.02)).unwrap_or_else(|| caustic(&drop.surface, 0.02));
+        let c = cgpu
+            .as_mut()
+            .and_then(|gpu| caustic_gpu_for_geometry(gpu, &drop.surface, drop.geometry(), 0.02))
+            .unwrap_or_else(|| caustic_for_geometry(&drop.surface, drop.geometry(), 0.02));
         tick(2, &mut lap);
         let peak_force = drop.fluid_force;
         drop.fluid_force = V::zero();
@@ -1622,8 +1697,7 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                 let mut zs: Vec<f64> = w.x.iter().map(|p| p.z).collect();
                 zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let mean = zs.iter().sum::<f64>() / zs.len() as f64;
-                let mel = drop.melon();
-                let body = crate::splash::Body { centre: Vec3::new(mel.centre.x, mel.centre.y, mel.centre.z), axis: Vec3::new(mel.axis.x, mel.axis.y, mel.axis.z), vel: Vec3::zeros() };
+                let body = drop.fluid_body(V::zero());
                 let inside = w.x.iter().filter(|p| body.sdf(**p).0 < 0.0).count();
                 println!("water  frame {k:3}  particles inside the melon {inside} ({:.2} kg)", inside as f64 * w.mass);
                 if let Some(far) = &drop.surface.far {

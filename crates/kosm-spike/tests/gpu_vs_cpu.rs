@@ -1,4 +1,5 @@
 //! The GPU solver against the CPU solver from the same state.
+use kosm_spike::pool::MELON_AXES;
 use kosm_spike::splash::{Body, Water};
 use phyz_math::Vec3;
 
@@ -22,7 +23,12 @@ fn one_and_many_substeps() {
     let mut cpu = Water::fill(h, dt, air, bulk);
     let mut gpu = Water::fill(h, dt, air, bulk);
     gpu.enable_gpu(1000).expect("gpu");
-    let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+    let far = Body {
+        centre: Vec3::new(0.0, 0.0, 50.0),
+        axis: Vec3::new(1.0, 0.0, 0.0),
+        vel: Vec3::zeros(),
+        semi: MELON_AXES,
+    };
     for &n in &[1usize, 10, 100, 1000] {
         for _ in 0..n {
             cpu.step(&far);
@@ -93,7 +99,12 @@ fn density_estimate_at_fill() {
         unsafe { std::env::set_var("KOSM_PPC", ppa.to_string()) };
         let h = 0.05;
         let mut w = Water::fill(h, 1e-4, 0.5, 2.0e6);
-        let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+        let far = Body {
+            centre: Vec3::new(0.0, 0.0, 50.0),
+            axis: Vec3::new(1.0, 0.0, 0.0),
+            vel: Vec3::zeros(),
+            semi: MELON_AXES,
+        };
         w.step(&far); // one step, so the grid mass is filled; positions move ~0
         let (mut r, mut b, mut n) = (0.0, 0.0, 0);
         for p in &w.x {
