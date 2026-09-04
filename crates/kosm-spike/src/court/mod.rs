@@ -17,14 +17,15 @@
 use std::path::Path;
 
 use phyz::Simulator;
-use phyz_camera::{CameraPose, RenderScene, RgbdCamera, SceneOptions};
 use phyz_contact::{ContactMaterial, ContactSolverConfig};
 use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
-use phyz_model::{Geometry, Model, ModelBuilder, State};
-use phyz_world::{CameraIntrinsics, Scene, SensorContext};
+use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
+use phyz_rigid::forward_kinematics;
 
 use crate::colliders;
 use crate::scene::{AuthoredScene, MM};
+
+pub mod render;
 
 pub const DEFAULT_COURT_SCENE: &str = "court.loon";
 
@@ -32,6 +33,9 @@ pub const DEFAULT_COURT_SCENE: &str = "court.loon";
 pub struct CourtScene {
     pub authored: AuthoredScene,
     pub n_balls: usize,
+    pub drop_x: f64,
+    pub shot: Option<Shot>,
+    pub hoop: Hoop,
     pub ball_r: f64,
     pub ball_mass: f64,
     pub restitution: f64,
@@ -53,7 +57,10 @@ impl CourtScene {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let authored = AuthoredScene::load(path)?;
         let scene = Self {
-            n_balls: authored.parameter("n_balls")?.round().max(1.0) as usize,
+            n_balls: authored.parameter("n_balls")?.round().max(0.0) as usize,
+            drop_x: authored.millimetres("drop_x_mm")?,
+            shot: Shot::from_scene(&authored)?,
+            hoop: Hoop::from_scene(&authored)?,
             ball_r: authored.millimetres("ball_r_mm")?,
             ball_mass: authored.parameter("ball_g")? * 1e-3,
             restitution: authored.parameter("restitution")?,
@@ -67,7 +74,13 @@ impl CourtScene {
             authored,
         };
         anyhow::ensure!(scene.dt > 0.0 && scene.fps > 0.0, "court needs a positive dt and fps");
+        anyhow::ensure!(scene.n_balls + scene.shot.is_some() as usize > 0, "court has no balls");
         Ok(scene)
+    }
+
+    /// Bodies in the model: the dropped balls, then the shot if there is one.
+    pub fn bodies(&self) -> usize {
+        self.n_balls + self.shot.is_some() as usize
     }
 
     pub fn frames(&self) -> usize {
@@ -77,8 +90,8 @@ impl CourtScene {
     /// Where ball `i` is released: a line along x, centred, each ball a little
     /// higher than the last so the bounces do not all land on the same beat.
     pub fn release(&self, i: usize) -> Vec3 {
-        let x = (i as f64 - (self.n_balls as f64 - 1.0) / 2.0) * self.spacing;
-        Vec3::new(x, 0.0, self.drop + self.ball_r + i as f64 * self.stagger)
+        let y = (i as f64 - (self.n_balls as f64 - 1.0) / 2.0) * self.spacing;
+        Vec3::new(self.drop_x, y, self.drop + self.ball_r + i as f64 * self.stagger)
     }
 
     pub fn material(&self) -> ContactMaterial {
@@ -87,6 +100,88 @@ impl CourtScene {
             restitution: self.restitution,
             ..Default::default()
         }
+    }
+}
+
+/// The level's parts, one collider set per root, with the root's material
+/// name: the physics takes them all as one body, the picture tells them apart.
+pub fn parts(scene: &CourtScene) -> anyhow::Result<Vec<(String, Vec<GeomInstance>)>> {
+    let doc = &scene.authored.document;
+    let mut out = Vec::new();
+    for root in &doc.roots {
+        let mut single = doc.clone();
+        single.roots = vec![root.clone()];
+        let derived = colliders::colliders_from_document(&single)?;
+        out.push((root.material.clone(), derived.colliders));
+    }
+    Ok(out)
+}
+
+/// The hoop, in metres: the rim's centre and inside radius, the board's face.
+#[derive(Clone, Copy, Debug)]
+pub struct Hoop {
+    pub rim_centre: Vec3,
+    pub rim_r: f64,
+    pub board_x: f64,
+}
+
+impl Hoop {
+    fn from_scene(s: &AuthoredScene) -> anyhow::Result<Self> {
+        let board_x = s.millimetres("board_x_mm")?;
+        Ok(Self {
+            rim_centre: Vec3::new(board_x - s.millimetres("rim_offset_mm")?, 0.0, s.millimetres("rim_z_mm")?),
+            rim_r: s.millimetres("rim_r_mm")?,
+            board_x,
+        })
+    }
+}
+
+/// A shot: where the ball leaves the hand, and how.
+#[derive(Clone, Copy, Debug)]
+pub struct Shot {
+    pub release: Vec3,
+    pub speed: f64,
+    pub elevation: f64,
+    pub azimuth: f64,
+    /// Backspin, rad/s, about the horizontal axis to the left of the shot.
+    pub backspin: f64,
+}
+
+impl Shot {
+    fn from_scene(s: &AuthoredScene) -> anyhow::Result<Option<Self>> {
+        let speed = s.parameter_or("shot_speed", 0.0);
+        if speed <= 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            release: Vec3::new(s.millimetres("shot_x_mm")?, s.millimetres("shot_y_mm")?, s.millimetres("shot_z_mm")?),
+            speed,
+            elevation: s.parameter("shot_elev_deg")?.to_radians(),
+            azimuth: s.parameter_or("shot_azimuth_deg", 0.0).to_radians(),
+            backspin: s.parameter_or("shot_backspin_rps", 0.0) * 2.0 * std::f64::consts::PI,
+        }))
+    }
+
+    pub fn velocity(&self) -> Vec3 {
+        let (ce, se) = (self.elevation.cos(), self.elevation.sin());
+        Vec3::new(self.speed * ce * self.azimuth.cos(), self.speed * ce * self.azimuth.sin(), self.speed * se)
+    }
+
+    /// Angular velocity for the backspin: about the horizontal axis to the
+    /// left of the shot, so the top of the ball moves backwards.
+    pub fn angular_velocity(&self) -> Vec3 {
+        let left = Vec3::new(-self.azimuth.sin(), self.azimuth.cos(), 0.0);
+        left * -self.backspin
+    }
+
+    /// The speed that puts the ball's centre through `target` at this
+    /// elevation, gravity only: `v² = g d² / (2 cos²θ (d tanθ − Δh))`.
+    pub fn ballistic_speed(&self, target: Vec3) -> Option<f64> {
+        let d = ((target.x - self.release.x).powi(2) + (target.y - self.release.y).powi(2)).sqrt();
+        let dh = target.z - self.release.z;
+        let (ce, te) = (self.elevation.cos(), self.elevation.tan());
+        let denom = 2.0 * ce * ce * (d * te - dh);
+        (denom > 0.0).then(|| (GRAVITY * d * d / denom).sqrt())
     }
 }
 
@@ -104,6 +199,10 @@ pub struct Court {
     pub model: Model,
     pub state: State,
     pub apexes: Vec<Apex>,
+    /// When the shot's centre passed down through the rim, if it did.
+    pub made_at: Option<f64>,
+    pub hoop: Hoop,
+    pub shot: Option<usize>,
     material: ContactMaterial,
     sim: Simulator,
     ball_r: f64,
@@ -126,22 +225,22 @@ impl Court {
         let ball_inertia = SpatialInertia::new(m, Vec3::zeros(), Mat3::from_diagonal(&Vec3::new(i, i, i)));
         let static_inertia = SpatialInertia::new(1.0, Vec3::zeros(), Mat3::identity() * 0.01);
 
+        let n = scene.bodies();
         let mut builder = ModelBuilder::new().gravity(Vec3::new(0.0, 0.0, -GRAVITY)).dt(scene.dt);
-        for k in 0..scene.n_balls {
+        for k in 0..n {
             builder = builder.add_free_body(&format!("ball{k}"), -1, SpatialTransform::identity(), ball_inertia);
         }
         let mut model = builder
             .add_fixed_body("court", -1, SpatialTransform::identity(), static_inertia)
             .build();
-        for k in 0..scene.n_balls {
+        for k in 0..n {
             model.bodies[k].geometry = Some(Geometry::Sphere { radius: r });
         }
-        let court = scene.n_balls;
-        model.bodies[court].collisions = derived.colliders.clone();
-        model.bodies[court].visuals = derived.colliders;
+        model.bodies[n].collisions = derived.colliders.clone();
+        model.bodies[n].visuals = derived.colliders;
 
-        let q_pos: Vec<usize> = (0..scene.n_balls).map(|k| model.q_offsets[model.bodies[k].joint_idx] + 3).collect();
-        let v_lin: Vec<usize> = (0..scene.n_balls).map(|k| model.v_offsets[model.bodies[k].joint_idx] + 3).collect();
+        let q_pos: Vec<usize> = (0..n).map(|k| model.q_offsets[model.bodies[k].joint_idx] + 3).collect();
+        let v_lin: Vec<usize> = (0..n).map(|k| model.v_offsets[model.bodies[k].joint_idx] + 3).collect();
 
         let mut state = model.default_state();
         for k in 0..scene.n_balls {
@@ -150,6 +249,17 @@ impl Court {
             state.q[q_pos[k] + 1] = p.y;
             state.q[q_pos[k] + 2] = p.z;
         }
+        let shot = scene.shot.map(|shot| {
+            let k = scene.n_balls;
+            let (p, v, w) = (shot.release, shot.velocity(), shot.angular_velocity());
+            let (p, v, w) = (p.as_array(), v.as_array(), w.as_array());
+            for i in 0..3 {
+                state.q[q_pos[k] + i] = p[i];
+                state.v[v_lin[k] + i] = v[i];
+                state.v[v_lin[k] - 3 + i] = w[i];
+            }
+            k
+        });
 
         let sim = Simulator::new().with_contact_config(ContactSolverConfig::simulation());
 
@@ -157,13 +267,16 @@ impl Court {
             model,
             state,
             apexes: Vec::new(),
+            made_at: None,
+            hoop: scene.hoop,
+            shot,
             material: scene.material(),
             sim,
             ball_r: r,
-            n_balls: scene.n_balls,
+            n_balls: n,
             q_pos,
             v_lin,
-            prev_vz: vec![0.0; scene.n_balls],
+            prev_vz: vec![0.0; n],
         })
     }
 
@@ -185,9 +298,32 @@ impl Court {
         (0..self.n_balls).map(|k| self.centre(k)).collect()
     }
 
+    /// Every ball, the shot included.
+    pub fn bodies(&self) -> usize {
+        self.n_balls
+    }
+
+    /// World→body rotation of a ball, from the free joint's exponential coordinates.
+    pub fn rotation(&self, ball: usize) -> Mat3 {
+        forward_kinematics(&self.model, &self.state).0[ball].rot
+    }
+
+    /// Where the shot's centre is relative to the rim's centre, if there is a shot.
+    pub fn shot_offset(&self) -> Option<Vec3> {
+        self.shot.map(|k| self.centre(k) - self.hoop.rim_centre)
+    }
+
     /// One step. The ground plane is far below the slab: the level is the court.
     pub fn step(&mut self) {
+        let before = self.shot_offset();
         self.sim.step_with_contacts(&self.model, &mut self.state, -10.0, &self.material);
+        if let (Some(a), Some(b), None) = (before, self.shot_offset(), self.made_at) {
+            // through the hoop: the centre crossed the rim plane downward,
+            // inside the ring, on this step
+            if a.z >= 0.0 && b.z < 0.0 && b.x.hypot(b.y) < self.hoop.rim_r {
+                self.made_at = Some(self.state.time);
+            }
+        }
         for k in 0..self.n_balls {
             let vz = self.velocity(k).z;
             if self.prev_vz[k] > 0.0 && vz <= 0.0 {
@@ -203,21 +339,6 @@ impl Court {
     }
 }
 
-/// Rendered with phyz-camera: the model's own geometry, balls and slab.
-pub fn render(court: &Court, width: u32, height: u32) -> anyhow::Result<image::RgbaImage> {
-    let intr = CameraIntrinsics::from_vfov(width, height, 0.8, 0.05, 30.0);
-    let mut cam = RgbdCamera::new(intr)?;
-    let scene = Scene::empty();
-    let ctx = SensorContext::free_flight(&court.model, &court.state, &scene);
-    let opts = SceneOptions { body_albedo: [0.80, 0.42, 0.18], ..SceneOptions::new() };
-    let rs = RenderScene::from_context(&ctx, &opts);
-    let pose = CameraPose::look_at(Vec3::new(0.6, -4.6, 1.4), Vec3::new(0.0, 0.0, 0.9), Vec3::z());
-    let frame = cam.render(&rs, &pose)?;
-    let rgba = frame.color_cpu().ok_or_else(|| anyhow::anyhow!("no cpu colour buffer"))?;
-    image::RgbaImage::from_raw(frame.width(), frame.height(), rgba.to_vec())
-        .ok_or_else(|| anyhow::anyhow!("frame size mismatch"))
-}
-
 /// Drop the balls, record, report the bounces against `e²`, encode.
 pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
@@ -230,6 +351,18 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
     std::fs::create_dir_all(&dir)?;
 
     let mut court = Court::from_scene(&scene)?;
+    if let Some(shot) = scene.shot {
+        println!(
+            "shot   from ({:+.2}, {:+.2}, {:.2}) at {:.2} m/s, {:.1}° up, {:.1} rps backspin; the rim centre wants {:.2} m/s at this elevation",
+            shot.release.x,
+            shot.release.y,
+            shot.release.z,
+            shot.speed,
+            shot.elevation.to_degrees(),
+            shot.backspin / (2.0 * std::f64::consts::PI),
+            shot.ballistic_speed(scene.hoop.rim_centre).unwrap_or(f64::NAN)
+        );
+    }
     println!(
         "court  {} balls, r {:.0} mm, {:.0} g, e {:.2}, μ {:.2}; dropped from {:.2} m; dt {:.1} ms, {} frames at {:.0} fps",
         scene.n_balls,
@@ -243,24 +376,56 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
         scene.fps
     );
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
+    let a = &scene.authored;
+    let (w, h) = if width > 0 { (width, height) } else { (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32) };
+    let spp = std::env::var("KOSM_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(a.parameter_or("render_spp", 8.0) as usize);
+    let cam = render::camera(&scene, w, h)?;
+    let still_t = a.parameter_or("still_t", -1.0);
+    let mut still_done = still_t < 0.0;
+    println!("render {w}×{h} at {spp} spp per frame; still {}×{} at {} spp at t = {still_t:.2} s",
+        a.parameter_or("still_w", 1920.0) as u32, a.parameter_or("still_h", 1080.0) as u32, a.parameter_or("still_spp", 128.0) as usize);
     let t0 = std::time::Instant::now();
     let mut sim_time = std::time::Duration::ZERO;
+    let mut render_time = std::time::Duration::ZERO;
     for k in 0..frames {
         let lap = std::time::Instant::now();
         for _ in 0..steps_per_frame {
             court.step();
         }
         sim_time += lap.elapsed();
-        render(&court, width, height)?.save(dir.join(format!("frame_{k:03}.png")))?;
+        let lap = std::time::Instant::now();
+        let picture = render::Scene::new(&scene, &court)?;
+        render::render(&picture, &cam, spp, k as u64).save(dir.join(format!("frame_{k:03}.png")))?;
+        render_time += lap.elapsed();
+        if !still_done && court.time() >= still_t {
+            still_done = true;
+            let (sw, sh) = (a.parameter_or("still_w", 1920.0) as u32, a.parameter_or("still_h", 1080.0) as u32);
+            let sspp = a.parameter_or("still_spp", 128.0) as usize;
+            let lap = std::time::Instant::now();
+            let still = out.join("court_still.png");
+            render::render(&picture, &render::camera(&scene, sw, sh)?, sspp, 1 << 32).save(&still)?;
+            println!("render {} at t = {:.2} s, {sw}×{sh} × {sspp} spp in {:.1} s", still.display(), court.time(), lap.elapsed().as_secs_f64());
+        }
+        if k % 30 == 0 {
+            println!("render frame {k} of {frames}: {:.1} s per frame", render_time.as_secs_f64() / (k + 1) as f64);
+        }
     }
     println!(
-        "court  {:.2} s simulated in {} ms; {} frames rendered in {:.1} s",
+        "court  {:.2} s simulated in {} ms; {} frames rendered in {:.1} s ({:.1} s total)",
         court.time(),
         sim_time.as_millis(),
         frames,
+        render_time.as_secs_f64(),
         t0.elapsed().as_secs_f64()
     );
     report(&scene, &court);
+    if let Some(k) = court.shot {
+        let c = court.centre(k);
+        match court.made_at {
+            Some(t) => println!("shot   through the hoop at {t:.2} s; the ball ends at ({:+.2}, {:+.2}, {:.2})", c.x, c.y, c.z),
+            None => println!("shot   missed; the ball ends at ({:+.2}, {:+.2}, {:.2})", c.x, c.y, c.z),
+        }
+    }
 
     let mp4 = out.join("court.mp4");
     let st = std::process::Command::new("ffmpeg")

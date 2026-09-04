@@ -370,7 +370,7 @@ fn main() -> anyhow::Result<()> {
     // re-evaluate large scenes once per parameter. This is before any threads.
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     match cli::Command::from_env()? {
-        cli::Command::Court { frames } => return court::run(Path::new("out"), frames, 1280, 720),
+        cli::Command::Court { frames } => return court::run(Path::new("out"), frames, 0, 0),
         cli::Command::Pool { frames } => return pool::run(Path::new("out"), frames, 1280, 720, false),
         cli::Command::Splash { frames } => return pool::run(Path::new("out"), frames, 1280, 720, true),
         cli::Command::Splat { ply } => return garage::survey_splat(&ply, Path::new("out/splat"), 960, 720),

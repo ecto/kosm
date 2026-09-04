@@ -170,20 +170,36 @@ contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.
 
 ### the court
 
-`kosm-spike --court [frames]` drops five basketballs onto the authored scene
-[`levels/court.loon`](levels/court.loon) (`court.rs`): a maple slab derived
-into colliders the same way the marble track is, and balls that are phyz free
-bodies with the ball, the drop, the restitution and the recording as knobs.
-The bounce is phyz's own restitution. Each ball's apexes are printed against
-Newton's `e²` law — with `e = 0.77` the first apex is the NBA's inflation test
-(dropped from 6 ft, the top of the ball must come back to 49–54 in), and every
-bounce lands within 0.7% of `e²`. Frames are phyz-camera, encoded to
-`out/court.mp4`; `tests/court.rs` is the rulebook test in the simulator.
+`kosm-spike --court [frames]` is a gym: the authored scene
+[`levels/court.loon`](levels/court.loon) (`court/`) has a maple slab, a
+regulation hoop at one end — backboard, a rim of 24 rod segments, bracket, arm
+and pole, all vcad geometry derived into colliders the same way the marble
+track is — and basketballs that are phyz free bodies. Three are dropped from
+6 ft; one is a free throw, released 15 ft from the board with the speed,
+elevation and backspin the level says. The bounce is phyz's own restitution.
+Each dropped ball's apexes are printed against Newton's `e²` law — with
+`e = 0.77` the first apex is the NBA's inflation test (the top of the ball
+must come back to 49–54 in), and every bounce lands within 0.7% of `e²`. The
+shot is called: the step its centre passes down through the rim. The level's
+default goes in at 1.02 s, off the glass.
+
+The picture is `court/render.rs`, a path tracer: the same derived colliders
+the physics stands on (the rim drawn as the torus its segments approximate),
+the balls with their contact pose so the seams turn with the backspin, and a
+gym the level describes — walls, a ceiling, rows of light panels that are the
+only light there is. Next-event estimation on the panels, Russian roulette,
+one sample stream per pixel and frame. Lacquered maple planks with the court
+painted on them, a thin dielectric backboard with its square, painted steel,
+pebbled rubber. 960×540 at 64 spp is about 4 s a frame on the CPU; the still
+`out/court_still.png` is 1080p at 512 spp, taken at `still_t`. Every knob —
+the balls, the shot, the hoop, the gym, the lights, the camera, the sample
+counts — is a `defparam` in the level. `tests/court.rs` is the rulebook test
+in the simulator.
 
 ```bash
-cargo run --release -p kosm-spike -- --court
-cargo run --release -p kosm-spike --example court_trace   # one ball, height and speed through each impact
-open out/court.mp4
+cargo run --release -p kosm-spike -- --court          # out/court.mp4, out/court_still.png
+KOSM_SPP=4 cargo run --release -p kosm-spike -- --court 30   # a quick look
+cargo run --release -p kosm-spike --example court_trace      # one ball, height and speed through each impact
 ```
 
 The balls did not bounce until phyz did. Its soft contact is a resting-contact
