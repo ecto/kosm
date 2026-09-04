@@ -168,6 +168,39 @@ a sphere's contact point in the sphere's frame and let the sphere own the
 contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.rs`,
 `phyz-diff/tests/sphere_body_body_adjoint.rs`.
 
+### the court
+
+`kosm-spike --court [frames]` drops five basketballs onto the authored scene
+[`levels/court.loon`](levels/court.loon) (`court.rs`): a maple slab derived
+into colliders the same way the marble track is, and balls that are phyz free
+bodies with the ball, the drop, the restitution and the recording as knobs.
+The bounce is phyz's own restitution. Each ball's apexes are printed against
+Newton's `e²` law — with `e = 0.77` the first apex is the NBA's inflation test
+(dropped from 6 ft, the top of the ball must come back to 49–54 in), and every
+bounce lands within 0.7% of `e²`. Frames are phyz-camera, encoded to
+`out/court.mp4`; `tests/court.rs` is the rulebook test in the simulator.
+
+```bash
+cargo run --release -p kosm-spike -- --court
+cargo run --release -p kosm-spike --example court_trace   # one ball, height and speed through each impact
+open out/court.mp4
+```
+
+The balls did not bounce until phyz did. Its soft contact is a resting-contact
+model — an impedance that delivers the rebound target scaled by `d`, a margin
+band that tapers `d` to nothing, and a stabilization push that adds `erp` to
+the effective `e` — and its own benchmarks recorded restitution 8–19% short of
+Newton with no rebound at all from 5 cm. A basketball at 6 m/s came back with
+77% of its nominal `e`, and the third bounce, detected half a millimetre above
+the floor, was swallowed whole. Fixed in the phyz worktree this depends on: an
+impacting contact row is rigid (to a part in a thousand, so a box landing on
+four corners stays conditioned) and bias-free, on the same smoothstep the
+restitution ramp already uses, and restitution reads the approach speed at the
+start of the step rather than off the free velocity with `g·dt` already in it
+(that was `m·g·dt·|v|` of energy gained per bounce). The §6.2 drop-height
+benchmark in `phyz/tests/contact_physics_benchmarks.rs` is now a Newton gate
+rather than a guard on the measured shortfall.
+
 ## the sound (`audio.rs`)
 
 Nothing is sampled. `audio.rs` asks `vcad-kernel-acoustics` for the level's

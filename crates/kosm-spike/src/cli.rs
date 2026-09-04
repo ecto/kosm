@@ -11,6 +11,7 @@ const DEFAULT_FRAMES: usize = 150;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Marble { level: PathBuf },
+    Court { frames: Option<usize> },
     Pool { frames: usize },
     Splash { frames: usize },
     Splat { ply: PathBuf },
@@ -30,6 +31,9 @@ impl Command {
         };
 
         match first.as_str() {
+            "--court" => Ok(Self::Court {
+                frames: args.next().and_then(|v| v.parse().ok()),
+            }),
             "--pool" => Ok(Self::Pool {
                 frames: frames(args.next()),
             }),
@@ -92,6 +96,12 @@ mod tests {
             parse(&["--pool", "not-a-number"]).unwrap(),
             Command::Pool { frames: 150 }
         );
+    }
+
+    #[test]
+    fn court_frames_default_to_the_scene() {
+        assert_eq!(parse(&["--court"]).unwrap(), Command::Court { frames: None });
+        assert_eq!(parse(&["--court", "30"]).unwrap(), Command::Court { frames: Some(30) });
     }
 
     #[test]

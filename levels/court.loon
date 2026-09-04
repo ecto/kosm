@@ -1,0 +1,37 @@
+; the court — a Kosm scene.
+;
+; Basketballs dropped onto a hardwood slab. This file is the level: the slab is
+; vcad geometry (Z-up, mm, cube corner at origin), and the balls, the drop and
+; the recording are `defparam`s. court.rs reads this and nothing else.
+;
+; A size-7 ball is 749–780 mm around (r ≈ 120 mm) and 567–650 g. The NBA's
+; inflation rule is a bounce test: dropped from 6 ft (1.83 m, bottom of the
+; ball), the *top* of the ball must come back to 49–54 in (1.245–1.37 m), so
+; the bottom reaches 1.005–1.13 m: a coefficient of restitution of 0.75–0.79
+; on hardwood. The first apex printed by `--court` is that test, in the sim.
+
+; ---- the balls --------------------------------------------------------------
+[defparam n_balls 5.0]
+[defparam ball_r_mm 120.0]
+[defparam ball_g 620.0]
+[defparam restitution 0.77]
+[defparam friction 0.6]
+[defparam drop_mm 1830.0]       ; bottom of the ball above the floor: the rulebook's 6 ft
+[defparam spacing_mm 500.0]     ; balls in a line along x
+[defparam stagger_mm 120.0]     ; each ball starts this much higher than the last
+
+; ---- the recording ----------------------------------------------------------
+[defparam t_end 4.0]
+[defparam fps 60.0]
+[defparam dt_ms 1.0]
+
+; ---- the court --------------------------------------------------------------
+[defparam court_x_mm 4000.0]
+[defparam court_y_mm 3000.0]
+[defparam court_t_mm 40.0]      ; a slab: its top is z = 0
+
+[let slab
+  [translate [/ court_x_mm -2.0] [/ court_y_mm -2.0] [* court_t_mm -1.0]
+    [cube court_x_mm court_y_mm court_t_mm]]]
+
+[root slab "maple"]
