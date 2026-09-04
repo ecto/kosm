@@ -25,6 +25,7 @@ use phyz_rigid::forward_kinematics;
 use crate::colliders;
 use crate::scene::{AuthoredScene, MM};
 
+pub mod net;
 pub mod parts;
 pub mod render;
 
@@ -204,6 +205,9 @@ pub struct Court {
     pub made_at: Option<f64>,
     pub hoop: Hoop,
     pub shot: Option<usize>,
+    /// Solids the picture draws that the physics does not own: the net.
+    pub extras: Vec<parts::PlacedSolid>,
+    pub net: Option<net::Net>,
     material: ContactMaterial,
     sim: Simulator,
     ball_r: f64,
@@ -266,6 +270,8 @@ impl Court {
         });
 
         let sim = Simulator::new().with_contact_config(ContactSolverConfig::simulation());
+        let net = net::Net::from_scene(scene)?;
+        let extras = net.as_ref().map(|n| n.placed_solids(n.cord_mm)).unwrap_or_default();
 
         Ok(Self {
             model,
@@ -274,6 +280,8 @@ impl Court {
             made_at: None,
             hoop: scene.hoop,
             shot,
+            extras,
+            net,
             material: scene.material(),
             sim,
             ball_r: r,
@@ -334,6 +342,13 @@ impl Court {
                 self.apexes.push(Apex { ball: k, t: self.state.time, height: self.centre(k).z - self.ball_r });
             }
             self.prev_vz[k] = vz;
+        }
+        if let Some(mut net) = self.net.take() {
+            let balls: Vec<(Vec3, Vec3, f64)> =
+                (0..self.n_balls).map(|k| (self.centre(k), self.velocity(k), self.ball_r)).collect();
+            net.step(&balls);
+            self.extras = net.placed_solids(net.cord_mm);
+            self.net = Some(net);
         }
     }
 
@@ -423,6 +438,17 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
         t0.elapsed().as_secs_f64()
     );
     report(&scene, &court);
+    if let Some(net) = &court.net {
+        println!(
+            "net    {} nodes, {} segments ({} strands × {} rows); the lowest node ends {:.3} m up, worst stretch {:+.2}%",
+            net.nodes.len(),
+            net.segments(),
+            net.strands(),
+            net.rows(),
+            net.lowest(),
+            net.worst_stretch() * 100.0
+        );
+    }
     if let Some(k) = court.shot {
         let c = court.centre(k);
         match court.made_at {

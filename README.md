@@ -183,6 +183,14 @@ must come back to 49–54 in), and every bounce lands within 0.7% of `e²`. The
 shot is called: the step its centre passes down through the rim. The level's
 default goes in at 1.02 s, off the glass.
 
+The rim wears a net (`court/net.rs`): 12 strands over 7 rings in the diamond
+mesh a real net is knotted into, hung from the rod as masses on damped
+springs, substepped under the court's `dt` with a length pass so the cord
+cannot stretch, and handed to the picture as one thin vcad cylinder per
+segment. The balls push the net and the net does not push back yet; it costs
+about 17 µs a step and `tests/net.rs` checks that it hangs to its cut length
+and that the free throw still goes through it.
+
 The picture is `court/render.rs`, a path tracer: the same derived colliders
 the physics stands on (the rim drawn as the torus its segments approximate),
 the balls with their contact pose so the seams turn with the backspin, and a

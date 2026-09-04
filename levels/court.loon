@@ -96,6 +96,20 @@
 [root pole "steel"]
 [root arm "steel"]
 
+; ---- the net ----------------------------------------------------------------
+; A mass-spring net hung from the rim's rod: net_rows rings of net_strands
+; nodes below the rim, each node tied to the two nodes half a strand round on
+; the ring below — the classic diamond mesh. A regulation net is 15–18 in long
+; and narrows towards the bottom.
+[defparam net_strands 12.0]     ; 0 turns the net off
+[defparam net_rows 7.0]         ; rings below the rim
+[defparam net_length_mm 400.0]  ; rim to the bottom ring
+[defparam net_bottom_r_mm 150.0]; the bottom ring's radius: the net narrows
+[defparam net_cord_mm 5.0]      ; cord diameter
+[defparam net_stiffness 900.0]  ; N/m per cord
+[defparam net_damping 0.9]      ; N·s/m along the cord
+[defparam net_mass_g 110.0]     ; the whole net
+
 ; ---- the gym, for the light ------------------------------------------------
 ; walls a little outside the slab, a ceiling, and rows of light panels in it.
 [defparam gym_h_mm 9000.0]
