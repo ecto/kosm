@@ -360,7 +360,9 @@ impl Court {
 
 /// Drop the balls, record, report the bounces against `e²`, encode.
 pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow::Result<()> {
+    let evaluated = std::time::Instant::now();
     let scene = CourtScene::bundled()?;
+    let evaluated = evaluated.elapsed();
     for warning in &scene.authored.warnings {
         println!("scene  {warning}");
     }
@@ -370,6 +372,14 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
     std::fs::create_dir_all(&dir)?;
 
     let mut court = Court::from_scene(&scene)?;
+    println!(
+        "level  {} evaluated in {:.0} ms: {} roots, {} of them stood on as {} colliders",
+        scene.authored.path().display(),
+        evaluated.as_secs_f64() * 1e3,
+        scene.authored.document.roots.len(),
+        scene.authored.document.roots.iter().filter(|r| parts::collides(&r.material)).count(),
+        court.model.bodies[court.bodies()].collisions.len(),
+    );
     if let Some(shot) = scene.shot {
         println!(
             "shot   from ({:+.2}, {:+.2}, {:.2}) at {:.2} m/s, {:.1}° up, {:.1} rps backspin; the rim centre wants {:.2} m/s at this elevation",

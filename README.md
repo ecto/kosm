@@ -190,6 +190,20 @@ cannot stretch, and handed to the picture as one thin vcad cylinder per
 segment. The balls push the net and the net does not push back yet; it costs
 about 17 µs a step and `tests/net.rs` checks that it hangs to its cut length
 and that the free throw still goes through it.
+The room is authored too, because the picture has no textures: everything you
+can see is a root with a material. The level draws the gym — four walls, a
+ceiling, the floor outside the slab flush with the maple so a ball rolling off
+does not step, a row of pads on the baseline wall, a band of windows high on
+the long walls and a small stepped bleacher — and paints the court as thin
+solids standing 1 mm proud of the slab: baseline, lane and key, the free-throw
+line and its circle, and the three-point arc, the last two as patterns of
+short bars the way the rim is a pattern of rod segments. Every line is
+measured off the hoop knobs, so moving the backboard moves the court with it
+and it stays regulation. The ball is two more roots at the origin, placed at
+each ball's pose: a sphere, and its eight-panel seams as four thin rings.
+Which of them the physics stands on is one list, `court::parts::collides` —
+`ball`, `paint`, `key`, `window` and friends are appearance, and a root that
+says nothing collides.
 
 The picture is `court/render.rs`, a path tracer: the same derived colliders
 the physics stands on (the rim drawn as the torus its segments approximate),
