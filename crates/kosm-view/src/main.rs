@@ -6,7 +6,11 @@
 //! frame: the live tier on the GPU (`live.rs`), and the reference tracer the
 //! CLI uses, one button away, side by side with the live frame when paused.
 //! Export is the CLI's render, as a button.
+//!
+//! `--court` opens the basketball court instead (`court.rs`), whose picture
+//! comes from vcad's own path tracer over the level's BRep solids.
 
+mod court;
 mod live;
 
 use std::sync::mpsc;
@@ -442,7 +446,27 @@ fn main() -> eframe::Result<()> {
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let splash = std::env::args().any(|a| a == "--splash");
+    let court = std::env::args().any(|a| a == "--court");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
+    if court {
+        let arg = |k: &str| std::env::args().find_map(|a| a.strip_prefix(k).map(str::to_owned));
+        let width: u32 = arg("--width=").and_then(|v| v.parse().ok()).unwrap_or(320);
+        let size = (width, (width * 9 / 16).max(1));
+        let spp: u32 = arg("--spp=").and_then(|v| v.parse().ok()).unwrap_or(2);
+        // `--shot=<path>` renders one frame with the same producer the window
+        // uses and writes it, no window: the picture, testable.
+        if let Some(path) = arg("--shot=") {
+            // the level's own `still_t` unless asked otherwise
+            let t: f64 = arg("--at=").and_then(|v| v.parse().ok()).unwrap_or(-1.0);
+            let spp = arg("--spp=").and_then(|v| v.parse().ok()).unwrap_or(32);
+            if let Err(error) = court::still(std::path::Path::new(&path), t, size, spp) {
+                eprintln!("court: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        return court::run(if std::env::args().any(|a| a.starts_with("--frames=")) { frames } else { 0 }, size, spp);
+    }
     let (tx, rx) = mpsc::channel();
     let status: Status = Default::default();
     let status_ui = status.clone();

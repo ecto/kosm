@@ -1580,6 +1580,10 @@ dependencies = [
  "log",
  "phyz-math",
  "tang",
+ "vcad-eval",
+ "vcad-kernel",
+ "vcad-kernel-math",
+ "vcad-kernel-raytrace",
 ]
 
 [[package]]
