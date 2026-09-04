@@ -245,6 +245,37 @@ the balls, the shot, the hoop, the gym, the lights, the camera, the sample
 counts — is a `defparam` in the level. `tests/court.rs` is the rulebook test
 in the simulator.
 
+The picture is vcad's. `court/render/` holds no renderer — it assembles a
+scene for `vcad-kernel-raytrace`'s `pathtrace`, the same integrator
+`vcad-render --photoreal` uses. The document's roots are evaluated to vcad
+solids and each gets one BVH over its *untessellated* BRep, so the rim's
+silhouette is the ring the CAD says it is at any resolution, not an
+approximation the picture keeps separately from the one the physics stands
+on. A root's material name resolves to a PBR through one table: the
+document's own `[material ...]` first, then the court's names (`maple`,
+`rim`, `ball`, `wall`), then vcad-render's built-in library. A root named
+`ball` is not part of the court — it is the ball's own solid, placed at each
+ball's pose from phyz, and without one the ball is `Solid::sphere` at the
+level's radius. `Court::extras` is drawn the same way, for solids that move
+and that the physics does not own. vcad is in millimetres and phyz is in
+metres; the whole picture is built in millimetres and every phyz quantity
+crosses that boundary once, in `Scene::at`.
+
+The gym is still code: four walls, a ceiling, a floor beyond the slab, and the
+rows of light panels that are the only light there is — but only until the
+level grows roots with material `wall` or `ceiling`, after which the room is
+the level's and only the panels stay. The camera is the level's `cam_*` knobs
+with a real iris (`cam_aperture_mm`, `cam_focus_mm`), and `shutter` opens the
+film for a fraction of a frame: `shutter_steps` sub-frames are rendered across
+that span of physics steps and averaged, so a ball at 8 m/s smears the way it
+does on film. 960×540 at 64 spp is about 23 s a frame on the CPU — five times
+the hand-written tracer it replaces, which is what real BRep intersection and
+next-event estimation on ten panels cost. The still `out/court_still.png` is
+1080p at 512 spp, taken at `still_t`. Every knob — the balls, the shot, the
+hoop, the gym, the lights, the camera, the sample counts, the denoiser — is a
+`defparam` in the level. `tests/court.rs` is the rulebook test in the
+simulator.
+
 ```bash
 cargo run --release -p kosm-spike -- --court          # out/court.mp4, out/court_still.png
 KOSM_SPP=4 cargo run --release -p kosm-spike -- --court 30   # a quick look
