@@ -1,4 +1,4 @@
-# newt
+# Kosm
 
 A game engine where the level is a CAD file, the physics is the robot's
 simulator, and every knob has a gradient. Built on
@@ -11,7 +11,7 @@ resolves its parameters, converts authored millimetres at the computation edge,
 and can write solved parameters back. Marble and pool then attach different
 computations to that source; they do not share an artificial simulation loop.
 
-## the marble (`crates/newt-spike`)
+## the marble (`crates/kosm-spike`)
 
 The first spike. The level is [`levels/marble.loon`](levels/marble.loon):
 geometry in vcad's loon vocabulary, knobs as `defparam`s (tilt, release point,
@@ -26,7 +26,7 @@ marble, horizon). Everything else is derived from that one file:
 - `out/marble.wav`: the hinted run, heard — modal synthesis in a room, no samples
 
 ```bash
-cargo run --release -p newt-spike            # or: newt-spike levels/other.loon
+cargo run --release -p kosm-spike            # or: kosm-spike levels/other.loon
 open out/track.svg out/frame_before.png out/frame_hint.png out/frame_tilted.png
 afplay out/marble.wav
 diff levels/marble.loon out/solved/marble.loon   # the solved knobs, written back
@@ -64,7 +64,7 @@ support test. The support test only ever sees the outside of the level, where a
 cup and a puck are the same shape — it is exactly blind to this bug.
 
 ```bash
-cargo run --release -p newt-spike levels/marble-cup.loon
+cargo run --release -p kosm-spike levels/marble-cup.loon
 ```
 
 The cup comes out as 24 wedges reaching 0.376 mm into the bore, and the marble
@@ -105,7 +105,7 @@ for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 
 ### the pool
 
-`newt-spike --pool [frames]` drops a watermelon into the authored scene
+`kosm-spike --pool [frames]` drops a watermelon into the authored scene
 [`levels/pool.loon`](levels/pool.loon) (`pool.rs`). Drop height, melon geometry
 and density, water parameters, and recording cadence come from that scene. The
 legacy ray tracer still requires the reference 50 m × 25 m × 2 m basin and
@@ -120,7 +120,7 @@ water that absorbs red first, and the melon seen through it. 1280×720 at
 
 ### the splash
 
-`newt-spike --splash [frames]` runs the same drop with the water simulated
+`kosm-spike --splash [frames]` runs the same drop with the water simulated
 (`splash.rs`): a dense-grid MLS-MPM for weakly compressible water over the
 whole pool, APIC transfer with a FLIP blend, and the thing phyz-particle's
 reference solver lacks, a rigid collider that pushes back. Grid nodes inside
@@ -145,7 +145,7 @@ fused field is truncated (|∇| ≈ 0.7) and its gradient leans a consistent few
 degrees off the surface it bounds, which a frictionless marble reads as a
 push (2.2 m in 2.2 s on a flat floor) and a robot's foot never notices. The
 frame is the splat, rendered by tang-3dgs, with the path drawn on the floor.
-Set `NEWT_MAP` to another map directory.
+Set `KOSM_MAP` to another map directory.
 
 ### the lamp
 
@@ -206,7 +206,7 @@ rung through a 100 µs contact.
 
 ## the window
 
-`cargo run --release -p newt-view [-- --splash] [--frames=N]` opens the pool
+`cargo run --release -p kosm-view [-- --splash] [--frames=N]` opens the pool
 (or the splash) in a window. The simulation runs on its own thread and hands
 over a snapshot per frame; the window keeps every snapshot, so the timeline
 is a recording: play, pause, scrub, follow live, and an inspector for the

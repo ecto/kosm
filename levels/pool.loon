@@ -1,4 +1,4 @@
-; the pool — a newt scene.
+; the pool — a Kosm scene.
 ;
 ; Authorship lives here; pool.rs supplies this scene's fluid, rigid-body, and
 ; light computations. vcad lengths are millimetres and simulation lengths are
