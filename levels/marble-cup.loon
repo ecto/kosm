@@ -1,4 +1,4 @@
-; the marble, with a cup that is a real hollow — a newt level.
+; the marble, with a cup that is a real hollow — a Kosm level.
 ;
 ; `marble.loon` builds its cup out of a ring of box segments, because a ring of
 ; boxes is a union of convex primitives and convex primitives are what phyz

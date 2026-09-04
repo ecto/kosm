@@ -1523,6 +1523,63 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kosm-mpm"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "pollster 0.4.0",
+ "wgpu 30.0.1",
+]
+
+[[package]]
+name = "kosm-spike"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hound",
+ "image",
+ "ipse-map",
+ "kosm-mpm",
+ "phyz",
+ "phyz-camera",
+ "phyz-collision",
+ "phyz-contact",
+ "phyz-diff",
+ "phyz-math",
+ "phyz-model",
+ "phyz-rigid",
+ "phyz-world",
+ "rayon",
+ "rustfft",
+ "tang",
+ "tang-3dgs",
+ "vcad",
+ "vcad-eval",
+ "vcad-ir",
+ "vcad-kernel",
+ "vcad-kernel-acoustics",
+ "vcad-kernel-export",
+ "vcad-kernel-optics",
+ "vcad-loon",
+ "vcad-render",
+]
+
+[[package]]
+name = "kosm-view"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "eframe",
+ "egui",
+ "image",
+ "kosm-spike",
+ "log",
+ "phyz-math",
+ "tang",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,63 +1913,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "newt-mpm"
-version = "0.0.1"
-dependencies = [
- "bytemuck",
- "pollster 0.4.0",
- "wgpu 30.0.1",
-]
-
-[[package]]
-name = "newt-spike"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "hound",
- "image",
- "ipse-map",
- "newt-mpm",
- "phyz",
- "phyz-camera",
- "phyz-collision",
- "phyz-contact",
- "phyz-diff",
- "phyz-math",
- "phyz-model",
- "phyz-rigid",
- "phyz-world",
- "rayon",
- "rustfft",
- "tang",
- "tang-3dgs",
- "vcad",
- "vcad-eval",
- "vcad-ir",
- "vcad-kernel",
- "vcad-kernel-acoustics",
- "vcad-kernel-export",
- "vcad-kernel-optics",
- "vcad-loon",
- "vcad-render",
-]
-
-[[package]]
-name = "newt-view"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bytemuck",
- "eframe",
- "egui",
- "image",
- "log",
- "newt-spike",
- "phyz-math",
- "tang",
 ]
 
 [[package]]

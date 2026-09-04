@@ -40,7 +40,7 @@ Five consequences, each a design rule:
 
 ## What we already have, mapped
 
-| rule | in newt today | gap |
+| rule | in Kosm today | gap |
 |---|---|---|
 | coarse state is the world | spectral far field in (η, ψ) with H conserved to 1e-13, 2nd-order Zakharov terms conserving H₂+H₃ to 8e-5; rigid melon; height-field surface; block-sparse MPM grid (dense block table, indirect dispatch; 11% tax at a full box) | the region is a disc of particles on a grid that spans the pool (dbcea1f): radial sponge, radial no-outflow wall, zero-gradient density beyond it, integer circle test; still fixed in place and pre-filled — spawn/retire is the next step |
 | ports | nudging in a blend band with its energy booked (Far::injected); sponge; reaction booked at grid incl. projection impulses; hydrostatic force 1.03× Archimedes at 2.5 cm | the nudge is not power-conserving; Water::energy exists but its EOS term is fictitious while J is not derived from positions (drift 1e-2 of potential per 0.4 s in every variant measured); melon neutral, not afloat (dynamic dissipation) |
