@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
-use kosm_spike::pool::{self, box_half, Caustic, Surface, DEPTH, POOL_X, POOL_Y, STAND_RISE, STAND_ROWS, STAND_TREAD, STAND_Y0};
+use kosm_spike::pool::{self, box_half, Caustic, PoolGeometry, Surface, STAND_RISE, STAND_ROWS, STAND_TREAD};
 use kosm_spike::splash::Droplet;
 use tang::Vec3 as V;
 
@@ -95,6 +95,7 @@ impl Camera {
 
 /// What one frame needs from the recording.
 pub struct LiveFrame {
+    pub geometry: PoolGeometry,
     pub surface: Surface,
     pub caustic: Caustic,
     pub melon_centre: V<f64>,
@@ -292,8 +293,12 @@ impl Resources {
         });
 
         // static geometry
-        let static_verts = static_geometry();
-        let static_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("static"), contents: bytemuck::cast_slice(&static_verts), usage: wgpu::BufferUsages::VERTEX });
+        let static_verts = static_geometry(PoolGeometry::reference());
+        let static_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("static"),
+            contents: bytemuck::cast_slice(&static_verts),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
         // water grid
         // two water meshes: the far field over the pool, the fine box over the splash
         let (mut wi, n1) = grid_indices(WATER_NX, WATER_NY);
@@ -439,13 +444,20 @@ impl CallbackTrait for LiveCallback {
             view_proj: self.camera.view_proj(w as f32 / h as f32),
             eye: [self.camera.eye.x as f32, self.camera.eye.y as f32, self.camera.eye.z as f32, self.time],
             sun: [sun.x as f32, sun.y as f32, sun.z as f32, 1.05],
-            pool: [POOL_X as f32, POOL_Y as f32, DEPTH as f32, COPING],
+            pool: [
+                f.geometry.half_extents[0] as f32,
+                f.geometry.half_extents[1] as f32,
+                f.geometry.depth as f32,
+                COPING,
+            ],
             melon_centre: [f.melon_centre.x as f32, f.melon_centre.y as f32, f.melon_centre.z as f32, 0.0],
             melon_axis: [f.melon_axis.x as f32, f.melon_axis.y as f32, f.melon_axis.z as f32, 0.0],
             melon_semi: [f.melon_axes[0] as f32, f.melon_axes[1] as f32, f.melon_axes[2] as f32, 0.0],
             caustic: [f.caustic.origin[0] as f32, f.caustic.origin[1] as f32, f.caustic.cell as f32, 0.0],
         };
         queue.write_buffer(&res.uniforms, 0, bytemuck::bytes_of(&u));
+        let static_verts = static_geometry(f.geometry);
+        queue.write_buffer(&res.static_vb, 0, bytemuck::cast_slice(&static_verts));
 
         // caustic map
         let (cw, ch) = res.caustic_dims;
@@ -465,7 +477,10 @@ impl CallbackTrait for LiveCallback {
         let (nx, ny) = res.wn;
         let mut wv = Vec::with_capacity(2 * nx * ny);
         let bh = box_half();
-        for (hx, hy, lift) in [(POOL_X, POOL_Y, 0.0), (bh, bh, 0.0005)] {
+        for (hx, hy, lift) in [
+            (f.geometry.half_extents[0], f.geometry.half_extents[1], 0.0),
+            (bh, bh, 0.0005),
+        ] {
             let xs: Vec<f64> = (0..nx).map(|i| -hx + (i as f64 / (nx - 1) as f64) * 2.0 * hx).collect();
             let ys: Vec<f64> = (0..ny).map(|j| -hy + (j as f64 / (ny - 1) as f64) * 2.0 * hy).collect();
             let hs: Vec<f64> = ys.iter().flat_map(|&y| xs.iter().map(move |&x| (x, y))).map(|(x, y)| f.surface.height(x, y)).collect();
@@ -598,8 +613,12 @@ fn quad(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3
     out.extend_from_slice(&[v(a), v(b), v(c), v(a), v(c), v(d)]);
 }
 
-fn static_geometry() -> Vec<Vertex> {
-    let (hx, hy, dp) = (POOL_X as f32, POOL_Y as f32, DEPTH as f32);
+fn static_geometry(geometry: PoolGeometry) -> Vec<Vertex> {
+    let (hx, hy, dp) = (
+        geometry.half_extents[0] as f32,
+        geometry.half_extents[1] as f32,
+        geometry.depth as f32,
+    );
     let big = hx + 20.0;
     let mut v = Vec::new();
     let up = [0.0, 0.0, 1.0];
@@ -616,8 +635,9 @@ fn static_geometry() -> Vec<Vertex> {
     // the floor
     quad(&mut v, [-hx, -hy, -dp], [hx, -hy, -dp], [hx, hy, -dp], [-hx, hy, -dp], up, 1);
     // the grandstand: treads and risers
+    let stand_y0 = geometry.stand_y0();
     for r in 0..STAND_ROWS {
-        let y0 = (STAND_Y0 + r as f64 * STAND_TREAD) as f32;
+        let y0 = (stand_y0 + r as f64 * STAND_TREAD) as f32;
         let y1 = y0 + STAND_TREAD as f32;
         let z0 = (COPING as f64 + r as f64 * STAND_RISE) as f32;
         let z1 = z0 + STAND_RISE as f32;

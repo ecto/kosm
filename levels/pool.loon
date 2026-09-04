@@ -25,8 +25,8 @@
 [defparam fps 60.0]
 
 ; vcad's cube has a corner at the origin. These roots make the authored scene
-; inspectable today; the legacy pool renderer is still being moved onto the
-; evaluated geometry and rejects changed pool dimensions in the meantime.
+; inspectable today. The coarse simulation and renderers consume these authored
+; dimensions; the fine-water solver still requires the reference basin.
 [let pool-volume
   [translate [/ pool_length_mm -2.0] [/ pool_width_mm -2.0] [* pool_depth_mm -1.0]
     [cube pool_length_mm pool_width_mm pool_depth_mm]]]

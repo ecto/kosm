@@ -143,6 +143,7 @@ fn far_fft_speed() {
 
 #[test]
 fn settled_water_energy_is_steady() {
+    use kosm_spike::pool::MELON_AXES;
     use kosm_spike::splash::{Body, Water};
     use phyz_math::Vec3;
     let h = 0.05;
@@ -152,7 +153,12 @@ fn settled_water_energy_is_steady() {
     w.enable_gpu(256).expect("gpu");
     w.settle(2.0);
     w.sync_from_gpu();
-    let far = Body { centre: Vec3::new(0.0, 0.0, 50.0), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::zeros() };
+    let far = Body {
+        centre: Vec3::new(0.0, 0.0, 50.0),
+        axis: Vec3::new(1.0, 0.0, 0.0),
+        vel: Vec3::zeros(),
+        semi: MELON_AXES,
+    };
     let (k0, p0, i0) = w.energy();
     let zmean = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
     let jmean = w.j.iter().sum::<f64>() / w.j.len() as f64;

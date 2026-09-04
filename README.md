@@ -107,9 +107,10 @@ for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 
 `kosm-spike --pool [frames]` drops a watermelon into the authored scene
 [`levels/pool.loon`](levels/pool.loon) (`pool.rs`). Drop height, melon geometry
-and density, water parameters, and recording cadence come from that scene. The
-legacy ray tracer still requires the reference 50 m × 25 m × 2 m basin and
-rejects divergent authored dimensions until its geometry is derived from vcad. The
+and density, water parameters, and recording cadence come from that scene.
+Typed pool geometry is carried through rigid dynamics, snapshots, and both the
+reference and live renderers. The fine-water/far-field solver still requires the
+reference 50 m × 25 m × 2 m basin until its grids are scene-sized. The
 melon is a phyz rigid body with Archimedes buoyancy and quadratic drag applied
 as generalized forces, so it plunges, slows and floats. The water surface is a
 wave field driven by the impact (deep-water dispersion, spreading and decaying

@@ -21,7 +21,12 @@ fn hold(h: f64, gpu: bool, z: f64) -> (f64, f64) {
     w.settle(2.0);
     let vol = 4.0 / 3.0 * std::f64::consts::PI * MELON_AXES[0] * MELON_AXES[1] * MELON_AXES[2];
     let arch = 1000.0 * GRAVITY * vol;
-    let at = |z: f64, vz: f64| Body { centre: Vec3::new(0.0, 0.0, z), axis: Vec3::new(1.0, 0.0, 0.0), vel: Vec3::new(0.0, 0.0, vz) };
+    let at = |z: f64, vz: f64| Body {
+        centre: Vec3::new(0.0, 0.0, z),
+        axis: Vec3::new(1.0, 0.0, 0.0),
+        vel: Vec3::new(0.0, 0.0, vz),
+        semi: MELON_AXES,
+    };
     // lower the melon in from above rather than teleporting it into place:
     // dropped into settled water it traps the litres it should have
     // displaced, and the trapped water's weight is booked as force
