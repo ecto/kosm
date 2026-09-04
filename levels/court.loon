@@ -34,6 +34,13 @@
 [defparam shot_azimuth_deg 0.0] ; about z, from +x
 [defparam shot_backspin_rps 2.0]
 
+; ---- the aim ----------------------------------------------------------------
+; `aim.rs`: the adjoint of "distance to the rim centre" at the moment the
+; ball's centre falls back through the rim plane, and a two-knob solve on
+; shot_speed and shot_elev_deg. 0 turns it off (the render-only path).
+[defparam aim 1.0]
+[defparam aim_t -1.0]           ; the horizon, s; <= 0 means the ballistic time
+
 ; ---- the recording ----------------------------------------------------------
 [defparam t_end 4.0]
 [defparam fps 60.0]
