@@ -1,222 +1,291 @@
-//! The court, lit: a path tracer.
+//! The court, lit: vcad's BRep path tracer.
 //!
-//! Where `frame.rs` is a ray caster that is its own derivative, this is the
-//! other end of the same idea — the reference tier for light on the court,
-//! written plainly on `f64` and thrown at every core. Geometry is the same
-//! derived colliders the physics stands on (the slab, the backboard, the
-//! bracket, the pole, one box each; the balls as spheres with their contact
-//! pose) plus a gym the level describes: walls, a ceiling, and rows of light
-//! panels that are the only light there is. The rim is the one place the
-//! picture and the physics disagree on purpose — the physics has 24 box
-//! segments, the picture has the torus they approximate.
+//! There is no renderer here. The picture is `vcad-kernel-raytrace`'s
+//! `pathtrace` — the same integrator `vcad-render --photoreal` uses — pointed
+//! at the level. What this module does is assemble its `Scene`: evaluate the
+//! authored document's roots to vcad solids, build one BVH per root over the
+//! *untessellated* BRep, resolve each root's material name to a `Pbr`, and put
+//! the balls where phyz says they are. So the rim's silhouette is the ring of
+//! rod segments the CAD says it is, at any resolution, and the picture and the
+//! physics are reading the same file.
 //!
-//! Light transport is unidirectional path tracing with next-event estimation
-//! on the panels, multiple importance sampling between the panel and the
-//! BSDF, Russian roulette after the third bounce, and one sample stream per
-//! pixel seeded by pixel, sample and frame so a frame is a pure function of
-//! the state. Surfaces: a Lambertian base under a dielectric coat where a
-//! coat belongs (lacquered maple, painted steel, rubber), the backboard as a
-//! thin dielectric sheet with its painted square, procedural maple planks
-//! and court markings, and a ball whose seams turn with its body frame.
+//! Millimetres. vcad is a CAD kernel and its solids are in millimetres; phyz
+//! is in metres. The whole picture is built in vcad's units, and every phyz
+//! quantity that enters it is multiplied by [`PER_M`] — the only unit
+//! conversion in the picture, and the only place either unit is named.
+//!
+//! Geometry the level does not author, the gym gets in code: four walls, a
+//! ceiling, a floor beyond the slab, and the rows of light panels that are the
+//! only light there is. The moment the level grows roots with material `wall`
+//! or `ceiling`, this stops — the room is then the level's business, and only
+//! the panels stay.
 
+mod materials;
 
-//! The picture is split by ownership: `camera` (the ray for a film point),
-//! `geometry` (shapes and intersections), `surface` (materials and the
-//! procedural textures), `transport` (sampling and the path), and this file
-//! (the scene, assembled from the court, and the frame).
+use std::collections::HashMap;
+use std::sync::Arc;
 
-mod camera;
-mod geometry;
-mod surface;
-mod transport;
+use vcad_kernel::Solid;
+use vcad_kernel_math::{Point3, Transform, Vec3};
+use vcad_kernel_raytrace::pathtrace::{self, AreaLight, Environment, Ground, Object, PathTraceOptions, Pbr};
+use vcad_kernel_raytrace::Bvh;
 
-use phyz_math::Mat3;
-use phyz_model::{GeomInstance, Geometry};
-use rayon::prelude::*;
-use tang::Vec3 as V3;
+pub use vcad_kernel_raytrace::pathtrace::{Camera, Film};
 
 use super::{Court, CourtScene};
-pub use camera::Camera;
-pub use surface::Material;
-use geometry::{arr, pv, Hit, Prim, Shape};
-use transport::{tonemap, Rng};
+use crate::scene::MM;
 
-type V = V3<f64>;
+/// Metres (phyz) to millimetres (vcad). The only unit conversion in the picture.
+const PER_M: f64 = 1.0 / MM;
 
-// ---- the scene --------------------------------------------------------------
+/// One traceable thing: a BVH, what it is made of, and where it sits.
+struct Placed {
+    bvh: Arc<Bvh>,
+    pbr: Pbr,
+    to_world: Transform,
+}
 
+impl Placed {
+    fn object(&self) -> Object {
+        Object::placed(self.bvh.clone(), self.pbr, self.to_world.clone())
+    }
+}
+
+/// The court's picture: everything that does not move, plus the recipe for
+/// everything that does.
 pub struct Scene {
-    pub(super) prims: Vec<Prim>,
-    /// Indices of the light panels.
-    pub(super) lights: Vec<usize>,
-    pub(super) light_radiance: f64,
-    pub(super) hoop: super::Hoop,
-    /// Where the court's lines are painted from: the baseline, 4 ft behind the board.
-    pub(super) baseline_x: f64,
+    /// The level's roots and the gym, already placed.
+    statics: Vec<Placed>,
+    /// The ball's own solid, centred on the origin, and its material.
+    ball: Arc<Bvh>,
+    ball_pbr: Pbr,
+    /// BVHs for `Court::extras`, kept across frames so a net that only moves
+    /// is not rebuilt. Keyed by the solid's identity.
+    extras: HashMap<usize, Arc<Bvh>>,
+    lights: Vec<AreaLight>,
+    env: Environment,
+    ground: Option<Ground>,
+    /// The document, for resolving an extra's material name.
+    doc: vcad_ir::Document,
 }
 
 impl Scene {
-    /// The scene at the court's current state.
-    pub fn new(scene: &CourtScene, court: &Court) -> anyhow::Result<Self> {
-        let mut prims = Vec::new();
+    /// The static picture, built once: the level's geometry and the gym's light.
+    pub fn new(scene: &CourtScene) -> anyhow::Result<Self> {
         let a = &scene.authored;
-        let mm = |k: &str| a.millimetres(k);
+        let doc = a.document.clone();
+        let evaluated = vcad_eval::evaluate_document(&doc, &vcad_eval::EvalOptions::default())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(
+            evaluated.parts.len() == doc.roots.len(),
+            "the court evaluated to {} parts for {} roots",
+            evaluated.parts.len(),
+            doc.roots.len()
+        );
 
-        // the level's parts, by their root material
-        for (material, instances) in super::parts(scene)? {
-            let mat = match material.as_str() {
-                "maple" => Material::Floor,
-                "glass" => Material::Glass,
-                "rim" => continue, // drawn as a torus below
-                _ => Material::Steel,
+        let mut statics = Vec::new();
+        let mut ball = None;
+        let mut authored_room = false;
+        for (part, root) in evaluated.parts.iter().zip(&doc.roots) {
+            let name = root.material.as_str();
+            authored_room |= matches!(name, "wall" | "ceiling");
+            let Some(solid) = part.solid.as_ref() else {
+                anyhow::bail!("the court's `{name}` root evaluated to no solid");
             };
-            for g in instances {
-                prims.push(Prim { shape: shape_of(&g), mat });
+            let bvh = build_bvh(solid);
+            if bvh.root().is_none() {
+                anyhow::bail!("the court's `{name}` root has no traceable geometry");
             }
-        }
-        let rod = mm("rim_rod_mm")?;
-        prims.push(Prim {
-            shape: Shape::Torus {
-                c: court.hoop.rim_centre - V::new(0.0, 0.0, 0.5 * rod),
-                big_r: court.hoop.rim_r + 0.5 * rod,
-                small_r: 0.5 * rod,
-            },
-            mat: Material::Rim,
-        });
-
-        // the balls
-        for k in 0..court.bodies() {
-            prims.push(Prim {
-                shape: Shape::Sphere { c: pv(court.centre(k)), r: scene.ball_r, rot: arr(&court.rotation(k)) },
-                mat: Material::Ball,
-            });
+            let bvh = Arc::new(bvh);
+            // a `ball` root is not part of the court: it is the ball's own
+            // appearance, drawn once per ball at that ball's pose
+            if name == "ball" {
+                ball = Some(bvh);
+                continue;
+            }
+            statics.push(Placed { bvh, pbr: materials::pbr(&doc, name), to_world: Transform::identity() });
         }
 
-        // the gym: walls a margin outside the slab, a ceiling, light panels
-        let (cx, cy) = (0.5 * mm("court_x_mm")?, 0.5 * mm("court_y_mm")?);
-        let margin = mm("gym_margin_mm")?;
-        let h = mm("gym_h_mm")?;
-        let (wx, wy) = (cx + margin, cy + margin);
-        let wall = |c: V, half: V| Prim { shape: Shape::Box { c, half, rot: arr(&Mat3::identity()) }, mat: Material::Wall };
-        let thick = 0.1;
-        prims.push(wall(V::new(wx + thick, 0.0, 0.5 * h), V::new(thick, wy + 2.0 * thick, 0.5 * h + thick)));
-        prims.push(wall(V::new(-wx - thick, 0.0, 0.5 * h), V::new(thick, wy + 2.0 * thick, 0.5 * h + thick)));
-        prims.push(wall(V::new(0.0, wy + thick, 0.5 * h), V::new(wx + 2.0 * thick, thick, 0.5 * h + thick)));
-        prims.push(wall(V::new(0.0, -wy - thick, 0.5 * h), V::new(wx + 2.0 * thick, thick, 0.5 * h + thick)));
-        // the floor beyond the slab, and the ceiling
-        prims.push(Prim {
-            shape: Shape::Box { c: V::new(0.0, 0.0, -0.021), half: V::new(wx, wy, 0.02), rot: arr(&Mat3::identity()) },
-            mat: Material::Wall,
-        });
-        prims.push(Prim {
-            shape: Shape::Box { c: V::new(0.0, 0.0, h + thick), half: V::new(wx, wy, thick), rot: arr(&Mat3::identity()) },
-            mat: Material::Ceiling,
-        });
+        // the gym: only until the level authors it
+        let h = a.parameter("gym_h_mm")?;
+        let margin = a.parameter("gym_margin_mm")?;
+        let (wx, wy) = (0.5 * a.parameter("court_x_mm")? + margin, 0.5 * a.parameter("court_y_mm")? + margin);
+        let floor_z = -a.parameter_or("court_t_mm", 40.0);
+        let mut ground = None;
+        if !authored_room {
+            let wall = materials::pbr(&doc, "wall");
+            let t = 100.0;
+            let slab = |sx: f64, sy: f64, sz: f64, at: (f64, f64, f64), pbr: Pbr| Placed {
+                bvh: Arc::new(build_bvh(&Solid::cube(sx, sy, sz))),
+                pbr,
+                to_world: Transform::translation(at.0, at.1, at.2),
+            };
+            statics.push(slab(t, 2.0 * wy + 2.0 * t, h + t, (wx, -wy - t, floor_z), wall));
+            statics.push(slab(t, 2.0 * wy + 2.0 * t, h + t, (-wx - t, -wy - t, floor_z), wall));
+            statics.push(slab(2.0 * wx, t, h + t, (-wx, wy, floor_z), wall));
+            statics.push(slab(2.0 * wx, t, h + t, (-wx, -wy - t, floor_z), wall));
+            statics.push(slab(2.0 * wx, 2.0 * wy, t, (-wx, -wy, h), materials::pbr(&doc, "ceiling")));
+            // the floor beyond the slab, which the slab sits on
+            ground = Some(Ground { z: floor_z, material: wall, shadow_catcher: false });
+        }
+
+        // the light panels, face down, in rows under the ceiling
         let (rows, cols) = (a.parameter("light_rows")?.max(1.0) as usize, a.parameter("light_cols")?.max(1.0) as usize);
-        let (lw, ll) = (mm("light_w_mm")?, mm("light_l_mm")?);
+        let (lw, ll) = (a.parameter("light_w_mm")?, a.parameter("light_l_mm")?);
+        let radiance = a.parameter_or("light_radiance", 18.0) as f32;
         let mut lights = Vec::new();
         for i in 0..cols {
             for j in 0..rows {
-                let x = (i as f64 + 0.5) / cols as f64 * 2.0 * wx - wx;
-                let y = (j as f64 + 0.5) / rows as f64 * 2.0 * wy - wy;
-                lights.push(prims.len());
-                prims.push(Prim {
-                    shape: Shape::Panel {
-                        c: V::new(x - 0.5 * lw, y - 0.5 * ll, h - 0.005),
-                        u: V::new(lw, 0.0, 0.0),
-                        v: V::new(0.0, ll, 0.0),
-                    },
-                    mat: Material::Light,
+                let x = ((i as f64 + 0.5) / cols as f64 * 2.0 - 1.0) * wx;
+                let y = ((j as f64 + 0.5) / rows as f64 * 2.0 - 1.0) * wy;
+                lights.push(AreaLight {
+                    center: Point3::new(x, y, h - 5.0),
+                    // u × v points down: the panel emits at the floor
+                    u: Vec3::new(0.0, 0.5 * ll, 0.0),
+                    v: Vec3::new(0.5 * lw, 0.0, 0.0),
+                    emission: [radiance; 3],
                 });
             }
         }
 
+        // a ball root is the ball; without one, a sphere of the right size
+        let ball = match ball {
+            Some(b) => b,
+            None => Arc::new(build_bvh(&Solid::sphere(scene.ball_r * PER_M, 64))),
+        };
+
+        let env = a.parameter_or("env_radiance", 0.05) as f32;
         Ok(Self {
-            prims,
+            statics,
+            ball,
+            ball_pbr: materials::pbr(&doc, "ball"),
+            extras: HashMap::new(),
             lights,
-            light_radiance: a.parameter_or("light_radiance", 18.0),
-            hoop: court.hoop,
-            baseline_x: court.hoop.board_x + 1.219,
+            env: Environment::constant([env; 3]),
+            ground,
+            doc,
         })
     }
 
-    pub(super) fn nearest(&self, o: V, d: V, t_max: f64) -> Option<Hit> {
-        let mut best: Option<Hit> = None;
-        for (i, prim) in self.prims.iter().enumerate() {
-            let limit = best.as_ref().map_or(t_max, |h| h.t);
-            if let Some((t, n)) = prim.shape.hit(o, d, limit) {
-                best = Some(Hit { t, p: o + d * t, n, prim: i });
+    /// The picture at the court's current state: the static half, the balls
+    /// where phyz has them, and whatever else the court is carrying.
+    ///
+    /// Everything that moves crosses the unit boundary here: a ball's centre
+    /// is phyz metres, and `PER_M` is what makes it a vcad millimetre.
+    pub fn at(&mut self, court: &Court) -> pathtrace::Scene {
+        let mut objects: Vec<Object> = self.statics.iter().map(Placed::object).collect();
+        for k in 0..court.bodies() {
+            let c = court.centre(k) * PER_M;
+            // `rotation` is world → body; an object → world placement is its transpose
+            let r = court.rotation(k).transpose();
+            objects.push(Object::placed(
+                self.ball.clone(),
+                self.ball_pbr,
+                rigid(&r, c.x, c.y, c.z),
+            ));
+        }
+        for extra in &court.extras {
+            let key = Arc::as_ptr(&extra.solid) as usize;
+            let bvh = self
+                .extras
+                .entry(key)
+                .or_insert_with(|| Arc::new(build_bvh(&extra.solid)))
+                .clone();
+            if bvh.root().is_none() {
+                continue;
             }
+            objects.push(Object::placed(bvh, materials::pbr(&self.doc, &extra.material), extra.to_world.clone()));
         }
-        best
-    }
-
-    /// What the camera's centre ray sees, for a sanity check: distance and material.
-    pub fn probe(&self, cam: &Camera) -> Option<(f64, Material)> {
-        let (o, d) = cam.ray(0.5 * cam.width as f64, 0.5 * cam.height as f64);
-        self.nearest(o, d, f64::INFINITY).map(|h| (h.t, self.prims[h.prim].mat))
-    }
-
-    pub fn prim_count(&self) -> usize {
-        self.prims.len()
-    }
-
-    pub(super) fn occluded(&self, o: V, d: V, t_max: f64) -> bool {
-        self.prims.iter().enumerate().any(|(i, prim)| {
-            // glass is not an occluder for the panels: the sheet is thin and
-            // its transmission is booked on the path through it
-            prim.mat != Material::Glass && !self.lights.contains(&i) && prim.shape.hit(o, d, t_max).is_some()
-        })
-    }
-}
-
-fn shape_of(g: &GeomInstance) -> Shape {
-    let c = pv(g.origin.pos);
-    match g.geometry {
-        Geometry::Box { half_extents } => Shape::Box { c, half: pv(half_extents), rot: arr(&g.origin.rot) },
-        Geometry::Sphere { radius } => Shape::Sphere { c, r: radius, rot: arr(&g.origin.rot) },
-        Geometry::Cylinder { radius, height } => Shape::Cylinder { c, r: radius, half_h: 0.5 * height },
-        _ => Shape::Sphere { c, r: 0.0, rot: arr(&Mat3::identity()) },
-    }
-}
-
-/// Render the scene: `spp` samples per pixel, one stream per pixel and frame.
-pub fn render(scene: &Scene, cam: &Camera, spp: usize, frame: u64) -> image::RgbImage {
-    let (w, h) = (cam.width, cam.height);
-    let rows: Vec<Vec<[u8; 3]>> = (0..h)
-        .into_par_iter()
-        .map(|y| {
-            (0..w)
-                .map(|x| {
-                    let mut sum = V::zero();
-                    for s in 0..spp {
-                        let mut rng = Rng::new(((frame << 40) ^ ((y as u64) << 20) ^ (x as u64)) * 0x2545_F491_4F6C_DD1D + s as u64);
-                        let (o, d) = cam.ray(x as f64 + rng.next(), y as f64 + rng.next());
-                        sum += scene.trace(o, d, &mut rng);
-                    }
-                    tonemap(sum / spp as f64, cam.exposure)
-                })
-                .collect()
-        })
-        .collect();
-    let mut img = image::RgbImage::new(w, h);
-    for (y, row) in rows.iter().enumerate() {
-        for (x, px) in row.iter().enumerate() {
-            img.put_pixel(x as u32, y as u32, image::Rgb(*px));
+        pathtrace::Scene {
+            objects,
+            lights: self.lights.clone(),
+            env: self.env.clone(),
+            ground: self.ground,
         }
     }
-    img
+
+    /// How many traceable objects the static half has, for a sanity check.
+    pub fn static_count(&self) -> usize {
+        self.statics.len()
+    }
+
+    /// How many light panels the level asked for.
+    pub fn light_count(&self) -> usize {
+        self.lights.len()
+    }
 }
 
-/// The camera the level asks for, at a given picture size.
-pub fn camera(scene: &CourtScene, width: u32, height: u32) -> anyhow::Result<Camera> {
+/// A BVH over a solid: its analytic BRep if it has one, its tessellation if
+/// not — the same fallback `vcad-render --photoreal` takes.
+fn build_bvh(solid: &Solid) -> Bvh {
+    match solid.as_brep() {
+        Some(brep) => Bvh::build(brep),
+        None => {
+            let mut mesh = solid.to_mesh(0);
+            vcad_kernel::vcad_kernel_tessellate::render_bake_default(&mut mesh);
+            Bvh::build_mesh(&mesh)
+        }
+    }
+}
+
+/// A rigid object → world transform from a body → world rotation and a
+/// translation in millimetres.
+fn rigid(r: &phyz_math::Mat3, x: f64, y: f64, z: f64) -> Transform {
+    Transform {
+        matrix: tang::Mat4::new(
+            r[(0, 0)], r[(0, 1)], r[(0, 2)], x, //
+            r[(1, 0)], r[(1, 1)], r[(1, 2)], y, //
+            r[(2, 0)], r[(2, 1)], r[(2, 2)], z, //
+            0.0, 0.0, 0.0, 1.0,
+        ),
+    }
+}
+
+/// The camera the level asks for, in millimetres.
+pub fn camera(scene: &CourtScene) -> anyhow::Result<Camera> {
     let a = &scene.authored;
-    Ok(Camera {
-        eye: V::new(a.millimetres("cam_x_mm")?, a.millimetres("cam_y_mm")?, a.millimetres("cam_z_mm")?),
-        target: V::new(a.millimetres("cam_at_x_mm")?, a.millimetres("cam_at_y_mm")?, a.millimetres("cam_at_z_mm")?),
-        vfov: a.parameter_or("cam_vfov_deg", 42.0).to_radians(),
-        width,
-        height,
-        exposure: a.parameter_or("exposure", 1.0),
-    })
+    let eye = Point3::new(a.parameter("cam_x_mm")?, a.parameter("cam_y_mm")?, a.parameter("cam_z_mm")?);
+    let target = Point3::new(a.parameter("cam_at_x_mm")?, a.parameter("cam_at_y_mm")?, a.parameter("cam_at_z_mm")?);
+    let mut cam = Camera::look_at(eye, target, Vec3::z(), a.parameter_or("cam_vfov_deg", 42.0));
+    // a real aperture: the radius of the iris, and the plane it is sharp on
+    cam.aperture = a.parameter_or("cam_aperture_mm", 0.0).max(0.0);
+    let focus = a.parameter_or("cam_focus_mm", 0.0);
+    if focus > 0.0 {
+        cam.focus_dist = focus;
+    }
+    Ok(cam)
+}
+
+/// Integrator settings the level asks for, at a given sample count.
+pub fn options(scene: &CourtScene, spp: usize, seed: u64) -> PathTraceOptions {
+    let a = &scene.authored;
+    PathTraceOptions {
+        spp: spp.max(1) as u32,
+        max_depth: a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+        show_background: true,
+        seed,
+        denoise: a.parameter_or("denoise", 1.0) > 0.5,
+        ..Default::default()
+    }
+}
+
+/// One render. The picture is `vcad-kernel-raytrace`'s; this only names it.
+pub fn render(picture: &pathtrace::Scene, cam: &Camera, width: u32, height: u32, opts: &PathTraceOptions) -> Film {
+    pathtrace::render(picture, cam, width, height, opts)
+}
+
+/// Sum `src` into `dst`, so a frame can be the average of its sub-frames.
+pub fn accumulate(dst: &mut Film, src: &Film) {
+    for (d, s) in dst.rgb.iter_mut().zip(&src.rgb) {
+        *d += *s;
+    }
+    for (d, s) in dst.alpha.iter_mut().zip(&src.alpha) {
+        *d += *s;
+    }
+}
+
+/// Tonemap a film to an image, dividing by however many sub-frames went into it.
+pub fn to_image(film: &Film, exposure: f64, n: usize) -> image::RgbaImage {
+    let px = film.to_srgb8(exposure as f32 / n.max(1) as f32, false);
+    image::RgbaImage::from_raw(film.width, film.height, px).expect("film is width × height × 4")
 }

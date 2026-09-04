@@ -105,7 +105,10 @@
 [defparam light_w_mm 1200.0]
 [defparam light_l_mm 600.0]
 [defparam light_radiance 18.0]   ; what a panel looks like straight on
+[defparam env_radiance 0.05]     ; constant grey from infinity, outside the room
 [defparam exposure 1.0]
+[defparam max_depth 6.0]         ; longest light path
+[defparam denoise 1.0]           ; the à-trous pass over the film, 0 for a reference render
 
 ; ---- the recording's picture ------------------------------------------------
 [defparam render_w 960.0]
@@ -122,3 +125,7 @@
 [defparam cam_at_y_mm 300.0]
 [defparam cam_at_z_mm 1900.0]
 [defparam cam_vfov_deg 40.0]
+[defparam cam_aperture_mm 0.0]   ; iris radius; 0 is a pinhole
+[defparam cam_focus_mm 0.0]      ; the sharp plane; 0 focuses on cam_at
+[defparam shutter 0.0]           ; exposure as a fraction of a frame; 0 is an instant
+[defparam shutter_steps 4.0]     ; sub-frames the exposure is sampled at

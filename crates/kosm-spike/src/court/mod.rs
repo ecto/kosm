@@ -19,7 +19,7 @@ use std::path::Path;
 use phyz::Simulator;
 use phyz_contact::{ContactMaterial, ContactSolverConfig};
 use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
-use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
+use phyz_model::{Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
 use crate::colliders;
@@ -102,20 +102,6 @@ impl CourtScene {
             ..Default::default()
         }
     }
-}
-
-/// The level's parts, one collider set per root, with the root's material
-/// name: the physics takes them all as one body, the picture tells them apart.
-pub fn parts(scene: &CourtScene) -> anyhow::Result<Vec<(String, Vec<GeomInstance>)>> {
-    let doc = &scene.authored.document;
-    let mut out = Vec::new();
-    for root in &doc.roots {
-        let mut single = doc.clone();
-        single.roots = vec![root.clone()];
-        let derived = colliders::colliders_from_document(&single)?;
-        out.push((root.material.clone(), derived.colliders));
-    }
-    Ok(out)
 }
 
 /// The hoop, in metres: the rim's centre and inside radius, the board's face.
@@ -204,6 +190,9 @@ pub struct Court {
     pub made_at: Option<f64>,
     pub hoop: Hoop,
     pub shot: Option<usize>,
+    /// Solids the picture draws that the physics does not own — a net, a
+    /// strand, a decal — placed in millimetres. Empty unless something fills it.
+    pub extras: Vec<parts::PlacedSolid>,
     material: ContactMaterial,
     sim: Simulator,
     ball_r: f64,
@@ -274,6 +263,7 @@ impl Court {
             made_at: None,
             hoop: scene.hoop,
             shot,
+            extras: Vec::new(),
             material: scene.material(),
             sim,
             ball_r: r,
@@ -383,23 +373,58 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
     let a = &scene.authored;
     let (w, h) = if width > 0 { (width, height) } else { (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32) };
     let spp = std::env::var("KOSM_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(a.parameter_or("render_spp", 8.0) as usize);
-    let cam = render::camera(&scene, w, h)?;
+    let cam = render::camera(&scene)?;
+    let exposure = a.parameter_or("exposure", 1.0);
+    // the shutter: what fraction of a frame the film is exposed for, and how
+    // many sub-frames that exposure is sampled at. 0 is an instant.
+    let shutter = a.parameter_or("shutter", 0.0).clamp(0.0, 1.0);
+    let subs = if shutter > 0.0 { a.parameter_or("shutter_steps", 4.0).max(1.0) as usize } else { 1 };
+    let open = ((shutter * steps_per_frame as f64).round() as usize).min(steps_per_frame);
+    let closed = steps_per_frame - open;
+    // the sample budget is the frame's, split across the sub-frames
+    let sub_spp = spp.div_ceil(subs);
     let still_t = a.parameter_or("still_t", -1.0);
     let mut still_done = still_t < 0.0;
-    println!("render {w}×{h} at {spp} spp per frame; still {}×{} at {} spp at t = {still_t:.2} s",
-        a.parameter_or("still_w", 1920.0) as u32, a.parameter_or("still_h", 1080.0) as u32, a.parameter_or("still_spp", 128.0) as usize);
+    let mut picture = render::Scene::new(&scene)?;
+    println!(
+        "render {w}×{h} at {spp} spp per frame ({subs} × {sub_spp}, shutter {:.2} frame); {} static objects, {} panels; still {}×{} at {} spp at t = {still_t:.2} s",
+        shutter,
+        picture.static_count(),
+        picture.light_count(),
+        a.parameter_or("still_w", 1920.0) as u32,
+        a.parameter_or("still_h", 1080.0) as u32,
+        a.parameter_or("still_spp", 128.0) as usize
+    );
     let t0 = std::time::Instant::now();
     let mut sim_time = std::time::Duration::ZERO;
     let mut render_time = std::time::Duration::ZERO;
     for k in 0..frames {
-        let lap = std::time::Instant::now();
-        for _ in 0..steps_per_frame {
-            court.step();
+        // the shutter opens `open` steps before the end of the frame's span;
+        // each sub-frame is a render at one point inside it, and the frame is
+        // their average
+        let mut stepped = 0usize;
+        let mut film: Option<render::Film> = None;
+        for j in 0..subs {
+            let lap = std::time::Instant::now();
+            let target = closed + (j + 1) * open / subs;
+            while stepped < target {
+                court.step();
+                stepped += 1;
+            }
+            sim_time += lap.elapsed();
+            let lap = std::time::Instant::now();
+            let at = picture.at(&court);
+            let opts = render::options(&scene, sub_spp, (k as u64) << 8 | j as u64);
+            let f = render::render(&at, &cam, w, h, &opts);
+            match &mut film {
+                Some(acc) => render::accumulate(acc, &f),
+                None => film = Some(f),
+            }
+            render_time += lap.elapsed();
         }
-        sim_time += lap.elapsed();
         let lap = std::time::Instant::now();
-        let picture = render::Scene::new(&scene, &court)?;
-        render::render(&picture, &cam, spp, k as u64).save(dir.join(format!("frame_{k:03}.png")))?;
+        let film = film.expect("at least one sub-frame");
+        render::to_image(&film, exposure, subs).save(dir.join(format!("frame_{k:03}.png")))?;
         render_time += lap.elapsed();
         if !still_done && court.time() >= still_t {
             still_done = true;
@@ -407,7 +432,9 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
             let sspp = a.parameter_or("still_spp", 128.0) as usize;
             let lap = std::time::Instant::now();
             let still = out.join("court_still.png");
-            render::render(&picture, &render::camera(&scene, sw, sh)?, sspp, 1 << 32).save(&still)?;
+            let at = picture.at(&court);
+            let opts = render::options(&scene, sspp, 1 << 32);
+            render::to_image(&render::render(&at, &cam, sw, sh, &opts), exposure, 1).save(&still)?;
             println!("render {} at t = {:.2} s, {sw}×{sh} × {sspp} spp in {:.1} s", still.display(), court.time(), lap.elapsed().as_secs_f64());
         }
         if k % 30 == 0 {
