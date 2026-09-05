@@ -105,6 +105,7 @@ pub struct Ride {
     actors: Vec<Actor>,
     #[serde(default)]
     track: usize,
+    #[serde(default)]
     frames: Vec<FrameDef>,
 }
 
@@ -113,6 +114,11 @@ fn one_sixtieth() -> f64 {
 }
 
 impl Ride {
+    /// A live ride before its header has arrived: nothing to draw yet.
+    fn empty() -> Self {
+        Self { name: String::new(), dt: one_sixtieth(), meshes: Vec::new(), fixed: Vec::new(), actors: Vec::new(), track: 0, frames: Vec::new() }
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let ride: Ride = serde_json::from_str(&text)?;
@@ -123,7 +129,7 @@ impl Ride {
     }
 
     fn duration(&self) -> f64 {
-        self.frames.last().map(|f| f.t).unwrap_or(0.0).max(self.dt * (self.frames.len() - 1) as f64)
+        self.frames.last().map(|f| f.t).unwrap_or(0.0).max(self.dt * self.frames.len().saturating_sub(1) as f64)
     }
 
     /// Every instance to draw at `frame`, grouped by mesh index.
@@ -578,35 +584,202 @@ impl CallbackTrait for RideCallback {
     }
 }
 
+// ---- the live child ---------------------------------------------------------
+
+/// Where a live ride comes from: a child process that streams the ride on
+/// stdout, one JSON object per line (see "Streaming" in `docs/ride-format.md`).
+pub struct LiveOpts {
+    /// program and arguments, already split
+    pub cmd: Vec<String>,
+    /// the child's working directory — the ipse recorder resolves
+    /// `objects/skateboard` relative to it, so it must run in its own tree
+    pub cwd: PathBuf,
+    pub shove: f64,
+    pub shove_at: f64,
+    pub duration: f64,
+    /// flags passed through untouched (`--policy`, `--scenario`)
+    pub extra: Vec<String>,
+}
+
+impl LiveOpts {
+    /// The full argv for one run: the configured command, the transport's
+    /// current knob values, then anything passed through.
+    fn argv(&self) -> Vec<String> {
+        let mut v = self.cmd.clone();
+        v.extend(["--shove".to_string(), format!("{:.3}", self.shove)]);
+        v.extend(["--shove-at".to_string(), format!("{:.3}", self.shove_at)]);
+        v.extend(["--duration".to_string(), format!("{:.3}", self.duration)]);
+        v.extend(self.extra.iter().cloned());
+        v
+    }
+}
+
+/// One line off the child's stdout, already parsed.
+enum Msg {
+    /// the header: the ride with no frames
+    Header(Box<Ride>),
+    Frame(Box<FrameDef>),
+    /// a line that would not parse, or a read error — logged, not fatal
+    Bad(String),
+    /// stdout closed
+    Eof,
+}
+
+/// A running child and the channel its frames arrive on.
+struct Live {
+    opts: LiveOpts,
+    child: Option<std::process::Child>,
+    rx: std::sync::mpsc::Receiver<Msg>,
+    /// set once the child is gone; the inner `None` means it was killed
+    ended: Option<Option<i32>>,
+    error: Option<String>,
+}
+
+impl Live {
+    fn spawn(opts: LiveOpts) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut live = Self { opts, child: None, rx, ended: None, error: None };
+        live.start(tx);
+        live
+    }
+
+    /// Kill whatever is running and start a fresh child with the current knobs.
+    fn restart(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = rx;
+        self.kill();
+        self.ended = None;
+        self.error = None;
+        self.start(tx);
+    }
+
+    fn start(&mut self, tx: std::sync::mpsc::Sender<Msg>) {
+        let argv = self.opts.argv();
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .current_dir(&self.opts.cwd)
+            .stdout(std::process::Stdio::piped())
+            // the child's diagnostics are ours: inherited, never swallowed
+            .stderr(std::process::Stdio::inherit());
+        eprintln!("live: {} (in {})", argv.join(" "), self.opts.cwd.display());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let stdout = child.stdout.take().expect("piped stdout");
+                std::thread::spawn(move || read_stream(stdout, tx));
+                self.child = Some(child);
+            }
+            Err(e) => {
+                // a missing recorder is a message in the window, not a panic
+                self.error = Some(format!("could not run `{}`: {e}", argv.join(" ")));
+                self.ended = Some(None);
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// Reap the child, so the status line can say how it ended.
+    fn poll_child(&mut self) {
+        if self.ended.is_some() {
+            return;
+        }
+        if let Some(c) = self.child.as_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                self.ended = Some(status.code());
+                self.child = None;
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.ended.is_none()
+    }
+}
+
+impl Drop for Live {
+    /// The window owns the child: closing the window ends the rollout.
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Parse the child's stdout: the header line first, then one frame per line.
+fn read_stream(stdout: std::process::ChildStdout, tx: std::sync::mpsc::Sender<Msg>) {
+    use std::io::BufRead as _;
+    let mut header = false;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = tx.send(Msg::Bad(format!("read: {e}")));
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg = if header {
+            match serde_json::from_str::<FrameDef>(&line) {
+                Ok(f) => Msg::Frame(Box::new(f)),
+                Err(e) => Msg::Bad(format!("frame: {e}")),
+            }
+        } else {
+            match serde_json::from_str::<Ride>(&line) {
+                Ok(r) => {
+                    header = true;
+                    Msg::Header(Box::new(r))
+                }
+                Err(e) => Msg::Bad(format!("header: {e}")),
+            }
+        };
+        if tx.send(msg).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(Msg::Eof);
+}
+
 // ---- the window -------------------------------------------------------------
 
 struct RideApp {
-    ride: Arc<Ride>,
+    ride: Ride,
+    /// `None` for a ride read from a file; `Some` while a child streams one
+    live: Option<Live>,
+    /// keep playing out to the newest frame as frames arrive
+    follow: bool,
+    /// the GPU buffers are built from the ride's meshes, which in live mode
+    /// only exist once the header has arrived — so they are made lazily
+    ready: bool,
+    /// something to show in the window instead of panicking
+    error: Option<String>,
     cursor: usize,
     playing: bool,
     speed: f64,
     accum: f64,
     camera: Camera,
     orbit: (f64, f64, f64),
-    ready: bool,
     /// `--shot=<path> --frame=<n>`: draw one frame offscreen and quit.
     shot: Option<PathBuf>,
+    shot_frame: usize,
     shot_now: Option<PathBuf>,
     ticks: u32,
     last: std::time::Instant,
 }
 
 impl RideApp {
-    fn new(cc: &eframe::CreationContext<'_>, ride: Arc<Ride>, frame: usize, shot: Option<PathBuf>) -> anyhow::Result<Self> {
-        let mut ready = false;
-        if let Some(rs) = &cc.wgpu_render_state {
-            let res = Resources::new(&rs.device, rs.target_format, &ride)?;
-            rs.renderer.write().callback_resources.insert(res);
-            ready = true;
-        }
-        let cursor = frame.min(ride.frames.len() - 1);
+    fn new(cc: &eframe::CreationContext<'_>, ride: Ride, live: Option<Live>, frame: usize, shot: Option<PathBuf>) -> anyhow::Result<Self> {
+        let cursor = frame.min(ride.frames.len().saturating_sub(1));
         let mut app = Self {
             ride,
+            live,
+            follow: true,
+            ready: false,
+            error: None,
             cursor,
             playing: shot.is_none(),
             speed: 1.0,
@@ -614,14 +787,67 @@ impl RideApp {
             camera: Camera { eye: V::new(0.0, -2.0, 1.0), target: V::new(0.0, 0.0, 0.0), vfov: 0.9 },
             // 25° up, 2.2 m back, looking along +x at the actor
             orbit: (-2.2, 25f64.to_radians(), 2.2),
-            ready,
             shot,
+            shot_frame: frame,
             shot_now: None,
             ticks: 0,
             last: std::time::Instant::now(),
         };
+        if let Some(rs) = &cc.wgpu_render_state {
+            app.build_resources(rs);
+        }
         app.aim();
         Ok(app)
+    }
+
+    /// Build the mesh buffers for the ride we have. A live ride has no meshes
+    /// until its header lands, so this does nothing until then and is retried.
+    fn build_resources(&mut self, rs: &egui_wgpu::RenderState) {
+        if self.ready || self.ride.meshes.is_empty() {
+            return;
+        }
+        match Resources::new(&rs.device, rs.target_format, &self.ride) {
+            Ok(res) => {
+                rs.renderer.write().callback_resources.insert(res);
+                self.ready = true;
+            }
+            Err(e) => self.error = Some(format!("scene: {e:#}")),
+        }
+    }
+
+    /// Drain everything the reader thread has parsed since the last repaint.
+    fn pump(&mut self) {
+        let Some(live) = self.live.as_mut() else { return };
+        live.poll_child();
+        loop {
+            match live.rx.try_recv() {
+                // the header carries the scene; keep any frames already in hand
+                Ok(Msg::Header(r)) => {
+                    let frames = std::mem::take(&mut self.ride.frames);
+                    self.ride = *r;
+                    self.ride.frames = frames;
+                }
+                Ok(Msg::Frame(f)) => self.ride.frames.push(*f),
+                Ok(Msg::Bad(e)) => eprintln!("live: {e}"),
+                Ok(Msg::Eof) => live.poll_child(),
+                Err(_) => break,
+            }
+        }
+        if let Some(e) = self.live.as_ref().and_then(|l| l.error.clone()) {
+            self.error = Some(e);
+        }
+    }
+
+    /// `live: 123 frames, t = 2.05 s, child running`.
+    fn live_status(&self) -> Option<String> {
+        let live = self.live.as_ref()?;
+        let t = self.ride.frames.last().map(|f| f.t).unwrap_or(0.0);
+        let child = match live.ended {
+            None => "child running".to_string(),
+            Some(Some(code)) => format!("child ended ({code})"),
+            Some(None) => "child ended (killed)".to_string(),
+        };
+        Some(format!("live: {} frames, t = {t:.2} s, {child}", self.ride.frames.len()))
     }
 
     fn aim(&mut self) {
@@ -629,35 +855,72 @@ impl RideApp {
         self.camera.target = self.ride.tracked(self.cursor);
         self.camera.eye = self.camera.target + V::new(dist * el.cos() * az.cos(), dist * el.cos() * az.sin(), dist * el.sin());
     }
+
+    /// The knobs and the restart button: a live ride is re-run, not re-read.
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        let Some(live) = self.live.as_mut() else { return };
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut live.opts.shove, 0.0..=40.0).text("shove peak (N·s)"));
+            ui.add(egui::DragValue::new(&mut live.opts.shove_at).speed(0.05).range(0.0..=60.0).prefix("at ").suffix(" s"));
+            ui.add(egui::DragValue::new(&mut live.opts.duration).speed(0.1).range(0.1..=600.0).prefix("for ").suffix(" s"));
+            if ui.button("restart").clicked() {
+                live.restart();
+                self.ride.frames.clear();
+                self.cursor = 0;
+                self.accum = 0.0;
+                self.follow = true;
+                self.playing = true;
+            }
+        });
+    }
 }
 
 impl eframe::App for RideApp {
-    fn ui(&mut self, root: &mut egui::Ui, _f: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, f: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.pump();
+        if !self.ready {
+            if let Some(rs) = f.wgpu_render_state().cloned() {
+                self.build_resources(&rs);
+            }
+        }
         let n = self.ride.frames.len();
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.last).as_secs_f64().min(0.25);
         self.last = now;
-        if self.playing && self.shot.is_none() {
+        if n > 0 && self.playing && self.shot.is_none() {
+            // Playback is paced by the ride's own dt against the wall clock,
+            // because the recorder runs several times faster than real time:
+            // "follow live" rides the frontier of arrived frames, it does not
+            // jump to it. A file ride loops; a live one holds at the newest.
             self.accum += dt * self.speed;
             let step = (self.accum / self.ride.dt).floor();
             if step >= 1.0 {
                 self.accum -= step * self.ride.dt;
-                self.cursor = (self.cursor + step as usize) % n;
+                let next = self.cursor + step as usize;
+                self.cursor = if self.live.is_some() { next.min(n - 1) } else { next % n };
             }
         }
+        self.cursor = self.cursor.min(n.saturating_sub(1));
         self.aim();
 
-        let t = self.ride.frames[self.cursor].t;
+        let t = self.ride.frames.get(self.cursor).map(|f| f.t).unwrap_or(0.0);
         egui::Panel::bottom("transport").show(root, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(if self.playing { "⏸ pause" } else { "▶ play" }).clicked() {
                     self.playing = !self.playing;
                 }
-                let mut c = self.cursor;
-                if ui.add(egui::Slider::new(&mut c, 0..=n - 1).text("frame")).changed() {
-                    self.cursor = c;
-                    self.playing = false;
+                if self.live.is_some() {
+                    ui.checkbox(&mut self.follow, "follow live");
+                }
+                if n > 0 {
+                    let mut c = self.cursor;
+                    if ui.add(egui::Slider::new(&mut c, 0..=n - 1).text("frame")).changed() {
+                        // scrubbing is a deliberate step off the live edge
+                        self.cursor = c;
+                        self.playing = false;
+                        self.follow = false;
+                    }
                 }
                 ui.separator();
                 ui.label(format!("t = {:.3} s / {:.3} s", t, self.ride.duration()));
@@ -668,6 +931,9 @@ impl eframe::App for RideApp {
                 ui.separator();
                 ui.label(format!("frame {} / {}", self.cursor + 1, n));
             });
+            if self.live.is_some() {
+                self.controls(ui);
+            }
         });
         egui::Panel::top("title").show(root, |ui| {
             ui.horizontal(|ui| {
@@ -677,6 +943,12 @@ impl eframe::App for RideApp {
                 let p = self.camera.target;
                 ui.label(format!("tracking {label} at ({:+.2}, {:+.2}, {:+.2}) m — drag to orbit, scroll to zoom", p.x, p.y, p.z));
             });
+            if let Some(s) = self.live_status() {
+                ui.label(s);
+            }
+            if let Some(e) = &self.error {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 90), e);
+            }
         });
 
         egui::CentralPanel::default().show(root, |ui| {
@@ -693,8 +965,10 @@ impl eframe::App for RideApp {
                 self.orbit.2 = (self.orbit.2 * (1.0 - scroll as f64 * 0.002)).clamp(0.3, 40.0);
                 self.aim();
             }
-            if !self.ready {
+            if !self.ready || n == 0 {
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+                let msg = self.error.clone().unwrap_or_else(|| "waiting for the first frame…".into());
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(18.0), egui::Color32::from_gray(170));
                 return;
             }
             let ppp = ctx.pixels_per_point();
@@ -709,13 +983,20 @@ impl eframe::App for RideApp {
             ));
         });
 
-        // headless verification: draw once, save, quit
+        // headless verification: draw once, save, quit. A live ride waits for
+        // the frame to arrive — or for the child to end without ever sending it.
         if let Some(path) = self.shot.clone() {
-            self.ticks += 1;
-            if self.ticks == 4 {
-                self.shot_now = Some(path);
-            }
-            if self.ticks == 8 {
+            let arrived = n > self.shot_frame || (n > 0 && !self.live.as_ref().map(|l| l.running()).unwrap_or(false));
+            if arrived && self.ready {
+                self.cursor = self.shot_frame.min(n - 1);
+                self.ticks += 1;
+                if self.ticks == 4 {
+                    self.shot_now = Some(path);
+                }
+                if self.ticks == 8 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            } else if self.error.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -723,16 +1004,30 @@ impl eframe::App for RideApp {
     }
 }
 
-/// `kosm-view --ride <ride.json>`: the window, playing a recording.
-pub fn run(path: &Path) -> anyhow::Result<()> {
-    let ride = Arc::new(Ride::load(path)?);
-    eprintln!("{}: {} frames, {} meshes, {} actors", path.display(), ride.frames.len(), ride.meshes.len(), ride.actors.len());
+/// Where the window gets its poses.
+pub enum Source {
+    /// `--ride <ride.json>`: a finished recording on disk
+    File(PathBuf),
+    /// `--live`: a child process streaming the ride as it runs
+    Live(LiveOpts),
+}
+
+/// `kosm-view --ride <ride.json>` / `--live`: the window, playing a ride.
+pub fn run(source: Source) -> anyhow::Result<()> {
+    let (ride, live) = match source {
+        Source::File(path) => {
+            let ride = Ride::load(&path)?;
+            eprintln!("{}: {} frames, {} meshes, {} actors", path.display(), ride.frames.len(), ride.meshes.len(), ride.actors.len());
+            (ride, None)
+        }
+        Source::Live(opts) => (Ride::empty(), Some(Live::spawn(opts))),
+    };
     let frame: usize = std::env::args().find_map(|a| a.strip_prefix("--frame=").and_then(|v| v.parse().ok())).unwrap_or(0);
     let shot: Option<PathBuf> = std::env::args().find_map(|a| a.strip_prefix("--shot=").map(PathBuf::from));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 760.0]).with_title("Kosm view — the ride"),
         ..Default::default()
     };
-    eframe::run_native("Kosm view", options, Box::new(move |cc| Ok(Box::new(RideApp::new(cc, ride, frame, shot)?))))
+    eframe::run_native("Kosm view", options, Box::new(move |cc| Ok(Box::new(RideApp::new(cc, ride, live, frame, shot)?))))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }

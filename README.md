@@ -271,6 +271,25 @@ ambient, no culling, because authored STLs are wound however they were wound.
 `--shot=out.png --frame=N` draws one frame offscreen and quits, which is how
 the mode is checked without a screen.
 
+`cargo run --release -p kosm-view -- --live` runs the rollout instead of
+reading one: the ipse recorder
+(`target/release/examples/k1_skatepark_ride --stream`, run from
+`/Users/cam/Developer/ipse` because it resolves `objects/skateboard` against
+the cwd) streams the ride on stdout — the header first, then one frame per
+line — and a reader thread appends frames as they land while its stderr goes
+straight to ours. `--live-cmd "<program and args>"` swaps in another streamer,
+split on whitespace, run from the current directory. The transport gains
+"follow live" (on by default), a shove peak (N·s), a shove time and a
+duration, and a "restart" button that kills the child and re-runs it with
+those values on an empty timeline; the status line reads
+`live: 123 frames, t = 2.05 s, child running`. Playback stays paced by the
+ride's own `dt` even though the recorder runs several times faster than real
+time, so following live rides the frontier of arrived frames rather than
+jumping to it, and pausing or scrubbing back works while frames keep
+arriving. Closing the window kills the child. `--shot`/`--frame` work here
+too: the window waits for that frame (or for the child to end) before it
+draws and quits.
+
 ## building
 
 `vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;
