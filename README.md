@@ -679,8 +679,8 @@ Four lobes, layered coat → sheen → (specular + diffuse):
   up to a fifth of the light it is given. `diffuse_roughness` (OpenPBR's
   `base_diffuse_roughness`) drives it and is separate from the specular
   roughness, because a surface's slope statistics and its subsurface scattering
-  length are unrelated facts. `subsurface` blends towards Disney's
-  Hanrahan-Krueger lobe for the short-mean-free-path look of rubber and skin.
+  length are unrelated facts. `subsurface` takes its share of this lobe away
+  and hands it to a random walk inside the object — see below.
 - **Specular — compensated anisotropic GGX.** VNDF sampling as before, with
   Turquin's (2019) multiple-scattering compensation on top: scale the
   single-scattering lobe by `1 + F0·(1 - E)/E`, where `E(mu, alpha)` is the
@@ -781,6 +781,65 @@ What the tests pin:
 | `an_iridescent_lobe_stays_under_one` | hemispherical albedo ≤ 1 for a white metal at three thicknesses and three roughnesses, RGB and hero paths both |
 | `a_film_in_the_visible_band_is_chromatic` | a 320 nm film is not grey — otherwise none of this bought anything |
 | `tests/gpu_bsdf.rs` | the sweep grew films over dielectrics and metals and a hero-wavelength axis: 4680 cases, worst relative disagreement 9.4e-6 |
+
+#### subsurface, as transport rather than as a look
+
+Disney's 2012 `subsurface` was a *blend*: a Hanrahan-Krueger-flavoured lobe
+that flattened the diffuse falloff and brightened grazing angles the way a
+short mean free path does. It looked like scattering and transported nothing.
+Light never entered the object, so it never came out anywhere else, and the
+effect vanished the moment you asked it for the thing that actually separates
+skin, marble and rubber from paint of the same colour: light going *in* here
+and coming *out* over there.
+
+This is the transport — Chiang, Kutz and Burley's "Practical and Controllable
+Subsurface Scattering for Production Path Tracing" (SIGGRAPH 2016). On a
+subsurface entry the path stops being a surface event: it crosses into the
+object, samples a distance against the medium's extinction, and either the
+boundary comes first — in which case the path leaves *there*, from a new point
+with a new normal — or it does not, in which case it scatters isotropically and
+goes again. The exit point is found with the same `Geometry`/TLAS trace
+everything else uses, with the ray inside the solid.
+
+| parameter | meaning |
+|---|---|
+| `subsurface` | OpenPBR's `subsurface_weight`. Takes that fraction of the diffuse lobe away and replaces it with the walk. `0` is off and the default |
+| `subsurface_color` | OpenPBR's, the **surface** albedo — what the material looks like, not what the medium is |
+| `subsurface_radius` | OpenPBR's, the mean free path per channel in scene units. Per channel because red travels furthest through most organic media, which is why a hand held up to a light goes red at the edges |
+
+**The inversion is the whole usability of it.** Nobody can pick a
+single-scattering albedo: a medium at 0.9 reads very nearly white at the
+surface, and the map between the two is a transcendental function of the
+transport. Chiang's cubic fit inverts it, so the knob is the surface colour and
+the renderer solves for the medium that produces it.
+
+**The walk is not a BSDF and is not pretended to be one.** It has no density at
+the point it entered — it leaves from somewhere else — so it never appears in
+the sum `bsdf_eval` returns; it appears only in the lobe-selection weights and
+in `bsdf_sample`, which reports "into the object" instead of a direction. The
+exit continues as a specular chain, because no NEE strategy found that
+direction and an emitter downstream must therefore take full MIS weight.
+
+**The GPU walks too, and it walks shorter.** The CPU takes up to 1024
+scattering events; the shader takes 12. A GPU path loop is a
+uniform-control-flow budget shared by every lane in the workgroup, and a
+thousand-step inner loop makes the whole wave wait on the one pixel that landed
+in a bright medium. Twelve is plenty for the short mean free paths these scenes
+use — the basketball's 2 mm rubber exits in three or four — and a medium bright
+enough to need more comes back darker on the device than on the CPU. That is
+the one place the two tiers are knowingly different; `subsurface = 0` is
+identical on both, and the BSDF halves agree to 3e-6 in the parity harness.
+
+What the tests pin:
+
+| test | what it holds |
+|---|---|
+| `a_semi_infinite_slab_returns_its_own_colour` | a half-space of the material reflects `subsurface_color` back to within 3% at 60k walks — the fit, the distance sampling and the per-channel MIS weights all at once |
+| `a_very_bright_medium_runs_a_little_dark` | and where the cubic gives out: 0.9 comes back as 0.87, stated rather than hidden behind a wider tolerance |
+| `a_thin_slab_transmits` | a slab 0.4 mean free paths thick passes more than 20% out the far side and still reflects some, and the two together stay under 1 |
+| `the_walk_never_returns_more_than_it_took` | energy ≤ 1 for white and for strongly coloured media |
+| `subsurface_zero_leaves_the_other_lobes_alone` | `assert_eq!` on the whole evaluator, and no subsurface lobe to pick |
+| `tests/gpu_bsdf.rs` | all six lobe-selection probabilities are now compared outright — a divergence there is invisible in any single evaluation and shows up only as noise |
 
 #### transmission and dispersion
 
