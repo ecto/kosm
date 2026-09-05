@@ -93,8 +93,8 @@ use std::time::{Duration, Instant};
 use kosm_render::gpu::InstanceMotion;
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
-use vcad_kernel_math::{Point3, Transform};
 use vcad_kernel_gpu::GpuContext;
+use vcad_kernel_math::{Point3, Transform};
 use vcad_kernel_raytrace::gpu::{
     DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START, GpuAreaLight, GpuCamera, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, GpuScene, HistoryPipeline, RayTracePipeline, ResidentScene,
@@ -128,7 +128,11 @@ fn flag(key: &str) -> Option<String> {
     args.iter().enumerate().find_map(|(i, a)| {
         a.strip_prefix(&format!("--{key}="))
             .map(str::to_owned)
-            .or_else(|| (a == &format!("--{key}")).then(|| args.get(i + 1).cloned()).flatten())
+            .or_else(|| {
+                (a == &format!("--{key}"))
+                    .then(|| args.get(i + 1).cloned())
+                    .flatten()
+            })
     })
 }
 
@@ -157,6 +161,31 @@ fn denoise_from_args() -> GpuDenoiseParams {
     d
 }
 
+/// ReSTIR DI off the command line.
+///
+/// `--restir` turns it on at sixteen candidates; `--restir=32` names M.
+/// `--restir-spatial N` and `--restir-radius R` are the reuse knobs, over the
+/// renderer's own one pass at four pixels. Absent, nothing changes: the
+/// shader takes the next-event path it always took and the picture is the one
+/// it always was.
+fn restir_from_args() -> Option<(u32, u32, f32)> {
+    let asked = std::env::args().any(|a| a == "--restir" || a.starts_with("--restir="));
+    if !asked {
+        return None;
+    }
+    let m = flag("restir")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(16)
+        .max(1);
+    let spatial = flag("restir-spatial")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1);
+    let radius = flag("restir-radius")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(4.0);
+    Some((m, spatial, radius))
+}
+
 /// One placed instance in the merged scene: which faces it owns, and the
 /// pose that put them where they are.
 ///
@@ -181,9 +210,18 @@ fn row_major(t: &Transform) -> [f32; 12] {
     };
     let (cx, cy, cz) = (c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0));
     [
-        cx[0] as f32, cy[0] as f32, cz[0] as f32, o.x as f32, //
-        cx[1] as f32, cy[1] as f32, cz[1] as f32, o.y as f32, //
-        cx[2] as f32, cy[2] as f32, cz[2] as f32, o.z as f32,
+        cx[0] as f32,
+        cy[0] as f32,
+        cz[0] as f32,
+        o.x as f32, //
+        cx[1] as f32,
+        cy[1] as f32,
+        cz[1] as f32,
+        o.y as f32, //
+        cx[2] as f32,
+        cy[2] as f32,
+        cz[2] as f32,
+        o.z as f32,
     ]
 }
 
@@ -219,6 +257,9 @@ pub struct Stage {
     /// the uniform jitter every earlier frame was drawn with, so a shot taken
     /// without the flag is the shot that was there before.
     filter: PixelFilter,
+    /// ReSTIR DI's `(candidates, spatial passes, radius)`, or `None` for the
+    /// next-event path. `--restir` turns it on; see `restir_from_args`.
+    restir: Option<(u32, u32, f32)>,
     /// The level's environment and sun, taken off the CPU tier's own
     /// `render::Scene` rather than rebuilt from the level's knobs. They reach
     /// the shader through `set_gradient_env` and `set_sun`, so the two tiers
@@ -328,6 +369,10 @@ impl Stage {
         let history = HistoryPipeline::new(&ctx)
             .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
         let filter = pixel_filter_from_args();
+        let restir = restir_from_args();
+        if let Some((m, sp, r)) = restir {
+            eprintln!("court  gpu: ReSTIR DI on — {m} candidates, {sp} spatial pass(es) at {r} px");
+        }
 
         // The statics are instances: sixty of the court's bars are one cube,
         // and packing that cube once and placing it sixty times is the whole
@@ -396,6 +441,7 @@ impl Stage {
             prev_ball_places: 0,
             max_depth,
             filter,
+            restir,
             env: stage.environment().clone(),
             sun: stage.sun(),
             resident: None,
@@ -657,6 +703,13 @@ impl Stage {
             // …and the same sun, which with `sky 1` is the only thing the
             // clerestory openings have to let in.
             state.set_sun(self.sun.as_ref());
+            // ReSTIR, if asked for. The reservoirs live in the resident
+            // scene and carry across passes on their own; every sample of
+            // the pass gets its own generation, temporal reuse and spatial
+            // round, because each is an independent sample of the frame.
+            if let Some((m, sp, r)) = self.restir {
+                state.set_restir(m, sp, r);
+            }
             self.pipeline
                 .accumulate_resident_temporal(
                     &self.ctx,

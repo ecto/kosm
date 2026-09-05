@@ -753,7 +753,19 @@ two runs of the *same* binary differ by 4 on twenty-nine.
 
 `--history-cap N`, `--clamp-k K`, `--clamp-reset N` and
 `--no-spatial-variance` are the knobs, over kosm-render's own defaults (64,
-4.0, 2, on). `Mask` and `Keep` stay in `history.rs` for the geometry the CPU
+4.0, 2, on).
+
+`--restir` turns on ReSTIR DI for the ceiling panels — `--restir=32` names the
+candidate count, `--restir-spatial N` and `--restir-radius R` the reuse — and
+without it nothing changes at all. Sixty live frames at 640x360 from t = 0.4 s,
+with and without: the same picture, the walls' even speckle down by a third
+(mean deviation from a pixel's own 3x3, 6.5/255 without, 4.3/255 with) and the
+mean luminance within 1%. No boiling, no ghosting, no trail behind the ball in
+flight — the reservoirs are gated on the same depth and normal tests the
+history is, and a pixel whose surface changed simply starts over. What ReSTIR
+does *not* quiet here is most of it: this court is lit through its clerestory
+by the sun, which keeps its own sample, and by three bounces of indirect,
+which are nobody's reservoir. The pass goes from 53 ms to 85 ms. `Mask` and `Keep` stay in `history.rs` for the geometry the CPU
 tier plans with and for the tests that keep it honest; nothing on the GPU tier
 calls them.
 
@@ -1448,6 +1460,105 @@ the balance heuristic. A 0.5° disc is found by BSDF sampling roughly once in
 fifty thousand rays, which is the whole reason it needs one.
 `tests/gpu_sun.rs` holds both tiers to `E·cos(theta)` on a Lambertian plane —
 measured 0.00–0.02% off the analytic answer at 0°, 30° and 60°.
+
+### ReSTIR, for the panels
+
+Bitterli, Wyman, Pharr, Shirley, Lefohn and Jarosz 2020 — spatiotemporal
+reservoir resampling. The direct term at the primary hit stops being one
+next-event sample and becomes a *resampled* one. Sixteen candidate points are
+drawn on the panels per pixel per frame and reduced to a single survivor by
+weighted reservoir sampling against an unshadowed target
+
+    p̂(y) = luminance( f(wo, wi)·cosθ · Le(y) ) · G(x, y)
+
+which costs no rays at all — and only the survivor is shadow-tested. The
+reservoir is then reused: from this pixel last frame, reprojected through the
+previous camera and gated on the same 10%-depth / 25°-normal similarity the
+history uses, and from a few neighbours this frame. So the pixel still spends
+exactly one shadow ray on the panels, and spends it on the light that
+hundreds of samples agreed was worth testing.
+
+`GpuRenderState::set_restir(candidates, spatial_passes, spatial_radius)` is
+the whole interface, and **zero candidates — the default — is the path the
+shader has always taken**. Every existing test and every `--shot` is
+byte-for-byte what it was; nothing about ReSTIR runs, and nothing about it is
+allocated.
+
+**What it covers, and what it deliberately does not.** The area panels, at
+the primary hit. Indirect bounces keep their one-light NEE — a reservoir is a
+per-pixel object and there is no pixel behind a second bounce — and so does
+the environment. So does *the sun*, and that one was learned the hard way: the
+sun went into the reservoir first, as one strategy among the panels, which in
+a court lit through clerestory openings by the sun meant ten pixels in eleven
+got no sun sample at all that frame. Sixty live frames came out visibly dark
+and three times specklier than the same frames without ReSTIR. A 0.6° disc is
+one light with a good importance sampler already; resampling is for choosing
+among many.
+
+**Biased, and by how much.** The temporal and spatial combinations are the
+paper's biased ones — Algorithm 4 without MIS weights, with the previous M
+clamped to 20x this frame's — because the unbiased variant needs a visibility
+ray per reused neighbour and the whole point is that reuse costs none. The
+spatial pass does normalise by *Z*, the candidates that could actually have
+produced the survivor, rather than by every candidate looked at; without that
+the frame comes out 10.4% dark. What is left biased is the visibility the
+pass does not test: a sample visible at the neighbour and occluded here still
+lights this pixel. On a closed room of twenty-four ceiling panels at 128x96,
+three bounces, against a 160-frame plain-NEE reference of the same scene:
+
+| | mean radiance | vs plain NEE |
+|---|---|---|
+| plain NEE | 2.46279 | — |
+| ReSTIR, temporal only | 2.45945 | −0.14% |
+| ReSTIR, one spatial pass | 2.45967 | −0.13% |
+
+Two things are *not* folded into the reservoir, and both were measured
+brightening it by several percent before they were taken out. Visibility is
+one: the reservoir never learns whether its survivor was occluded — the
+shadow ray is spent at shading time — because a chain that keeps the samples
+that were visible and drops the ones that were not is conditioned on
+visibility, and read +4.5%. The other is the sample's own existence: a
+reservoir whose survivor names a point the panel has since moved out from
+under is dropped *whole*, M and all, rather than kept at zero weight.
+
+**Noise.** One sample a frame, after eight frames, root-mean-square from a
+192-frame reference:
+
+| | plain NEE | ReSTIR (M=16, 1 spatial) | |
+|---|---|---|---|
+| direct term only | 1.534 | 0.526 | **2.91x quieter** |
+| the whole 3-bounce path | 2.333 | 1.835 | 1.27x quieter |
+
+The second row is the honest one for a viewport: ReSTIR does nothing about
+indirect noise, and indirect is most of what is left. Wide reuse measures
+*worse* than narrow at every candidate count — 2.91x at a 4 px radius, 2.68x
+at 16 px — because a neighbour four pixels away is looking at very nearly the
+same integral and one thirty pixels away is not, so the default radius is 4
+and one pass.
+
+**A light that moves does not linger.** Nothing else would notice: a panel
+keeps its index and its emission when it is translated, so a stale point in
+empty air resolves to a perfectly plausible direction, distance and geometry
+term. Re-evaluating p̂ every frame only helps if p̂ can *tell*, so
+`restir_resolve` asks whether the stored point is still on the panel it names.
+Without that check, translating the test room's rig under settled reservoirs
+left the picture 26% bright and it stayed there. With it, the very next frame
+is within 2% of a render that never saw the old rig, and stays there.
+
+**Cost.** 512x288, M=16, against the same scene's plain pass: 33 ms with one
+spatial pass and 42 ms with two, over 10–14 ms plain. Four submissions a
+frame rather than one — the stages differ only in a uniform, and a queue
+write applies to every command buffer in the submission it precedes. The
+reservoirs ride in spare planes of `depth_normal_buffer`, 192 bytes a pixel,
+because the shader already binds all ten storage buffers a browser
+guarantees and five of those belong to the geometry module. Four slots: two
+ping-pong across frames and carry the temporal chain, two ping-pong across
+this frame's spatial passes. Keeping them apart is not tidiness — feeding
+spatial output back into the temporal chain compounds its bias, and a 30 px
+radius measured *worse than plain NEE* by frame eight while measuring 2.4x
+better on frame one, which is what a feedback loop looks like.
+
+`tests/gpu_restir.rs` is all four claims.
 
 ### the denoiser, and what it now refuses to spend
 
