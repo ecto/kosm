@@ -29,6 +29,7 @@ pub mod net;
 pub mod aim;
 pub mod parts;
 pub mod render;
+pub mod denoise;
 
 pub const DEFAULT_COURT_SCENE: &str = "court.loon";
 
