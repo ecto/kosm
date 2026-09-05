@@ -2,3 +2,7 @@ target
 out
 .wt
 assets
+# ...except the viewer's, which is one trained denoiser and is small enough to
+# live in the tree beside the code that embeds it.
+!crates/kosm-view/assets
+!crates/kosm-view/assets/**

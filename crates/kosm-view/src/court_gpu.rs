@@ -100,6 +100,10 @@ use vcad_kernel_raytrace::gpu::{
     GpuMaterial, GpuRenderState, GpuScene, HistoryPipeline, RayTracePipeline, ResidentScene,
 };
 use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter, Sun};
+// The learned denoiser is kosm-render's own; vcad re-exports the a-trous half
+// of `gpu` and has no reason to know about this one.
+use kosm_render::gpu::{NeuralDenoiser, NeuralPipeline};
+use kosm_render::neural::Weights;
 
 use crate::court::Camera;
 
@@ -155,6 +159,50 @@ fn denoise_from_args() -> GpuDenoiseParams {
         d.spatial_variance = false;
     }
     d
+}
+
+/// The court's own trained denoiser, shipped inside the binary.
+///
+/// Under a megabyte, so it is embedded rather than looked up beside the
+/// executable: a viewer that has to find a file next to itself is a viewer
+/// that breaks when someone moves it.
+const BUNDLED_WEIGHTS: &[u8] = include_bytes!("../assets/denoise-court.bin");
+
+/// Which filter `--denoise` asks for.
+///
+/// `--denoise atrous` (the default) is the a-trous wavelet chain in
+/// `history.wgsl`. `--denoise neural` is the network in
+/// `kosm_render::gpu::neural`, trained on this court's own reference renders
+/// by kosm-spike's `denoise_dataset` example; `--denoise neural=PATH` runs a
+/// different set of weights, which is how a new fit is looked at without a
+/// rebuild.
+fn neural_weights_from_args() -> anyhow::Result<Option<Weights>> {
+    let Some(v) = flag("denoise") else {
+        return Ok(None);
+    };
+    let (kind, path) = match v.split_once('=') {
+        Some((k, p)) => (k, Some(p.to_owned())),
+        None => (v.as_str(), None),
+    };
+    match kind {
+        "atrous" | "none" => Ok(None),
+        "neural" => {
+            let w = match path {
+                Some(p) => {
+                    Weights::load(&p).map_err(|e| anyhow::anyhow!("the weights at {p}: {e}"))?
+                }
+                None => Weights::from_bytes(BUNDLED_WEIGHTS)
+                    .map_err(|e| anyhow::anyhow!("the bundled weights: {e}"))?,
+            };
+            eprintln!(
+                "denoise: neural, {} hidden channels, {} parameters",
+                w.hidden,
+                w.parameters()
+            );
+            Ok(Some(w))
+        }
+        other => anyhow::bail!("--denoise {other}: expected `atrous` or `neural[=weights.bin]`"),
+    }
 }
 
 /// One placed instance in the merged scene: which faces it owns, and the
@@ -254,6 +302,12 @@ pub struct Stage {
     uploaded: Option<u64>,
     /// The history and denoise passes, compiled once.
     history: HistoryPipeline,
+    /// The learned filter, when `--denoise neural` asked for one: the three
+    /// compute pipelines and the weights and activations they run over. It
+    /// stands exactly where the a-trous chain stands - see
+    /// `RayTracePipeline::denoise_and_resolve_resident_neural` - so
+    /// everything else about a pass is the same either way.
+    neural: Option<(NeuralPipeline, NeuralDenoiser)>,
     /// How the device filters the running mean. The default fades the filter
     /// out as a pixel reaches thirty-two samples, which is
     /// `History::resolve`'s `DENOISE_UNTIL` and right for a window that keeps
@@ -327,6 +381,16 @@ impl Stage {
             .map_err(|e| anyhow::anyhow!("the tracer's pipeline: {e}"))?;
         let history = HistoryPipeline::new(&ctx)
             .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
+        // Sized for nothing yet; the first pass calls `ensure` with the frame
+        // it actually got.
+        let neural = match neural_weights_from_args()? {
+            Some(w) => Some((
+                NeuralPipeline::new(&ctx)
+                    .map_err(|e| anyhow::anyhow!("the neural denoiser's pipelines: {e}"))?,
+                NeuralDenoiser::new(&ctx, &w, 0, 0),
+            )),
+            None => None,
+        };
         let filter = pixel_filter_from_args();
 
         // The statics are instances: sixty of the court's bars are one cube,
@@ -401,6 +465,7 @@ impl Stage {
             resident: None,
             uploaded: None,
             history,
+            neural,
             denoise: denoise_from_args(),
             target: None,
             passes: 0,
@@ -694,9 +759,24 @@ impl Stage {
         // boxes that was four demodulate/à-trous/resolve chains over the full
         // frame to show one frame.
         let denoised = Instant::now();
-        self.pipeline
-            .denoise_and_resolve_resident(&self.ctx, &self.history, res, &denoise, &view)
-            .map_err(|e| anyhow::anyhow!("the denoiser: {e}"))?;
+        match self.neural.as_mut() {
+            Some((pipe, net)) => self
+                .pipeline
+                .denoise_and_resolve_resident_neural(
+                    &self.ctx,
+                    &self.history,
+                    pipe,
+                    net,
+                    res,
+                    &denoise,
+                    &view,
+                )
+                .map_err(|e| anyhow::anyhow!("the neural denoiser: {e}"))?,
+            None => self
+                .pipeline
+                .denoise_and_resolve_resident(&self.ctx, &self.history, res, &denoise, &view)
+                .map_err(|e| anyhow::anyhow!("the denoiser: {e}"))?,
+        }
 
         // Wait for the passes to land. Not a readback — no pixel comes back —
         // but with nothing else synchronising the two sides the worker would

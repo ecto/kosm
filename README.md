@@ -1450,6 +1450,125 @@ At 16 samples that is 3 iterations where it used to run 5 — 40% of the filter
 gone — for 0.09 of one 8-bit code. The 1- and 4-sample rows are unchanged to
 the digit, because at those counts the budget is still full.
 
+### a denoiser trained on our own reference renders
+
+The à-trous filter above is *general*: five constants that have to be right for
+a kitchen, a skatepark and a gym at once. There is another option, and it is
+one only a renderer that owns its scenes can take. The court is ours, the path
+tracer is ours, and a 1024-spp render of the court is exact ground truth we can
+make as much of as we are willing to wait for. So: sample the level, render
+each sample noisy *and* converged, and fit a filter to the difference.
+
+**The dataset** (`kosm-spike`, `examples/denoise_dataset.rs`). Fifty (camera,
+time) states — the authored camera orbited through a full circle of azimuth,
+±0.25/0.45 rad of elevation and 0.7–1.35× its distance, at a random instant of
+the first four seconds of the shot. Each rendered at 320×180 sixteen times at
+one sample per pixel, snapshotted as running means at 1, 2, 4, 8 and 16 passes
+with the variance of each mean, plus the normal, depth and albedo guides — and
+then once more at **1024 spp with the filter off**. Every plane f16, whole
+frame, crops taken at load time: **172.8 MB, 39 minutes** on sixteen cores
+(8.2 hours of CPU). Cut into 64×64 tiles that is 2000 training tiles and 500
+held out.
+
+**The network** (`kosm_render::neural`, trained by `court::denoise`). A
+kernel-predicting network in the sense of Bako et al., not a U-Net: three 3×3
+convolutions over ten per-pixel feature planes, 32 hidden channels, ReLU, and a
+softmax over 25 outputs that are then used as the weights of a 5×5 average over
+the frame's *own* demodulated illumination. **19,385 parameters, 77 KB.** It
+predicts a filter and not a picture, so it cannot invent light — the same
+promise the à-trous filter makes, with the weights learned rather than
+stipulated. A U-Net's downsamples are exactly what would let it hallucinate a
+shadow, and a hallucinated shadow that flickers is worse than the grain it
+replaced.
+
+The convolutions are hand-written `f32` loops with hand-written backward
+passes. `tang_train::Conv2d` exists and is gradient-checked, but its forward is
+`Tensor::from_fn` over a multi-dimensional `get`; this network is 80 MMAC per
+tile forward and that difference is a training run against a weekend. What
+`tang_train` does supply is what it is good at: `Parameter` holding the weights
+and their gradients, and `ModuleAdam` stepping them. The backward pass is
+checked against a directional finite difference through every layer.
+
+The loss is L1 on `x/(1+x)`-compressed radiance plus a tenth-weight
+gradient-domain term — L1 rather than L2 because L2's optimum under uncertainty
+is the mean and the mean of "this edge is here or one pixel over" is a blurred
+edge; plus gradients because L1 alone is indifferent between the right values
+and the right values in the wrong arrangement.
+
+Thirty epochs, batch 16, Adam at 2e-3: **18 minutes**, loss 0.0137 → 0.0076.
+Held-out RMSE on the 500 tiles it never saw, through the same tone curve:
+
+| accumulated passes | raw | à-trous | neural |
+|---|---|---|---|
+| 1 | 0.0764 | 0.0201 | **0.0155** |
+| 2 | 0.0607 | 0.0164 | **0.0130** |
+| 4 | 0.0472 | 0.0128 | **0.0107** |
+| 8 | 0.0357 | 0.0111 | **0.0091** |
+| 16 | 0.0268 | 0.0103 | **0.0080** |
+
+16–23% better than the filter it replaces, at every history length.
+
+**Inference** (`gpu/neural.rs`, `neural.wgsl`, `--denoise neural`). Three
+compute dispatches, one per convolution, with the hidden activations in storage
+buffers rather than workgroup memory — a fused pass would need 39 KB of the
+16 KB budget and would recompute every pixel outside its own 8×8 tile twice.
+The pass reads the history's running mean, its per-pixel statistics and the
+scene's guide planes, and writes into the same `(illumination, variance)`
+scratch buffer the wavelet iterations write, so `resolve` remodulates and
+tonemaps without knowing which filter ran. `tests/gpu_neural.rs` pins the WGSL
+against the Rust reference forward to 2e-3 relative, and a test in `kosm-spike`
+pins the *trainer's* forward against that same reference — three
+implementations of one network, and the weight file means the same thing to all
+three.
+
+At 512×288 on Metal: **13.6 ms** against the à-trous chain's 0.7–1.0 ms on a
+converged frame. It is not a cheaper filter. `9·(10h + h² + 25h)` is 19,300
+multiply-accumulates a pixel and there is no getting around it at 32 channels.
+
+**And then we looked at it.** `--dump-frames` at 512×288, à-trous and neural,
+against a 256-pass reference of the same instant. RMSE in 8-bit codes:
+
+| region | à-trous | neural |
+|---|---|---|
+| whole frame | 9.31 | 17.84 |
+| back wall | 6.45 | 7.55 |
+| bleachers | 7.08 | 7.75 |
+| floor | 10.07 | **9.81** |
+| hoop and backboard | 12.77 | **42.68** |
+
+The held-out table says the network wins and the viewer says it loses, and both
+are true. On the flat, noisy, low-frequency majority of the frame the two are
+within a code of each other. The whole of the difference is the hoop: the glass
+backboard comes out **1.7× too bright** (159 against the reference's 94) and
+the net's cords blur into a white smudge where the à-trous filter keeps the
+lattice.
+
+What it does *not* do is flicker. Frame to frame on a patch of static wall
+across the sequence the neural filter moves 3.8, 4.8, 5.6 codes against the
+à-trous filter's 3.8, 5.2, 6.5 — slightly steadier, which is what a
+kernel-predicting network with no downsampling should be. The failure is
+spatial and it is stationary; it is the same wrong backboard every frame.
+
+Two things are different between the tiles it was scored on and the frame it
+was run on, and both are ours:
+
+* **The history does not mean what the dataset said it means.** A dataset tier
+  is the mean of *k* independent one-spp passes and the variance of that mean.
+  The viewer's history is an exponential moving average with a `history_cap`,
+  carried across camera and object motion by the reprojection and shortened by
+  the neighbourhood clamp. Its `count` and `variance` are not the dataset's
+  `count` and `variance`, and two of the network's ten input planes are exactly
+  those. The task's better option — driving the device history headlessly to
+  build the dataset — is the fix, and this is the bill for not taking it.
+* **The tiles are 320×180 and the frame is 512×288.** A 5×5 kernel covers
+  different amounts of world in the two, and the net's cords are about a pixel
+  wide in one and two in the other.
+
+So: the method works, the plumbing is right end to end, and the weights that
+ship are not yet good enough to make `--denoise neural` the default. That is
+the honest state of it, and the next move is a dataset built from the device's
+own history at the viewport's own resolution rather than a bigger network.
+
 ### the pixel filter
 
 Primary rays were jittered uniformly inside the pixel. That is a box filter —
