@@ -13,31 +13,34 @@
 //! is on wgpu 30 now, so the surface and the tracer are one set of wgpu types
 //! and there is one adapter in the process rather than two.
 //!
-//! What comes out of [`Stage::sample`] is one *raw* linear sample of the
-//! frame, with the denoiser's guide planes, packed into the same
-//! `pathtrace::Film` the CPU integrator produces. Nothing accumulates on the
-//! device: the accumulator in this program is [`crate::history`] — one
-//! per-pixel running mean, one geometric change mask, one reprojection — for
-//! both tiers. The shader's own progressive average, its spatial denoise and
-//! its tonemap all happen on the way to an output texture that is thrown
-//! away.
+//! ## nothing comes back
+//!
+//! [`Stage::accumulate`] is the whole of a pass, and it reads nothing back.
+//! vcad's `accumulate_and_denoise_resident` traces one raw sample, folds it
+//! into a per-pixel mean and count that live in device buffers, runs the
+//! à-trous filter against the resident guide planes, and tonemaps the result
+//! into a storage texture — [`Stage::target`] — which is on the viewport's own
+//! device and which the blit samples directly. There is no `Film`, no
+//! readback, and no CPU-side history on this tier at all.
+//!
+//! What this side still owns is the **keep mask**: one byte a pixel, 1 to go
+//! on accumulating and 0 to start over, computed by [`crate::history::Mask`]
+//! from the same geometry the CPU tier masks with. Reprojection is not on the
+//! device, so a moved camera uploads an all-restart mask — the CPU tier still
+//! carries its samples through a moved camera and this one does not.
+//!
+//! It also owns the scissor, by not using it. `GpuRenderState::set_scissor`
+//! still sizes the *trace*, but vcad's accumulate pass runs over every pixel
+//! of the frame regardless, so it would fold the stale raw sample outside the
+//! rectangle into the history as if it were fresh. Until the accumulate
+//! shader honours the same rectangle, a pass on this tier is a full frame.
 //!
 //! ## residency
 //!
 //! The court is uploaded once and stays there. `ResidentScene` holds the
 //! surface, face, BVH, material and light buffers; a frame rewrites only the
 //! bytes that moved (`update_scene`, once per *frame*, not once per pass) and
-//! a pass rewrites only the camera and the render state. So a pass is a
-//! dispatch and a readback, not a re-upload of the whole court — which is
-//! what `RayTracePipeline::render_with_render_state` used to make it, and what
-//! the fixed term in the window's cost model was mostly paying for.
-//!
-//! `render_resident_linear` is the exit that makes this usable: it forces the
-//! shader into raw-sample mode and hands back linear radiance plus depth,
-//! normal and albedo, in exactly `pathtrace::render`'s conventions. That is
-//! why the GPU tier now reprojects through a moved camera and runs the à-trous
-//! denoiser, like the CPU one, instead of throwing its whole history away
-//! whenever the camera turns.
+//! a pass rewrites only the camera and the render state.
 //!
 //! ## what the GPU picture is not
 //!
@@ -46,27 +49,26 @@
 //! - The shader's implicit ground plane is switched off because the level
 //!   authors its own floor, while the CPU path also gets an infinite one at
 //!   the slab's underside.
-//! - The environment is the shader's analytic studio gradient scaled by the
-//!   level's `env_radiance`, where the CPU's is that constant flat. Making
-//!   them agree exactly is possible — a 1x1 lat-long map is a constant
-//!   environment the shader will take — and it was tried: at
-//!   `env_radiance = 0.05` in a closed gym lit by ten panels at 18 it changed
-//!   the 960x540 still by **less than one code value anywhere in the frame**,
-//!   and cost 60% more per pass, because an environment *image* is a light
-//!   the shader draws a next-event sample towards on every bounce. So the
-//!   gradient stays. It is not why the two tiers differ in brightness.
+//!
+//! The environment is no longer among them. It used to be: the shader's
+//! analytic gradient is a different colour in every direction, and scaling it
+//! by the level's `env_radiance` gave the GPU about 45% of the light the CPU's
+//! flat constant gives, because `GpuRenderState` had no way to be told the
+//! gradient's own colours. It has one now — `set_gradient_env` — so this tier
+//! sends the very `Environment::constant(env_radiance)` the CPU tier builds.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_raytrace::gpu::{
-    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, GpuScene, RayTracePipeline, ResidentScene,
-    DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START,
+    GpuAreaLight, GpuCamera, GpuDenoiseParams, GpuMaterial, GpuRenderState, GpuScene,
+    HistoryPipeline, RayTracePipeline, ResidentScene, DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START,
 };
-use vcad_kernel_raytrace::pathtrace::{Film, Pbr};
+use vcad_kernel_raytrace::pathtrace::{Environment, Pbr};
 
 use crate::court::Camera;
 
@@ -86,9 +88,11 @@ pub struct Stage {
     extras: HashMap<usize, Option<GpuScene>>,
     lights: Vec<GpuAreaLight>,
     max_depth: u32,
-    /// The level's `env_radiance`: the brightness of the shader's analytic
-    /// environment. See [`Stage::new`] for why it is not the CPU's constant.
-    env_radiance: f32,
+    /// The level's environment, built exactly as `render::Scene` builds the
+    /// CPU tier's: `Environment::constant(env_radiance)`. It reaches the
+    /// shader through `GpuRenderState::set_gradient_env`, so the two tiers are
+    /// lit by the same sky.
+    env: Environment,
     /// The merged scene for the frame on screen, and which frame that was.
     /// Assembling it is a clone of the statics and a placement per instance,
     /// which costs the same whatever the resolution — so it is done once per
@@ -99,6 +103,19 @@ pub struct Stage {
     /// camera. `uploaded` is the frame whose placements are currently in it.
     resident: Option<ResidentScene>,
     uploaded: Option<u64>,
+    /// The history and denoise passes, compiled once.
+    history: HistoryPipeline,
+    /// How the device filters the running mean. The default fades the filter
+    /// out as a pixel reaches thirty-two samples, which is
+    /// `History::resolve`'s `DENOISE_UNTIL` and right for a window that keeps
+    /// converging. A still that stops at thirty-two wants the filter at full
+    /// strength instead — see [`Stage::always_denoise`].
+    denoise: GpuDenoiseParams,
+    /// What the pass tonemaps into and the blit samples: an `Rgba8Unorm`
+    /// storage texture on the viewport's device, remade only on a resize. It
+    /// carries an `Rgba8UnormSrgb` view format because the blit decodes on the
+    /// way in when the surface will re-encode on the way out.
+    target: Option<(Arc<wgpu::Texture>, wgpu::TextureView)>,
     /// Passes since the stage was built. Nothing accumulates across them —
     /// this only drives the shader's jitter and its RNG, so that two passes
     /// of the same frame are two different samples.
@@ -146,6 +163,8 @@ impl Stage {
         let ctx = GpuContext { device: device.clone(), queue: queue.clone() };
         let pipeline =
             RayTracePipeline::new(&ctx).map_err(|e| anyhow::anyhow!("the tracer's pipeline: {e}"))?;
+        let history = HistoryPipeline::new(&ctx)
+            .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
 
         let mut dropped = 0usize;
         let packed: Vec<GpuScene> = stage
@@ -196,9 +215,12 @@ impl Stage {
             lights,
             scene: None,
             max_depth,
-            env_radiance,
+            env: Environment::constant([env_radiance; 3]),
             resident: None,
             uploaded: None,
+            history,
+            denoise: GpuDenoiseParams::default(),
+            target: None,
             passes: 0,
             size: (0, 0),
         })
@@ -236,37 +258,32 @@ impl Stage {
         scene
     }
 
-    /// One fresh sample of the frame, in linear radiance, with guides.
+    /// One pass, folded in, denoised and tonemapped — on the device.
     ///
-    /// The court is already on the device. A *frame* rewrites the placements
-    /// — `update_scene`, with the clone-and-merge in [`Stage::at`] behind it
-    /// — and a *pass* rewrites the camera and the render state and nothing
-    /// else, so the second and later passes of a still picture cost a
-    /// dispatch and a readback. `frame_index` still climbs: it is what moves
-    /// the shader's Halton jitter and its RNG, so two passes of one frame are
-    /// two samples.
+    /// The court is already there. A *frame* rewrites the placements
+    /// (`update_scene`, with the clone-and-merge in [`Stage::at`] behind it)
+    /// and a *pass* rewrites the camera, the render state and the keep mask,
+    /// so a pass of a still picture is a dispatch and four small compute
+    /// passes. `frame_index` still climbs: it is what moves the shader's
+    /// Halton jitter and its RNG, so two passes of one frame are two samples.
     ///
-    /// `render_resident_linear` forces raw-sample mode, so what comes back is
-    /// one unweighted sample and not a step of the shader's running average,
-    /// and it fills `depth`, `normal` and `albedo` in `pathtrace::render`'s
-    /// conventions. That is what lets [`crate::history`] reproject this tier
-    /// through a moved camera and denoise it, as it always could the CPU's.
+    /// `keep` is one byte a pixel: 1 to go on accumulating that pixel's mean,
+    /// 0 to start it over at this pass's sample. Empty means keep everything.
+    /// [`crate::history::Mask`] builds it from the poses, before a ray is cast.
     ///
-    /// `scissor` is `[x, y, w, h]`, and it is what makes a pass cost what
-    /// moved: the dispatch is sized to the rectangle and every invocation is
-    /// offset into it. **Pixels outside come back stale** — whatever the
-    /// previous pass left in the device's buffers, not zero — which is
-    /// exactly the CPU tier's `render_into` contract, and the history is told
-    /// which rectangle was fresh.
-    pub fn sample(
+    /// What comes back is the texture the picture is now in, on the viewport's
+    /// own device. Nothing was read back to make it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate(
         &mut self,
         stage: &render::Scene,
         snap: &Snapshot,
         frame_id: u64,
         camera: &Camera,
         size: (u32, u32),
-        scissor: Option<[u32; 4]>,
-    ) -> anyhow::Result<Film> {
+        keep: &[u8],
+        samples: u32,
+    ) -> anyhow::Result<Arc<wgpu::Texture>> {
         let n = (size.0 as u64) * (size.1 as u64);
         anyhow::ensure!(n > 0, "an empty picture");
         let assembled = Instant::now();
@@ -286,29 +303,17 @@ impl Stage {
                 }
             }
             None => {
-                self.resident =
-                    Some(self.pipeline.resident_scene(&self.ctx, scene, size.0, size.1));
+                self.resident = Some(self.pipeline.resident_scene(&self.ctx, scene, size.0, size.1));
             }
         }
         self.uploaded = Some(frame_id);
+        if self.size != size {
+            self.target = None;
+        }
         self.size = size;
         let upload = uploaded.elapsed();
-        self.passes += 1;
 
-        let mut state = GpuRenderState::new(self.passes);
-        // A photoreal viewport: no edge overlay, no stylisation, and no
-        // implicit ground plane — the level authors its own floor.
-        state.enable_edges = 0;
-        state.stylize = 0;
-        state.ground_enabled = 0;
-        state.max_depth = self.max_depth;
-        state.rr_start = DEFAULT_RR_START;
-        state.firefly_clamp = DEFAULT_FIREFLY_CLAMP;
-        state.env_intensity = self.env_radiance;
-        if let Some(r) = scissor.filter(|r| r[2] > 0 && r[3] > 0) {
-            state.set_scissor(r);
-        }
-
+        let (texture, view) = self.ensure_target(size);
         let cam = GpuCamera::new(
             [camera.eye.x as f32, camera.eye.y as f32, camera.eye.z as f32],
             [camera.target.x as f32, camera.target.y as f32, camera.target.z as f32],
@@ -317,11 +322,52 @@ impl Stage {
             size.0,
             size.1,
         );
+        let denoise = GpuDenoiseParams { exposure: camera.exposure, ..self.denoise };
         let traced = Instant::now();
         let res = self.resident.as_mut().expect("just built");
-        let film =
-            pollster::block_on(self.pipeline.render_resident_linear(&self.ctx, res, &cam, state))
+        // `samples` samples, each its own call: vcad's accumulate folds one
+        // raw sample per call, so a pass of several is several calls with a
+        // climbing `frame_index` to move the jitter and the RNG. Only the
+        // first carries the keep mask — the pixels this pass restarts are
+        // restarted once, and the rest of the pass accumulates onto them.
+        for k in 0..samples.max(1) {
+            self.passes += 1;
+            let mut state = GpuRenderState::new(self.passes);
+            // A photoreal viewport: no edge overlay, no stylisation, and no
+            // implicit ground plane — the level authors its own floor.
+            state.enable_edges = 0;
+            state.stylize = 0;
+            state.ground_enabled = 0;
+            state.max_depth = self.max_depth;
+            state.rr_start = DEFAULT_RR_START;
+            state.firefly_clamp = DEFAULT_FIREFLY_CLAMP;
+            // The same sky the CPU tier integrates against, colours and all.
+            if let Environment::Gradient(g) = &self.env {
+                state.set_gradient_env(g);
+            }
+            // No scissor: vcad's accumulate pass has no scissor of its own and
+            // would fold the stale raw sample outside the rectangle in as if
+            // it were fresh. See the module docs.
+            self.pipeline
+                .accumulate_and_denoise_resident(
+                    &self.ctx,
+                    &self.history,
+                    res,
+                    &cam,
+                    state,
+                    if k == 0 { keep } else { &[] },
+                    &denoise,
+                    &view,
+                )
                 .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
+        }
+
+        // Wait for the passes to land. Not a readback — no pixel comes back —
+        // but with nothing else synchronising the two sides the worker would
+        // queue passes faster than the device retires them, and the window's
+        // tuner would be timing `queue.submit` rather than the render. A pass
+        // has to be a pass before it can be measured.
+        self.ctx.device.poll(wgpu::PollType::wait_indefinitely())?;
 
         // Where a pass goes, when anyone asks.
         if std::env::var("KOSM_GPU_TIMING").is_ok() {
@@ -334,6 +380,99 @@ impl Stage {
                 traced.elapsed().as_secs_f64() * 1e3,
             );
         }
-        Ok(film)
+        Ok(texture)
+    }
+
+    /// Filter every pass at full strength, however many samples a pixel has.
+    ///
+    /// For `--shot`, which takes a fixed number of passes and then stops: the
+    /// fade exists so a window that goes on converging is not softened once it
+    /// no longer needs the filter, and a still that ends at exactly the cutoff
+    /// would get the fade with none of the convergence.
+    pub fn always_denoise(&mut self) {
+        self.denoise.count_cutoff = u32::MAX;
+    }
+
+    /// The storage texture the passes write and the blit reads, made once per
+    /// size.
+    fn ensure_target(&mut self, size: (u32, u32)) -> (Arc<wgpu::Texture>, wgpu::TextureView) {
+        if let Some((t, v)) = &self.target {
+            return (t.clone(), v.clone());
+        }
+        let texture = Arc::new(self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("court gpu target"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            // The shader stores through the unorm view; the blit samples
+            // through the sRGB one when the surface re-encodes.
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb],
+        }));
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
+            ..Default::default()
+        });
+        self.target = Some((texture.clone(), view.clone()));
+        (texture, view)
+    }
+
+    /// The target texture as sRGB bytes.
+    ///
+    /// The one readback on this tier, and it is not in the window: `--shot`
+    /// takes its passes and then asks once, for the PNG.
+    pub fn read_target(&self) -> anyhow::Result<Vec<u8>> {
+        let (texture, _) = self.target.as_ref().ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
+        let (w, h) = self.size;
+        // A texture-to-buffer copy wants its rows aligned; the padding comes
+        // straight back out below.
+        let row = (4 * w).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let staging = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("court gpu readback"),
+            size: (row as u64) * (h as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.ctx.device.poll(wgpu::PollType::wait_indefinitely())?;
+        rx.recv()??;
+        let mapped = slice.get_mapped_range()?;
+        let mut out = Vec::with_capacity((4 * w * h) as usize);
+        for y in 0..h as usize {
+            let start = y * row as usize;
+            out.extend_from_slice(&mapped[start..start + (4 * w) as usize]);
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
     }
 }

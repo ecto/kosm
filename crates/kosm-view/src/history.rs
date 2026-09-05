@@ -273,6 +273,7 @@ impl Plan {
 
     /// One rectangle covering every rectangle in the plan — what a single
     /// scissored dispatch can do.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bbox(&self) -> Option<[u32; 4]> {
         let mut it = self.rects.iter();
         let first = *it.next()?;
@@ -519,7 +520,26 @@ impl History {
     /// rectangles rather than the frame. It reads only what the history
     /// already holds (`self.poses`), which is why it is `&self`.
     fn mask_rects(&self, view: &View, poses: &[Pose], lights: &[Point3]) -> Vec<Rect> {
-        let (w, h) = self.size;
+        mask_rects(self.size, view, poses, &self.poses, lights)
+    }
+}
+
+/// The rectangles the world moved under, for a size, a view, and the poses of
+/// two consecutive frames.
+///
+/// Free of any history because both tiers need it and only one of them keeps
+/// a history now: the CPU tier's [`History`] calls it to plan and to paint its
+/// own mask, and the GPU tier's [`Mask`] calls it to build the keep mask the
+/// device-side accumulator takes. One geometry, one answer, both tiers.
+fn mask_rects(
+    size: (u32, u32),
+    view: &View,
+    poses: &[Pose],
+    prev: &[Pose],
+    lights: &[Point3],
+) -> Vec<Rect> {
+    {
+        let (w, h) = size;
         let screen = (w as usize) * (h as usize);
         let _ = h;
         let mut rects: Vec<Rect> = Vec::new();
@@ -554,19 +574,22 @@ impl History {
         // seconds — so a changed count is not a reason to repaint the whole
         // screen. The shared prefix is compared pairwise; anything past the
         // end of either list appeared or left and is masked on its own.
-        let shared = poses.len().min(self.poses.len());
+        let shared = poses.len().min(prev.len());
         for k in 0..shared {
-            if !poses[k].differs(&self.poses[k]) {
+            if !poses[k].differs(&prev[k]) {
                 continue;
             }
             paint(&poses[k], &mut push);
-            paint(&self.poses[k], &mut push);
+            paint(&prev[k], &mut push);
         }
-        for p in poses.iter().skip(shared).chain(self.poses.iter().skip(shared)) {
+        for p in poses.iter().skip(shared).chain(prev.iter().skip(shared)) {
             paint(p, &mut push);
         }
         rects
     }
+}
+
+impl History {
 
     /// What the next pass should trace, given where everything now is.
     ///
@@ -734,6 +757,103 @@ fn shadow_disc(light: Point3, centre: Point3, radius: f64) -> Option<(Point3, f6
     let to_ball = d.norm().max(1e-6);
     let to_floor = (floor - light).norm();
     Some((floor, radius * to_floor / to_ball))
+}
+
+// ---- the mask, without a history behind it ---------------------------------
+
+/// What the GPU tier keeps of its device-side history.
+///
+/// The device holds the running mean and the count now — vcad's
+/// [`accumulate_and_denoise_resident`] folds each raw sample in on the GPU and
+/// never sends one back — so the only thing left on this side is the question
+/// the device cannot answer: *which pixels is last frame's mean still true
+/// for?* That is the same geometry [`History`] masks with, so it is the same
+/// [`mask_rects`], and this struct is only the two frames of state that
+/// function needs: the view and the poses the last pass was taken under.
+///
+/// The answer is a **keep mask**: one byte a pixel, 1 to go on accumulating
+/// and 0 to start that pixel over at this pass's sample.
+pub struct Mask {
+    size: (u32, u32),
+    view: Option<View>,
+    poses: Vec<Pose>,
+    /// Samples behind each pixel, mirroring what the device is doing to its
+    /// own counts — the only reason to keep it is to be able to say how far
+    /// the picture has converged without reading the device back.
+    counts: Vec<u32>,
+    fraction: f32,
+}
+
+impl Mask {
+    pub fn new(size: (u32, u32)) -> Self {
+        Self {
+            size,
+            view: None,
+            poses: Vec::new(),
+            counts: vec![0; (size.0 as usize) * (size.1 as usize)],
+            fraction: 1.0,
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The share of the frame the last mask restarted.
+    pub fn fraction(&self) -> f32 {
+        self.fraction
+    }
+
+    /// Samples behind the average pixel.
+    pub fn mean_samples(&self) -> f32 {
+        if self.counts.is_empty() {
+            return 0.0;
+        }
+        self.counts.iter().map(|&c| c as f64).sum::<f64>() as f32 / self.counts.len() as f32
+    }
+
+    /// The keep mask for a pass of `samples` samples, and a note that it was
+    /// taken.
+    ///
+    /// A camera that moved restarts *everything*: reprojection is still the
+    /// CPU tier's alone, and nothing on the device knows where last frame's
+    /// pixel went. A camera that did not moved restarts only the rectangles
+    /// the world moved under, which is the whole point — the walls keep
+    /// accumulating while the balls bounce through them.
+    pub fn keep(&mut self, view: &View, poses: &[Pose], lights: &[Point3], samples: u32) -> Vec<u8> {
+        let n = (self.size.0 as usize) * (self.size.1 as usize);
+        let restart_all = self.view != Some(*view) || self.counts.iter().all(|&c| c == 0);
+        let mut keep = vec![u8::from(!restart_all); n];
+        if !restart_all {
+            let rects = merged(mask_rects(self.size, view, poses, &self.poses, lights));
+            paint_zero(&mut keep, self.size, rects.iter().map(|r| r.to_xywh()));
+        }
+        let restarted = keep.iter().filter(|&&k| k == 0).count();
+        self.fraction = restarted as f32 / n.max(1) as f32;
+        let samples = samples.max(1);
+        for (c, &k) in self.counts.iter_mut().zip(&keep) {
+            *c = if k == 0 { samples } else { *c + samples };
+        }
+        self.view = Some(*view);
+        self.poses = poses.to_vec();
+        keep
+    }
+}
+
+/// Zero every pixel inside `rects`, clipped to `size`. The keep mask's one
+/// piece of raster work, shared so a caller cannot get the clipping subtly
+/// different from [`History::merge`]'s.
+fn paint_zero(keep: &mut [u8], size: (u32, u32), rects: impl Iterator<Item = [u32; 4]>) {
+    for r in rects {
+        let x0 = r[0].min(size.0);
+        let y0 = r[1].min(size.1);
+        let x1 = r[0].saturating_add(r[2]).min(size.0);
+        let y1 = r[1].saturating_add(r[3]).min(size.1);
+        for py in y0..y1 {
+            let row = (py * size.0) as usize;
+            keep[row + x0 as usize..row + x1 as usize].fill(0);
+        }
+    }
 }
 
 // ---- tests ------------------------------------------------------------------

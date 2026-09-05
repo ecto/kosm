@@ -377,93 +377,86 @@ where the surface and the tracer share a device and a queue, from two to four
 *seconds* a pass to twenty-five milliseconds. `--cpu` picks the CPU
 integrator, which is the reference and the fallback.
 
-Neither accumulates. A pass is one raw sample and `history.rs` is the
-accumulator for both, because one sample a pixel is a blizzard and what makes
-it watchable is refusing to throw the last frame away. Every pixel keeps a
-running mean and its count, and when something moves the renderer knows which
-something: the bounding sphere of each ball and extra whose pose changed, at
-its old pose and its new, plus the disc its shadow throws from each panel.
-Being geometric, that mask reads the same on both tiers, so the walls
-accumulate for the whole run while the balls bounce through them.
+Neither tracer accumulates, and each tier now has its own accumulator. A pass
+is one raw sample; what makes one sample a pixel watchable is refusing to throw
+the last frame away. Every pixel keeps a running mean and a count, and when
+something moves the renderer knows which something — the bounding sphere of
+each ball and extra whose pose changed, at its old pose and its new, plus the
+disc its shadow throws from each panel. That mask is geometric, so it reads the
+same on both tiers and the walls accumulate for the whole run while the balls
+bounce through them. It is computed before a ray is cast, from the poses alone.
 
-The mask is now the *brief* for a pass rather than its verdict. It is computed
-from the poses alone, so it is known before a ray is cast: `History::plan` hands
-the renderer rectangles — overlapping ones merged until none of them meet, or
-`render_into` traces a shared pixel once per rectangle it is in and a pass
-measured seventeen times the work of the frame — the CPU tier re-traces exactly
-those with `pathtrace::render_into` into a film it keeps between passes, and the
-GPU tier sets `GpuRenderState::set_scissor` to their bounding box, which sizes
-the compute dispatch and lets the readback be trimmed to the rows it spans.
-`History::merge` is told which rectangles were traced and leaves every other
-pixel's mean *and* its count alone — a count that climbed without a sample
-behind it would weigh a stale mean against the next real one.
+On the CPU tier the accumulator is `history.rs`: `History::plan` hands the
+renderer disjoint rectangles, `pathtrace::render_into` re-traces exactly those
+into a film kept between passes, `History::merge` leaves every other pixel's
+mean *and* its count alone, and a reprojection carries the picture through a
+moved camera. A masked pass is taken only when it saves more than half the
+frame — the pixels outside it get nothing, and a picture that is always masked
+never converges.
 
-A masked pass is taken only when it saves more than half the frame, because the
-pixels outside it get nothing at all and a picture that is always masked never
-converges. So the balls bouncing buy cheap passes, and the quiet stretches
-between them buy full ones. On the GPU that gate bites: the scissor is one
-bounding box, and four balls scattered across the picture mask a fifth of it
-while boxing four fifths, so this level's frame mostly renders full.
+**The GPU tier does none of that on this side, and reads nothing back.** vcad's
+`accumulate_and_denoise_resident` traces the sample, folds it into a mean and
+count that live in device buffers, runs the à-trous filter against the resident
+guide planes and tonemaps into a storage texture — on the viewport's own
+device, which the blit samples directly (`viewport::Image` is bytes *or* a
+texture now; the CPU tier still hands over bytes). What is left on this side is
+the **keep mask**: one byte a pixel, 1 to go on accumulating and 0 to start
+over, built by `history::Mask` from the same `mask_rects` the CPU tier plans
+with, so the two tiers mask on one piece of geometry. Reprojection stays CPU-side
+only, so a camera move uploads an all-restart mask and the GPU picture loses
+its whole history where the CPU one keeps most of it.
 
-The tuner reads the two kinds of pass as two points on a line. Its model is
-`ms = fixed + per-pixel × work`, fitted from exponential moving averages of the
-cheap end and the dear end of the work actually traced — sticky in work, so the
-two ends do not collapse onto whatever size is on screen. One term could not
-describe a pass whose floor (the court crossing the bus and the frame coming
-back, a rayon fork, the net's BVH) does not scale with the picture at all: it
-charged the size for the floor and shrank the window to a postage stamp chasing
-a budget no size could meet. Now the size is only charged for what the size
-buys, an overrun is only the size's fault when a coarser picture has actually
-been measured cheaper, and the target is still 30 ms. Resolution, tracer, pass
-time, how much of the frame it traced, mask share and mean samples a pixel go to
-stderr. Under load, that moved the GPU tier from 170×96 to 256×144 at the same
-pass time, and left the CPU tier at its size with masked passes about a third
-off a full one.
+The scissor is gone from that tier, and deliberately. `set_scissor` sizes the
+*trace*, but vcad's accumulate pass walks every pixel of the frame regardless,
+so outside the rectangle it would fold a stale raw sample in as a fresh one.
+Until that shader takes the same rectangle, a GPU pass is a full frame — which
+also means the GPU tier no longer produces the cheap-and-dear pair the cost
+model was fitting a line through. `Cost::terms` now refuses to call two buckets
+two points until they are `SPREAD` apart: drifted together, they were fitting
+470 ms a megapixel-sample against a real fifty and the window sat at 183×102
+refusing to grow. And a pass now really is `spp` samples: vcad folds one sample
+a call, so a pass of four is four calls, and the tuner's sample knob means
+something on this tier for the first time.
 
-A moved camera no longer parts them. Both passes bring guide buffers now —
-vcad's `render_resident_linear` hands back one raw *linear* sample plus depth,
-normal and albedo in exactly `pathtrace::render`'s conventions, where the
-shader's other two exits hand back tonemapped bytes that cannot be averaged or
-reprojected at all. So on either tier a pixel unprojects its own hit along
-`Film::depth`, carries it back through the previous camera and keeps what
-agrees to two per cent of distance and 0.9 of normal, and the à-trous filter
-runs on the resolved buffer, blended out as counts pass thirty-two. An orbit
-used to cost the GPU picture its whole history; it now costs it the pixels
-that failed to reproject.
+The wait is the other honest thing. With nothing read back, nothing
+synchronises the two sides, so the worker queued passes faster than the device
+retired them and the tuner timed `queue.submit`. A pass ends on
+`device.poll(wait)` — a fence, not a readback.
 
-That has a price, and it is now the pass. The filter is `pathtrace::denoise`
-on the CPU over the whole frame, and at 512×288 a GPU pass measures 25 ms
-tracing, 5 ms merging and **420 ms resolving**. The tuner is told about it:
-`work` counts megapixel-samples *touched*, the traced patch plus the frame the
-history then walks, because a masked pass that traced a sixth of the screen
-still resolves all of it. Charging only the patch put that whole cost in
-`fixed`, where no change of size could reach it, and the window sat at 512×288
-and half a second a pass against a 30 ms target. It now settles around
-320×180, and the filter is skipped outright once every pixel has its
-thirty-two samples. Getting the rest of the way to 30 ms means a denoiser that
-is not a full-frame CPU pass — on the device, or over the mask alone.
+What that bought, at a 1280×720 window on a retina display (so 2560×1440
+physical): the GPU tier used to settle at 320×180 with a pass of about 450 ms,
+of which 420 ms was the CPU à-trous filter. It now settles around 365×205 at
+25–30 ms a pass, and takes four samples in about 85 ms — some forty times the
+samples a second, at the same size. It does **not** reach the full window: a
+sample measured on this machine costs about 9 ms at 320×180 and 31 ms at
+960×540, so 30 ms buys roughly half a megapixel and no more. The CPU tier is
+unchanged, masked passes and all.
 
 It is incomplete elsewhere too. The painted markings have no BRep to pack and
 are CPU-only — the GPU court has no lines on its floor. The ball's seams *are*
 on the GPU again: the shader used to trace a torus wide enough to engulf the
 ball it was drawn on, and vcad's torus intersection is fixed.
 
-The two pictures still do not agree on brightness: the gym's walls read 46 on
-the GPU against the CPU's 79. It is not the environment. The shader's analytic
-studio gradient is a different colour in every direction where the CPU's is
-the level's `env_radiance` flat, so the constant was tried as a 1×1 lat-long
-map — an exact match — and it moved no pixel of the 960×540 still by a single
-code value while costing 60% more per pass, because an environment *image* is
-a light the shader samples towards on every bounce. At `env_radiance = 0.05`
-under ten panels at 18, the environment is not what either picture is made of.
-Nor is it the path budget: the GPU traces *deeper* (6 bounces to the CPU's 5),
-starts Russian roulette later and clamps fireflies higher. The difference is
-in the integrator, and it is vcad's to answer.
+The environment is no longer a difference between them. The GPU tier used to
+scale the shader's analytic studio gradient by the level's `env_radiance`,
+which is a different colour in every direction where the CPU's is that constant
+flat; `GpuRenderState::set_gradient_env` now sends the very
+`Environment::constant(env_radiance)` the CPU tier builds. It moved no pixel of
+the 960×540 still, and neither does raising it a hundredfold: the gym is
+closed, no ray reaches the environment on either tier, and at
+`env_radiance = 0.05` under ten panels at 18 the environment is not what either
+picture is made of.
+
+The two pictures still do not agree on brightness: over one patch of the +y
+wall the GPU reads 71 to the CPU's 105. It is not the environment, by the test
+above. Nor is it the path budget: the GPU traces *deeper* (6 bounces to the
+CPU's 5), starts Russian roulette later and clamps fireflies higher. The
+difference is in the integrator, and it is vcad's to answer.
 
 There is one artifact left, and it is not a packing bug. A faint dark disc
-sits on the +y wall at about x = 265, y = 270 of the 960×540 still, some six
-per cent below its surroundings and about thirty pixels across, and the CPU
-picture has nothing there. Bisecting the packed roots puts it in the *walls*
+sits on the +y wall at about x = 265, y = 270 of the 960×540 still, about
+thirty pixels across and now some thirty per cent below its surroundings — the
+device history did not remove it — and the CPU picture has nothing there. Bisecting the packed roots puts it in the *walls*
 root alone: it survives with no balls, no net, no bleachers and one bounce, so
 it is neither a root packed at the origin nor the seams packed twice. Its
 world position is (−848, 8500, 1891) — precisely where the view ray meets that
@@ -471,22 +464,11 @@ wall head on, the camera's own retro-reflection point. A view-dependent term
 in the shader's BRDF that the CPU integrator does not reproduce, then; it is
 in vcad, and this worktree does not touch vcad.
 
-The pass still re-uploads the court and reads the image back rather than
-sharing a texture with the blit, and this is deliberate rather than pending.
-vcad grew a `ResidentScene` — upload once, rewrite placements and camera in
-place — and a `render_resident_into` that writes a storage texture with no
-readback at all, which is exactly the shape this wants. Neither is used, because
-both hand back the shader's *output* texture: ACES-tonemapped, gamma-encoded,
-eight bits, while the resident accumulator that holds linear radiance is
-private. This tier's contract is one raw linear sample per pass, and the mean of
-tonemapped samples is not the tonemap of their mean. Reaching residency and
-zero-copy needs one of two things in vcad: a public view of the resident
-accumulator, or a compute shader that folds the history — mean and count per
-pixel, against an uploaded mask — on the device, so nothing linear ever has to
-come down. Until then the readback is the fixed term the tuner now models
-explicitly. The deforming net still pays for a BVH build inside every CPU pass.
-Evaluating the level takes a few seconds and the window is black until it is
-done; it says so on stderr while it works.
+The one readback left in the GPU path is `--shot`'s: N passes through the
+device history and one copy of the target texture out for the PNG. Nothing in
+the window reads back at all. The deforming net still pays for a BVH build
+inside every CPU pass. Evaluating the level takes a few seconds and the window
+is black until it is done; it says so on stderr while it works.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
 window, which is how the picture is checked; it uses the GPU tracer unless

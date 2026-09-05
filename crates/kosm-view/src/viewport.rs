@@ -16,10 +16,32 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-/// An RGBA8 picture, top row first, `4 * size.0 * size.1` bytes.
-pub struct Image {
-    pub size: (u32, u32),
-    pub rgba: Vec<u8>,
+/// A picture, and where it already is.
+///
+/// The CPU tier makes its picture in memory and hands over bytes; the GPU tier
+/// makes it in a storage texture on *this* device — vcad's history and
+/// denoise passes tonemap straight into it — and hands over the texture, which
+/// the blit then samples. Nothing crosses the bus in the second case, which is
+/// the whole point of it.
+pub enum Image {
+    /// An RGBA8 picture, top row first, `4 * size.0 * size.1` bytes, already
+    /// sRGB-encoded.
+    Bytes { size: (u32, u32), rgba: Vec<u8> },
+    /// An `Rgba8Unorm` texture holding the same sRGB-encoded bytes, on the
+    /// viewport's own device. It must have been created with
+    /// `TEXTURE_BINDING` and with `Rgba8UnormSrgb` among its `view_formats`,
+    /// because on an sRGB surface the blit samples it through an sRGB view —
+    /// exactly as the bytes path uploads into an `Rgba8UnormSrgb` texture.
+    Texture(Arc<wgpu::Texture>),
+}
+
+impl Image {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Image::Bytes { size, .. } => *size,
+            Image::Texture(t) => (t.width(), t.height()),
+        }
+    }
 }
 
 /// The keys the viewport passes on. Escape is not among them: it quits.
@@ -84,8 +106,13 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// The scene's image on the GPU, remade whenever its size changes.
-    image: Option<(wgpu::Texture, wgpu::BindGroup, (u32, u32))>,
+    /// The scene's image on the GPU, remade whenever its size changes: the
+    /// texture the bytes path owns (`None` when the scene brought its own),
+    /// the bind group the blit draws with, and what it is of.
+    image: Option<(Option<wgpu::Texture>, wgpu::BindGroup, (u32, u32))>,
+    /// The scene's own texture, held so the bind group stays valid and so a
+    /// second frame from the same texture is recognised rather than rebound.
+    borrowed: Option<Arc<wgpu::Texture>>,
     /// Whether the surface encodes sRGB, which decides the texture's format:
     /// the scene's bytes are already sRGB, so they must be decoded on the way
     /// in exactly when they will be re-encoded on the way out.
@@ -182,7 +209,7 @@ impl Gpu {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Ok(Self { surface, device, queue, config, pipeline, layout, sampler, image: None, srgb })
+        Ok(Self { surface, device, queue, config, pipeline, layout, sampler, image: None, borrowed: None, srgb })
     }
 
     fn resize(&mut self, px: (u32, u32)) {
@@ -194,39 +221,79 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn upload(&mut self, image: &Image) {
-        let (w, h) = image.size;
-        if w == 0 || h == 0 || image.rgba.len() < (4 * w * h) as usize {
+    /// Bind `view` as what the blit samples.
+    fn bind(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
+    }
+
+    /// The format the blit samples through: the scene's bytes are already
+    /// sRGB, so they are decoded on the way in exactly when the surface will
+    /// re-encode them on the way out.
+    fn sample_format(&self) -> wgpu::TextureFormat {
+        if self.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm }
+    }
+
+    fn upload(&mut self, image: Image) {
+        let (w, h) = image.size();
+        if w == 0 || h == 0 {
             return;
         }
-        if self.image.as_ref().map(|(_, _, s)| *s) != Some(image.size) {
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("scene"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: if self.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            });
-            self.image = Some((texture, bind, image.size));
+        match image {
+            // Already on the device: bind it and draw. No upload, no
+            // readback, nothing across the bus at all.
+            Image::Texture(texture) => {
+                let same = self.borrowed.as_ref().is_some_and(|t| Arc::ptr_eq(t, &texture))
+                    && self.image.as_ref().map(|(_, _, s)| *s) == Some((w, h));
+                if !same {
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(self.sample_format()),
+                        // Sampling only: a view inherits the texture's usage
+                        // otherwise, and the sRGB format the blit wants is not
+                        // a storage format.
+                        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+                        ..Default::default()
+                    });
+                    self.image = Some((None, self.bind(&view), (w, h)));
+                    self.borrowed = Some(texture);
+                }
+            }
+            Image::Bytes { size, rgba } => {
+                if rgba.len() < (4 * w * h) as usize {
+                    return;
+                }
+                let fresh =
+                    self.image.as_ref().map(|(t, _, s)| (t.is_some(), *s)) != Some((true, size));
+                if fresh {
+                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("scene"),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.sample_format(),
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let bind = self.bind(&texture.create_view(&Default::default()));
+                    self.image = Some((Some(texture), bind, size));
+                    self.borrowed = None;
+                }
+                let Some((Some(texture), _, _)) = &self.image else { return };
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    &rgba,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+            }
         }
-        let Some((texture, _, _)) = &self.image else { return };
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &image.rgba,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
     }
 
     fn draw(&mut self) {
@@ -357,7 +424,7 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &mut self.gpu {
                     if let Some(image) = self.scene.image() {
-                        gpu.upload(&image);
+                        gpu.upload(image);
                     }
                     gpu.draw();
                 }

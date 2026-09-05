@@ -59,7 +59,7 @@ use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
 use crate::court_gpu;
-use crate::history::{History, Pose, Plan, View};
+use crate::history::{History, Mask, Plan, Pose, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -164,11 +164,16 @@ pub struct Job {
     pub spp: u32,
 }
 
-/// What comes back: RGBA at the requested size, and what the pass cost at
-/// what sample count. The window sizes itself by those numbers.
+/// What comes back: the picture at the requested size, and what the pass cost
+/// at what sample count. The window sizes itself by those numbers.
+///
+/// The picture is bytes from the CPU tier and a *texture* from the GPU one —
+/// the device history tonemaps into a storage texture on the viewport's own
+/// device and nothing is read back — which is why this is a
+/// [`viewport::Image`] and not a `Vec<u8>`.
 pub struct Shot {
     pub size: (u32, u32),
-    pub rgba: Vec<u8>,
+    pub image: viewport::Image,
     pub spp: u32,
     pub ms: u128,
     /// The share of the screen this pass had to start over on.
@@ -290,11 +295,14 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
 
     let lights = stage.light_centres();
 
-    // The history is the picture. A job is only ever "this snapshot, this
-    // camera, this size, one sample" — neither tracer is allowed to decide
-    // that the last frame was worthless. The history decides that, per pixel.
+    // The history is the picture — on whichever side of the bus it lives.
+    // The CPU tier keeps it here: a running mean, a count, a reprojection.
+    // The GPU tier keeps it on the device and keeps only [`Mask`] here, which
+    // is the one question the device cannot answer — which pixels last
+    // frame's mean is still true for.
     let mut current: Option<Job> = None;
     let mut history = History::new((0, 0));
+    let mut mask = Mask::new((0, 0));
     // The CPU tier's frame, kept between passes: `render_into` patches it, so
     // the pixels a masked pass did not touch are last pass's and not black.
     let mut film = pathtrace::Film::new(0, 0);
@@ -326,6 +334,9 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if history.size() != job.size {
             history = History::new(job.size);
         }
+        if mask.size() != job.size {
+            mask = Mask::new(job.size);
+        }
         if (film.width, film.height) != job.size {
             film = pathtrace::Film::new(job.size.0, job.size.1);
         }
@@ -333,61 +344,69 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         let cam = job.camera.to_pathtrace();
         let view = View::of(&cam, job.size.0, job.size.1);
         let poses = poses(&mut stage, &job.frame);
-        let seed = 0x5eed_0000 ^ (job.generation << 20) ^ (lap.elapsed().as_nanos() as u64) ^ passes_seed(&history);
-
-        // The mask comes *first* now. It is computed from the poses alone —
-        // where every ball and the net were, where they are — so it can be
-        // known before a ray is cast, and both tracers can be handed the
-        // rectangles instead of the frame. An empty plan means nothing moved,
-        // and that is exactly when the whole frame is worth tracing: a still
-        // world is how the picture gains samples.
-        let plan: Plan = history.plan(&view, &poses, &lights);
         let frame_px = (job.size.0 as u64) * (job.size.1 as u64);
-        // What each tier would actually trace for this plan. The GPU gets one
-        // scissored dispatch over the union — a dispatch per rectangle would
-        // be a readback per rectangle, and the readback is most of what a
-        // pass costs now that the court is resident — while the CPU traces
-        // the rectangles themselves.
-        let patch_px: u64 = match &tracer {
-            Tracer::Gpu(_) => plan.bbox().map_or(0, |r| (r[2] as u64) * (r[3] as u64)),
-            Tracer::Cpu => plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum(),
-        };
-        // A masked pass is only worth having when it is genuinely most of the
-        // frame cheaper. It buys its rays at a price: the pixels outside get
-        // *nothing*, so a picture that is always masked never converges. Half
-        // the frame is where the two stop trading evenly — and it is a real
-        // gate on the GPU, whose scissor is one bounding box, so four balls
-        // scattered across the picture can mask a fifth of it and still make a
-        // dispatch that covers four fifths.
-        let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
-        let traced_px = if full { frame_px } else { patch_px };
 
-        // One raw sample, whoever traced it, guides and all: the GPU's
-        // `render_resident_linear` fills depth, normal and albedo in the same
-        // conventions `pathtrace::render` does.
-        let traced = match &mut tracer {
+        // A pass, on whichever tier. Both answer the same question — what
+        // does the picture look like now, what did it cost, how much of it
+        // started over — and the tuner above does not know which one it is
+        // talking to.
+        let (image, mask_frac, mean_spp, traced_px, kind) = match &mut tracer {
+            // On the device: one dispatch, four small compute passes, and a
+            // texture. No film comes back, so there is nothing here to merge
+            // or resolve; the keep mask is the whole of this side's work.
+            //
+            // The scissor is not used. It sizes the *trace*, but vcad's
+            // accumulate pass walks every pixel of the frame regardless and
+            // would fold the stale raw sample outside the rectangle in as a
+            // fresh one, so a pass here is always the whole frame.
             Tracer::Gpu(gpu) => {
-                let scissor = if full { None } else { plan.bbox() };
-                match gpu.sample(&stage, &job.frame, job.frame_id, &job.camera, job.size, scissor) {
-                    Ok(sampled) => {
-                        film = sampled;
-                        // The scissor is one rectangle, so that rectangle —
-                        // not the plan's several — is what came back fresh.
-                        scissor.map(|r| vec![r])
-                    }
+                let keep = mask.keep(&view, &poses, &lights, job.spp);
+                match gpu.accumulate(
+                    &stage,
+                    &job.frame,
+                    job.frame_id,
+                    &job.camera,
+                    job.size,
+                    &keep,
+                    job.spp,
+                ) {
+                    Ok(texture) => (
+                        viewport::Image::Texture(texture),
+                        mask.fraction(),
+                        mask.mean_samples(),
+                        frame_px,
+                        "full".to_string(),
+                    ),
                     Err(error) => {
                         eprintln!("court  gpu: {error}; falling back to the CPU tracer");
                         tracer = Tracer::Cpu;
                         history = History::new(job.size);
+                        mask = Mask::new(job.size);
                         film = pathtrace::Film::new(job.size.0, job.size.1);
                         continue;
                     }
                 }
             }
+            // On this side: the mask comes first, the tracer re-traces exactly
+            // the rectangles it names, and the history folds the film in and
+            // denoises it.
             Tracer::Cpu => {
+                let seed = 0x5eed_0000
+                    ^ (job.generation << 20)
+                    ^ (lap.elapsed().as_nanos() as u64)
+                    ^ passes_seed(&history);
+                let plan: Plan = history.plan(&view, &poses, &lights);
+                let patch_px: u64 =
+                    plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum();
+                // A masked pass is only worth having when it is genuinely
+                // most of the frame cheaper. The pixels outside it get
+                // *nothing*, so a picture that is always masked never
+                // converges; half the frame is where the two stop trading
+                // evenly.
+                let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
                 let scene = stage.at_snapshot(&job.frame);
                 let opts = options(job.spp, seed, false);
-                if full {
+                let traced = if full {
                     film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts);
                     None
                 } else {
@@ -397,37 +416,42 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     // since it is about to be told not to look at them.
                     pathtrace::render_into(&scene, &cam, &mut film, &opts, &plan.rects);
                     Some(plan.rects.clone())
+                };
+                let t_merge = Instant::now();
+                history.merge(&film, &view, &poses, &lights, traced.as_deref());
+                let merge_ms = t_merge.elapsed().as_secs_f64() * 1e3;
+                let t_res = Instant::now();
+                let opts = options(job.spp, seed, true);
+                let rgba = history.resolve(job.camera.exposure, &opts);
+                if std::env::var("KOSM_GPU_TIMING").is_ok() {
+                    eprintln!(
+                        "court  history: {}\u{d7}{} \u{2014} {merge_ms:.1} ms merging, {:.1} ms resolving",
+                        job.size.0,
+                        job.size.1,
+                        t_res.elapsed().as_secs_f64() * 1e3,
+                    );
                 }
+                let traced_px = if full { frame_px } else { patch_px };
+                (
+                    viewport::Image::Bytes { size: job.size, rgba },
+                    history.mask_fraction(),
+                    history.mean_samples(),
+                    traced_px,
+                    if full {
+                        "full".to_string()
+                    } else {
+                        format!("{:.0}% ", 100.0 * traced_px as f64 / frame_px as f64)
+                    },
+                )
             }
         };
-        let t_merge = Instant::now();
-        history.merge(&film, &view, &poses, &lights, traced.as_deref());
-        let merge_ms = t_merge.elapsed().as_secs_f64() * 1e3;
-        let t_res = Instant::now();
-        // Denoise the resolved buffer, blended out as the counts climb. Both
-        // tiers bring the guides it stops on now, so this is the same filter
-        // on either.
-        let opts = options(job.spp, seed, true);
-        let rgba = history.resolve(job.camera.exposure, &opts);
-        // The history's own half of a pass, when anyone asks. It is not
-        // small any more: with guides on both tiers the a-trous filter runs
-        // on every pass, and on the GPU tier it is now the dearest thing in
-        // the loop by an order of magnitude.
-        if std::env::var("KOSM_GPU_TIMING").is_ok() {
-            eprintln!(
-                "court  history: {}\u{d7}{} \u{2014} {merge_ms:.1} ms merging, {:.1} ms resolving",
-                job.size.0,
-                job.size.1,
-                t_res.elapsed().as_secs_f64() * 1e3,
-            );
-        }
         let shot = Shot {
             size: job.size,
-            rgba,
+            image,
             spp: job.spp,
             ms: lap.elapsed().as_millis(),
-            mask: history.mask_fraction(),
-            mean_spp: history.mean_samples(),
+            mask: mask_frac,
+            mean_spp,
             traced_px,
         };
         if said_at.elapsed().as_secs() >= 2 {
@@ -439,11 +463,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                 job.size.1,
                 job.spp,
                 shot.ms,
-                if full {
-                    "full".to_string()
-                } else {
-                    format!("{:.0}% ", 100.0 * traced_px as f64 / (job.size.0 as f64 * job.size.1 as f64))
-                },
+                kind,
                 100.0 * shot.mask,
                 shot.mean_spp
             );
@@ -500,8 +520,9 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
 
 /// The same still, traced on the GPU. There is no window and so no surface
 /// device, so this asks `vcad-kernel-gpu` for a headless one — the same
-/// adapter, just nobody's surface — and averages `passes` raw samples, which
-/// is what the window does too, only without a mask to complicate it.
+/// adapter, just nobody's surface — and takes `passes` samples through the
+/// same device-side history the window uses. There is one readback in the
+/// whole of it, at the end, for the PNG.
 pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
     let stage = render::Scene::new(&scene)?;
@@ -524,46 +545,21 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
     let frame = Frame::of(&court);
 
     let t0 = Instant::now();
-    let n = (size.0 as usize) * (size.1 as usize);
-    let mut sum = vec![0.0f32; n * 3];
-    let mut alpha = vec![0.0f32; n];
-    let mut var = vec![0.0f32; n];
     let passes = passes.max(1);
-    // The last pass's film carries the guides for the whole still — every
-    // pass here is the same frame from the same camera, so they are the same
-    // guides — and the mean goes into it before it is denoised. That is the
-    // window's `History::resolve` in miniature, minus the reprojection there
-    // is nothing here to reproject through.
-    let mut film = pathtrace::Film::new(size.0, size.1);
+    gpu.always_denoise();
+    // The window's loop, without a window: `passes` samples folded into the
+    // device-side mean and denoised there, with an all-keep mask because
+    // nothing moves between them. The picture never leaves the device until
+    // the last line, which reads the target texture once for the PNG.
     for _ in 0..passes {
-        film = gpu.sample(&stage, &frame, 0, &camera, size, None)?;
-        for (acc, v) in sum.iter_mut().zip(&film.rgb) {
-            *acc += v;
-        }
-        for (acc, v) in alpha.iter_mut().zip(&film.alpha) {
-            *acc += v;
-        }
-        for (acc, v) in var.iter_mut().zip(&film.variance) {
-            *acc += v;
-        }
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], 1)?;
     }
-    let k = 1.0 / passes as f32;
-    for (dst, v) in film.rgb.iter_mut().zip(&sum) {
-        *dst = v * k;
-    }
-    for (dst, v) in film.alpha.iter_mut().zip(&alpha) {
-        *dst = v * k;
-    }
-    for (dst, v) in film.variance.iter_mut().zip(&var) {
-        *dst = v * k;
-    }
-    pathtrace::denoise(&mut film, &options(passes, 0x5eed_1234, true));
-    let rgba = film.to_srgb8(camera.exposure, false);
+    let rgba = gpu.read_target()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     image::RgbaImage::from_raw(size.0, size.1, rgba)
-        .ok_or_else(|| anyhow::anyhow!("the film is the wrong size"))?
+        .ok_or_else(|| anyhow::anyhow!("the target texture is the wrong size"))?
         .save(path)?;
     println!(
         "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} over {passes} gpu passes in {:.2} s → {}",
@@ -706,7 +702,14 @@ impl Cost {
     /// `(fixed ms, ms per megapixel per sample)`.
     fn terms(&self) -> (f64, f64) {
         match (self.lo, self.hi) {
-            (Some(lo), Some(hi)) if hi.0 > lo.0 * 1.001 => {
+            // Two points only count as two when they are genuinely apart.
+            // The buckets drift towards whatever work is being fed them, and
+            // two that have drifted together give a slope of nothing over
+            // nothing: at 183x102 that fitted 470 ms a megapixel-sample
+            // against a real 50, and the window refused to grow past a
+            // postage stamp. Below [`SPREAD`] the honest answer is the
+            // one-term fit.
+            (Some(lo), Some(hi)) if hi.0 > lo.0 * SPREAD => {
                 let per = ((hi.1 - lo.1) / (hi.0 - lo.0)).max(0.0);
                 ((lo.1 - per * lo.0).max(0.0), per)
             }
@@ -1026,7 +1029,7 @@ impl viewport::Scene for App {
         let mut newest = None;
         while let Ok(shot) = self.shots.try_recv() {
             let fair = self.tune(&shot);
-            newest = Some(viewport::Image { size: shot.size, rgba: shot.rgba });
+            newest = Some(shot.image);
             if !fair {
                 continue;
             }
