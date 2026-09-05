@@ -113,9 +113,10 @@
 [defparam net_length_mm 400.0]  ; rim to the bottom ring
 [defparam net_bottom_r_mm 150.0]; the bottom ring's radius: the net narrows
 [defparam net_cord_mm 5.0]      ; cord diameter
-[defparam net_stiffness 900.0]  ; N/m per cord
+[defparam net_stiffness 2000.0] ; N/m per cord: nylon, not elastic
 [defparam net_damping 0.9]      ; N·s/m along the cord
 [defparam net_mass_g 110.0]     ; the whole net
+[defparam net_drag 2.0]         ; air on the cords, 1/s: what lets a swing die
 
 ; ---- the gym ----------------------------------------------------------------
 ; The room is geometry, not a background: four walls, a ceiling, and the floor

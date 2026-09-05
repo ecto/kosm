@@ -59,6 +59,8 @@ pub struct Net {
     dt: f64,
     /// Sub-steps per court step: the cords are stiffer than phyz's dt.
     substeps: usize,
+    /// Air drag on every node, per second.
+    drag: f64,
     stiffness: f64,
     damping: f64,
     node_mass: f64,
@@ -94,6 +96,7 @@ impl Net {
         let cord_mm = a.parameter_or("net_cord_mm", 5.0);
         let stiffness = a.parameter_or("net_stiffness", 900.0);
         let damping = a.parameter_or("net_damping", 0.9);
+        let drag = a.parameter_or("net_drag", 2.0);
         let mass = a.parameter_or("net_mass_g", 110.0) * 1e-3;
         let rod = a.millimetres("rim_rod_mm").unwrap_or(0.016);
 
@@ -129,6 +132,16 @@ impl Net {
                 }
             }
         }
+        // the bottom loop: a real net ends in a ring of cord that holds the
+        // mouth open. Without it the bottom ring is free to close, and the
+        // diagonals it hangs from straighten until the net is longer than it
+        // was cut.
+        for s in 0..strands {
+            let a = rows * strands + s;
+            let b = rows * strands + (s + 1) % strands;
+            let rest = (nodes[b] - nodes[a]).norm();
+            cords.push(Cord { a, b, rest });
+        }
 
         let n = nodes.len();
         let node_mass = (mass / n as f64).max(1e-6);
@@ -157,6 +170,7 @@ impl Net {
             rows,
             dt: scene.dt,
             substeps,
+            drag,
             stiffness,
             damping,
             node_mass,
@@ -183,6 +197,11 @@ impl Net {
     }
 
     /// The lowest node's height above the floor.
+    /// The fastest node, in m/s: how far from rest the net is.
+    pub fn max_speed(&self) -> f64 {
+        self.vel.iter().map(|v| v.norm()).fold(0.0, f64::max)
+    }
+
     pub fn lowest(&self) -> f64 {
         self.nodes.iter().map(|p| p.z).fold(f64::INFINITY, f64::min)
     }
@@ -217,14 +236,32 @@ impl Net {
             }
 
             let inv_m = 1.0 / self.node_mass;
+            // Air: a cord this thin moving this slowly is in Stokes' regime,
+            // and the drag is what lets a swing die. Without it the only
+            // damping is along the cords, and a swing of the whole net is
+            // across every one of them.
+            let air = (1.0 - self.drag * h).max(0.0);
             for i in self.pinned..self.nodes.len() {
                 self.vel[i] += force[i] * (inv_m * h);
+                self.vel[i] *= air;
                 let v = self.vel[i];
                 self.nodes[i] += v * h;
             }
 
+            // The length pass moves positions; the velocity has to follow, or
+            // a node pulled back is still travelling outward and is pulled
+            // back again next step forever — a position projection that
+            // leaves velocity alone is a small energy pump. So the velocity is
+            // whatever displacement the step actually produced.
+            let before: Vec<Vec3> = self.nodes[self.pinned..].to_vec();
             for _ in 0..RELAX_PASSES {
                 self.relax();
+            }
+            for (i, was) in (self.pinned..self.nodes.len()).zip(before) {
+                let moved = self.nodes[i] - was;
+                if moved.norm_sq() > 0.0 {
+                    self.vel[i] += moved / h;
+                }
             }
         }
         self.collide(balls);

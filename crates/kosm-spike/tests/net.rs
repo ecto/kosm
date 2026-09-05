@@ -49,3 +49,21 @@ fn a_made_shot_goes_through_the_net() {
     let net = court.net.as_ref().unwrap();
     assert!(net.nodes.iter().all(|p| p.z.is_finite()), "a node went to NaN");
 }
+
+/// A net let go from its cut shape swings, and then it hangs still. The
+/// length pass used to leave velocities behind and pump the swing forever.
+#[test]
+fn the_net_comes_to_rest() {
+    let mut scene = CourtScene::bundled().unwrap();
+    // one ball, dropped far from the hoop, so the net is left alone
+    scene.n_balls = 1;
+    scene.shot = None;
+    let mut court = Court::from_scene(&scene).unwrap();
+    while court.time() < 8.0 {
+        court.step();
+    }
+    let net = court.net.as_ref().expect("the level asks for a net");
+    let speed = net.max_speed();
+    println!("fastest node after 8 s: {:.2e} m/s", speed);
+    assert!(speed < 2e-3, "the net should be still after 8 s, fastest node moves at {speed:.3e} m/s");
+}
