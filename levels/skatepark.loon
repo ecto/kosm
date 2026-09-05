@@ -28,6 +28,11 @@
 ; a solid sphere the size of a skateboard wheel, set on the +x transition
 ; with its contact point drop_mm above the flat, released, rolled on the
 ; baked map through the same SDF contact path the K1's feet use.
+; check_x/y/z name the flat end of the transition the wheel is released on,
+; so a level with its ramp somewhere other than the origin checks the same way.
+[defparam check_x_mm 1500.0]
+[defparam check_y_mm 0.0]
+[defparam check_z_mm 0.0]
 [defparam wheel_r_mm 27.0]
 [defparam wheel_g 60.0]
 [defparam drop_mm 450.0]
@@ -36,6 +41,9 @@
 [defparam dt_ms 1.0]
 
 ; ---- the ipse scenario ------------------------------------------------------
+[defparam spawn_x_mm 0.0]       ; where the K1 stands, and which way it faces
+[defparam spawn_y_mm 0.0]
+[defparam spawn_yaw_deg 0.0]
 [defparam shove_at 1.0]         ; s
 [defparam shove_ns 8.0]         ; N·s, sagittal, toward the +x transition
 
