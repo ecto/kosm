@@ -8,6 +8,11 @@
 //! Export is the CLI's render, as a button.
 
 mod live;
+mod ride;
+
+/// The ipse tree the live recorder lives in — it resolves its assets against
+/// its own cwd, so the child is run from there.
+const IPSE: &str = "/Users/cam/Developer/ipse";
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -441,6 +446,50 @@ fn main() -> eframe::Result<()> {
     // Set before the simulation or UI threads exist.
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    // `--ride <ride.json>` plays a recorded rollout, `--live` streams one from
+    // a child simulator, either instead of simulating a pool
+    let args: Vec<String> = std::env::args().collect();
+    let after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let source = if let Some(i) = args.iter().position(|a| a == "--ride") {
+        let Some(path) = args.get(i + 1) else {
+            eprintln!("--ride wants a path to a ride.json");
+            std::process::exit(2);
+        };
+        Some(ride::Source::File(path.into()))
+    } else if args.iter().any(|a| a == "--live") {
+        // the default child is the ipse recorder, run from its own tree
+        // because it resolves `objects/skateboard` relative to the cwd
+        let (cmd, cwd) = match after("--live-cmd") {
+            Some(c) => (c.split_whitespace().map(str::to_string).collect(), std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            None => (vec![format!("{IPSE}/target/release/examples/k1_skatepark_ride"), "--stream".into()], std::path::PathBuf::from(IPSE)),
+        };
+        let num = |flag: &str, d: f64| after(flag).and_then(|v| v.parse().ok()).unwrap_or(d);
+        // the recorder's own knobs, passed through untouched
+        let mut extra = Vec::new();
+        for flag in ["--policy", "--scenario"] {
+            if let Some(v) = after(flag) {
+                extra.push(flag.to_string());
+                extra.push(v);
+            }
+        }
+        Some(ride::Source::Live(ride::LiveOpts {
+            cmd,
+            cwd,
+            shove: num("--shove", 8.0),
+            shove_at: num("--shove-at", 0.5),
+            duration: num("--duration", 6.0),
+            extra,
+        }))
+    } else {
+        None
+    };
+    if let Some(source) = source {
+        if let Err(e) = ride::run(source) {
+            eprintln!("ride: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let splash = std::env::args().any(|a| a == "--splash");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
     let (tx, rx) = mpsc::channel();

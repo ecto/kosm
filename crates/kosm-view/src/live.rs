@@ -57,7 +57,7 @@ impl Camera {
     pub fn view(&self, width: u32, height: u32) -> pool::View {
         pool::View { eye: self.eye, target: self.target, width, height, vfov: self.vfov }
     }
-    fn view_proj(&self, aspect: f32) -> [[f32; 4]; 4] {
+    pub(crate) fn view_proj(&self, aspect: f32) -> [[f32; 4]; 4] {
         let f = (self.target - self.eye).normalize();
         let r = f.cross(&V::new(0.0, 0.0, 1.0)).normalize();
         let u = r.cross(&f);

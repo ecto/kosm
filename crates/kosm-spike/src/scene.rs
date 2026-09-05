@@ -59,6 +59,13 @@ impl AuthoredScene {
         &self.path
     }
 
+    /// The Loon source, as authored. Root names live only here — vcad's
+    /// `SceneEntry` carries a material and nothing else — so a caller that
+    /// wants to name the parts it exported reads them back off the text.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     pub fn parameter(&self, name: &str) -> anyhow::Result<f64> {
         self.parameters
             .get(name)
