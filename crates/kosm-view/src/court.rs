@@ -583,6 +583,10 @@ struct App {
     quiet: u32,
     /// Consecutive passes that overran the budget. One is noise.
     over: u32,
+    /// Consecutive passes that came back at under half the budget. Enough of
+    /// them and a size the tuner had sworn off is worth trying again: the
+    /// overrun that condemned it may have been the net minting a solid.
+    cheap: u32,
     generation: u64,
     asked: Option<Ask>,
     /// The render thread's ends of the two channels, held until the surface
@@ -624,6 +628,7 @@ impl App {
             cost: GUESS,
             quiet: 0,
             over: 0,
+            cheap: 0,
             generation: 0,
             asked: None,
             pending: Some(pending),
@@ -787,6 +792,7 @@ impl viewport::Scene for App {
             // resolution, or the samples that bought it. A pass that came back
             // with little of the screen repainted is one more piece of
             // evidence that the picture is worth growing.
+            self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS { self.cheap + 1 } else { 0 };
             if shot.ms as f64 > TARGET_MS * 1.5 {
                 self.over += 1;
                 if self.over >= 2 {
@@ -818,10 +824,18 @@ impl viewport::Scene for App {
             self.floor = 1;
             self.samples = 1;
             self.quiet = 0;
-        } else if self.quiet >= CLIMB_AFTER && (self.scale > self.floor || self.samples < self.spp) {
+        } else if self.quiet >= CLIMB_AFTER && (self.scale > self.floor || self.samples < self.spp || self.floor > 1) {
             if self.scale > self.floor && self.pass_ms(self.scale - 1) <= TARGET_MS {
                 self.scale -= 1;
-            } else if self.scale == self.floor {
+            } else if self.scale == self.floor && self.floor > 1 && self.cheap >= 2 * CLIMB_AFTER {
+                // Passes here have run at under half the budget for a while:
+                // the size above was condemned by a pass that was not a
+                // render. Give it another hearing.
+                self.floor -= 1;
+                self.scale -= 1;
+                self.samples = 1;
+                self.cheap = 0;
+            } else if self.scale == self.floor && self.samples < self.spp {
                 self.samples = self.spp;
             }
             self.quiet = 0;

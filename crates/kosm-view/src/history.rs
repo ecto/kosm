@@ -166,6 +166,13 @@ impl View {
     fn sphere_rect(&self, centre: Point3, radius: f64) -> Option<Rect> {
         let v = centre - self.eye;
         let z = v.dot(&self.forward);
+        // Behind the camera altogether: nothing on screen. A ball that has
+        // rolled into the corner behind the viewer used to come back as the
+        // whole screen from here, and with it every shadow it threw.
+        if z < -radius {
+            return None;
+        }
+        // Straddling the camera plane: there is no rectangle, so everything.
         if z <= radius + 1e-6 {
             return Some(Rect::everything(self.width, self.height));
         }
@@ -457,11 +464,26 @@ impl History {
         // seconds — so a changed count is not a reason to repaint the whole
         // screen. The shared prefix is compared pairwise; anything past the
         // end of either list appeared or left and is masked on its own.
+        let screen = (w as usize) * (h as usize);
         let paint = |p: &Pose, push: &mut dyn FnMut(Option<Rect>)| {
-            push(view.sphere_rect(p.point(), p.radius));
+            let body = view.sphere_rect(p.point(), p.radius);
+            if let Some(r) = &body {
+                let area = ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize);
+                if area * 5 > screen * 3 && std::env::var_os("KOSM_MASK_DEBUG").is_some() {
+                    eprintln!("mask   a pose covers {}% of the screen: centre {:?} radius {:.0} mm", 100 * area / screen.max(1), p.centre, p.radius);
+                }
+            }
+            push(body);
             for light in lights {
                 if let Some((c, r)) = shadow_disc(*light, p.point(), p.radius) {
-                    push(view.sphere_rect(c, r));
+                    let disc = view.sphere_rect(c, r);
+                    if let Some(rc) = &disc {
+                        let area = ((rc.x1 - rc.x0) as usize) * ((rc.y1 - rc.y0) as usize);
+                        if area * 5 > screen * 3 && std::env::var_os("KOSM_MASK_DEBUG").is_some() {
+                            eprintln!("mask   a shadow covers {}%: light {:?} pose {:?} r {:.0} → disc r {:.0} mm", 100 * area / screen.max(1), light, p.centre, p.radius, r);
+                        }
+                    }
+                    push(disc);
                 }
             }
         };
