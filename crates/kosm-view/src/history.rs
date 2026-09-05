@@ -744,7 +744,11 @@ impl History {
         // and it was five times slower, because `render_into` sets up a rayon
         // traversal of the whole film per rectangle, and a circular mask cut
         // into rows is one rectangle per row. Fewer, fatter boxes win.
-        let boxes = merged(raw);
+        // The same clustering the GPU tier's scissor uses. `render_into`
+        // sets up a rayon traversal of the film per rectangle, so a handful
+        // of fat boxes beats a long list of thin ones here for the same
+        // reason it beats one dispatch per rectangle there.
+        let boxes = cluster(&raw, MAX_BOXES);
         let covered: usize = boxes
             .iter()
             .map(|r| ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize))
@@ -878,6 +882,67 @@ fn merged(mut rects: Vec<Rect>) -> Vec<Rect> {
     rects
 }
 
+/// The most boxes a masked pass will be cut into.
+///
+/// Each box is a dispatch of its own, and a dispatch is not free. vcad's
+/// `accumulate_and_denoise_resident` scissors the *trace*, but the reproject,
+/// accumulate, demodulate, a-trous and resolve passes behind it are still
+/// dispatched over the whole frame, and the keep mask is re-uploaded with
+/// them. Past a handful of boxes that fixed part outgrows the rays a tighter
+/// cover saves.
+pub const MAX_BOXES: usize = 4;
+
+/// Cluster disjoint rectangles into at most `k` disjoint boxes.
+///
+/// Greedy, and the greed is over *wasted* area: the pair whose union adds the
+/// least to what the two already cover is merged first, so boxes that nearly
+/// touch collapse long before boxes at opposite corners of the court do.
+/// Merging down to `k` is not optional — the dispatch budget is what it is —
+/// but a pair whose union adds nothing is merged even when the count already
+/// fits, because two boxes that tile a rectangle are strictly worse than the
+/// one box they tile.
+///
+/// A union can overlap a box neither of its parents met, so the cover is
+/// re-merged after every step: what comes out is always disjoint, which is
+/// what lets both tiers add the areas up and trust the total.
+fn cluster(rects: &[Rect], k: usize) -> Vec<Rect> {
+    let mut boxes = merged(rects.to_vec());
+    if k == 0 {
+        return boxes;
+    }
+    let area = |r: &Rect| ((r.x1 - r.x0) as u64) * ((r.y1 - r.y0) as u64);
+    let union = |a: &Rect, b: &Rect| Rect {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    };
+    while boxes.len() > 1 {
+        // The cheapest pair to merge, by the area their union adds to them.
+        let mut best: Option<(usize, usize, u64)> = None;
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                let cost = area(&union(&boxes[i], &boxes[j]))
+                    .saturating_sub(area(&boxes[i]) + area(&boxes[j]));
+                if best.is_none_or(|(_, _, b)| cost < b) {
+                    best = Some((i, j, cost));
+                }
+            }
+        }
+        let (i, j, cost) = best.expect("two or more boxes have a pair");
+        // Over the budget a merge happens whatever it costs; under it, only a
+        // merge that adds no area is worth losing a box for.
+        if boxes.len() <= k && cost > 0 {
+            break;
+        }
+        let m = union(&boxes[i], &boxes[j]);
+        boxes.swap_remove(j);
+        boxes[i] = m;
+        boxes = merged(boxes);
+    }
+    boxes
+}
+
 /// Where a sphere's shadow lands on `z = 0`, from a light above it, and how
 /// big it is.
 ///
@@ -978,32 +1043,39 @@ impl Mask {
     /// so the move restarts everything. With it (see [`Mask::reprojecting`])
     /// the move is masked exactly like a still-camera pass and vcad's
     /// reprojection decides what survives — but the pass goes over the whole
-    /// frame, since every pixel is looking somewhere new, so no scissor is
-    /// offered on a move.
+    /// frame, since every pixel is looking somewhere new, so no boxes are
+    /// offered on a move. The pass after it is boxed again like any other.
     pub fn keep(&mut self, view: &View, poses: &[Pose], lights: &[Point3], samples: u32) -> Keep {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
         let moved = self.view.is_some() && self.view != Some(*view);
         let empty = self.view.is_none() || self.counts.iter().all(|&c| c == 0);
         let restart_all = empty || (moved && !self.reproject);
         let mut keep = vec![u8::from(!restart_all); n];
-        let mut scissor = None;
+        let mut boxes: Vec<[u32; 4]> = Vec::new();
         if !restart_all {
             let rects = merged(mask_rects(self.size, view, poses, &self.poses, lights));
             paint_zero(&mut keep, self.size, rects.iter().map(|r| r.to_xywh()));
-            // One rectangle over everything that restarted is what a single
-            // scissored dispatch can do, and vcad's accumulate honours the
-            // same rectangle now — every pixel outside keeps its mean, its
-            // count and its variance untouched, so nothing stale is folded in
-            // as fresh. It is only worth taking when it saves more than half
-            // the frame: outside it no pixel gains a sample, and a picture
-            // that is always scissored never converges. A moved camera takes
-            // none: the reprojection needs this pass's depth everywhere.
+            // One rectangle over everything that restarted was what a single
+            // scissored dispatch could do, and with four balls spread across
+            // the court that rectangle is most of the frame — the bound never
+            // paid and every pass went full. So the change rects are
+            // clustered into at most [`MAX_BOXES`] boxes instead, one
+            // dispatch each, and vcad's accumulate honours each box in turn:
+            // every pixel outside them keeps its mean, its count and its
+            // variance untouched, so nothing stale is folded in as fresh.
+            // Still only worth taking when the boxes together save more than
+            // half the frame — outside them no pixel gains a sample, and a
+            // picture that is always masked never converges. A moved camera
+            // takes none: the reprojection needs this pass's depth
+            // everywhere.
             if !moved {
-                if let Some(bbox) = bounding(&rects) {
-                    let area = (bbox[2] as usize) * (bbox[3] as usize);
-                    if area * 2 < n {
-                        scissor = Some(bbox);
-                    }
+                let clustered = cluster(&rects, MAX_BOXES);
+                let area: usize = clustered
+                    .iter()
+                    .map(|r| ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize))
+                    .sum();
+                if area * 2 < n {
+                    boxes = clustered.into_iter().map(Rect::to_xywh).collect();
                 }
             }
         }
@@ -1014,10 +1086,12 @@ impl Mask {
         // outside it gains a sample either — the mirror of the counts has to
         // say the same thing the device's own do.
         for (i, (c, &k)) in self.counts.iter_mut().zip(&keep).enumerate() {
-            let inside = scissor.is_none_or(|s| {
+            let inside = boxes.is_empty() || {
                 let (px, py) = ((i as u32) % self.size.0, (i as u32) / self.size.0);
-                px >= s[0] && px < s[0] + s[2] && py >= s[1] && py < s[1] + s[3]
-            });
+                boxes
+                    .iter()
+                    .any(|s| px >= s[0] && px < s[0] + s[2] && py >= s[1] && py < s[1] + s[3])
+            };
             if !inside {
                 continue;
             }
@@ -1027,19 +1101,21 @@ impl Mask {
         self.poses = poses.to_vec();
         Keep {
             keep,
-            scissor,
+            boxes,
             reproject: moved && self.reproject && !empty,
         }
     }
 }
 
-/// A keep mask and, when it pays for itself, the one rectangle the pass need
+/// A keep mask and, when they pay for themselves, the few boxes the pass need
 /// not step outside of.
 pub struct Keep {
     /// One byte a pixel: 1 to go on accumulating, 0 to start over.
     pub keep: Vec<u8>,
-    /// `[x, y, w, h]`, or `None` for the whole frame.
-    pub scissor: Option<[u32; 4]>,
+    /// The boxes this pass need not step outside of — `[x, y, w, h]` each,
+    /// disjoint, at most [`MAX_BOXES`] of them. Empty for a pass that covers
+    /// the whole frame.
+    pub boxes: Vec<[u32; 4]>,
     /// The camera moved and the consumer reprojects: this pass should carry
     /// its history across the move rather than restart it. Note the counts
     /// this mask mirrors are optimistic on such a pass — the device restarts
@@ -1228,7 +1304,7 @@ mod tests {
             "a move is a restart"
         );
         assert!(!moved.reproject);
-        assert!(moved.scissor.is_none());
+        assert!(moved.boxes.is_empty());
 
         let mut device = Mask::reprojecting((W, H));
         let _ = device.keep(&va, &poses, &[], 1);
@@ -1238,7 +1314,7 @@ mod tests {
             "a moved camera should ask to be reprojected"
         );
         assert!(
-            moved.scissor.is_none(),
+            moved.boxes.is_empty(),
             "a reprojected pass needs this pass's depth everywhere"
         );
         let restarted = moved.keep.iter().filter(|&&k| k == 0).count();
@@ -1426,5 +1502,105 @@ mod tests {
         assert!(c.z.abs() < 1e-9);
         // Twice as far as the ball, so twice the radius.
         assert!((r - 240.0).abs() < 1e-6, "{r}");
+    }
+
+    // ---- clustering the change rects into boxes ------------------------------
+
+    fn r(x0: u32, y0: u32, x1: u32, y1: u32) -> Rect {
+        Rect { x0, y0, x1, y1 }
+    }
+
+    fn area(r: &Rect) -> u64 {
+        ((r.x1 - r.x0) as u64) * ((r.y1 - r.y0) as u64)
+    }
+
+    /// Nine scattered rectangles are still only ever [`MAX_BOXES`] dispatches.
+    #[test]
+    fn clustering_holds_the_dispatch_budget() {
+        let mut rects = Vec::new();
+        for i in 0..3u32 {
+            for j in 0..3u32 {
+                rects.push(r(i * 70, j * 70, i * 70 + 20, j * 70 + 20));
+            }
+        }
+        let out = cluster(&rects, MAX_BOXES);
+        assert!(out.len() <= MAX_BOXES, "{} boxes", out.len());
+        assert!(!out.is_empty());
+    }
+
+    /// Clustering only ever merges, so the cover can never grow past the one
+    /// box the old code used — the bound the boxes have to beat to be worth
+    /// their dispatches.
+    #[test]
+    fn clustering_never_costs_more_than_the_bounding_box() {
+        let rects = vec![
+            r(0, 0, 20, 20),
+            r(180, 0, 200, 20),
+            r(0, 180, 20, 200),
+            r(180, 180, 200, 200),
+            r(90, 90, 110, 110),
+        ];
+        let bbox = bounding(&merged(rects.clone())).expect("a bound");
+        let bbox_area = (bbox[2] as u64) * (bbox[3] as u64);
+        for k in 1..=6 {
+            let out = cluster(&rects, k);
+            let covered: u64 = out.iter().map(area).sum();
+            assert!(
+                covered <= bbox_area,
+                "k={k}: {covered} covered vs {bbox_area} for the bound",
+            );
+        }
+        // One box is the bounding box, exactly.
+        assert_eq!(cluster(&rects, 1).len(), 1);
+    }
+
+    /// Boxes far enough apart that merging any pair would cost more than it
+    /// saves are handed back untouched when they already fit the budget.
+    #[test]
+    fn disjoint_boxes_that_fit_are_left_alone() {
+        let rects = vec![
+            r(0, 0, 20, 20),
+            r(180, 0, 200, 20),
+            r(0, 180, 20, 200),
+            r(180, 180, 200, 200),
+        ];
+        let out = cluster(&rects, MAX_BOXES);
+        assert_eq!(out.len(), 4);
+        let covered: u64 = out.iter().map(area).sum();
+        assert_eq!(covered, 4 * 400, "no area was added");
+    }
+
+    /// Two boxes that tile a rectangle are strictly worse than the one box
+    /// they tile, so they are merged even with dispatches to spare.
+    #[test]
+    fn boxes_that_tile_a_rectangle_merge_under_the_budget() {
+        let rects = vec![r(0, 0, 50, 100), r(50, 0, 100, 100)];
+        let out = cluster(&rects, MAX_BOXES);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], r(0, 0, 100, 100));
+    }
+
+    /// Whatever comes out is disjoint: both tiers add the areas up and trust
+    /// the total, and a union can overlap a box neither parent met.
+    #[test]
+    fn clustering_leaves_the_cover_disjoint() {
+        let rects = vec![
+            r(0, 0, 40, 40),
+            r(60, 0, 100, 40),
+            r(30, 30, 70, 70),
+            r(0, 60, 40, 100),
+            r(60, 60, 100, 100),
+            r(120, 120, 160, 160),
+        ];
+        for k in 1..=6 {
+            let out = cluster(&rects, k);
+            for i in 0..out.len() {
+                for j in (i + 1)..out.len() {
+                    let (a, b) = (&out[i], &out[j]);
+                    let meet = a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+                    assert!(!meet, "k={k}: {a:?} meets {b:?}");
+                }
+            }
+        }
     }
 }
