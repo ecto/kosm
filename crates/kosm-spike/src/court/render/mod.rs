@@ -60,7 +60,13 @@ impl Snapshot {
 }
 
 /// One traceable thing: a BVH, what it is made of, and where it sits.
+///
+/// The solid the BVH was built over is kept alongside it. The CPU tracer
+/// never looks at it — a BVH is all it wants — but a GPU scene is packed
+/// from the BRep itself, so a renderer that is not the CPU one needs the
+/// geometry and not just the index over it.
 struct Placed {
+    solid: Arc<Solid>,
     bvh: Arc<Bvh>,
     pbr: Pbr,
     to_world: Transform,
@@ -79,7 +85,7 @@ pub struct Scene {
     statics: Vec<Placed>,
     /// The ball's own appearance, centred on the origin: its solid and its
     /// seams, each with a material, drawn once per ball at that ball's pose.
-    ball: Vec<(Arc<Bvh>, Pbr)>,
+    ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr)>,
     /// BVHs for `Court::extras`, kept across frames so a net that only moves
     /// is not rebuilt. Keyed by the solid's identity.
     extras: HashMap<usize, Arc<Bvh>>,
@@ -105,7 +111,7 @@ impl Scene {
         );
 
         let mut statics = Vec::new();
-        let mut ball: Vec<(Arc<Bvh>, Pbr)> = Vec::new();
+        let mut ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr)> = Vec::new();
         let mut authored_room = false;
         for (part, root) in evaluated.parts.iter().zip(&doc.roots) {
             let name = root.material.as_str();
@@ -118,13 +124,19 @@ impl Scene {
                 anyhow::bail!("the court's `{name}` root has no traceable geometry");
             }
             let bvh = Arc::new(bvh);
+            let solid = Arc::new(solid.clone());
             // a `ball` root (and its `ball-seams`) is not part of the court: it
             // is the ball's own appearance, drawn once per ball at that ball's pose
             if matches!(name, "ball" | "ball-seams" | "seam") {
-                ball.push((bvh, materials::pbr(&doc, name)));
+                ball.push((name.to_owned(), solid, bvh, materials::pbr(&doc, name)));
                 continue;
             }
-            statics.push(Placed { bvh, pbr: materials::pbr(&doc, name), to_world: Transform::identity() });
+            statics.push(Placed {
+                solid,
+                bvh,
+                pbr: materials::pbr(&doc, name),
+                to_world: Transform::identity(),
+            });
         }
 
         // the gym: only until the level authors it
@@ -136,10 +148,14 @@ impl Scene {
         if !authored_room {
             let wall = materials::pbr(&doc, "wall");
             let t = 100.0;
-            let slab = |sx: f64, sy: f64, sz: f64, at: (f64, f64, f64), pbr: Pbr| Placed {
-                bvh: Arc::new(build_bvh(&Solid::cube(sx, sy, sz))),
-                pbr,
-                to_world: Transform::translation(at.0, at.1, at.2),
+            let slab = |sx: f64, sy: f64, sz: f64, at: (f64, f64, f64), pbr: Pbr| {
+                let solid = Arc::new(Solid::cube(sx, sy, sz));
+                Placed {
+                    bvh: Arc::new(build_bvh(&solid)),
+                    solid,
+                    pbr,
+                    to_world: Transform::translation(at.0, at.1, at.2),
+                }
             };
             statics.push(slab(t, 2.0 * wy + 2.0 * t, h + t, (wx, -wy - t, floor_z), wall));
             statics.push(slab(t, 2.0 * wy + 2.0 * t, h + t, (-wx - t, -wy - t, floor_z), wall));
@@ -171,8 +187,11 @@ impl Scene {
 
         // a ball root is the ball; without one, a sphere of the right size
         if ball.is_empty() {
+            let solid = Arc::new(Solid::sphere(scene.ball_r * PER_M, 64));
             ball.push((
-                Arc::new(build_bvh(&Solid::sphere(scene.ball_r * PER_M, 64))),
+                "ball".to_owned(),
+                solid.clone(),
+                Arc::new(build_bvh(&solid)),
                 materials::pbr(&doc, "ball"),
             ));
         }
@@ -205,7 +224,7 @@ impl Scene {
             let c = *centre * PER_M;
             // `rotation` is world → body; an object → world placement is its transpose
             let r = rot.transpose();
-            for (bvh, pbr) in &self.ball {
+            for (_, _, bvh, pbr) in &self.ball {
                 objects.push(Object::placed(bvh.clone(), *pbr, rigid(&r, c.x, c.y, c.z)));
             }
         }
@@ -227,6 +246,55 @@ impl Scene {
             env: self.env.clone(),
             ground: self.ground,
         }
+    }
+
+    // ---- the same picture, for a renderer that packs BReps -----------------
+    //
+    // The CPU tracer wants BVHs and gets them above. A GPU scene is packed
+    // from the BRep instead, and packs each solid once and then says where
+    // its instances are — so what it needs from here is the geometry, the
+    // material and the placement, and never a BVH. These hand that over
+    // without a second copy of the assembly logic: the same statics, the same
+    // ball parts, the same extras, the same lights.
+
+    /// The level's geometry and the gym's, each solid with its material and
+    /// where it sits. Built once and never moves.
+    pub fn static_parts(&self) -> impl Iterator<Item = (&Solid, Pbr, &Transform)> {
+        self.statics.iter().map(|p| (p.solid.as_ref(), p.pbr, &p.to_world))
+    }
+
+    /// The ball's own parts — its solid and its seams — centred on the origin,
+    /// one copy of each to be placed at every ball's pose, each with the root
+    /// material that named it.
+    pub fn ball_parts(&self) -> impl Iterator<Item = (&str, &Solid, Pbr)> {
+        self.ball.iter().map(|(name, s, _, pbr)| (name.as_str(), s.as_ref(), *pbr))
+    }
+
+    /// Where each ball is at this instant, as an object → world placement in
+    /// millimetres — one per ball, to be applied to every part of
+    /// [`Self::ball_parts`].
+    pub fn ball_placements(&self, snap: &Snapshot) -> Vec<Transform> {
+        snap.balls
+            .iter()
+            .map(|(centre, rot)| {
+                let c = *centre * PER_M;
+                let r = rot.transpose();
+                rigid(&r, c.x, c.y, c.z)
+            })
+            .collect()
+    }
+
+    /// Whatever else the court is carrying this frame — the net — as solid,
+    /// material and placement.
+    pub fn extra_parts<'a>(&'a self, snap: &'a Snapshot) -> impl Iterator<Item = (&'a Solid, Pbr, &'a Transform)> {
+        snap.extras
+            .iter()
+            .map(move |e| (e.solid.as_ref(), materials::pbr(&self.doc, &e.material), &e.to_world))
+    }
+
+    /// The gym's light panels: the only lights there are.
+    pub fn lights(&self) -> &[AreaLight] {
+        &self.lights
     }
 
     /// How many traceable objects the static half has, for a sanity check.

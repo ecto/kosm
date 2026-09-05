@@ -9,25 +9,29 @@
 //! placed where phyz has them, the panels as area lights. This file owns the
 //! window's camera and the pace; nothing here describes a shape or a material.
 //!
-//! ## why the CPU tier
+//! ## the two tiers
 //!
-//! `vcad-kernel-raytrace` has a `gpu` feature, and it does compile in this
-//! workspace — but it pins **wgpu 23**, while the viewport's surface is on
-//! **wgpu 30**. Two major versions of wgpu are two unrelated sets of types:
-//! the `Device`, `Queue`, `Buffer` and `Texture` the surface hands out cannot
-//! be passed to `RayTracePipeline`, and a texture the tracer wrote cannot be
-//! sampled by the blit. There is no conversion; they are different crates
-//! that happen to share a name. So the GPU tracer could only run on a
-//! *second*, headless wgpu-23 device with a full CPU readback per frame —
-//! and its scene format (`GpuScene::from_brep`, one merged BRep with no
-//! per-instance transform) would force the whole court to be rebuilt and
-//! re-uploaded every time a ball moves.
+//! `vcad-kernel-raytrace` has a `gpu` feature, and it is on. It used to be
+//! unusable here: it pinned **wgpu 23** while the viewport's surface is on
+//! **wgpu 30**, and two majors of wgpu are two unrelated sets of types — the
+//! `Device` the surface hands out could not be passed to `RayTracePipeline`
+//! at all. vcad is on wgpu 30 now, so the tracer runs on the viewport's own
+//! device (`viewport::Scene::init` hands it over) and there is one adapter in
+//! the process rather than two.
 //!
-//! So this is the CPU path tracer, `pathtrace::render`, run small on a worker
-//! thread and accumulated progressively: passes keep being added to the same
-//! frame while nothing changes, and the accumulator is thrown away the moment
-//! the cursor, the camera or the window size moves. It is the same integrator
-//! the CLI's reference tier uses, at fewer samples.
+//! The scene format was the other half of it. `GpuScene::from_brep` packed a
+//! merged BRep with no per-instance transform, so a ball moving meant
+//! re-packing the whole court. `GpuScene::placed` is the answer: each solid
+//! is packed once and every frame only says where its instances are, which
+//! for a rigid placement is a pass over the packed surface frames and the
+//! node bounds. See `court_gpu.rs`.
+//!
+//! The CPU integrator stays, as the fallback: `--cpu` asks for it, and it is
+//! what runs when there is no adapter or the court will not pack. Both tiers
+//! answer the same `Job` with the same `Shot`, so the window's adaptive
+//! tuner — render the window's size over an integer divisor, aim at one
+//! frame a pass, walk the divisor back down while nothing moves — does not
+//! know which one it is talking to.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
@@ -37,6 +41,7 @@ use kosm_spike::court::{Court, CourtScene};
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film};
 
+use crate::court_gpu;
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -225,7 +230,7 @@ impl Accum {
 
 /// The renderer: build the stage once, then keep adding passes to whatever
 /// the window last asked for.
-fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
+fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Device, wgpu::Queue)>) {
     // Evaluating the level and building its BVHs takes minutes, and the
     // window is black until it is done. Say so, or it looks broken.
     eprintln!("court  evaluating the level…");
@@ -235,6 +240,25 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
         Err(error) => return eprintln!("court: could not build the picture: {error}"),
     };
     eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.static_count(), stage.light_count(), t0.elapsed().as_secs_f64());
+
+    // The GPU tier if the surface gave us a device and the court packs for
+    // it; the CPU integrator otherwise, saying which and why.
+    let scene = CourtScene::bundled().ok();
+    let mut tracer = gpu.and_then(|(device, queue)| {
+        let a = scene.as_ref().map(|s| &s.authored);
+        let depth = a.map_or(6.0, |a| a.parameter_or("max_depth", 6.0)).max(1.0) as u32;
+        let env = a.map_or(0.05, |a| a.parameter_or("env_radiance", 0.05)) as f32;
+        match court_gpu::Stage::new(&stage, &device, &queue, depth, env) {
+            Ok(gpu) => Some(gpu),
+            Err(error) => {
+                eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                None
+            }
+        }
+    });
+    if tracer.is_none() {
+        eprintln!("court  the CPU path tracer");
+    }
 
     let mut current: Option<Job> = None;
     let mut accum: Option<Accum> = None;
@@ -260,6 +284,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
                 Err(_) => return,
             }
         }
+        let fresh = latest.is_some();
         if let Some(job) = latest {
             accum = None;
             current = Some(job);
@@ -268,23 +293,39 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
         if job.size.0 == 0 || job.size.1 == 0 {
             continue;
         }
-        let acc = accum.get_or_insert_with(|| Accum::new(job.size));
-        if acc.size != job.size {
-            *acc = Accum::new(job.size);
-        }
         let lap = Instant::now();
-        let opts = options(job.spp, 0x5eed_0000 ^ (job.generation << 20) ^ acc.passes as u64, true);
-        let scene = stage.at_snapshot(&job.frame);
-        let film = pathtrace::render(&scene, &job.camera.to_pathtrace(), job.size.0, job.size.1, &options(job.spp, opts.seed, false));
-        acc.add(film);
-        let rgba = acc.resolve(job.camera.exposure, &opts);
-        let shot = Shot { size: job.size, rgba, spp: job.spp, ms: lap.elapsed().as_millis() };
-        if said != Some((job.size, job.spp)) || said_at.elapsed().as_secs() >= 2 {
-            said = Some((job.size, job.spp));
+        let (rgba, spp, passes) = if let Some(gpu) = tracer.as_mut() {
+            // The GPU keeps its own accumulator, in a buffer that never
+            // leaves the device; a new subject throws it away.
+            if fresh {
+                gpu.reset();
+            }
+            match gpu.pass(&stage, &job.frame, &job.camera, job.size) {
+                Ok(rgba) => (rgba, 1, gpu.passes()),
+                Err(error) => {
+                    eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                    tracer = None;
+                    continue;
+                }
+            }
+        } else {
+            let acc = accum.get_or_insert_with(|| Accum::new(job.size));
+            if acc.size != job.size {
+                *acc = Accum::new(job.size);
+            }
+            let opts = options(job.spp, 0x5eed_0000 ^ (job.generation << 20) ^ acc.passes as u64, true);
+            let scene = stage.at_snapshot(&job.frame);
+            let film = pathtrace::render(&scene, &job.camera.to_pathtrace(), job.size.0, job.size.1, &options(job.spp, opts.seed, false));
+            acc.add(film);
+            (acc.resolve(job.camera.exposure, &opts), job.spp, acc.passes)
+        };
+        let shot = Shot { size: job.size, rgba, spp, ms: lap.elapsed().as_millis() };
+        if said != Some((job.size, shot.spp)) || said_at.elapsed().as_secs() >= 2 {
+            said = Some((job.size, shot.spp));
             said_at = Instant::now();
             eprintln!(
                 "court  {}×{} at {} spp: {} ms a pass, {} accumulated",
-                job.size.0, job.size.1, job.spp, shot.ms, acc.passes
+                job.size.0, job.size.1, shot.spp, shot.ms, passes
             );
         }
         if out.send(shot).is_err() {
@@ -320,6 +361,56 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
         .save(path)?;
     println!(
         "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} at {spp} spp in {:.1} s → {}",
+        court.time(),
+        frame.balls.len(),
+        stage.static_count(),
+        size.0,
+        size.1,
+        t0.elapsed().as_secs_f64(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// The same still, traced on the GPU. There is no window and so no surface
+/// device, so this asks `vcad-kernel-gpu` for a headless one — the same
+/// adapter, just nobody's surface — and accumulates `passes` of one sample
+/// each, which is what the window does too.
+pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
+    let scene = CourtScene::bundled()?;
+    let stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let a = &scene.authored;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+        a.parameter_or("env_radiance", 0.05) as f32,
+    )?;
+
+    let t = if t < 0.0 { a.parameter_or("still_t", 0.95) } else { t };
+    let mut court = Court::from_scene(&scene)?;
+    while court.time() < t {
+        court.step();
+    }
+    let frame = Frame::of(&court);
+
+    let t0 = Instant::now();
+    let mut rgba = Vec::new();
+    for _ in 0..passes.max(1) {
+        rgba = gpu.pass(&stage, &frame, &camera, size)?;
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    image::RgbaImage::from_raw(size.0, size.1, rgba)
+        .ok_or_else(|| anyhow::anyhow!("the film is the wrong size"))?
+        .save(path)?;
+    println!(
+        "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} over {passes} gpu passes in {:.2} s → {}",
         court.time(),
         frame.balls.len(),
         stage.static_count(),
@@ -395,10 +486,26 @@ struct App {
     settled: u32,
     generation: u64,
     asked: Option<Ask>,
+    /// The render thread's ends of the two channels, held until the surface
+    /// exists. The tracer runs on the *window's* device, and there is no
+    /// device until there is a window — so the thread that would use it
+    /// cannot be started before then.
+    pending: Option<(Receiver<Job>, Sender<Shot>)>,
+    /// Forced by `--cpu`: never hand the render thread a device.
+    cpu_only: bool,
 }
 
 impl App {
-    fn new(rx: Receiver<Frame>, shots: Receiver<Shot>, jobs: Sender<Job>, camera: Camera, spp: u32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        rx: Receiver<Frame>,
+        shots: Receiver<Shot>,
+        jobs: Sender<Job>,
+        camera: Camera,
+        spp: u32,
+        pending: (Receiver<Job>, Sender<Shot>),
+        cpu_only: bool,
+    ) -> Self {
         let mut app = Self {
             rx,
             shots,
@@ -418,6 +525,8 @@ impl App {
             settled: 0,
             generation: 0,
             asked: None,
+            pending: Some(pending),
+            cpu_only,
         };
         app.orbit = app.orbit_from_camera();
         app
@@ -522,6 +631,12 @@ impl App {
 }
 
 impl viewport::Scene for App {
+    fn init(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some((jobs, shots)) = self.pending.take() else { return };
+        let gpu = (!self.cpu_only).then(|| (device.clone(), queue.clone()));
+        std::thread::spawn(move || render_worker(jobs, shots, gpu));
+    }
+
     fn event(&mut self, event: viewport::Event) {
         use viewport::{Event, Key};
         match event {
@@ -599,12 +714,15 @@ impl viewport::Scene for App {
 }
 
 /// `kosm-view`: the court, live.
-pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
+///
+/// The render thread is not started here. It renders on the window's own
+/// device, and the window does not exist yet — `App::init` starts it once the
+/// surface has come up and handed the device over.
+pub fn run(frames: usize, spp: u32, cpu_only: bool) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || simulate(tx, frames));
-    std::thread::spawn(move || render_worker(job_rx, shot_tx));
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
@@ -615,5 +733,9 @@ pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
         exposure: 1.0,
     });
 
-    viewport::run("Kosm view — the court", (1280, 720), App::new(rx, shot_rx, job_tx, camera, spp))
+    viewport::run(
+        "Kosm view — the court",
+        (1280, 720),
+        App::new(rx, shot_rx, job_tx, camera, spp, (job_rx, shot_tx), cpu_only),
+    )
 }

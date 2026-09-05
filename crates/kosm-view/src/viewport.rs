@@ -45,6 +45,13 @@ pub enum Event {
 /// What the window shows. The scene owns its own threads and clock; the
 /// viewport asks it for the newest picture once per redraw.
 pub trait Scene {
+    /// The surface's own device and queue, handed over once, when they exist.
+    ///
+    /// A scene that renders on the GPU renders on *this* device: one adapter,
+    /// one queue, and the tracer's output and the blit's input are the same
+    /// wgpu. A scene with nothing to do with the GPU ignores it, which is
+    /// what the default does.
+    fn init(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
     fn event(&mut self, event: Event);
     /// The newest picture, or `None` to keep the one already on screen.
     fn image(&mut self) -> Option<Image>;
@@ -98,9 +105,15 @@ impl Gpu {
             compatible_surface: Some(&surface),
             ..Default::default()
         }))?;
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor { label: Some("kosm-view"), ..Default::default() }),
-        )?;
+        // The adapter's own limits, not wgpu's defaults. The path tracer's
+        // bind group binds ten storage buffers in one compute stage and the
+        // default limit is eight, so a device asked for defaults cannot build
+        // its pipeline at all — and the blit does not care either way.
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("kosm-view"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))?;
 
         let px = window.inner_size();
         let mut config = surface
@@ -285,7 +298,10 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
             }
         };
         match Gpu::new(event_loop, window.clone()) {
-            Ok(gpu) => self.gpu = Some(gpu),
+            Ok(gpu) => {
+                self.scene.init(&gpu.device, &gpu.queue);
+                self.gpu = Some(gpu);
+            }
             Err(error) => {
                 eprintln!("view: could not bring up wgpu: {error}");
                 return event_loop.exit();

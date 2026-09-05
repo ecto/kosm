@@ -359,26 +359,44 @@ the frame it is on. Space pauses; space again rejoins the simulation where it
 has got to.
 
 The picture is not written by the viewer. The level's roots are evaluated once
-by `vcad-eval` into BRep solids, each gets a `vcad-kernel-raytrace` BVH, and
-every frame is a `pathtrace::Scene`: those solids as placed objects with a
-material per root name, the ball's solid placed at each ball's pose, and the
-level's ceiling panels as the only lights. It is the CPU path tracer, on a
-third thread, and it is asked for something it can finish in about 30 ms: the
-window's pixel size over an integer divisor, one sample a pass, with the
-divisor retuned from the pass times actually measured and the blit upscaling
-whatever comes back. When nothing is moving the passes accumulate on the same
-picture and the divisor walks back down to 1, so a paused frame resolves to
-the window's own resolution. The chosen size and the pass time go to stderr.
-`vcad-kernel-raytrace`'s `gpu` feature pins wgpu 23 and the surface is on wgpu
-30, so that tracer cannot be handed this device.
+by `vcad-eval` into BRep solids and every frame is that geometry with the balls
+and the net placed where phyz has them, a material per root name, and the
+level's ceiling panels as the only lights. It is asked for something it can
+finish in about 30 ms: the window's pixel size over an integer divisor, one
+sample a pass, with the divisor retuned from the pass times actually measured
+and the blit upscaling whatever comes back. When nothing is moving the passes
+accumulate on the same picture and the divisor walks back down to 1, so a
+paused frame resolves to the window's own resolution. The chosen size and the
+pass time go to stderr.
 
-The window is black for the first few minutes: evaluating the level is a pile
-of CSG booleans in `vcad-kernel-booleans`, and the picture cannot start until
-they are done. It says so on stderr while it works.
+Two tracers answer that, and the tuner cannot tell which it is talking to.
+`vcad-kernel-raytrace`'s `gpu` feature used to be unreachable from here — it
+pinned wgpu 23 while the surface is on wgpu 30, and two majors of wgpu are two
+unrelated sets of types, so the surface's `Device` could not be handed to the
+tracer at all. vcad is on wgpu 30 now (a worktree of it, `claude/wgpu-30`), so
+the compute tracer runs on the window's own device and one adapter serves both
+the trace and the blit. Each solid is packed for the GPU once and every frame
+only says where its instances are, which for a rigid placement is a pass over
+the packed surface frames — assembling a whole frame of the court costs about
+0.3 ms. On this Mac the GPU tier holds 365×205 at 25 ms a pass where the CPU
+integrator holds 232×130 at the same cost.
+
+The CPU path tracer is still there and is still the reference: `--cpu` asks for
+it, and it is what runs when there is no adapter or the court will not pack.
+Two things the GPU tier does not draw. The court's painted markings evaluate to
+a solid with no BRep, and the compute shader reads analytic surfaces, so they
+are skipped and said so on stderr. The ball's seams are skipped deliberately:
+the shader traces a torus wider than the solid is — at the identity transform a
+torus covering 330 pixels on the CPU covers 603 on the GPU — and a seam ring
+swollen like that engulfs the ball it is drawn on.
+
+Evaluating the level takes a few seconds and the window is black until it is
+done. It says so on stderr while it works.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
-window, which is how the picture is checked. `--pool` and `--splash` are gone
-for now: they were egui, and the pool's live tier went with it.
+window, which is how the picture is checked; it uses the GPU tracer unless
+`--cpu` says otherwise. `--pool` and `--splash` are gone for now: they were
+egui, and the pool's live tier went with it.
 
 ## building
 

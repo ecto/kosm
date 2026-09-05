@@ -18,6 +18,7 @@
 //! Escape to quit.
 
 mod court;
+mod court_gpu;
 mod viewport;
 
 /// Warnings from wgpu and vcad, on stderr; anything quieter is noise.
@@ -61,7 +62,24 @@ fn main() -> anyhow::Result<()> {
         let size = (width, (width * 9 / 16).max(1));
         // the level's own `still_t` unless asked otherwise
         let t: f64 = parse("at").unwrap_or(-1.0);
-        return court::still(std::path::Path::new(&path), t, size, parse("spp").unwrap_or(32));
+        // The GPU tracer unless asked otherwise: `--cpu` takes the CPU
+        // integrator, which is the reference the GPU picture is checked
+        // against.
+        let path = std::path::Path::new(&path);
+        let spp = parse("spp").unwrap_or(32);
+        if std::env::args().any(|a| a == "--cpu") {
+            return court::still(path, t, size, spp);
+        }
+        return match court::still_gpu(path, t, size, spp) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                court::still(path, t, size, spp)
+            }
+        };
     }
-    court::run(parse("frames").unwrap_or(0), parse("spp").unwrap_or(4))
+    // `--cpu` pins the CPU integrator; without it the window uses the GPU
+    // tracer when the adapter and the court allow it.
+    let cpu_only = std::env::args().any(|a| a == "--cpu");
+    court::run(parse("frames").unwrap_or(0), parse("spp").unwrap_or(4), cpu_only)
 }
