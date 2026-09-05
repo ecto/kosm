@@ -602,6 +602,79 @@ tests), `vcad-render`'s (114) and the 42 that came with the renderer all
 pass, and the 960×540 court still is the same one, to within the low bit of
 float noise two builds of the same source already differ by.
 
+### the material
+
+The BSDF is Disney's "principled" parameterisation (Burley 2012) with the
+corrections the field settled on afterwards, composed the way OpenPBR 1.0
+composes them. One `Pbr` struct, one `bsdf_eval`, one `bsdf_sample`, in Rust
+for the CPU renderer and in WGSL for the GPU one, checked against each other on
+real hardware.
+
+Four lobes, layered coat → sheen → (specular + diffuse):
+
+- **Diffuse — EON.** Not Lambert. d'Eon, Portsmouth, Hill and Fascione's
+  energy-preserving Oren-Nayar (JCGT 14(1), 2025), which is the Fujii
+  Oren-Nayar single-scattering term plus a closed-form multiple-scattering
+  compensation. Oren-Nayar is what makes chalk, latex paint and unfinished
+  concrete read as those things rather than as shiny plastic dimmed; the
+  compensation is what makes it safe to leave on, since plain Oren-Nayar loses
+  up to a fifth of the light it is given. `diffuse_roughness` (OpenPBR's
+  `base_diffuse_roughness`) drives it and is separate from the specular
+  roughness, because a surface's slope statistics and its subsurface scattering
+  length are unrelated facts. `subsurface` blends towards Disney's
+  Hanrahan-Krueger lobe for the short-mean-free-path look of rubber and skin.
+- **Specular — compensated anisotropic GGX.** VNDF sampling as before, with
+  Turquin's (2019) multiple-scattering compensation on top: scale the
+  single-scattering lobe by `1 + F0·(1 - E)/E`, where `E(mu, alpha)` is the
+  lobe's own `F = 1` directional albedo, baked into a 32×32 table in
+  `tables.rs`. That table is not a textbook GGX — it is a stratified VNDF
+  estimate of `E[G2/G1]` for exactly the `d_ggx` and `v_smith` in this file, so
+  the compensation compensates *this* renderer.
+- **Sheen — LTC.** Zeltner, Burley and Chiang's "Practical Multiple-Scattering
+  Sheen Using Linearly Transformed Cosines" (SIGGRAPH 2022), their published
+  `approx` fit transcribed from the authors' pbrt-v3 reference. It is a real
+  fit to multiple scattering in a layer of normally oriented fibres, not
+  Disney's 2012 Schlick-weighted tint, and being an LTC it evaluates,
+  integrates and importance-samples in closed form. OpenPBR calls this layer
+  *fuzz*; the parameters here are `sheen`, `sheen_color` and `sheen_roughness`,
+  which are OpenPBR's `fuzz_weight` / `fuzz_color` / `fuzz_roughness` under
+  more familiar names.
+- **Coat — GTR1.** Disney's clearcoat distribution (γ = 1, longer-tailed than
+  GGX) at a fixed IOR of 1.5, layering onto everything beneath with `1 - F`
+  attenuation.
+
+Two parameters describe the same number, so the precedence is stated rather
+than left to chance: `ior` wins whenever it is not the default 1.5, and
+otherwise `specular` drives `F0` through Disney's `F0 = 0.08 · specular`. The
+two agree exactly at the defaults (both 0.04), so the rule has no seam where it
+switches. `clearcoat_roughness` is Disney's `clearcoatGloss` respelled the way
+the rest of the struct spells roughness: Disney maps gloss onto GTR1's alpha as
+`mix(0.1, 0.001, gloss)`, so their satin end is `clearcoat_roughness ≈ 0.32`
+and their gloss end `≈ 0.032`.
+
+Every parameter added on top of the old metallic-roughness set defaults to the
+value that reduces the model to what it was — `diffuse_roughness = 0` *is*
+Lambert, `sheen = 0` and `subsurface = 0` switch their lobes off outright — so
+a material written before any of them exists renders as it did.
+
+What the tests pin:
+
+| test | what it holds |
+|---|---|
+| `the_eon_diffuse_lobe_passes_a_white_furnace` | a white diffuse surface reflects ≥ 0.98 and ≤ 1 at every roughness and every incidence angle |
+| `the_eon_diffuse_lobe_is_reciprocal` | `f(wo, wi) == f(wi, wo)` to 1e-6 |
+| `a_rough_metal_furnace_closes_to_one_percent` | `F0 = 1` GGX returns 1 ± 1% at α = 0.2, 0.5, 1.0 — uncompensated it keeps 0.947, 0.687 and 0.307 |
+| `a_dielectric_specular_lobe_stays_under_one` | compensation is a correction, not a licence to make light |
+| `the_sheen_lobe_is_bounded_and_brightens_at_grazing` | sheen albedo in [0, 1], and grazing at least 1.2× normal |
+| `the_layered_bsdf_is_reciprocal` | the whole stack, coat attenuation and sheen albedo-scaling included, to 1% |
+| `sampling_every_lobe_recovers_the_evaluated_albedo` | `E[f/pdf]` lands on the evaluator's own quadrature for every lobe |
+| `tests/gpu_bsdf.rs` | the WGSL port agrees with the Rust across a 1728-case parameter sweep (worst relative disagreement 6e-7), the device's sample PDF equals its eval PDF, and the furnace closes on the GPU's own table interpolation |
+
+What is *not* here yet: **transmission** (the backboard and the windows are
+opaque bright dielectrics, not glass a ray goes through), **iridescence** (thin
+films), and **BSSRDF** — `subsurface` is Disney's local approximation, which
+will not bleed light into a shadow or through a thin part.
+
 ### the GPU tier
 
 The compute pipeline moved too, behind `--features gpu`. Same split, one level
