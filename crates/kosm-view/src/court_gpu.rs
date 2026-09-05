@@ -53,6 +53,22 @@
 //! target texture stays whole. So a pass whose keep mask fits in a box worth
 //! less than half the frame traces and folds that box and nothing else.
 //!
+//! ## one denoise a frame, not one a box
+//!
+//! vcad's scissor is a single rectangle, so `k` dirty boxes are `k` calls.
+//! Fused, that was `k` of *everything*: `k` traces, which is what was wanted,
+//! and also `k` demodulate/à-trous/resolve chains over the whole frame, which
+//! was not — the denoise cannot be scissored (the filter reaches 32 pixels off
+//! a box's edge and the resolve has to leave the texture whole), so a viewer
+//! with four small boxes paid four full-frame filters to show one frame.
+//!
+//! [`Stage::accumulate`] uses vcad's split now: `accumulate_resident` once per
+//! box — trace and fold, both scissored, and the fold's *dispatch* is the
+//! box's workgroups rather than the frame's — then
+//! `denoise_and_resolve_resident` once for the pass. Measured in vcad's own
+//! suite at 512x288 with four boxes of a tenth of the frame each: 5.4 ms fused
+//! against 3.9 ms split. `KOSM_GPU_TIMING` prints the two halves separately.
+//!
 //! ## the panels are in the picture
 //!
 //! `set_camera_visible_lights` is off in vcad's default state, and with it off
@@ -88,7 +104,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
@@ -441,6 +457,9 @@ impl Stage {
             );
         }
         let traced = Instant::now();
+        // Timing splits the pass in two, which costs a sync point the render
+        // path does not otherwise want.
+        let timing = std::env::var("KOSM_GPU_TIMING").is_ok();
         let res = self.resident.as_mut().expect("just built");
         // `samples` samples, each its own call: vcad's accumulate folds one
         // raw sample per call, so a pass of several is several calls with a
@@ -456,8 +475,10 @@ impl Stage {
         } else {
             boxes.iter().map(|&b| Some(b)).collect()
         };
+        let mut accumulated = Duration::ZERO;
         for k in 0..samples.max(1) {
             for (b, rect) in dispatches.iter().enumerate() {
+            let box_started = Instant::now();
             self.passes += 1;
             let mut state = GpuRenderState::new(self.passes);
             // A photoreal viewport: no edge overlay, no stylisation, and no
@@ -487,7 +508,7 @@ impl Stage {
                 state.set_scissor(rect);
             }
             self.pipeline
-                .accumulate_and_denoise_resident_reprojected(
+                .accumulate_resident(
                     &self.ctx,
                     &self.history,
                     res,
@@ -497,12 +518,12 @@ impl Stage {
                     // each box restarts its own pixels once and no box can
                     // touch another's.
                     if k == 0 { keep } else { &[] },
-                    &denoise,
-                    &view,
                     // Only the first sample of the pass, and only its first
                     // box: after that the history is already in this pass's
-                    // view. A reprojected pass is a full pass anyway, so
-                    // there is only ever the one box here.
+                    // view. The reprojection gathers over the whole frame and
+                    // every later box reads that gather out of the scratch
+                    // pair, so it is a once-per-pass thing whatever the boxes
+                    // are.
                     if k == 0 && b == 0 {
                         prev_view.as_ref()
                     } else {
@@ -510,8 +531,29 @@ impl Stage {
                     },
                 )
                 .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
+            accumulated += box_started.elapsed();
             }
         }
+
+        // With no sync here `accumulated` is the cost of *submitting* the box
+        // passes, which is not what anyone reading a timing line wants to
+        // know. Close them out on the device first, and take the whole
+        // elapsed time rather than the sum of the per-box submits.
+        if timing {
+            self.ctx.device.poll(wgpu::PollType::wait_indefinitely())?;
+            accumulated = traced.elapsed();
+        }
+
+        // One denoise for the whole pass, however many boxes went into it.
+        // This is the half that cannot be scissored — the filter reaches 32
+        // pixels off a box's edge and the resolve has to leave the target
+        // texture whole — and it used to run once per box per sample. At four
+        // boxes that was four demodulate/à-trous/resolve chains over the full
+        // frame to show one frame.
+        let denoised = Instant::now();
+        self.pipeline
+            .denoise_and_resolve_resident(&self.ctx, &self.history, res, &denoise, &view)
+            .map_err(|e| anyhow::anyhow!("the denoiser: {e}"))?;
 
         // Wait for the passes to land. Not a readback — no pixel comes back —
         // but with nothing else synchronising the two sides the worker would
@@ -519,16 +561,25 @@ impl Stage {
         // tuner would be timing `queue.submit` rather than the render. A pass
         // has to be a pass before it can be measured.
         self.ctx.device.poll(wgpu::PollType::wait_indefinitely())?;
+        let denoise_time = denoised.elapsed();
 
         // Where a pass goes, when anyone asks.
-        if std::env::var("KOSM_GPU_TIMING").is_ok() {
+        if timing {
             eprintln!(
-                "court  gpu: {}\u{d7}{} pass \u{2014} {:.1} ms assembling, {:.1} ms uploading, {:.1} ms tracing",
+                "court  gpu: {}\u{d7}{} pass \u{2014} {:.1} ms assembling, {:.1} ms uploading, \
+                 {:.1} ms tracing ({} box{} \u{d7} {} sample{}, {:.1} ms tracing and \
+                 accumulating, {:.1} ms denoising once)",
                 size.0,
                 size.1,
                 assembly.as_secs_f64() * 1e3,
                 upload.as_secs_f64() * 1e3,
                 traced.elapsed().as_secs_f64() * 1e3,
+                dispatches.len(),
+                if dispatches.len() == 1 { "" } else { "es" },
+                samples.max(1),
+                if samples.max(1) == 1 { "" } else { "s" },
+                accumulated.as_secs_f64() * 1e3,
+                denoise_time.as_secs_f64() * 1e3,
             );
         }
         self.last_view = Some((size, cam));
