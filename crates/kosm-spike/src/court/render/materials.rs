@@ -77,11 +77,19 @@ fn court(name: &str) -> Option<Pbr> {
             ..p([0.78, 0.78, 0.75], 0.45, 0.15)
         },
         // A ball is rubber: pebbled, barely glossy, and lit a millimetre under
-        // its own skin. A touch of `subsurface` is what keeps the terminator
-        // soft; the sheen is the pebbling catching the light at the silhouette.
+        // its own skin. `subsurface` is a real random walk through that skin —
+        // light goes in here and comes out a couple of millimetres away, which
+        // is what softens the terminator and rounds the silhouette in a way no
+        // diffuse lobe does. A 2 mm mean free path is the scale of moulded
+        // rubber, run a little longer in red because that is what makes the
+        // shadowed side of a ball warm rather than merely dark; the colour is
+        // the ball's own, so the walk returns the hue the surface already has.
+        // The sheen is the pebbling catching the light at the silhouette.
         "ball" => Pbr {
             diffuse_roughness: 0.7,
             subsurface: 0.25,
+            subsurface_color: [0.58, 0.24, 0.08],
+            subsurface_radius: [0.0028, 0.0020, 0.0016],
             specular: 0.35,
             sheen: 0.25,
             sheen_color: [1.0, 0.85, 0.72],
