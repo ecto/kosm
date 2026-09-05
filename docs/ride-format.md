@@ -32,3 +32,15 @@ read by `kosm-view --ride <ride.json>`. Metres, z up, quaternions as
 `fixed` is drawn once; `actors[i]` is drawn every frame at
 `frame.poses[i]` composed with its offset: `world = pose ∘ offset`.
 Colours are linear RGB in 0..1. A reader ignores keys it does not know.
+
+## Streaming: `--stream`
+
+For a live window the same recorder writes the ride to stdout as it runs,
+one JSON object per line, flushed per frame:
+
+1. the header: the `ride.json` object with `"frames": []`;
+2. then one frame object per line, `{"t": 0.017, "poses": [...]}`, in order;
+3. EOF when the rollout ends (or the process is killed).
+
+Diagnostics go to stderr, never stdout. A reader appends frames as they
+arrive and may keep following the newest one.
