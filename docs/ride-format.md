@@ -9,7 +9,7 @@ read by `kosm-view --ride <ride.json>`. Metres, z up, quaternions as
   "name": "skatepark — mini ramp, skate-cem-p96x48-s9",
   "dt": 0.016666,                       // seconds between frames
   "meshes": [                           // shapes, referenced by index
-    {"kind": "stl", "path": "/abs/K1/meshes/Trunk.STL", "scale": 0.001},
+    {"kind": "stl", "path": "/abs/K1/meshes/Trunk.STL", "scale": 1.0},
     {"kind": "box", "half": [0.39, 0.098, 0.0055]},
     {"kind": "sphere", "radius": 0.027},
     {"kind": "cylinder", "radius": 0.008, "half_length": 0.09, "axis": [0, 1, 0]}
@@ -28,7 +28,7 @@ read by `kosm-view --ride <ride.json>`. Metres, z up, quaternions as
 }
 ```
 
-`scale` on an `stl` mesh multiplies its vertices (the K1's STLs are in mm).
+`scale` on an `stl` mesh multiplies its vertices (the K1's STLs are already in metres).
 `fixed` is drawn once; `actors[i]` is drawn every frame at
 `frame.poses[i]` composed with its offset: `world = pose ∘ offset`.
 Colours are linear RGB in 0..1. A reader ignores keys it does not know.
