@@ -314,8 +314,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         .and_then(|(device, queue)| {
             let a = scene.as_ref().map(|s| &s.authored);
             let depth = a.map_or(6.0, |a| a.parameter_or("max_depth", 6.0)).max(1.0) as u32;
-            let env = a.map_or(0.05, |a| a.parameter_or("env_radiance", 0.05)) as f32;
-            match court_gpu::Stage::new(&stage, &device, &queue, depth, env) {
+            match court_gpu::Stage::new(&stage, &device, &queue, depth) {
                 Ok(gpu) => Some(Tracer::Gpu(Box::new(gpu))),
                 Err(error) => {
                     eprintln!("court  gpu: {error}; falling back to the CPU tracer");
@@ -640,7 +639,6 @@ pub fn still_gpu(
         &ctx.device,
         &ctx.queue,
         a.parameter_or("max_depth", 6.0).max(1.0) as u32,
-        a.parameter_or("env_radiance", 0.05) as f32,
     )?;
 
     let t = if t < 0.0 {
@@ -706,7 +704,6 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
         &ctx.device,
         &ctx.queue,
         a.parameter_or("max_depth", 6.0).max(1.0) as u32,
-        a.parameter_or("env_radiance", 0.05) as f32,
     )?;
     let t = if t < 0.0 {
         a.parameter_or("still_t", 0.95)

@@ -133,7 +133,36 @@
 [defparam light_w_mm 1200.0]
 [defparam light_l_mm 600.0]
 [defparam light_radiance 18.0]   ; what a panel looks like straight on
-[defparam env_radiance 0.05]     ; constant grey from infinity, outside the room
+[defparam env_radiance 0.05]     ; constant grey from infinity, when sky is 0
+
+; ---- daylight ---------------------------------------------------------------
+; `sky 0` is the old still exactly: a constant grey of env_radiance from
+; infinity and no sun. `sky 1` puts a sky gradient and a sun disc outside the
+; room, and the only way either reaches the floor is the clerestory band — the
+; walls are closed solids, so what you get is a row of sun patches thrown from
+; the window openings onto the floor and the bleachers.
+;
+; The band is a real *opening*, not glass, and that is a renderer's decision
+; showing through the level. Next-event estimation is an any-hit shadow ray:
+; anything the ray touches occludes, a thin dielectric included. With glass in
+; the band, the sun could only ever be found by a BSDF-sampled path that
+; happened to refract through a pane and then wander into a 0.27° cone — one
+; ray in tens of thousands — and 32 passes of that is salt-and-pepper, not
+; daylight. An opening lets NEE see the sun directly and it converges in a
+; handful of passes. Real gyms have glass; when kosm-render learns to carry a
+; shadow ray through a thin dielectric, the panes come back and this comment
+; goes away.
+[defparam sky 1.0]               ; 0: the old constant grey. 1: sky gradient + sun
+[defparam sky_zenith 1.1]        ; radiance straight up (a blue-tinted hue)
+[defparam sky_horizon 1.6]       ; radiance at the horizon (near-white)
+[defparam sun_elevation_deg 35.0]  ; above the horizon
+[defparam sun_azimuth_deg 250.0]   ; towards the sun, about z, from +x
+; Irradiance, not radiance, so widening the disc softens the shadow without
+; changing the exposure. 6 is about six times what the ceiling panels put on
+; the floor: the patches are the brightest thing in the room and still hold
+; their colour rather than clipping to white (80 clips; 6 does not).
+[defparam sun_irradiance 6.0]
+[defparam sun_angular_radius_deg 0.27]
 [defparam exposure 1.0]
 [defparam max_depth 6.0]         ; longest light path
 [defparam denoise 1.0]           ; the à-trous pass over the film, 0 for a reference render
@@ -148,14 +177,38 @@
 [let room-x [+ [* 2.0 gym-hx] [* 2.0 wall_t_mm]]]
 [let room-y [+ [* 2.0 gym-hy] [* 2.0 wall_t_mm]]]
 
+; a window band high on the two long walls: real openings, above everything a
+; ball can reach. The band is a gap in the wall — a course below the sill, a
+; course above the head, and a pier between each pair of openings — so the sky
+; and the sun outside actually get in. See `sky`, above, for why it is a hole
+; and not a pane of glass.
+[defparam window_n 8.0]
+[defparam window_w_mm 1800.0]
+[defparam window_h_mm 1400.0]
+[defparam window_sill_mm 6200.0]
+[let window-pitch [/ [* 2.0 gym-hx] window_n]]
+[let window-x0 [+ [* -1.0 gym-hx] [/ window-pitch 2.0]]]
+[let window-head [+ window_sill_mm window_h_mm]]
+[let pier-w [- window-pitch window_w_mm]]
+
 ; the four walls — a ball can hit them, so they are colliders like the slab
 [let wall-side [box-c wall_t_mm room-y gym_h_mm]]
-[let wall-end [box-c [* 2.0 gym-hx] wall_t_mm gym_h_mm]]
+[let wall-under [box-c [* 2.0 gym-hx] wall_t_mm window_sill_mm]]
+[let wall-over [box-c [* 2.0 gym-hx] wall_t_mm [- gym_h_mm window-head]]]
+[let pier [box-c pier-w wall_t_mm window_h_mm]]
+; one pier before each opening and one after the last: the end piers run a
+; little past the corner, into the ±x walls, which is where a jamb belongs.
+[let long-wall [fn [y]
+  [union [translate 0.0 y [/ window_sill_mm 2.0] wall-under]
+  [union [translate 0.0 y [/ [+ gym_h_mm window-head] 2.0] wall-over]
+         [linear-pattern 1.0 0.0 0.0 [+ window_n 1.0] window-pitch
+           [translate [- window-x0 [/ window-pitch 2.0]] y
+                      [+ window_sill_mm [/ window_h_mm 2.0]] pier]]]]]]
 [let walls
   [union [translate wall-off-x 0.0 wall-hz wall-side]
   [union [translate [* -1.0 wall-off-x] 0.0 wall-hz wall-side]
-  [union [translate 0.0 wall-off-y wall-hz wall-end]
-         [translate 0.0 [* -1.0 wall-off-y] wall-hz wall-end]]]]]
+  [union [long-wall wall-off-y]
+         [long-wall [* -1.0 wall-off-y]]]]]]
 
 [let ceiling
   [translate 0.0 0.0 [+ gym_h_mm [/ wall_t_mm 2.0]] [box-c room-x room-y wall_t_mm]]]
@@ -186,25 +239,6 @@
     [box-c pad_t_mm pad_w_mm pad_h_mm]]]
 [let pads [linear-pattern 0.0 1.0 0.0 pad_n pad-pitch pad0]]
 
-; a window band high on the two long walls: thin panes set against the inner
-; face, above everything a ball can reach, so they are appearance only.
-[defparam window_n 8.0]
-[defparam window_w_mm 1800.0]
-[defparam window_h_mm 1400.0]
-[defparam window_t_mm 20.0]
-[defparam window_sill_mm 6200.0]
-[let window-pitch [/ [* 2.0 gym-hx] window_n]]
-[let window-x0 [+ [* -1.0 gym-hx] [/ window-pitch 2.0]]]
-[let window-z [+ window_sill_mm [/ window_h_mm 2.0]]]
-[let window-y [- gym-hy [/ window_t_mm 2.0]]]
-[let pane [box-c window_w_mm window_t_mm window_h_mm]]
-[let windows
-  [union
-    [linear-pattern 1.0 0.0 0.0 window_n window-pitch
-      [translate window-x0 window-y window-z pane]]
-    [linear-pattern 1.0 0.0 0.0 window_n window-pitch
-      [translate window-x0 [* -1.0 window-y] window-z pane]]]]
-
 ; a small bleacher along the +y side: rows stepping up towards the wall. Real
 ; benches — they collide, you can stand on them.
 [defparam bleacher_rows 5.0]
@@ -224,7 +258,6 @@
 [root ceiling "ceiling"]
 [root floor "floor"]
 [root pads "pad"]
-[root windows "window"]
 [root bleachers "oak"]
 
 ; ---- the markings -----------------------------------------------------------

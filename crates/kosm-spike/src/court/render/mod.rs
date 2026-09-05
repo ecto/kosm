@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use vcad_kernel::Solid;
 use vcad_kernel_math::{Point3, Transform, Vec3};
-use vcad_kernel_raytrace::pathtrace::{self, AreaLight, Environment, Ground, Object, PathTraceOptions, Pbr};
+use vcad_kernel_raytrace::pathtrace::{
+    self, AreaLight, Environment, GradientEnv, Ground, Object, PathTraceOptions, Pbr, Sun,
+};
 use vcad_kernel_raytrace::tlas::placement;
 use vcad_kernel_raytrace::{BrepBvh, Bvh};
 
@@ -93,6 +95,7 @@ pub struct Scene {
     extras: HashMap<usize, Arc<Bvh>>,
     lights: Vec<AreaLight>,
     env: Environment,
+    sun: Option<Sun>,
     ground: Option<Ground>,
     /// The document, for resolving an extra's material name.
     doc: vcad_ir::Document,
@@ -199,13 +202,14 @@ impl Scene {
             ));
         }
 
-        let env = a.parameter_or("env_radiance", 0.05) as f32;
+        let (env, sun) = daylight(a);
         Ok(Self {
             statics,
             ball,
             extras: HashMap::new(),
             lights,
-            env: Environment::constant([env; 3]),
+            env,
+            sun,
             ground,
             doc,
         })
@@ -259,8 +263,8 @@ impl Scene {
             objects,
             lights: self.lights.clone(),
             env: self.env.clone(),
-            // the gym is lit by its panels; there is no sky in it
-            sun: None,
+            // the panels, and — with `sky` on — whatever the clerestory lets in
+            sun: self.sun,
             ground: self.ground,
         }
     }
@@ -309,7 +313,19 @@ impl Scene {
             .map(move |e| (e.solid.as_ref(), materials::pbr(&self.doc, &e.material), &e.to_world))
     }
 
-    /// The gym's light panels: the only lights there are.
+    /// The level's environment: the constant grey, or the sky `sky 1` asks
+    /// for. The GPU tier reads this rather than rebuilding it, so the two
+    /// tiers cannot disagree about what is outside the room.
+    pub fn environment(&self) -> &Environment {
+        &self.env
+    }
+
+    /// The sun, if the level lit one.
+    pub fn sun(&self) -> Option<Sun> {
+        self.sun
+    }
+
+    /// The gym's light panels.
     pub fn lights(&self) -> &[AreaLight] {
         &self.lights
     }
@@ -362,6 +378,48 @@ impl Scene {
         let r = 0.5 * (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
         Some((extra.to_world.apply_point(&c), r))
     }
+}
+
+/// The level's daylight: what is outside the room, and the sun in it.
+///
+/// `sky 0` is the room as it was — a constant grey of `env_radiance` from
+/// infinity, and no sun — and is byte-identical to the still that shipped
+/// before there was any daylight at all. `sky 1` swaps the grey for a
+/// [`GradientEnv`] and hangs a [`Sun`] disc at the level's elevation and
+/// azimuth. Neither reaches the floor except through the clerestory band the
+/// level cuts in the long walls: the room is closed solids otherwise.
+///
+/// Both tiers call this. The CPU integrator gets the `Environment` and the
+/// `Sun` straight; the GPU tier uploads the same gradient through
+/// `set_gradient_env` and the same disc through `set_sun`.
+fn daylight(a: &crate::scene::AuthoredScene) -> (Environment, Option<Sun>) {
+    let grey = a.parameter_or("env_radiance", 0.05) as f32;
+    if a.parameter_or("sky", 0.0) <= 0.5 {
+        return (Environment::constant([grey; 3]), None);
+    }
+    // Hue is fixed and the knobs are the two radiances: a blue-tinted zenith,
+    // a near-white horizon, and the room's own grey below, which is what a
+    // ray leaving through a window and looking down at the ground outside
+    // finds. `intensity` is 1 so the knobs *are* the radiances.
+    let zenith = a.parameter_or("sky_zenith", 1.1) as f32;
+    let horizon = a.parameter_or("sky_horizon", 1.6) as f32;
+    let env = Environment::Gradient(GradientEnv {
+        zenith: [0.50 * zenith, 0.68 * zenith, zenith],
+        horizon: [0.95 * horizon, 0.97 * horizon, horizon],
+        ground: [grey; 3],
+        intensity: 1.0,
+    });
+    let el = a.parameter_or("sun_elevation_deg", 35.0).to_radians();
+    let az = a.parameter_or("sun_azimuth_deg", 250.0).to_radians();
+    let dir = Vec3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin());
+    let irr = a.parameter_or("sun_irradiance", 80.0) as f32;
+    let sun = Sun::new(
+        dir,
+        a.parameter_or("sun_angular_radius_deg", 0.27).to_radians(),
+        // Daylight is warm against the panels' neutral white.
+        [irr, 0.97 * irr, 0.90 * irr],
+    );
+    (env, Some(sun))
 }
 
 /// A BVH over a solid: its analytic BRep if it has one, its tessellation if

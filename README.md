@@ -203,7 +203,7 @@ and that the free throw still goes through it.
 The room is authored too, because the picture has no textures: everything you
 can see is a root with a material. The level draws the gym — four walls, a
 ceiling, the floor outside the slab flush with the maple so a ball rolling off
-does not step, a row of pads on the baseline wall, a band of windows high on
+does not step, a row of pads on the baseline wall, a band of clerestory openings high on
 the long walls and a small stepped bleacher — and paints the court as thin
 solids standing 1 mm proud of the slab: baseline, lane and key, the free-throw
 line and its circle, and the three-point arc, the last two as patterns of
@@ -250,8 +250,7 @@ only light there is. Next-event estimation on the panels, Russian roulette,
 one sample stream per pixel and frame. Lacquered maple planks with the court
 painted on them, a real glass backboard — full transmission at IOR 1.52, with
 float glass's faint iron green as Beer–Lambert absorption, so the ring's shadow
-and the wall behind read through it — thin-walled clerestory panes, painted
-steel, pebbled rubber. 960×540 at 64 spp is about 4 s a frame on the CPU; the still
+and the wall behind read through it — painted steel, pebbled rubber. 960×540 at 64 spp is about 4 s a frame on the CPU; the still
 `out/court_still.png` is 1080p at 512 spp, taken at `still_t`. Every knob —
 the balls, the shot, the hoop, the gym, the lights, the camera, the sample
 counts — is a `defparam` in the level. `tests/court.rs` is the rulebook test
@@ -278,6 +277,33 @@ level's radius. `Court::extras` is drawn the same way, for solids that move
 and that the physics does not own. vcad is in millimetres and phyz is in
 metres; the whole picture is built in millimetres and every phyz quantity
 crosses that boundary once, in `Scene::at`.
+
+The gym has daylight. `sky 1` in the level swaps the constant grey outside the
+room for a sky gradient (`sky_zenith`, `sky_horizon`) and hangs a sun disc at
+`sun_elevation_deg` / `sun_azimuth_deg` with `sun_irradiance` on a surface
+square-on and `sun_angular_radius_deg` across — 35°, 250°, 6 and 0.27° by
+default, which is about six times what the ceiling panels put on the floor:
+bright enough to be the light in the room, low enough that the patches hold
+their colour instead of clipping. The room is closed solids, so
+the only way any of it gets in is the clerestory band on the long walls, and
+what the picture shows is eight slabs of afternoon sun thrown across the floor
+and up the far wall, with the panels' own even light underneath. `sky 0` is
+the old still exactly: `Environment::constant(env_radiance)` and no sun. Both
+tiers read the same two values off `render::Scene` — the CPU integrator takes
+the `Environment` and the `Sun` directly, the GPU tier uploads them through
+`set_gradient_env` and `set_sun` — so neither can be lit differently from the
+other.
+
+The band is a real opening and not a pane of glass, which is a renderer's
+limit showing through the level. Next-event estimation is an any-hit shadow
+ray: anything it touches occludes, a thin dielectric included. With glass in
+the window band the sun can only be found by a BSDF-sampled path that refracts
+through a pane and then wanders into a 0.27° cone, which is roughly one ray in
+a hundred thousand — 32 passes of that is salt and pepper, not daylight. With
+the band open, NEE sees the sun directly and the patches are clean in a
+handful of passes. Real gyms have glass; *NEE through thin dielectrics* is the
+kosm-render item that would let the panes come back, and the `window` material
+is still in the table waiting for it.
 
 The gym is still code: four walls, a ceiling, a floor beyond the slab, and the
 rows of light panels that are the only light there is — but only until the
