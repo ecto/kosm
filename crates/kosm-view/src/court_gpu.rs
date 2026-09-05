@@ -94,8 +94,8 @@ use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_raytrace::gpu::{
-    GpuAreaLight, GpuCamera, GpuDenoiseParams, GpuMaterial, GpuRenderState, GpuScene,
-    HistoryPipeline, RayTracePipeline, ResidentScene, DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START,
+    DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START, GpuAreaLight, GpuCamera, GpuDenoiseParams,
+    GpuMaterial, GpuRenderState, GpuScene, HistoryPipeline, RayTracePipeline, ResidentScene,
 };
 use vcad_kernel_raytrace::pathtrace::{Environment, Pbr};
 
@@ -196,9 +196,12 @@ impl Stage {
         max_depth: u32,
         env_radiance: f32,
     ) -> anyhow::Result<Self> {
-        let ctx = GpuContext { device: device.clone(), queue: queue.clone() };
-        let pipeline =
-            RayTracePipeline::new(&ctx).map_err(|e| anyhow::anyhow!("the tracer's pipeline: {e}"))?;
+        let ctx = GpuContext {
+            device: device.clone(),
+            queue: queue.clone(),
+        };
+        let pipeline = vcad_kernel_raytrace::gpu::brep_pipeline(&ctx)
+            .map_err(|e| anyhow::anyhow!("the tracer's pipeline: {e}"))?;
         let history = HistoryPipeline::new(&ctx)
             .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
 
@@ -239,8 +242,11 @@ impl Stage {
             .collect();
         anyhow::ensure!(!ball.is_empty(), "the ball does not pack for the GPU");
 
-        let lights: Vec<GpuAreaLight> =
-            stage.lights().iter().map(GpuAreaLight::from_area_light).collect();
+        let lights: Vec<GpuAreaLight> = stage
+            .lights()
+            .iter()
+            .map(GpuAreaLight::from_area_light)
+            .collect();
 
         eprintln!(
             "court  gpu: {kept} solids packed ({dropped} skipped, no BRep), \
@@ -273,7 +279,6 @@ impl Stage {
             said_reprojected: false,
         })
     }
-
 
     /// The whole scene at one instant: the statics, plus every ball part at
     /// every ball's pose, plus the net.
@@ -360,7 +365,10 @@ impl Stage {
                 }
             }
             None => {
-                self.resident = Some(self.pipeline.resident_scene(&self.ctx, scene, size.0, size.1));
+                self.resident = Some(
+                    self.pipeline
+                        .resident_scene(&self.ctx, scene, size.0, size.1),
+                );
             }
         }
         self.uploaded = Some(frame_id);
@@ -372,14 +380,25 @@ impl Stage {
 
         let (texture, view) = self.ensure_target(size);
         let cam = GpuCamera::new(
-            [camera.eye.x as f32, camera.eye.y as f32, camera.eye.z as f32],
-            [camera.target.x as f32, camera.target.y as f32, camera.target.z as f32],
+            [
+                camera.eye.x as f32,
+                camera.eye.y as f32,
+                camera.eye.z as f32,
+            ],
+            [
+                camera.target.x as f32,
+                camera.target.y as f32,
+                camera.target.z as f32,
+            ],
             [0.0, 0.0, 1.0],
             (camera.fov_deg as f32).to_radians(),
             size.0,
             size.1,
         );
-        let denoise = GpuDenoiseParams { exposure: camera.exposure, ..self.denoise };
+        let denoise = GpuDenoiseParams {
+            exposure: camera.exposure,
+            ..self.denoise
+        };
         // The view the history is currently in. Only a previous pass at the
         // same size can be reprojected from — vcad reallocates the history on
         // a resize, so a stepped size has no previous plane to test against
@@ -391,7 +410,9 @@ impl Stage {
         self.reprojected = prev_view.is_some();
         if self.reprojected && !self.said_reprojected {
             self.said_reprojected = true;
-            eprintln!("court  gpu: the history follows the camera — passes on a moved camera reproject");
+            eprintln!(
+                "court  gpu: the history follows the camera — passes on a moved camera reproject"
+            );
         }
         let traced = Instant::now();
         let res = self.resident.as_mut().expect("just built");
@@ -490,7 +511,11 @@ impl Stage {
         }
         let texture = Arc::new(self.ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("court gpu target"),
-            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -500,7 +525,10 @@ impl Stage {
                 | wgpu::TextureUsages::COPY_SRC,
             // The shader stores through the unorm view; the blit samples
             // through the sRGB one when the surface re-encodes.
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb],
+            view_formats: &[
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            ],
         }));
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(wgpu::TextureFormat::Rgba8Unorm),
@@ -522,7 +550,10 @@ impl Stage {
     /// since the host's mirror of the counts cannot know which pixels the
     /// reprojection failed to match.
     pub fn history_counts(&mut self) -> anyhow::Result<Vec<u32>> {
-        let res = self.resident.as_mut().ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
+        let res = self
+            .resident
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
         let hist = pollster::block_on(self.pipeline.read_history(&self.ctx, res))
             .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("no history yet"))?;
@@ -530,11 +561,15 @@ impl Stage {
     }
 
     pub fn read_target(&self) -> anyhow::Result<Vec<u8>> {
-        let (texture, _) = self.target.as_ref().ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
+        let (texture, _) = self
+            .target
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
         let (w, h) = self.size;
         // A texture-to-buffer copy wants its rows aligned; the padding comes
         // straight back out below.
-        let row = (4 * w).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let row = (4 * w).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let staging = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("court gpu readback"),
             size: (row as u64) * (h as u64),
@@ -557,7 +592,11 @@ impl Stage {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         self.ctx.queue.submit(Some(enc.finish()));
 

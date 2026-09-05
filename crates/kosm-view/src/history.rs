@@ -197,7 +197,12 @@ struct Rect {
 
 impl Rect {
     fn everything(w: u32, h: u32) -> Self {
-        Self { x0: 0, y0: 0, x1: w, y1: h }
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: w,
+            y1: h,
+        }
     }
 
     /// `[x, y, w, h]`, which is what both tracers' masked entry points take.
@@ -239,7 +244,11 @@ pub struct Pose {
 impl Pose {
     #[cfg(test)]
     pub fn still(centre: [f64; 3], radius: f64) -> Self {
-        Self { centre, rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], radius }
+        Self {
+            centre,
+            rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            radius,
+        }
     }
 
     fn point(&self) -> Point3 {
@@ -257,7 +266,10 @@ impl Pose {
         if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > MOVED_MM {
             return true;
         }
-        self.rot.iter().zip(&other.rot).any(|(a, b)| (a - b).abs() > TURNED)
+        self.rot
+            .iter()
+            .zip(&other.rot)
+            .any(|(a, b)| (a - b).abs() > TURNED)
     }
 }
 
@@ -283,7 +295,11 @@ impl Plan {
         if self.full || n <= 0.0 {
             return 1.0;
         }
-        let px: f32 = self.rects.iter().map(|r| (r[2] as f32) * (r[3] as f32)).sum();
+        let px: f32 = self
+            .rects
+            .iter()
+            .map(|r| (r[2] as f32) * (r[3] as f32))
+            .sum();
         (px / n).min(1.0)
     }
 
@@ -420,7 +436,10 @@ impl History {
         self.albedo = lerp(&self.albedo, 3);
         self.variance = lerp(&self.variance, 1);
         let counts: Vec<f32> = self.count.iter().map(|&c| c as f32).collect();
-        self.count = lerp(&counts, 1).into_iter().map(|c| c.round().max(0.0) as u32).collect();
+        self.count = lerp(&counts, 1)
+            .into_iter()
+            .map(|c| c.round().max(0.0) as u32)
+            .collect();
         self.size = size;
         self.view = self.view.map(|v| v.at_size(nw, nh));
     }
@@ -642,7 +661,12 @@ fn mask_rects(
             if let Some(r) = &body {
                 let area = ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize);
                 if area * 5 > screen * 3 && std::env::var_os("KOSM_MASK_DEBUG").is_some() {
-                    eprintln!("mask   a pose covers {}% of the screen: centre {:?} radius {:.0} mm", 100 * area / screen.max(1), p.centre, p.radius);
+                    eprintln!(
+                        "mask   a pose covers {}% of the screen: centre {:?} radius {:.0} mm",
+                        100 * area / screen.max(1),
+                        p.centre,
+                        p.radius
+                    );
                 }
             }
             push(body);
@@ -652,7 +676,14 @@ fn mask_rects(
                     if let Some(rc) = &disc {
                         let area = ((rc.x1 - rc.x0) as usize) * ((rc.y1 - rc.y0) as usize);
                         if area * 5 > screen * 3 && std::env::var_os("KOSM_MASK_DEBUG").is_some() {
-                            eprintln!("mask   a shadow covers {}%: light {:?} pose {:?} r {:.0} → disc r {:.0} mm", 100 * area / screen.max(1), light, p.centre, p.radius, r);
+                            eprintln!(
+                                "mask   a shadow covers {}%: light {:?} pose {:?} r {:.0} → disc r {:.0} mm",
+                                100 * area / screen.max(1),
+                                light,
+                                p.centre,
+                                p.radius,
+                                r
+                            );
                         }
                     }
                     push(disc);
@@ -679,7 +710,6 @@ fn mask_rects(
 }
 
 impl History {
-
     /// What the next pass should trace, given where everything now is.
     ///
     /// This is the whole of the masked-pass restructuring: the mask used to be
@@ -689,12 +719,18 @@ impl History {
     /// no rectangle describes what changed there.
     pub fn plan(&self, view: &View, poses: &[Pose], lights: &[Point3]) -> Plan {
         if self.view != Some(*view) || self.count.iter().all(|&c| c == 0) {
-            return Plan { rects: Vec::new(), full: true };
+            return Plan {
+                rects: Vec::new(),
+                full: true,
+            };
         }
         let (w, h) = self.size;
         let raw = self.mask_rects(view, poses, lights);
         if raw.is_empty() {
-            return Plan { rects: Vec::new(), full: false };
+            return Plan {
+                rects: Vec::new(),
+                full: false,
+            };
         }
         // Four balls with ten shadow discs each, at their old pose and their
         // new, is eighty-odd rectangles that overlap heavily — and
@@ -709,19 +745,34 @@ impl History {
         // traversal of the whole film per rectangle, and a circular mask cut
         // into rows is one rectangle per row. Fewer, fatter boxes win.
         let boxes = merged(raw);
-        let covered: usize = boxes.iter().map(|r| ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize)).sum();
+        let covered: usize = boxes
+            .iter()
+            .map(|r| ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize))
+            .sum();
         // Past this much of the screen the boxes cost more than the rays they
         // save, and the whole frame is the better pass: it is one rectangle,
         // and every pixel outside the mask gains a sample from it.
         if covered * 10 > (w as usize) * (h as usize) * 6 {
-            return Plan { rects: Vec::new(), full: true };
+            return Plan {
+                rects: Vec::new(),
+                full: true,
+            };
         }
         let _ = h;
-        Plan { rects: boxes.into_iter().map(Rect::to_xywh).collect(), full: false }
+        Plan {
+            rects: boxes.into_iter().map(Rect::to_xywh).collect(),
+            full: false,
+        }
     }
 
     /// Kill the pixels the world moved under, and say how many.
-    fn paint_mask(&self, view: &View, poses: &[Pose], lights: &[Point3], live: &mut [bool]) -> usize {
+    fn paint_mask(
+        &self,
+        view: &View,
+        poses: &[Pose],
+        lights: &[Point3],
+        live: &mut [bool],
+    ) -> usize {
         let (w, _) = self.size;
         // The union, counted once — overlapping rectangles are one mask.
         let mut masked = vec![false; live.len()];
@@ -892,7 +943,10 @@ impl Mask {
 
     /// The same mask, for a consumer that reprojects on the device.
     pub fn reprojecting(size: (u32, u32)) -> Self {
-        Self { reproject: true, ..Self::new(size) }
+        Self {
+            reproject: true,
+            ..Self::new(size)
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -971,7 +1025,11 @@ impl Mask {
         }
         self.view = Some(*view);
         self.poses = poses.to_vec();
-        Keep { keep, scissor, reproject: moved && self.reproject && !empty }
+        Keep {
+            keep,
+            scissor,
+            reproject: moved && self.reproject && !empty,
+        }
     }
 }
 
@@ -1030,7 +1088,12 @@ mod tests {
     const H: u32 = 24;
 
     fn camera(eye: Point3) -> pathtrace::Camera {
-        pathtrace::Camera::look_at(eye, Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 45.0)
+        pathtrace::Camera::look_at(
+            eye,
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            45.0,
+        )
     }
 
     /// A film whose every pixel hits the plane `y = 0`, facing the camera —
@@ -1107,7 +1170,11 @@ mod tests {
         h.merge(&film2, &view2, &poses, &[], None);
         assert_eq!(h.size, (w2, h2));
         // Forty-one, not one: nothing was thrown away and this pass counted.
-        assert!(h.mean_samples() > 40.0, "mean spp collapsed to {}", h.mean_samples());
+        assert!(
+            h.mean_samples() > 40.0,
+            "mean spp collapsed to {}",
+            h.mean_samples()
+        );
         assert!((h.mean[0] - 1.0).abs() < 1e-4);
         assert_eq!(h.mask_fraction(), 0.0);
     }
@@ -1128,7 +1195,10 @@ mod tests {
         // Move it half a metre: a real move, but a small one on screen.
         h.merge(&film, &view, &at(500.0), &[], None);
         let f = h.mask_fraction();
-        assert!(f > 0.0 && f < 0.9, "the mask should be a patch, not the screen: {f}");
+        assert!(
+            f > 0.0 && f < 0.9,
+            "the mask should be a patch, not the screen: {f}"
+        );
         let inside = h.count.iter().filter(|&&c| c == 1).count();
         let outside = h.count.iter().filter(|&&c| c == 9).count();
         assert_eq!(inside + outside, (W * H) as usize);
@@ -1152,17 +1222,30 @@ mod tests {
         let mut plain = Mask::new((W, H));
         let _ = plain.keep(&va, &poses, &[], 1);
         let moved = plain.keep(&vb, &poses, &[], 1);
-        assert_eq!(moved.keep.iter().filter(|&&k| k == 0).count(), n, "a move is a restart");
+        assert_eq!(
+            moved.keep.iter().filter(|&&k| k == 0).count(),
+            n,
+            "a move is a restart"
+        );
         assert!(!moved.reproject);
         assert!(moved.scissor.is_none());
 
         let mut device = Mask::reprojecting((W, H));
         let _ = device.keep(&va, &poses, &[], 1);
         let moved = device.keep(&vb, &poses, &[], 1);
-        assert!(moved.reproject, "a moved camera should ask to be reprojected");
-        assert!(moved.scissor.is_none(), "a reprojected pass needs this pass's depth everywhere");
+        assert!(
+            moved.reproject,
+            "a moved camera should ask to be reprojected"
+        );
+        assert!(
+            moved.scissor.is_none(),
+            "a reprojected pass needs this pass's depth everywhere"
+        );
         let restarted = moved.keep.iter().filter(|&&k| k == 0).count();
-        assert!(restarted < n / 2, "the mask should be the world's patch, not the frame: {restarted}");
+        assert!(
+            restarted < n / 2,
+            "the mask should be the world's patch, not the frame: {restarted}"
+        );
 
         // The first pass is still a restart, reprojection or not: there is no
         // history behind it to carry.
@@ -1201,7 +1284,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn a_still_world_plans_nothing_and_a_moved_one_plans_a_patch() {
         let cam = camera(Point3::new(0.0, -3000.0, 0.0));
@@ -1223,11 +1305,20 @@ mod tests {
         let moved = h.plan(&view, &at(500.0), &[]);
         assert!(!moved.full && !moved.rects.is_empty());
         let share = moved.coverage((W, H));
-        assert!(share > 0.0 && share < 0.9, "a patch, not the screen: {share}");
+        assert!(
+            share > 0.0 && share < 0.9,
+            "a patch, not the screen: {share}"
+        );
         let bbox = moved.bbox().unwrap();
         for r in &moved.rects {
-            assert!(r[0] >= bbox[0] && r[0] + r[2] <= bbox[0] + bbox[2], "{r:?} outside {bbox:?}");
-            assert!(r[1] >= bbox[1] && r[1] + r[3] <= bbox[1] + bbox[3], "{r:?} outside {bbox:?}");
+            assert!(
+                r[0] >= bbox[0] && r[0] + r[2] <= bbox[0] + bbox[2],
+                "{r:?} outside {bbox:?}"
+            );
+            assert!(
+                r[1] >= bbox[1] && r[1] + r[3] <= bbox[1] + bbox[3],
+                "{r:?} outside {bbox:?}"
+            );
         }
     }
 
@@ -1264,9 +1355,10 @@ mod tests {
         for py in 0..H {
             for px in 0..W {
                 let i = (py * W + px) as usize;
-                let in_plan = plan.rects.iter().any(|r| {
-                    px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3]
-                });
+                let in_plan = plan
+                    .rects
+                    .iter()
+                    .any(|r| px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3]);
                 if in_plan {
                     inside += 1;
                     // Re-traced and masked: one sample, the fresh one.
@@ -1299,7 +1391,10 @@ mod tests {
                 Pose::still([-120.0, 60.0, k + 50.0], 200.0),
             ]
         };
-        let lights = [Point3::new(0.0, 0.0, 6000.0), Point3::new(400.0, 200.0, 6000.0)];
+        let lights = [
+            Point3::new(0.0, 0.0, 6000.0),
+            Point3::new(400.0, 200.0, 6000.0),
+        ];
         h.merge(&plane_film(&view, 1.0), &view, &at(300.0), &lights, None);
         let plan = h.plan(&view, &at(600.0), &lights);
         assert!(!plan.rects.is_empty());
@@ -1314,7 +1409,11 @@ mod tests {
             }
         }
         assert!(hits.iter().all(|&n| n <= 1), "a pixel is in two rectangles");
-        assert!(plan.rects.len() < 12, "{} boxes is too many to trace", plan.rects.len());
+        assert!(
+            plan.rects.len() < 12,
+            "{} boxes is too many to trace",
+            plan.rects.len()
+        );
         let traced: u32 = plan.rects.iter().map(|r| r[2] * r[3]).sum();
         assert_eq!(traced as usize, hits.iter().filter(|&&n| n == 1).count());
         assert!(traced <= W * H, "the plan traces more than the frame");

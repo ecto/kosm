@@ -1177,8 +1177,14 @@ dependencies = [
 name = "kosm-render"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
+ "js-sys",
+ "pollster",
  "rayon",
  "tang",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu 30.0.1",
 ]
 
 [[package]]
@@ -3348,6 +3354,7 @@ name = "vcad-kernel-gpu"
 version = "0.9.4"
 dependencies = [
  "bytemuck",
+ "kosm-render",
  "pollster",
  "tang-expr",
  "thiserror 2.0.20",

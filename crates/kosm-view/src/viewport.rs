@@ -124,7 +124,10 @@ impl Gpu {
         // The display handle matters on Wayland/GLES and is ignored elsewhere;
         // winit's is the one the surface will be made against.
         let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle())).with_env(),
+            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+                event_loop.owned_display_handle(),
+            ))
+            .with_env(),
         );
         let surface = instance.create_surface(window.clone())?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -136,11 +139,12 @@ impl Gpu {
         // bind group binds ten storage buffers in one compute stage and the
         // default limit is eight, so a device asked for defaults cannot build
         // its pipeline at all — and the blit does not care either way.
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("kosm-view"),
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("kosm-view"),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            }))?;
 
         let px = window.inner_size();
         let mut config = surface
@@ -189,11 +193,20 @@ impl Gpu {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blit"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
@@ -209,7 +222,18 @@ impl Gpu {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Ok(Self { surface, device, queue, config, pipeline, layout, sampler, image: None, borrowed: None, srgb })
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            pipeline,
+            layout,
+            sampler,
+            image: None,
+            borrowed: None,
+            srgb,
+        })
     }
 
     fn resize(&mut self, px: (u32, u32)) {
@@ -227,8 +251,14 @@ impl Gpu {
             label: Some("blit"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
             ],
         })
     }
@@ -237,7 +267,11 @@ impl Gpu {
     /// sRGB, so they are decoded on the way in exactly when the surface will
     /// re-encode them on the way out.
     fn sample_format(&self) -> wgpu::TextureFormat {
-        if self.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm }
+        if self.srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        }
     }
 
     fn upload(&mut self, image: Image) {
@@ -249,7 +283,10 @@ impl Gpu {
             // Already on the device: bind it and draw. No upload, no
             // readback, nothing across the bus at all.
             Image::Texture(texture) => {
-                let same = self.borrowed.as_ref().is_some_and(|t| Arc::ptr_eq(t, &texture))
+                let same = self
+                    .borrowed
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, &texture))
                     && self.image.as_ref().map(|(_, _, s)| *s) == Some((w, h));
                 if !same {
                     let view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -273,7 +310,11 @@ impl Gpu {
                 if fresh {
                     let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("scene"),
-                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        size: wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
@@ -285,12 +326,27 @@ impl Gpu {
                     self.image = Some((Some(texture), bind, size));
                     self.borrowed = None;
                 }
-                let Some((Some(texture), _, _)) = &self.image else { return };
+                let Some((Some(texture), _, _)) = &self.image else {
+                    return;
+                };
                 self.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
                     &rgba,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * w),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
             }
         }
@@ -298,7 +354,8 @@ impl Gpu {
 
     fn draw(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return;
@@ -315,7 +372,10 @@ impl Gpu {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -380,7 +440,11 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor())
+            .unwrap_or(1.0);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             // A minimised window is 0×0, which nothing downstream can use.
@@ -401,7 +465,11 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
                 };
                 self.scene.event(Event::Key(key));
             }
-            WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state,
+                ..
+            } => {
                 self.dragging = state == ElementState::Pressed;
                 self.cursor = None;
             }

@@ -584,17 +584,92 @@ tests), `vcad-render`'s (114) and the 42 that came with the renderer all
 pass, and the 960×540 court still is the same one, to within the low bit of
 float noise two builds of the same source already differ by.
 
-The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon` and
-later `wgpu` — never on `vcad-*`, `phyz-*`, or any other Kosm crate.** It is a
-leaf. And it must compile for the browser:
+### the GPU tier
 
-```bash
-cargo check -p kosm-render --target wasm32-unknown-unknown
+The compute pipeline moved too, behind `--features gpu`. Same split, one level
+down: `kosm-render` owns the *light* — the device, the BSDF, the environment,
+the camera and render state, the accumulator, the per-pixel history and the
+denoiser — and a client owns the *geometry*, in two halves.
+
+The WGSL half. A geometry module is a string of WGSL, composed between the
+renderer's prelude and its integrator, defining five functions:
+
+```wgsl
+fn trace_scene(origin: vec3<f32>, dir: vec3<f32>) -> RayHit
+fn hit_normal(hit: RayHit) -> vec3<f32>
+fn hit_tangent(hit: RayHit) -> vec3<f32>
+fn hit_material_index(hit: RayHit) -> u32
+fn hit_orientation(hit: RayHit) -> u32
 ```
 
-which is why `rayon` is a `cfg(not(target_arch = "wasm32"))` dependency rather
-than a hard one. A renderer that cannot run where the picture is looked at is
-half a renderer.
+`RayHit`, `MAX_T`, `EPSILON`, the two `face_idx` sentinels, the scale-aware
+`ray_eps`, `intersect_aabb` and `shading_frame` come from the prelude; `PI`,
+`GpuMaterial` and `onb` from the BSDF. `trace_scene` returns `FACE_IDX_MISS` on
+a miss and must never return `FACE_IDX_GROUND`, which the integrator keeps for
+its implicit ground plane. `hit_tangent` may return the zero vector where the
+parameterisation is degenerate — the anisotropy just goes round.
+
+The binding half, which is where the interesting constraint is. A browser
+guarantees only **ten** storage buffers per compute stage. The renderer takes
+five and leaves five:
+
+| binding | owner | what |
+|---|---|---|
+| 0 | renderer | camera uniform |
+| **1..=5** | **client** | geometry slabs, read-only storage |
+| 6 | renderer | output storage texture |
+| 7 | renderer | render-state uniform |
+| 8 | renderer | accumulation buffer |
+| 9 | renderer | materials |
+| 10 | renderer | depth/normal + denoise guide planes |
+| 11 | renderer | area lights |
+| 12 | renderer | feature ids (analytic crease detection) |
+| 13, 14 | renderer | environment *textures* |
+
+The environment is a pair of textures rather than buffers for exactly this
+reason: there were no storage slots left. Native Metal allows far more, so a
+sixth client buffer passes every test on this machine and dies in Chrome with
+an invalid bind-group layout, a valid pipeline and a blank viewport. That is
+why `RayTracePipeline::new` rejects a module with more than five bindings and
+why `the_renderer_leaves_five_storage_bindings_for_geometry` asserts the sum,
+not either half.
+
+The Rust half is two types: a `GeometryModule` (the WGSL plus the layout
+entries, fixed for the pipeline's life) and a `GpuGeometry` implementation that
+hands over the packed bytes as `GeometrySlab`s per scene. `SceneRef` carries
+those alongside the renderer's own materials, lights and environment; a client
+writes `impl From<&MyScene> for SceneRef` and passes `&my_scene` everywhere.
+
+`kosm-render` ships one worked example, `AnalyticGeometry` — spheres and
+planes, one storage buffer, ~140 lines of WGSL — so the renderer's own GPU
+tests trace something without a client crate:
+
+```bash
+cargo test -p kosm-render --features gpu -- --ignored --test-threads=1
+```
+
+`vcad-kernel-raytrace::gpu` is now the B-rep adapter over that seam: it packs
+faces, surfaces, the BVH, trim loops and inner-loop descriptors into the five
+slabs, supplies `brep.wgsl`, and re-exports everything else so
+`vcad-kernel-wasm`, `vcad-ffi` and `kosm-view` see one API. The device moved
+with the renderer, and `vcad-kernel-gpu` re-exports it, so there is still
+exactly one `GpuContext` in the graph. The 960×540 court still is byte-identical
+across the move.
+
+The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
+`wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other
+Kosm crate.** It is a leaf. And it must compile for the browser, GPU tier
+included:
+
+```bash
+cargo check -p kosm-render --target wasm32-unknown-unknown --features gpu
+```
+
+which is why `rayon` and `pollster` are `cfg(not(target_arch = "wasm32"))`
+dependencies rather than hard ones, and why the wasm buffer-mapping path uses
+`js-sys` and `wasm-bindgen-futures` directly instead of logging through
+`web-sys`. A renderer that cannot run where the picture is looked at is half a
+renderer.
 
 ## building
 

@@ -110,7 +110,11 @@ fn simulate(tx: Sender<Frame>, frames: usize) {
         }
         if !said && court.time() >= scene.t_end {
             said = true;
-            eprintln!("court  {:.2} s simulated in {:.1} s; still running", court.time(), start.elapsed().as_secs_f64());
+            eprintln!(
+                "court  {:.2} s simulated in {:.1} s; still running",
+                court.time(),
+                start.elapsed().as_secs_f64()
+            );
         }
     }
 }
@@ -131,8 +135,16 @@ fn authored_camera(scene: &CourtScene) -> Camera {
     let a = &scene.authored;
     let k = |name: &str, fallback: f64| a.parameter_or(name, fallback);
     Camera {
-        eye: KVec3::new(k("cam_x_mm", -800.0), k("cam_y_mm", -5600.0), k("cam_z_mm", 1900.0)),
-        target: KVec3::new(k("cam_at_x_mm", 900.0), k("cam_at_y_mm", 300.0), k("cam_at_z_mm", 1900.0)),
+        eye: KVec3::new(
+            k("cam_x_mm", -800.0),
+            k("cam_y_mm", -5600.0),
+            k("cam_z_mm", 1900.0),
+        ),
+        target: KVec3::new(
+            k("cam_at_x_mm", 900.0),
+            k("cam_at_y_mm", 300.0),
+            k("cam_at_z_mm", 1900.0),
+        ),
         fov_deg: k("cam_vfov_deg", 42.0),
         exposure: k("exposure", 1.0) as f32,
     }
@@ -217,9 +229,15 @@ fn poses(stage: &mut render::Scene, snap: &Snapshot) -> Vec<Pose> {
         out.push(Pose {
             centre: [c.x, c.y, c.z],
             rot: [
-                rot[(0, 0)], rot[(0, 1)], rot[(0, 2)], //
-                rot[(1, 0)], rot[(1, 1)], rot[(1, 2)], //
-                rot[(2, 0)], rot[(2, 1)], rot[(2, 2)],
+                rot[(0, 0)],
+                rot[(0, 1)],
+                rot[(0, 2)], //
+                rot[(1, 0)],
+                rot[(1, 1)],
+                rot[(1, 2)], //
+                rot[(2, 0)],
+                rot[(2, 1)],
+                rot[(2, 2)],
             ],
             radius: r,
         });
@@ -244,7 +262,11 @@ fn poses(stage: &mut render::Scene, snap: &Snapshot) -> Vec<Pose> {
             .iter()
             .map(|(c, r)| ((c.x - cx).powi(2) + (c.y - cy).powi(2) + (c.z - cz).powi(2)).sqrt() + r)
             .fold(0.0, f64::max);
-        out.push(Pose { centre: [cx, cy, cz], rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], radius });
+        out.push(Pose {
+            centre: [cx, cy, cz],
+            rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            radius,
+        });
     }
     out
 }
@@ -278,7 +300,12 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         Ok(stage) => stage,
         Err(error) => return eprintln!("court: could not build the picture: {error}"),
     };
-    eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.static_count(), stage.light_count(), t0.elapsed().as_secs_f64());
+    eprintln!(
+        "court  {} vcad solids, {} panels, in {:.1} s",
+        stage.static_count(),
+        stage.light_count(),
+        t0.elapsed().as_secs_f64()
+    );
 
     // The GPU tier if the surface handed a device over and the court packs for
     // it; the CPU integrator otherwise, saying which and why.
@@ -433,8 +460,11 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     ^ (lap.elapsed().as_nanos() as u64)
                     ^ passes_seed(&history);
                 let plan: Plan = history.plan(&view, &poses, &lights);
-                let patch_px: u64 =
-                    plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum();
+                let patch_px: u64 = plan
+                    .rects
+                    .iter()
+                    .map(|r| (r[2] as u64) * (r[3] as u64))
+                    .sum();
                 // A masked pass is only worth having when it is genuinely
                 // most of the frame cheaper. The pixels outside it get
                 // *nothing*, so a picture that is always masked never
@@ -470,7 +500,10 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                 }
                 let traced_px = if full { frame_px } else { patch_px };
                 (
-                    viewport::Image::Bytes { size: job.size, rgba },
+                    viewport::Image::Bytes {
+                        size: job.size,
+                        rgba,
+                    },
                     history.mask_fraction(),
                     history.mean_samples(),
                     traced_px,
@@ -528,7 +561,11 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
     let scene = CourtScene::bundled()?;
     let mut stage = render::Scene::new(&scene)?;
     let camera = authored_camera(&scene);
-    let t = if t < 0.0 { scene.authored.parameter_or("still_t", 0.95) } else { t };
+    let t = if t < 0.0 {
+        scene.authored.parameter_or("still_t", 0.95)
+    } else {
+        t
+    };
     let mut court = Court::from_scene(&scene)?;
     while court.time() < t {
         court.step();
@@ -536,7 +573,13 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
     let frame = Frame::of(&court);
     let t0 = Instant::now();
     let picture = stage.at_snapshot(&frame);
-    let film = pathtrace::render(&picture, &camera.to_pathtrace(), size.0, size.1, &options(spp, 0x5eed_1234, true));
+    let film = pathtrace::render(
+        &picture,
+        &camera.to_pathtrace(),
+        size.0,
+        size.1,
+        &options(spp, 0x5eed_1234, true),
+    );
     let rgba = film.to_srgb8(camera.exposure, false);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -562,12 +605,18 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
 /// adapter, just nobody's surface — and takes `passes` samples through the
 /// same device-side history the window uses. There is one readback in the
 /// whole of it, at the end, for the PNG.
-pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
+pub fn still_gpu(
+    path: &std::path::Path,
+    t: f64,
+    size: (u32, u32),
+    passes: u32,
+) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
     let stage = render::Scene::new(&scene)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
-    let ctx = vcad_kernel_gpu::GpuContext::init_blocking().map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
     let mut gpu = court_gpu::Stage::new(
         &stage,
         &ctx.device,
@@ -576,7 +625,11 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
         a.parameter_or("env_radiance", 0.05) as f32,
     )?;
 
-    let t = if t < 0.0 { a.parameter_or("still_t", 0.95) } else { t };
+    let t = if t < 0.0 {
+        a.parameter_or("still_t", 0.95)
+    } else {
+        t
+    };
     let mut court = Court::from_scene(&scene)?;
     while court.time() < t {
         court.step();
@@ -628,7 +681,8 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
     let mut stage = render::Scene::new(&scene)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
-    let ctx = vcad_kernel_gpu::GpuContext::init_blocking().map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
     let mut gpu = court_gpu::Stage::new(
         &stage,
         &ctx.device,
@@ -636,7 +690,11 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
         a.parameter_or("max_depth", 6.0).max(1.0) as u32,
         a.parameter_or("env_radiance", 0.05) as f32,
     )?;
-    let t = if t < 0.0 { a.parameter_or("still_t", 0.95) } else { t };
+    let t = if t < 0.0 {
+        a.parameter_or("still_t", 0.95)
+    } else {
+        t
+    };
     let mut court = Court::from_scene(&scene)?;
     while court.time() < t {
         court.step();
@@ -665,10 +723,33 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
     let mut mask = Mask::reprojecting(size);
     let lights = stage.light_centres();
     let poses = poses(&mut stage, &frame);
-    let _ = mask.keep(&View::of(&camera.to_pathtrace(), size.0, size.1), &poses, &lights, passes);
-    let keep = mask.keep(&View::of(&moved.to_pathtrace(), size.0, size.1), &poses, &lights, 1);
-    anyhow::ensure!(keep.reproject, "a moved camera should ask for a reprojected pass");
-    gpu.accumulate(&stage, &frame, 0, &moved, size, &keep.keep, keep.scissor, 1, keep.reproject)?;
+    let _ = mask.keep(
+        &View::of(&camera.to_pathtrace(), size.0, size.1),
+        &poses,
+        &lights,
+        passes,
+    );
+    let keep = mask.keep(
+        &View::of(&moved.to_pathtrace(), size.0, size.1),
+        &poses,
+        &lights,
+        1,
+    );
+    anyhow::ensure!(
+        keep.reproject,
+        "a moved camera should ask for a reprojected pass"
+    );
+    gpu.accumulate(
+        &stage,
+        &frame,
+        0,
+        &moved,
+        size,
+        &keep.keep,
+        keep.scissor,
+        1,
+        keep.reproject,
+    )?;
     anyhow::ensure!(gpu.reprojected(), "the pass should have reprojected");
 
     let after = gpu.history_counts()?;
@@ -982,12 +1063,19 @@ impl App {
     fn apply_orbit(&mut self) {
         let (az, el, dist) = self.orbit;
         let t = self.camera.target;
-        self.camera.eye = t + KVec3::new(dist * el.cos() * az.cos(), dist * el.cos() * az.sin(), dist * el.sin());
+        self.camera.eye = t + KVec3::new(
+            dist * el.cos() * az.cos(),
+            dist * el.cos() * az.sin(),
+            dist * el.sin(),
+        );
     }
 
     /// The render size: the window over the divisor, never degenerate.
     fn size(&self) -> (u32, u32) {
-        ((self.window.0 / self.scale).max(32), (self.window.1 / self.scale).max(18))
+        (
+            (self.window.0 / self.scale).max(32),
+            (self.window.1 / self.scale).max(18),
+        )
     }
 
     /// The work a *full* pass at this divisor is, in megapixel-samples. Full,
@@ -996,7 +1084,10 @@ impl App {
     /// fit. The frame counts twice — once traced, once resolved — which is
     /// what [`Cost`] measures against.
     fn work(&self, scale: u32) -> f64 {
-        let (w, h) = ((self.window.0 / scale).max(32), (self.window.1 / scale).max(18));
+        let (w, h) = (
+            (self.window.0 / scale).max(32),
+            (self.window.1 / scale).max(18),
+        );
         2.0 * w as f64 * h as f64 / 1e6 * self.samples.max(1) as f64
     }
 
@@ -1023,7 +1114,9 @@ impl App {
 
     /// The largest picture whose *per-pixel* cost fits what is left.
     fn affordable(&self) -> u32 {
-        (1..MAX_SCALE).find(|s| self.pixel_ms(*s) <= self.budget()).unwrap_or(MAX_SCALE)
+        (1..MAX_SCALE)
+            .find(|s| self.pixel_ms(*s) <= self.budget())
+            .unwrap_or(MAX_SCALE)
     }
 
     /// Re-estimate the cost of a pixel from a pass that actually happened, and
@@ -1060,7 +1153,11 @@ impl App {
         // tuner's.
         if shot.traced_px >= (shot.size.0 as u64) * (shot.size.1 as u64) {
             let slot = &mut self.seen[(self.scale as usize).min(MAX_SCALE as usize + 1)];
-            *slot = if *slot > 0.0 { 0.7 * *slot + 0.3 * ms } else { ms };
+            *slot = if *slot > 0.0 {
+                0.7 * *slot + 0.3 * ms
+            } else {
+                ms
+            };
         }
         true
     }
@@ -1078,7 +1175,10 @@ impl App {
     /// Would a step coarser actually be cheaper? Unknown counts as yes — the
     /// only way to find out is to try it once.
     fn shrinking_helps(&self) -> bool {
-        let (here, coarser) = (self.seen[self.scale as usize], self.seen[(self.scale + 1) as usize]);
+        let (here, coarser) = (
+            self.seen[self.scale as usize],
+            self.seen[(self.scale + 1) as usize],
+        );
         here <= 0.0 || coarser <= 0.0 || coarser < 0.75 * here
     }
 
@@ -1108,7 +1208,9 @@ impl App {
     }
 
     fn ask(&mut self) {
-        let Some(frame) = self.frames.get(self.cursor) else { return };
+        let Some(frame) = self.frames.get(self.cursor) else {
+            return;
+        };
         self.generation += 1;
         let job = Job {
             generation: self.generation,
@@ -1125,7 +1227,9 @@ impl App {
 
 impl viewport::Scene for App {
     fn init(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let Some((jobs, shots)) = self.pending.take() else { return };
+        let Some((jobs, shots)) = self.pending.take() else {
+            return;
+        };
         let gpu = (!self.cpu_only).then(|| (device.clone(), queue.clone()));
         std::thread::spawn(move || render_worker(jobs, shots, gpu));
     }
@@ -1185,7 +1289,11 @@ impl viewport::Scene for App {
             // resolution, or the samples that bought it. A pass that came back
             // with little of the screen repainted is one more piece of
             // evidence that the picture is worth growing.
-            self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS { self.cheap + 1 } else { 0 };
+            self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS {
+                self.cheap + 1
+            } else {
+                0
+            };
             self.last_ms = shot.ms as f64;
             self.resize_costs_history = shot.resize_costs_history;
             self.mean_spp = shot.mean_spp;
@@ -1243,7 +1351,11 @@ impl viewport::Scene for App {
                     self.samples = 1;
                 }
                 self.scale -= 1;
-            } else if room && self.scale == self.floor && self.floor > 1 && self.cheap >= CLIMB_AFTER {
+            } else if room
+                && self.scale == self.floor
+                && self.floor > 1
+                && self.cheap >= CLIMB_AFTER
+            {
                 self.floor -= 1;
                 self.scale -= 1;
                 self.samples = 1;
@@ -1273,16 +1385,26 @@ pub fn run(frames: usize, spp: u32, cpu_only: bool) -> anyhow::Result<()> {
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
-    let camera = CourtScene::bundled().map(|s| authored_camera(&s)).unwrap_or(Camera {
-        eye: KVec3::new(-800.0, -5600.0, 1900.0),
-        target: KVec3::new(900.0, 300.0, 1900.0),
-        fov_deg: 40.0,
-        exposure: 1.0,
-    });
+    let camera = CourtScene::bundled()
+        .map(|s| authored_camera(&s))
+        .unwrap_or(Camera {
+            eye: KVec3::new(-800.0, -5600.0, 1900.0),
+            target: KVec3::new(900.0, 300.0, 1900.0),
+            fov_deg: 40.0,
+            exposure: 1.0,
+        });
 
     viewport::run(
         "Kosm view — the court",
         (1280, 720),
-        App::new(rx, shot_rx, job_tx, camera, spp, (job_rx, shot_tx), cpu_only),
+        App::new(
+            rx,
+            shot_rx,
+            job_tx,
+            camera,
+            spp,
+            (job_rx, shot_tx),
+            cpu_only,
+        ),
     )
 }

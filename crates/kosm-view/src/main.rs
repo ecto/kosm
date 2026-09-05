@@ -46,7 +46,11 @@ fn arg(key: &str) -> Option<String> {
     args.iter().enumerate().find_map(|(i, a)| {
         a.strip_prefix(&format!("--{key}="))
             .map(str::to_owned)
-            .or_else(|| (a == &format!("--{key}")).then(|| args.get(i + 1).cloned()).flatten())
+            .or_else(|| {
+                (a == &format!("--{key}"))
+                    .then(|| args.get(i + 1).cloned())
+                    .flatten()
+            })
     })
 }
 
@@ -89,11 +93,17 @@ fn main() -> anyhow::Result<()> {
         let width: u32 = parse("width").unwrap_or(480);
         let size = (width, (width * 9 / 16).max(1));
         let t: f64 = parse("at").unwrap_or(-1.0);
-        let deg: f64 = arg("orbit-test").and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        let deg: f64 = arg("orbit-test")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3.0);
         return court::orbit_test(t, size, parse("spp").unwrap_or(8), deg);
     }
     // `--cpu` pins the CPU integrator; without it the window uses the GPU
     // tracer when the adapter and the court allow it.
     let cpu_only = std::env::args().any(|a| a == "--cpu");
-    court::run(parse("frames").unwrap_or(0), parse("spp").unwrap_or(4), cpu_only)
+    court::run(
+        parse("frames").unwrap_or(0),
+        parse("spp").unwrap_or(4),
+        cpu_only,
+    )
 }
