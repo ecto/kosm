@@ -460,10 +460,16 @@ impl App {
         }
     }
 
-    /// What the frame under the cursor looks like, to the millimetre: two
-    /// frames of a world at rest are the same subject, however many arrive,
-    /// so a live window whose balls have stopped still gets to accumulate.
+    /// What the frame under the cursor looks like, to a couple of
+    /// centimetres: two frames of a world at rest — or creeping, a ball
+    /// rolling out its last millimetres, a net swaying — are the same
+    /// subject, however many arrive, so a live window gets to accumulate
+    /// while nothing the eye would notice is happening. A creeping ball still
+    /// crosses a cell now and then and the picture starts over; that is the
+    /// price of not having motion vectors yet.
     fn frame_key(&self) -> u64 {
+        const CELL_M: f64 = 0.02;
+        const CELL_MM: f64 = 20.0;
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut mix = |v: i64| {
             h ^= v as u64;
@@ -471,15 +477,15 @@ impl App {
         };
         if let Some(frame) = self.frames.get(self.cursor) {
             for (c, _) in &frame.balls {
-                mix((c.x * 1e3).round() as i64);
-                mix((c.y * 1e3).round() as i64);
-                mix((c.z * 1e3).round() as i64);
+                mix((c.x / CELL_M).round() as i64);
+                mix((c.y / CELL_M).round() as i64);
+                mix((c.z / CELL_M).round() as i64);
             }
             for extra in &frame.extras {
                 let m = &extra.to_world.matrix;
-                mix((m[(0, 3)]).round() as i64);
-                mix((m[(1, 3)]).round() as i64);
-                mix((m[(2, 3)]).round() as i64);
+                mix((m[(0, 3)] / CELL_MM).round() as i64);
+                mix((m[(1, 3)] / CELL_MM).round() as i64);
+                mix((m[(2, 3)] / CELL_MM).round() as i64);
             }
         }
         h
