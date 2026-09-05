@@ -45,13 +45,20 @@ fn court(name: &str) -> Option<Pbr> {
             clearcoat_roughness: 0.045,
             ..p([0.52, 0.36, 0.19], 0.30, 0.85)
         },
-        // The backboard: soda-lime glass over the painted square. Real IOR,
-        // full specular weight; it is opaque here because transmission is not
-        // in the model yet, so it reads as a very bright, very smooth sheet.
+        // The backboard: real soda-lime glass. A full transmission lobe at
+        // 1.52, so the ring's shadow and the wall behind carry through it the
+        // way they do in a gym, and the faint green of iron in float glass —
+        // a metre of it transmits about (0.78, 0.92, 0.83) — put in as
+        // Beer-Lambert absorption rather than as a tint on the surface, so a
+        // 12 mm board is barely green and its polished edge is bottle-green,
+        // which is exactly the tell that a backboard is glass and not acrylic.
         "glass" => Pbr {
-            specular: 1.0,
+            transmission: 1.0,
             ior: 1.52,
-            ..p([0.72, 0.78, 0.80], 0.04, 0.0)
+            attenuation_color: [0.78, 0.92, 0.83],
+            attenuation_distance: 1000.0,
+            specular: 1.0,
+            ..p([1.0, 1.0, 1.0], 0.02, 0.0)
         },
         // Painted steel ring: baked enamel over metal. The paint is a
         // dielectric, so the ring is not `metallic` — the coat is what makes
@@ -132,10 +139,16 @@ fn court(name: &str) -> Option<Pbr> {
             specular: 0.2,
             ..p([0.20, 0.20, 0.21], 0.90, 0.0)
         },
+        // The clerestory panes. Modelled as 20 mm boxes, which is thicker
+        // than the pane they stand for, so they are `thin_walled`: the
+        // daylight behind them arrives undisplaced instead of being refracted
+        // twice through a slab it is not really twenty millimetres of.
         "window" => Pbr {
-            specular: 1.0,
+            transmission: 1.0,
+            thin_walled: true,
             ior: 1.52,
-            ..p([0.72, 0.78, 0.80], 0.04, 0.0)
+            specular: 1.0,
+            ..p([1.0, 1.0, 1.0], 0.02, 0.0)
         },
         "decor" => Pbr {
             diffuse_roughness: 0.5,

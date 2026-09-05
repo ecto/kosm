@@ -454,8 +454,14 @@ pub fn picture(
         ),
         kosm_render::Object::new(
             Arc::new(kosm_render::Bvh::build(Analytic::ball(marble, marble_r))),
-            // the marble: a clearcoated bead, so the rig reads on it
-            kosm_render::Pbr::plastic([0.80, 0.82, 0.86], 0.06, 1.0),
+            // The marble is glass, and it is the *same* glass `light.rs`
+            // traces its caustic through: N-BK7's Sellmeier coefficients, so
+            // the beauty frame and the five-band caustic tracer disperse by
+            // one curve and not by two. A path that meets it draws a hero
+            // wavelength and carries it, which is what puts the colour fringe
+            // on the plate underneath.
+            kosm_render::Pbr::glass(1.5168, 0.0)
+                .with_sellmeier(kosm_render::spectrum::BK7_SELLMEIER),
         ),
     ];
     kosm_render::Scene {
