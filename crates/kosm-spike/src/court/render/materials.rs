@@ -12,9 +12,9 @@ use vcad_kernel_raytrace::pathtrace::Pbr;
 /// The PBR a root's material name means, in this document.
 pub fn pbr(doc: &Document, name: &str) -> Pbr {
     if let Some(def) = doc.materials.get(name) {
-        return Pbr::from_material_def(Some(def), None);
+        return vcad_kernel_raytrace::pathtrace::from_material_def(Some(def), None);
     }
-    court(name).unwrap_or_else(|| Pbr::from_material_def(vcad_render::materials::builtin(name).as_ref(), None))
+    court(name).unwrap_or_else(|| vcad_kernel_raytrace::pathtrace::from_material_def(vcad_render::materials::builtin(name).as_ref(), None))
 }
 
 /// The names a basketball court uses that no general material library has.

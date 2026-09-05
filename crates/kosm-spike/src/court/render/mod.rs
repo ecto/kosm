@@ -29,7 +29,8 @@ use std::sync::Arc;
 use vcad_kernel::Solid;
 use vcad_kernel_math::{Point3, Transform, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, AreaLight, Environment, Ground, Object, PathTraceOptions, Pbr};
-use vcad_kernel_raytrace::Bvh;
+use vcad_kernel_raytrace::tlas::placement;
+use vcad_kernel_raytrace::{BrepBvh, Bvh};
 
 pub use vcad_kernel_raytrace::pathtrace::{Camera, Film};
 
@@ -75,7 +76,7 @@ struct Placed {
 
 impl Placed {
     fn object(&self) -> Object {
-        Object::placed(self.bvh.clone(), self.pbr, self.to_world.clone())
+        Object::placed(self.bvh.clone(), self.pbr, placement(&self.to_world))
     }
 }
 
@@ -228,7 +229,7 @@ impl Scene {
             let r = rot.transpose();
             let at = rigid(&r, c.x, c.y, c.z);
             for (_, _, bvh, pbr, local) in &self.ball {
-                objects.push(Object::placed(bvh.clone(), *pbr, Transform { matrix: at.matrix * local.matrix }));
+                objects.push(Object::placed(bvh.clone(), *pbr, placement(&Transform { matrix: at.matrix * local.matrix })));
             }
         }
         // BVHs for the extras, kept from frame to frame by the solid's
@@ -251,7 +252,7 @@ impl Scene {
             if bvh.root().is_none() {
                 continue;
             }
-            objects.push(Object::placed(bvh, materials::pbr(&self.doc, &extra.material), extra.to_world.clone()));
+            objects.push(Object::placed(bvh, materials::pbr(&self.doc, &extra.material), placement(&extra.to_world)));
         }
         self.extras = seen;
         pathtrace::Scene {
@@ -365,7 +366,7 @@ impl Scene {
 /// not — the same fallback `vcad-render --photoreal` takes.
 fn build_bvh(solid: &Solid) -> Bvh {
     match solid.as_brep() {
-        Some(brep) => Bvh::build(brep),
+        Some(brep) => Bvh::build_brep(brep),
         None => {
             let mut mesh = solid.to_mesh(0);
             vcad_kernel::vcad_kernel_tessellate::render_bake_default(&mut mesh);

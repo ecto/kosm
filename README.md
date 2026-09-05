@@ -567,13 +567,22 @@ meets one. That is the whole seam. A `Hit` carries the primitive index and
 nothing that names it, so the geometry — not the renderer — says whether index
 7 is a `FaceId`, a triangle or a gaussian.
 
-The geometry stayed with the geometry. `intersect/` (plane, cylinder, sphere,
-cone, torus, bilinear, B-spline) and `trim.rs` are still vcad's, because
-knowing that a ray-sphere hit at *(u, v)* falls outside a trimmed face's
-boundary loop is a B-rep fact, not a lighting one. `vcad-kernel-raytrace` now
-implements the trait over its faces and re-exports `Bvh`, `Ray`, `RayHit`,
-`Tlas` as before; vcad is a client of Kosm's renderer, and the pictures did
-not move.
+The integrator went with them. `Scene`, `Object`, `Pbr`, the softboxes, the
+environment, the film, the à-trous denoiser and `render` never knew what a
+B-rep was — the one line that did, reading a `vcad_ir::MaterialDef` into a
+`Pbr`, stayed in vcad as `pathtrace::from_material_def`.
+
+The geometry stayed with the geometry too. `intersect/` (plane, cylinder,
+sphere, cone, torus, bilinear, B-spline) and `trim.rs` are still vcad's,
+because knowing that a ray-sphere hit at *(u, v)* falls outside a trimmed
+face's boundary loop is a B-rep fact, not a lighting one.
+`vcad-kernel-raytrace` implements the trait over its faces, and `Bvh`, `Tlas`,
+`Instance`, `Object` and `Scene` are aliases for the generic ones with vcad's
+geometry filled in — so `vcad-render --photoreal`, the GPU upload and the
+window all draw the same picture through the same code. Its own suite (92
+tests), `vcad-render`'s (114) and the 42 that came with the renderer all
+pass, and the 960×540 court still is the same one, to within the low bit of
+float noise two builds of the same source already differ by.
 
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon` and
 later `wgpu` — never on `vcad-*`, `phyz-*`, or any other Kosm crate.** It is a
