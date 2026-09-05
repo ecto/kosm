@@ -29,13 +29,28 @@
 //!   also gets an infinite one at the slab's underside. Neither shows through a
 //!   closed gym at `env_radiance = 0.05`, but they are why the two images are
 //!   alike and not identical.
-//! - The shader traces a torus wider than the solid says it is, so the ball's
-//!   seams are left out here (see [`Stage::new`]).
 //! - A root with no BRep — the painted markings, which are drawn and not
 //!   modelled — cannot be packed and is not in the GPU picture at all.
 //! - `RayTracePipeline` builds its buffers per call, so every pass re-uploads
 //!   the whole court, and it hands the image back through a CPU readback
-//!   rather than a texture the blit could sample. Both live in vcad.
+//!   rather than a texture the blit could sample.
+//!
+//!   vcad now has a `ResidentScene` that fixes exactly this — upload once,
+//!   rewrite placements and camera in place, and a `render_resident_into` that
+//!   writes a storage texture the blit could sample with no readback at all.
+//!   It is not used here, and the reason is the *accumulator*. A resident
+//!   scene keeps its `accum` buffer private, and both of its exits
+//!   (`render_resident`, `render_resident_into`) hand back the shader's
+//!   **output texture**: ACES-tonemapped, gamma-encoded, eight bits. This
+//!   tier's contract is one *raw linear* sample per pass, because
+//!   [`crate::history`] is the accumulator for both tiers and the mean of
+//!   tonemapped samples is not the tonemap of their mean. The one call that
+//!   hands back linear radiance is `render_with_render_state`, which takes and
+//!   returns *our* accumulator — so residency of the geometry is what is given
+//!   up to keep the sample honest. Reaching the resident path needs one of two
+//!   things in vcad: a public view of `ResidentScene`'s accum buffer, or a
+//!   compute shader that folds the history (mean and count per pixel, against
+//!   an uploaded mask) on the device so nothing linear ever has to come down.
 //! - There are no guide buffers. The shader writes depth and normals into a
 //!   buffer it allocates itself, without `COPY_SRC` and without returning it,
 //!   so this tier hands the history colour alone — which is why a moved camera
@@ -153,19 +168,15 @@ impl Stage {
         let statics = merge_all(packed.into_iter())
             .ok_or_else(|| anyhow::anyhow!("nothing in the court packs for the GPU"))?;
 
-        // The ball's seams do not go on the GPU. They are four thin tori, and
-        // the shader traces a torus wider than the solid says it is — an
-        // untrimmed one, near enough: a torus that covers 330 pixels under the
-        // CPU integrator covers 603 under the compute shader, at the identity
-        // transform, with nothing placed. On a seam that means each ring swells
-        // until it engulfs the ball it is drawn on, and a ball whose seams are
-        // near-black comes out a black blob. Better a ball with no seams on it
-        // than a ball that is not a ball. The rim is a torus too and is drawn:
-        // at its size the difference does not read, and losing the hoop would
-        // cost more than it saves.
+        // The ball's seams are on the GPU again. They are four thin tori, and
+        // the shader used to trace a torus wider than the solid said it was —
+        // a ring that covered 330 pixels on the CPU covered 603 here, which on
+        // a seam meant each near-black ring swelling until it engulfed the
+        // ball it was drawn on. vcad's torus intersection is fixed (its
+        // silhouettes now agree with the CPU integrator's to an IoU of 0.993),
+        // so the seams are packed like any other part.
         let ball: Vec<GpuScene> = stage
             .ball_parts()
-            .filter(|(name, _, _)| !matches!(*name, "ball-seams" | "seam"))
             .filter_map(|(_, solid, pbr)| pack(solid, pbr))
             .collect();
         anyhow::ensure!(!ball.is_empty(), "the ball does not pack for the GPU");
@@ -240,6 +251,15 @@ impl Stage {
     /// running average degenerates to `sample / frame_index`, which is undone
     /// here. The output texture, which is where the shader's own denoise and
     /// tonemap land, is discarded: [`crate::history`] does the accumulating.
+    ///
+    /// `scissor` is `[x, y, w, h]`, and it is what makes a pass cost what
+    /// moved. `GpuRenderState::set_scissor` sizes the dispatch to the
+    /// rectangle and offsets every invocation into it, so the shader does the
+    /// work of the rectangle; the readback is trimmed to the rows the
+    /// rectangle spans, which is the other half of the saving, since a pass
+    /// that only touched a band of the screen has no business dragging the
+    /// whole frame back across the bus. Pixels outside come back as the zeros
+    /// the clear left, and the history is told not to look at them.
     pub fn sample(
         &mut self,
         stage: &render::Scene,
@@ -247,6 +267,7 @@ impl Stage {
         frame_id: u64,
         camera: &Camera,
         size: (u32, u32),
+        scissor: Option<[u32; 4]>,
     ) -> anyhow::Result<Sample> {
         let n = (size.0 as u64) * (size.1 as u64);
         anyhow::ensure!(n > 0, "an empty picture");
@@ -300,6 +321,14 @@ impl Stage {
         state.rr_start = DEFAULT_RR_START;
         state.firefly_clamp = DEFAULT_FIREFLY_CLAMP;
         state.env_intensity = self.env_intensity;
+        // Rows the pass will actually write, for the readback below.
+        let rows = match scissor {
+            Some(r) if r[2] > 0 && r[3] > 0 => {
+                state.set_scissor(r);
+                (r[1].min(size.1), (r[1].saturating_add(r[3])).min(size.1))
+            }
+            _ => (0, size.1),
+        };
 
         let cam = GpuCamera::new(
             [camera.eye.x as f32, camera.eye.y as f32, camera.eye.z as f32],
@@ -325,7 +354,7 @@ impl Stage {
         };
         self.accum = Some(accum);
 
-        let sample = self.read_back(n as usize)?;
+        let sample = self.read_back(size, rows)?;
         // Where a pass goes, when anyone asks. The trace includes the upload
         // of every buffer and the readback: the pipeline builds its buffers
         // per call, so a pass pays for the whole scene crossing the bus
@@ -343,16 +372,28 @@ impl Stage {
     }
 
     /// Copy the accumulator down and undo the shader's `1 / frame_index`.
-    fn read_back(&self, n: usize) -> anyhow::Result<Sample> {
+    ///
+    /// Only the rows `rows.0 .. rows.1` are copied and mapped: the accumulator
+    /// is row-major, so a scissored pass's rows are one contiguous run, and
+    /// the rest of the frame is left as the zeros the clear put there. The
+    /// history never reads outside the rectangle it asked for.
+    fn read_back(&self, size: (u32, u32), rows: (u32, u32)) -> anyhow::Result<Sample> {
         let (accum, read) = match (&self.accum, &self.read) {
             (Some(a), Some(r)) => (a, r),
             _ => anyhow::bail!("no accumulator to read"),
         };
+        let n = (size.0 as usize) * (size.1 as usize);
+        let stride = (size.0 as u64) * 16;
+        let (y0, y1) = (rows.0 as u64, rows.1.max(rows.0) as u64);
+        let (offset, span) = (y0 * stride, (y1 - y0) * stride);
+        if span == 0 {
+            return Ok(Sample { rgb: vec![0.0; n * 3], alpha: vec![0.0; n] });
+        }
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(accum, 0, read, 0, (n as u64) * 16);
+        enc.copy_buffer_to_buffer(accum, offset, read, offset, span);
         self.ctx.queue.submit([enc.finish()]);
 
-        let slice = read.slice(..);
+        let slice = read.slice(offset..offset + span);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -374,11 +415,13 @@ impl Stage {
             let view = slice.get_mapped_range();
             let view = view.map_err(|e| anyhow::anyhow!("the readback: {e}"))?;
             let f: &[f32] = bytemuck::cast_slice(&view);
-            for i in 0..n {
+            let base = (y0 as usize) * (size.0 as usize);
+            for j in 0..(f.len() / 4) {
+                let i = base + j;
                 for c in 0..3 {
-                    rgb[i * 3 + c] = f[i * 4 + c] * k;
+                    rgb[i * 3 + c] = f[j * 4 + c] * k;
                 }
-                alpha[i] = f[i * 4 + 3] * k;
+                alpha[i] = f[j * 4 + 3] * k;
             }
         }
         read.unmap();

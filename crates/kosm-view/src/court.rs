@@ -37,8 +37,19 @@
 //! whole picture where it costs the CPU one a few silhouettes. Both tiers
 //! answer the same `Job` with the same `Shot`, so the window's tuner does not
 //! know which one it is talking to. This file's job is the pace: how big to
-//! ask for, at how many samples, and when a measurement was fair enough to
-//! believe.
+//! ask for, at how many samples, which rectangles, and when a measurement was
+//! fair enough to believe.
+//!
+//! ## the pass is the mask
+//!
+//! [`crate::history`] answers, before a pass runs, which rectangles the world
+//! moved under. The CPU tier re-traces exactly those with
+//! `pathtrace::render_into`, into a `Film` it keeps between passes so the
+//! pixels it did not touch are last pass's rather than black; the GPU tier
+//! sets the shader's scissor to their bounding box. A masked pass is only
+//! taken when it saves more than half the frame, because the pixels outside it
+//! gain nothing and a picture that is always masked never converges — so the
+//! bounces buy cheap passes and the quiet between them buys full ones.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
@@ -49,7 +60,7 @@ use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
 use crate::court_gpu;
-use crate::history::{Guides, History, Pose, View};
+use crate::history::{Guides, History, Pose, Plan, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -163,6 +174,10 @@ pub struct Shot {
     pub ms: u128,
     /// The share of the screen this pass had to start over on.
     pub mask: f32,
+    /// Pixels this pass actually traced. A masked pass traces its rectangles
+    /// and nothing else, so this — not the frame — is what the pass cost is
+    /// per, and it is what the tuner's model is fitted against.
+    pub traced_px: u64,
     /// Samples behind the average pixel of the picture that came back.
     pub mean_spp: f32,
 }
@@ -299,6 +314,9 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
     // that the last frame was worthless. The history decides that, per pixel.
     let mut current: Option<Job> = None;
     let mut history = History::new((0, 0));
+    // The CPU tier's frame, kept between passes: `render_into` patches it, so
+    // the pixels a masked pass did not touch are last pass's and not black.
+    let mut film = pathtrace::Film::new(0, 0);
     let mut said_at = Instant::now();
     loop {
         // Take the newest request; anything older is already stale.
@@ -327,30 +345,80 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if history.size() != job.size {
             history = History::new(job.size);
         }
+        if (film.width, film.height) != job.size {
+            film = pathtrace::Film::new(job.size.0, job.size.1);
+        }
         let lap = Instant::now();
         let cam = job.camera.to_pathtrace();
         let view = View::of(&cam, job.size.0, job.size.1);
         let poses = poses(&mut stage, &job.frame);
         let seed = 0x5eed_0000 ^ (job.generation << 20) ^ (lap.elapsed().as_nanos() as u64) ^ passes_seed(&history);
+
+        // The mask comes *first* now. It is computed from the poses alone —
+        // where every ball and the net were, where they are — so it can be
+        // known before a ray is cast, and both tracers can be handed the
+        // rectangles instead of the frame. An empty plan means nothing moved,
+        // and that is exactly when the whole frame is worth tracing: a still
+        // world is how the picture gains samples.
+        let plan: Plan = history.plan(&view, &poses, &lights);
+        let frame_px = (job.size.0 as u64) * (job.size.1 as u64);
+        // What each tier would actually trace for this plan. The GPU gets one
+        // scissored dispatch over the union — `render_with_render_state`
+        // rebuilds its buffers per call, so a dispatch per rectangle would pay
+        // for the whole court once per rectangle — while the CPU traces the
+        // rectangles themselves.
+        let patch_px: u64 = match &tracer {
+            Tracer::Gpu(_) => plan.bbox().map_or(0, |r| (r[2] as u64) * (r[3] as u64)),
+            Tracer::Cpu => plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum(),
+        };
+        // A masked pass is only worth having when it is genuinely most of the
+        // frame cheaper. It buys its rays at a price: the pixels outside get
+        // *nothing*, so a picture that is always masked never converges. Half
+        // the frame is where the two stop trading evenly — and it is a real
+        // gate on the GPU, whose scissor is one bounding box, so four balls
+        // scattered across the picture can mask a fifth of it and still make a
+        // dispatch that covers four fifths.
+        let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
+        let traced_px = if full { frame_px } else { patch_px };
+
         // One raw sample, whoever traced it: the GPU hands back linear
         // radiance and nothing else, the CPU fills the guides too.
-        let (film, guides) = match &mut tracer {
-            Tracer::Gpu(gpu) => match gpu.sample(&stage, &job.frame, job.frame_id, &job.camera, job.size) {
-                Ok(sample) => (blank_film(job.size, sample), Guides::None),
-                Err(error) => {
-                    eprintln!("court  gpu: {error}; falling back to the CPU tracer");
-                    tracer = Tracer::Cpu;
-                    history = History::new(job.size);
-                    continue;
+        let (guides, traced) = match &mut tracer {
+            Tracer::Gpu(gpu) => {
+                let scissor = if full { None } else { plan.bbox() };
+                match gpu.sample(&stage, &job.frame, job.frame_id, &job.camera, job.size, scissor) {
+                    Ok(sample) => {
+                        film = blank_film(job.size, sample);
+                        // The scissor is one rectangle, so that rectangle —
+                        // not the plan's several — is what came back fresh.
+                        (Guides::None, scissor.map(|r| vec![r]))
+                    }
+                    Err(error) => {
+                        eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                        tracer = Tracer::Cpu;
+                        history = History::new(job.size);
+                        film = pathtrace::Film::new(job.size.0, job.size.1);
+                        continue;
+                    }
                 }
-            },
+            }
             Tracer::Cpu => {
                 let scene = stage.at_snapshot(&job.frame);
                 let opts = options(job.spp, seed, false);
-                (pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts), Guides::Film)
+                if full {
+                    film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts);
+                    (Guides::Film, None)
+                } else {
+                    // `render_into` patches the film in place and never
+                    // denoises, so the pixels outside the rectangles are still
+                    // the previous pass's — which is what the history wants,
+                    // since it is about to be told not to look at them.
+                    pathtrace::render_into(&scene, &cam, &mut film, &opts, &plan.rects);
+                    (Guides::Film, Some(plan.rects.clone()))
+                }
             }
         };
-        history.merge(&film, guides, &view, &poses, &lights);
+        history.merge(&film, guides, &view, &poses, &lights, traced.as_deref());
         // Denoise the resolved buffer, blended out as the counts climb. With
         // no guides the à-trous filter passes every pixel through untouched,
         // so on the GPU tier this is a no-op rather than a blur.
@@ -363,16 +431,22 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             ms: lap.elapsed().as_millis(),
             mask: history.mask_fraction(),
             mean_spp: history.mean_samples(),
+            traced_px,
         };
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
             eprintln!(
-                "court  {} {}×{} at {} spp: {} ms a pass, {:.0}% repainted, {:.1} samples a pixel",
+                "court  {} {}×{} at {} spp: {} ms a {} pass, {:.0}% repainted, {:.1} samples a pixel",
                 tracer.name(),
                 job.size.0,
                 job.size.1,
                 job.spp,
                 shot.ms,
+                if full {
+                    "full".to_string()
+                } else {
+                    format!("{:.0}% ", 100.0 * traced_px as f64 / (job.size.0 as f64 * job.size.1 as f64))
+                },
                 100.0 * shot.mask,
                 shot.mean_spp
             );
@@ -458,7 +532,7 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
     let mut alpha = vec![0.0f32; n];
     let passes = passes.max(1);
     for _ in 0..passes {
-        let s = gpu.sample(&stage, &frame, 0, &camera, size)?;
+        let s = gpu.sample(&stage, &frame, 0, &camera, size, None)?;
         for (acc, v) in sum.iter_mut().zip(&s.rgb) {
             *acc += v;
         }
@@ -533,6 +607,98 @@ const CLIMB_AFTER: u32 = 6;
 /// be small and quick, not right.
 const GUESS: f64 = 750.0;
 
+/// Two measurements have to be this far apart in work before they count as
+/// two points and not one noisy one.
+const SPREAD: f64 = 1.5;
+
+/// What a pass costs: a fixed part and a per-pixel part.
+///
+/// One term was never enough. A pass has a floor that does not scale with the
+/// picture at all — the GPU tier re-uploads the whole court and drags the
+/// frame back across the bus whatever its size; the CPU tier rebuilds the
+/// net's BVH and forks a rayon pool. Milliseconds per megapixel per sample
+/// folded that floor into the slope, so the model over-charged a big picture
+/// and under-charged a small one, and the tuner oscillated: grow on a
+/// prediction, overrun, shrink, go quiet, grow again.
+///
+/// So: `ms = fixed + per * work`, where `work` is megapixels actually traced
+/// times samples. Fitting a line needs two points, and the passes supply them
+/// for free now that a masked pass traces a fraction of the frame — the two
+/// buckets below are exponential moving averages of the cheap end and the dear
+/// end of whatever work has been asked for, and the line through them is the
+/// model. Until they are far enough apart to be two points, it degenerates to
+/// the old one-term fit through the origin, which is what a single
+/// measurement can honestly say.
+#[derive(Clone, Copy)]
+struct Cost {
+    lo: Option<(f64, f64)>,
+    hi: Option<(f64, f64)>,
+}
+
+impl Cost {
+    fn new() -> Self {
+        Self { lo: None, hi: None }
+    }
+
+    /// Fold one (work, milliseconds) measurement in.
+    ///
+    /// The *work* coordinate barely moves — a tenth of the way — while the
+    /// time is a normal moving average. That asymmetry is deliberate: two
+    /// buckets that chase the work they are fed collapse onto whatever size
+    /// the window is currently rendering, the spread closes, and the fit falls
+    /// back to one term exactly when two are needed. A measurement well
+    /// outside both ends does not blend at all; it *becomes* that end, because
+    /// a new extreme is news and not noise.
+    fn observe(&mut self, work: f64, ms: f64) {
+        let blend = |p: &mut (f64, f64)| {
+            p.0 = 0.9 * p.0 + 0.1 * work;
+            p.1 = 0.7 * p.1 + 0.3 * ms;
+        };
+        match (&mut self.lo, &mut self.hi) {
+            (None, _) => self.lo = Some((work, ms)),
+            (Some(lo), None) => {
+                if work > lo.0 * SPREAD {
+                    self.hi = Some((work, ms));
+                } else if work * SPREAD < lo.0 {
+                    self.hi = Some(*lo);
+                    self.lo = Some((work, ms));
+                } else {
+                    blend(lo);
+                }
+            }
+            (Some(lo), Some(hi)) => {
+                if work * SPREAD < lo.0 {
+                    *lo = (work, ms);
+                } else if work > hi.0 * SPREAD {
+                    *hi = (work, ms);
+                } else if work <= 0.5 * (lo.0 + hi.0) {
+                    blend(lo);
+                } else {
+                    blend(hi);
+                }
+            }
+        }
+    }
+
+    /// `(fixed ms, ms per megapixel per sample)`.
+    fn terms(&self) -> (f64, f64) {
+        match (self.lo, self.hi) {
+            (Some(lo), Some(hi)) if hi.0 > lo.0 * 1.001 => {
+                let per = ((hi.1 - lo.1) / (hi.0 - lo.0)).max(0.0);
+                ((lo.1 - per * lo.0).max(0.0), per)
+            }
+            (Some(lo), _) if lo.0 > 0.0 => (0.0, lo.1 / lo.0),
+            _ => (0.0, GUESS),
+        }
+    }
+
+    /// What a pass of `work` megapixel-samples should cost.
+    fn predict(&self, work: f64) -> f64 {
+        let (fixed, per) = self.terms();
+        fixed + per * work
+    }
+}
+
 /// What was last asked for: the frame, the camera to the millimetre, the size,
 /// and the sample count. Not a *subject* any more — nothing about a change
 /// here throws the picture away, because the history keeps whatever survives
@@ -561,22 +727,26 @@ struct App {
     sized: (u32, u32),
     /// What the window's size is divided by to get the render size.
     scale: u32,
-    /// The finest divisor not yet known to overrun. The cost model is
-    /// milliseconds per megapixel per sample, which is honest about the CPU
-    /// tracer and a lie about the GPU one: a GPU pass re-uploads the whole
-    /// court and reads the image back whatever its size, so most of its cost
-    /// does not scale with pixels at all. Left to itself the tuner then
-    /// oscillates — it grows the picture on a prediction, overruns, shrinks
-    /// back, goes quiet, grows again — and every step resizes the history and
-    /// throws it away, so the picture never accumulates past one sample. A
-    /// size that has actually overrun is remembered instead, and never
-    /// climbed back into until the window itself changes.
+    /// The finest divisor not yet known to overrun. A size that has actually
+    /// overrun is remembered here and never climbed back into until the window
+    /// itself changes, so a mispredicted step does not become an oscillation
+    /// — grow on a prediction, overrun, shrink back, go quiet, grow again —
+    /// with the history thrown away at every step. [`Cost`] is what stops the
+    /// prediction being wrong in the first place, but the two are belt and
+    /// braces and both are cheap.
     floor: u32,
     /// Samples a pass now, and the most it is allowed to ask for.
     samples: u32,
     spp: u32,
-    /// The measured cost of a pass, in milliseconds per megapixel per sample.
-    cost: f64,
+    /// The measured cost of a pass: a fixed part and a per-pixel part.
+    cost: Cost,
+    /// What a *full* pass has actually been seen to cost at each divisor, in
+    /// milliseconds, or zero for one never tried. The model says what a size
+    /// should cost; this remembers what it did. Shrinking is vetoed when the
+    /// smaller size has been measured and was not meaningfully cheaper —
+    /// which on the GPU tier is most of the time, because the pass is mostly
+    /// the court going up the bus and the frame coming back down.
+    seen: [f64; MAX_SCALE as usize + 2],
     /// Consecutive passes that came back cheap and with an empty mask: the
     /// window only buys a bigger picture when the world has stopped repainting
     /// itself.
@@ -625,7 +795,8 @@ impl App {
             floor: 1,
             samples: 1,
             spp: spp.max(1),
-            cost: GUESS,
+            cost: Cost::new(),
+            seen: [0.0; MAX_SCALE as usize + 2],
             quiet: 0,
             over: 0,
             cheap: 0,
@@ -655,15 +826,38 @@ impl App {
         ((self.window.0 / self.scale).max(32), (self.window.1 / self.scale).max(18))
     }
 
-    /// One pass at one sample, in milliseconds, at this divisor.
-    fn pass_ms(&self, scale: u32) -> f64 {
+    /// The work a *full* pass at this divisor is, in megapixel-samples. Full,
+    /// because that is the pass whose cost decides how big the picture may be:
+    /// a masked pass is cheaper by definition and never the thing that has to
+    /// fit.
+    fn work(&self, scale: u32) -> f64 {
         let (w, h) = ((self.window.0 / scale).max(32), (self.window.1 / scale).max(18));
-        self.cost * w as f64 * h as f64 / 1e6
+        w as f64 * h as f64 / 1e6 * self.samples.max(1) as f64
     }
 
-    /// The largest picture whose pass is predicted to fit in a frame.
+    /// The part of a pass at this divisor that the *size* is paying for.
+    ///
+    /// Only this part answers to resolution. The fixed part is paid whether
+    /// the picture is 512 pixels across or 91 — on the GPU tier it is the
+    /// court crossing the bus and the frame coming back, and it is most of the
+    /// pass — so charging the size for it is what made the old tuner shrink
+    /// the picture to nothing chasing a budget no size could meet.
+    fn pixel_ms(&self, scale: u32) -> f64 {
+        let (_, per) = self.cost.terms();
+        per * self.work(scale)
+    }
+
+    /// What is left of the frame's budget once the unavoidable is paid. Never
+    /// less than half a frame: a fixed cost that has eaten the budget whole is
+    /// a reason to stop growing, not a reason to shrink to a postage stamp.
+    fn budget(&self) -> f64 {
+        let (fixed, _) = self.cost.terms();
+        (TARGET_MS - fixed).max(0.5 * TARGET_MS)
+    }
+
+    /// The largest picture whose *per-pixel* cost fits what is left.
     fn affordable(&self) -> u32 {
-        (1..MAX_SCALE).find(|s| self.pass_ms(*s) <= TARGET_MS).unwrap_or(MAX_SCALE)
+        (1..MAX_SCALE).find(|s| self.pixel_ms(*s) <= self.budget()).unwrap_or(MAX_SCALE)
     }
 
     /// Re-estimate the cost of a pixel from a pass that actually happened, and
@@ -676,17 +870,38 @@ impl App {
     /// the rest of the session. So a pass more than [`OUTLIER`] times the
     /// standing prediction is thrown away whole: it neither retunes the cost
     /// nor counts as an overrun.
+    /// A pass that traced only a patch is charged for the patch: `traced_px`,
+    /// not the frame. That is what makes the two-term fit possible at all —
+    /// the masked passes and the full ones are the two work levels the line is
+    /// drawn through, with no probe pass and no calibration phase.
     fn tune(&mut self, shot: &Shot) -> bool {
-        let work = shot.size.0 as f64 * shot.size.1 as f64 / 1e6 * shot.spp.max(1) as f64;
+        let work = shot.traced_px as f64 / 1e6 * shot.spp.max(1) as f64;
         if work <= 0.0 {
             return false;
         }
-        let measured = shot.ms as f64 / work;
-        if measured > OUTLIER * self.cost {
+        let ms = shot.ms as f64;
+        // A pass wildly past what the standing model says is not a render: it
+        // is the net minting a solid and paying for its BVH inside the timing.
+        // The floor keeps a fast machine from rejecting everything.
+        if ms > OUTLIER * self.cost.predict(work).max(1.0) {
             return false;
         }
-        self.cost = 0.7 * self.cost + 0.3 * measured;
+        self.cost.observe(work, ms);
+        // Only a full pass says anything about what a *size* costs; a masked
+        // one traced a patch whose size is the world's business, not the
+        // tuner's.
+        if shot.traced_px >= (shot.size.0 as u64) * (shot.size.1 as u64) {
+            let slot = &mut self.seen[(self.scale as usize).min(MAX_SCALE as usize + 1)];
+            *slot = if *slot > 0.0 { 0.7 * *slot + 0.3 * ms } else { ms };
+        }
         true
+    }
+
+    /// Would a step coarser actually be cheaper? Unknown counts as yes — the
+    /// only way to find out is to try it once.
+    fn shrinking_helps(&self) -> bool {
+        let (here, coarser) = (self.seen[self.scale as usize], self.seen[(self.scale + 1) as usize]);
+        here <= 0.0 || coarser <= 0.0 || coarser < 0.75 * here
     }
 
     /// Which frame of the recording the cursor is on. That is the whole of
@@ -793,7 +1008,14 @@ impl viewport::Scene for App {
             // with little of the screen repainted is one more piece of
             // evidence that the picture is worth growing.
             self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS { self.cheap + 1 } else { 0 };
-            if shot.ms as f64 > TARGET_MS * 1.5 {
+            // An overrun is only the size's fault if the size is paying for
+            // an appreciable share of the pass. When the fixed cost dominates
+            // — the GPU tier, where a pass is mostly the court going up and
+            // the frame coming down — a smaller picture costs the same, and
+            // shrinking buys nothing but a blurrier one.
+            let size_matters = self.pixel_ms(self.scale) > 0.25 * self.cost.terms().0.max(1.0)
+                && self.shrinking_helps();
+            if shot.ms as f64 > TARGET_MS * 1.5 && size_matters {
                 self.over += 1;
                 if self.over >= 2 {
                     if self.samples > 1 {
@@ -825,7 +1047,7 @@ impl viewport::Scene for App {
             self.samples = 1;
             self.quiet = 0;
         } else if self.quiet >= CLIMB_AFTER && (self.scale > self.floor || self.samples < self.spp || self.floor > 1) {
-            if self.scale > self.floor && self.pass_ms(self.scale - 1) <= TARGET_MS {
+            if self.scale > self.floor && self.pixel_ms(self.scale - 1) <= self.budget() {
                 self.scale -= 1;
             } else if self.scale == self.floor && self.floor > 1 && self.cheap >= 2 * CLIMB_AFTER {
                 // Passes here have run at under half the budget for a while:

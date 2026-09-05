@@ -43,20 +43,21 @@
 //! is therefore sharp and unfiltered at one sample, and starts over on an
 //! orbit; the CPU tier is neither.
 //!
-//! ## what is not here
+//! ## the mask buys rays now
 //!
-//! vcad's `pathtrace::render` renders a whole frame: it splits `rgb` into
-//! scanline chunks with rayon and walks every pixel of every row. There is no
-//! sub-rectangle entry point, no pixel-list entry point, and no per-pixel
-//! public function — `radiance` is private, and `cpu.rs` is the *other*
-//! renderer (a studio rasteriser), not a tap into this one. So the mask cannot
-//! yet buy fewer rays; it only buys which samples survive. The next multiplier
-//! would be a `render_into(&mut Film, &[Rect])` beside `render` in
-//! `crates/vcad-kernel-raytrace/src/pathtrace.rs`, taking the same
-//! `par_chunks_mut` loop and skipping pixels outside the rects — an hour's
-//! work there, and a five-to-ten times cut in rays here whenever the mask is
-//! the ten per cent of the screen a bouncing ball actually is. Not this
-//! change: vcad is not ours to edit today.
+//! vcad grew `pathtrace::render_into(scene, cam, &mut Film, opts, rects)` — a
+//! bit-identical masked re-trace of a list of rectangles — and
+//! `GpuRenderState::set_scissor`, which sizes the compute dispatch to one
+//! rectangle. So the mask is no longer only a filter on which samples survive:
+//! it is the work. [`History::plan`] answers *before* a pass which rectangles
+//! the world moved under, the renderer traces only those, and
+//! [`History::merge`] is told which rectangles were actually traced so it
+//! leaves every other pixel — its mean *and* its count — exactly as it was.
+//! A pass now costs in proportion to what moved.
+//!
+//! When nothing moved the plan is empty, and an empty plan means a *full*
+//! pass: that is the only way the picture converges, and it is what the quiet
+//! stretches between bounces are for.
 
 use vcad_kernel_math::{Point3, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film, PathTraceOptions};
@@ -198,6 +199,11 @@ impl Rect {
         Self { x0: 0, y0: 0, x1: w, y1: h }
     }
 
+    /// `[x, y, w, h]`, which is what both tracers' masked entry points take.
+    fn to_xywh(self) -> [u32; 4] {
+        [self.x0, self.y0, self.x1 - self.x0, self.y1 - self.y0]
+    }
+
     fn around(cx: f64, cy: f64, r: f64, w: u32, h: u32) -> Option<Self> {
         let r = r + DILATE as f64;
         let x0 = (cx - r).floor();
@@ -251,6 +257,49 @@ impl Pose {
             return true;
         }
         self.rot.iter().zip(&other.rot).any(|(a, b)| (a - b).abs() > TURNED)
+    }
+}
+
+/// What a pass should trace, decided before it runs.
+///
+/// `full` means the whole frame: either there is no history to keep (the first
+/// pass, a resize) or the camera moved, which the mask cannot describe. An
+/// empty `rects` with `full` false means *nothing moved*, and the caller
+/// should also render the whole frame — that is the only way a picture with a
+/// still world gains samples.
+pub struct Plan {
+    pub rects: Vec<[u32; 4]>,
+    pub full: bool,
+}
+
+impl Plan {
+    /// The pixels the plan asks for, as a share of the screen. Rectangles may
+    /// overlap, so this is an upper bound — which is the safe side for a
+    /// caller deciding whether a patch is still cheaper than the frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn coverage(&self, size: (u32, u32)) -> f32 {
+        let n = (size.0 as f32) * (size.1 as f32);
+        if self.full || n <= 0.0 {
+            return 1.0;
+        }
+        let px: f32 = self.rects.iter().map(|r| (r[2] as f32) * (r[3] as f32)).sum();
+        (px / n).min(1.0)
+    }
+
+    /// One rectangle covering every rectangle in the plan — what a single
+    /// scissored dispatch can do.
+    pub fn bbox(&self) -> Option<[u32; 4]> {
+        let mut it = self.rects.iter();
+        let first = *it.next()?;
+        let (mut x0, mut y0) = (first[0], first[1]);
+        let (mut x1, mut y1) = (first[0] + first[2], first[1] + first[3]);
+        for r in it {
+            x0 = x0.min(r[0]);
+            y0 = y0.min(r[1]);
+            x1 = x1.max(r[0] + r[2]);
+            y1 = y1.max(r[1] + r[3]);
+        }
+        Some([x0, y0, x1 - x0, y1 - y0])
     }
 }
 
@@ -321,11 +370,40 @@ impl History {
     /// camera carries its samples across, *then* mask, so a moved ball takes
     /// out the pixels it is in — at both its old and its new pose — whether or
     /// not the camera also moved.
-    pub fn merge(&mut self, film: &Film, guides: Guides, view: &View, poses: &[Pose], lights: &[Point3]) {
+    pub fn merge(
+        &mut self,
+        film: &Film,
+        guides: Guides,
+        view: &View,
+        poses: &[Pose],
+        lights: &[Point3],
+        traced: Option<&[[u32; 4]]>,
+    ) {
         if self.size != (film.width, film.height) {
             *self = History::new((film.width, film.height));
         }
         let n = (self.size.0 as usize) * (self.size.1 as usize);
+
+        // Which pixels this pass actually re-traced. `None` is the whole
+        // frame; anything else and every pixel outside keeps its mean *and*
+        // its count, because no new sample was drawn there and a count that
+        // climbed without one would weight a stale mean against the next
+        // real sample.
+        let fresh: Option<Vec<bool>> = traced.map(|rects| {
+            let mut f = vec![false; n];
+            for r in rects {
+                let x0 = r[0].min(self.size.0);
+                let y0 = r[1].min(self.size.1);
+                let x1 = r[0].saturating_add(r[2]).min(self.size.0);
+                let y1 = r[1].saturating_add(r[3]).min(self.size.1);
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        f[(py * self.size.0 + px) as usize] = true;
+                    }
+                }
+            }
+            f
+        });
 
         // A pixel is live if it has history that survived both tests.
         let mut live: Vec<bool> = self.count.iter().map(|&c| c > 0).collect();
@@ -344,6 +422,9 @@ impl History {
         self.mask_fraction = masked as f32 / n.max(1) as f32;
 
         for i in 0..n {
+            if fresh.as_ref().is_some_and(|f| !f[i]) {
+                continue;
+            }
             if live[i] {
                 let c = self.count[i] + 1;
                 self.count[i] = c;
@@ -366,6 +447,9 @@ impl History {
         // pass with none leaves them zeroed, which is the background sentinel
         // — the denoiser passes such a pixel through, so it becomes a no-op
         // rather than a blur with nothing to stop it.
+        // The CPU tier's film is persistent — patched in place by
+        // `render_into` — so its guides describe the whole picture as it now
+        // stands, masked pass or not, and are copied whole.
         if guides == Guides::Film {
             self.normal.copy_from_slice(&film.normal);
             self.depth.copy_from_slice(&film.depth);
@@ -444,7 +528,7 @@ impl History {
         self.variance = variance;
     }
 
-    /// Kill the pixels the world moved under, and say how many.
+    /// The rectangles the world moved under.
     ///
     /// For each pose that changed: the bounding sphere at the old pose and at
     /// the new one, and — because a ball's shadow is as visibly wrong as the
@@ -452,19 +536,20 @@ impl History {
     /// shadow is a cone; the disc where it meets `z = 0` is approximated by
     /// its axis (the light-through-centre line, met with the floor) and a
     /// radius scaled by how much further the floor is than the ball.
-    fn paint_mask(&self, view: &View, poses: &[Pose], lights: &[Point3], live: &mut [bool]) -> usize {
+    ///
+    /// Called *before* the pass now, so the tracer can be handed the
+    /// rectangles rather than the frame. It reads only what the history
+    /// already holds (`self.poses`), which is why it is `&self`.
+    fn mask_rects(&self, view: &View, poses: &[Pose], lights: &[Point3]) -> Vec<Rect> {
         let (w, h) = self.size;
+        let screen = (w as usize) * (h as usize);
+        let _ = h;
         let mut rects: Vec<Rect> = Vec::new();
         let mut push = |r: Option<Rect>| {
             if let Some(r) = r {
                 rects.push(r);
             }
         };
-        // Bodies are appended — the court drops its balls in over several
-        // seconds — so a changed count is not a reason to repaint the whole
-        // screen. The shared prefix is compared pairwise; anything past the
-        // end of either list appeared or left and is masked on its own.
-        let screen = (w as usize) * (h as usize);
         let paint = |p: &Pose, push: &mut dyn FnMut(Option<Rect>)| {
             let body = view.sphere_rect(p.point(), p.radius);
             if let Some(r) = &body {
@@ -487,6 +572,10 @@ impl History {
                 }
             }
         };
+        // Bodies are appended — the court drops its balls in over several
+        // seconds — so a changed count is not a reason to repaint the whole
+        // screen. The shared prefix is compared pairwise; anything past the
+        // end of either list appeared or left and is masked on its own.
         let shared = poses.len().min(self.poses.len());
         for k in 0..shared {
             if !poses[k].differs(&self.poses[k]) {
@@ -498,17 +587,61 @@ impl History {
         for p in poses.iter().skip(shared).chain(self.poses.iter().skip(shared)) {
             paint(p, &mut push);
         }
+        rects
+    }
 
+    /// What the next pass should trace, given where everything now is.
+    ///
+    /// This is the whole of the masked-pass restructuring: the mask used to be
+    /// a consequence of a pass and is now its brief. A view that does not
+    /// match the one the history was built under — a moved camera, a resize —
+    /// or a history with nothing in it yet asks for the whole frame, because
+    /// no rectangle describes what changed there.
+    pub fn plan(&self, view: &View, poses: &[Pose], lights: &[Point3]) -> Plan {
+        if self.view != Some(*view) || self.count.iter().all(|&c| c == 0) {
+            return Plan { rects: Vec::new(), full: true };
+        }
+        let (w, h) = self.size;
+        let raw = self.mask_rects(view, poses, lights);
+        if raw.is_empty() {
+            return Plan { rects: Vec::new(), full: false };
+        }
+        // Four balls with ten shadow discs each, at their old pose and their
+        // new, is eighty-odd rectangles that overlap heavily — and
+        // `render_into` traces an overlap once per rectangle it is in, so the
+        // raw list measured passes at seventeen times the work of the frame.
+        // Overlapping rectangles are therefore merged into their union until
+        // none of them meet: what comes out is a handful of disjoint boxes.
+        //
+        // A disjoint *cover* is not the only thing wanted here. Cutting the
+        // union into exact row-runs is disjoint too, and it is much tighter —
+        // and it was five times slower, because `render_into` sets up a rayon
+        // traversal of the whole film per rectangle, and a circular mask cut
+        // into rows is one rectangle per row. Fewer, fatter boxes win.
+        let boxes = merged(raw);
+        let covered: usize = boxes.iter().map(|r| ((r.x1 - r.x0) as usize) * ((r.y1 - r.y0) as usize)).sum();
+        // Past this much of the screen the boxes cost more than the rays they
+        // save, and the whole frame is the better pass: it is one rectangle,
+        // and every pixel outside the mask gains a sample from it.
+        if covered * 10 > (w as usize) * (h as usize) * 6 {
+            return Plan { rects: Vec::new(), full: true };
+        }
+        let _ = h;
+        Plan { rects: boxes.into_iter().map(Rect::to_xywh).collect(), full: false }
+    }
+
+    /// Kill the pixels the world moved under, and say how many.
+    fn paint_mask(&self, view: &View, poses: &[Pose], lights: &[Point3], live: &mut [bool]) -> usize {
+        let (w, _) = self.size;
         // The union, counted once — overlapping rectangles are one mask.
-        let mut masked = vec![false; (w as usize) * (h as usize)];
-        for r in rects {
+        let mut masked = vec![false; live.len()];
+        for r in self.mask_rects(view, poses, lights) {
             for py in r.y0..r.y1 {
                 for px in r.x0..r.x1 {
                     masked[(py * w + px) as usize] = true;
                 }
             }
         }
-        let _ = h;
         for (l, &m) in live.iter_mut().zip(&masked) {
             if m {
                 *l = false;
@@ -564,6 +697,40 @@ impl History {
         }
         film.to_srgb8(exposure, false)
     }
+}
+
+/// Rectangles merged until none of them overlap.
+///
+/// Any two that meet are replaced by the box around both, which over-covers a
+/// little and is exactly the right trade: the caller traces every pixel of
+/// every box it is handed, so what matters is that no pixel is in two boxes
+/// (it would be traced twice) and that there are few of them (each costs a
+/// traversal of the film). A pixel inside a box but outside the true mask is
+/// simply a pixel that got a fresh sample it did not need, and the history
+/// accumulates it like any other.
+fn merged(mut rects: Vec<Rect>) -> Vec<Rect> {
+    let meet = |a: &Rect, b: &Rect| a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+    let mut again = true;
+    while again {
+        again = false;
+        let mut out: Vec<Rect> = Vec::with_capacity(rects.len());
+        for r in rects {
+            match out.iter().position(|o| meet(o, &r)) {
+                Some(k) => {
+                    out[k] = Rect {
+                        x0: out[k].x0.min(r.x0),
+                        y0: out[k].y0.min(r.y0),
+                        x1: out[k].x1.max(r.x1),
+                        y1: out[k].y1.max(r.y1),
+                    };
+                    again = true;
+                }
+                None => out.push(r),
+            }
+        }
+        rects = out;
+    }
+    rects
 }
 
 /// Where a sphere's shadow lands on `z = 0`, from a light above it, and how
@@ -636,7 +803,7 @@ mod tests {
         let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
         let mut h = History::new((W, H));
         for _ in 0..16 {
-            h.merge(&film, Guides::Film, &view, &poses, &[]);
+            h.merge(&film, Guides::Film, &view, &poses, &[], None);
         }
         for py in 0..H {
             for px in 0..W {
@@ -656,13 +823,13 @@ mod tests {
         let mut h = History::new((W, H));
         let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
         for _ in 0..8 {
-            h.merge(&film, Guides::Film, &view, &at(0.0), &[]);
+            h.merge(&film, Guides::Film, &view, &at(0.0), &[], None);
         }
         let before: Vec<u32> = h.count.clone();
         assert!(before.iter().all(|&c| c == 8));
 
         // Move it half a metre: a real move, but a small one on screen.
-        h.merge(&film, Guides::Film, &view, &at(500.0), &[]);
+        h.merge(&film, Guides::Film, &view, &at(500.0), &[], None);
         let f = h.mask_fraction();
         assert!(f > 0.0 && f < 0.9, "the mask should be a patch, not the screen: {f}");
         let inside = h.count.iter().filter(|&&c| c == 1).count();
@@ -680,7 +847,7 @@ mod tests {
         let mut h = History::new((W, H));
         let poses = [Pose::still([0.0, 0.0, 500.0], 100.0)];
         for _ in 0..8 {
-            h.merge(&plane_film(&va, 1.0), Guides::Film, &va, &poses, &[]);
+            h.merge(&plane_film(&va, 1.0), Guides::Film, &va, &poses, &[], None);
         }
         let b = pathtrace::Camera::look_at(
             Point3::new(200.0, -3000.0, 0.0),
@@ -689,7 +856,7 @@ mod tests {
             45.0,
         );
         let vb = View::of(&b, W, H);
-        h.merge(&plane_film(&vb, 1.0), Guides::Film, &vb, &poses, &[]);
+        h.merge(&plane_film(&vb, 1.0), Guides::Film, &vb, &poses, &[], None);
 
         // The strip that slid in from the edge is new; the rest is carried.
         let kept = h.count.iter().filter(|&&c| c == 9).count();
@@ -698,6 +865,125 @@ mod tests {
             "a pure pan should keep most of the frame, kept {kept} of {}",
             W * H
         );
+    }
+
+
+    #[test]
+    fn a_still_world_plans_nothing_and_a_moved_one_plans_a_patch() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let film = plane_film(&view, 1.0);
+        let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
+        let mut h = History::new((W, H));
+        // Nothing in the history yet: the whole frame, because no rectangle
+        // describes a picture that does not exist.
+        assert!(h.plan(&view, &at(0.0), &[]).full);
+        h.merge(&film, Guides::Film, &view, &at(0.0), &[], None);
+
+        // A world that did not move asks for nothing — and an empty plan is
+        // the caller's cue to render the whole frame and converge.
+        let quiet = h.plan(&view, &at(0.0), &[]);
+        assert!(!quiet.full && quiet.rects.is_empty());
+
+        // A ball that moved asks for a patch, not the screen.
+        let moved = h.plan(&view, &at(500.0), &[]);
+        assert!(!moved.full && !moved.rects.is_empty());
+        let share = moved.coverage((W, H));
+        assert!(share > 0.0 && share < 0.9, "a patch, not the screen: {share}");
+        let bbox = moved.bbox().unwrap();
+        for r in &moved.rects {
+            assert!(r[0] >= bbox[0] && r[0] + r[2] <= bbox[0] + bbox[2], "{r:?} outside {bbox:?}");
+            assert!(r[1] >= bbox[1] && r[1] + r[3] <= bbox[1] + bbox[3], "{r:?} outside {bbox:?}");
+        }
+    }
+
+    /// The point of a masked pass: a pixel nobody re-traced must not have its
+    /// count incremented, or the next real sample there is weighed against a
+    /// mean that never earned its weight.
+    #[test]
+    fn a_masked_pass_leaves_the_rest_of_the_screen_alone() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let mut h = History::new((W, H));
+        let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
+        for _ in 0..8 {
+            h.merge(&plane_film(&view, 1.0), Guides::Film, &view, &at(0.0), &[], None);
+        }
+        assert!(h.count.iter().all(|&c| c == 8));
+
+        let plan = h.plan(&view, &at(500.0), &[]);
+        assert!(!plan.rects.is_empty());
+        // A film whose fresh patch is a different colour; outside it is what
+        // the previous pass left, exactly as `render_into` would leave it.
+        let mut film = plane_film(&view, 1.0);
+        for r in &plan.rects {
+            for py in r[1]..(r[1] + r[3]).min(H) {
+                for px in r[0]..(r[0] + r[2]).min(W) {
+                    let i = (py * W + px) as usize;
+                    film.rgb[i * 3..i * 3 + 3].copy_from_slice(&[0.25, 0.25, 0.25]);
+                }
+            }
+        }
+        h.merge(&film, Guides::Film, &view, &at(500.0), &[], Some(&plan.rects));
+
+        let mut inside = 0usize;
+        for py in 0..H {
+            for px in 0..W {
+                let i = (py * W + px) as usize;
+                let in_plan = plan.rects.iter().any(|r| {
+                    px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3]
+                });
+                if in_plan {
+                    inside += 1;
+                    // Re-traced and masked: one sample, the fresh one.
+                    assert_eq!(h.count[i], 1, "pixel {px},{py}");
+                    assert!((h.mean[i * 3] - 0.25).abs() < 1e-6);
+                } else {
+                    // Untouched: the same eight samples and the same mean.
+                    assert_eq!(h.count[i], 8, "pixel {px},{py}");
+                    assert!((h.mean[i * 3] - 1.0).abs() < 1e-6);
+                }
+            }
+        }
+        assert!(inside > 0 && inside < (W * H) as usize);
+    }
+
+    /// The plan must tile the mask, not merely cover it: a pixel in two
+    /// rectangles is a pixel traced twice, and the CPU tier once measured
+    /// passes at seventeen times the work of the frame that way.
+    #[test]
+    fn the_plan_is_a_disjoint_cover() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let mut h = History::new((W, H));
+        // Three balls, all moving, with shadows: plenty of overlap in the raw
+        // rectangles the mask makes.
+        let at = |k: f64| {
+            [
+                Pose::still([0.0, 0.0, k], 200.0),
+                Pose::still([120.0, 0.0, k + 100.0], 200.0),
+                Pose::still([-120.0, 60.0, k + 50.0], 200.0),
+            ]
+        };
+        let lights = [Point3::new(0.0, 0.0, 6000.0), Point3::new(400.0, 200.0, 6000.0)];
+        h.merge(&plane_film(&view, 1.0), Guides::Film, &view, &at(300.0), &lights, None);
+        let plan = h.plan(&view, &at(600.0), &lights);
+        assert!(!plan.rects.is_empty());
+
+        let mut hits = vec![0u32; (W * H) as usize];
+        for r in &plan.rects {
+            for py in r[1]..r[1] + r[3] {
+                for px in r[0]..r[0] + r[2] {
+                    assert!(px < W && py < H, "{r:?} leaves the film");
+                    hits[(py * W + px) as usize] += 1;
+                }
+            }
+        }
+        assert!(hits.iter().all(|&n| n <= 1), "a pixel is in two rectangles");
+        assert!(plan.rects.len() < 12, "{} boxes is too many to trace", plan.rects.len());
+        let traced: u32 = plan.rects.iter().map(|r| r[2] * r[3]).sum();
+        assert_eq!(traced as usize, hits.iter().filter(|&&n| n == 1).count());
+        assert!(traced <= W * H, "the plan traces more than the frame");
     }
 
     #[test]

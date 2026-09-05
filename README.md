@@ -379,8 +379,41 @@ running mean and its count, and when something moves the renderer knows which
 something: the bounding sphere of each ball and extra whose pose changed, at
 its old pose and its new, plus the disc its shadow throws from each panel.
 Being geometric, that mask reads the same on both tiers, so the walls
-accumulate for the whole run while the balls bounce through them. Resolution,
-tracer, pass time, mask share and mean samples a pixel go to stderr.
+accumulate for the whole run while the balls bounce through them.
+
+The mask is now the *brief* for a pass rather than its verdict. It is computed
+from the poses alone, so it is known before a ray is cast: `History::plan` hands
+the renderer rectangles — overlapping ones merged until none of them meet, or
+`render_into` traces a shared pixel once per rectangle it is in and a pass
+measured seventeen times the work of the frame — the CPU tier re-traces exactly
+those with `pathtrace::render_into` into a film it keeps between passes, and the
+GPU tier sets `GpuRenderState::set_scissor` to their bounding box, which sizes
+the compute dispatch and lets the readback be trimmed to the rows it spans.
+`History::merge` is told which rectangles were traced and leaves every other
+pixel's mean *and* its count alone — a count that climbed without a sample
+behind it would weigh a stale mean against the next real one.
+
+A masked pass is taken only when it saves more than half the frame, because the
+pixels outside it get nothing at all and a picture that is always masked never
+converges. So the balls bouncing buy cheap passes, and the quiet stretches
+between them buy full ones. On the GPU that gate bites: the scissor is one
+bounding box, and four balls scattered across the picture mask a fifth of it
+while boxing four fifths, so this level's frame mostly renders full.
+
+The tuner reads the two kinds of pass as two points on a line. Its model is
+`ms = fixed + per-pixel × work`, fitted from exponential moving averages of the
+cheap end and the dear end of the work actually traced — sticky in work, so the
+two ends do not collapse onto whatever size is on screen. One term could not
+describe a pass whose floor (the court crossing the bus and the frame coming
+back, a rayon fork, the net's BVH) does not scale with the picture at all: it
+charged the size for the floor and shrank the window to a postage stamp chasing
+a budget no size could meet. Now the size is only charged for what the size
+buys, an overrun is only the size's fault when a coarser picture has actually
+been measured cheaper, and the target is still 30 ms. Resolution, tracer, pass
+time, how much of the frame it traced, mask share and mean samples a pixel go to
+stderr. Under load, that moved the GPU tier from 170×96 to 256×144 at the same
+pass time, and left the CPU tier at its size with masked passes about a third
+off a full one.
 
 A moved camera parts them. The CPU pass brings guide buffers, so a pixel
 unprojects its own hit along `Film::depth`, carries it back through the
@@ -390,15 +423,27 @@ thirty-two. The shader's depth and normals go into a buffer it neither marks
 copyable nor returns, so the GPU tier hands over colour alone: an orbit costs
 it the whole picture, and its denoise is a no-op.
 
-It is incomplete elsewhere too — the painted markings have no BRep to pack, the
-seams are dropped because the shader traces a torus wide enough to engulf the
-ball, and vcad's pipeline rebuilds its buffers per call, so a pass re-uploads
-the court and reads the image back rather than sharing a texture. That last
-cost barely falls with resolution, which is why the tuner remembers a size that
-overran rather than believe a prediction. Neither tier gets fewer rays out of
-the mask yet, and the deforming net still pays for a BVH build inside every CPU
-pass. Evaluating the level takes a few seconds and the window is black until it
-is done; it says so on stderr while it works.
+It is incomplete elsewhere too. The painted markings have no BRep to pack and
+are CPU-only — the GPU court has no lines on its floor. The ball's seams *are*
+on the GPU again: the shader used to trace a torus wide enough to engulf the
+ball it was drawn on, and vcad's torus intersection is fixed.
+
+The pass still re-uploads the court and reads the image back rather than
+sharing a texture with the blit, and this is deliberate rather than pending.
+vcad grew a `ResidentScene` — upload once, rewrite placements and camera in
+place — and a `render_resident_into` that writes a storage texture with no
+readback at all, which is exactly the shape this wants. Neither is used, because
+both hand back the shader's *output* texture: ACES-tonemapped, gamma-encoded,
+eight bits, while the resident accumulator that holds linear radiance is
+private. This tier's contract is one raw linear sample per pass, and the mean of
+tonemapped samples is not the tonemap of their mean. Reaching residency and
+zero-copy needs one of two things in vcad: a public view of the resident
+accumulator, or a compute shader that folds the history — mean and count per
+pixel, against an uploaded mask — on the device, so nothing linear ever has to
+come down. Until then the readback is the fixed term the tuner now models
+explicitly. The deforming net still pays for a BVH build inside every CPU pass.
+Evaluating the level takes a few seconds and the window is black until it is
+done; it says so on stderr while it works.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
 window, which is how the picture is checked; it uses the GPU tracer unless
