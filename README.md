@@ -680,6 +680,36 @@ fifty thousand rays, which is the whole reason it needs one.
 `tests/gpu_sun.rs` holds both tiers to `E·cos(theta)` on a Lambertian plane —
 measured 0.00–0.02% off the analytic answer at 0°, 30° and 60°.
 
+### the denoiser, and what it now refuses to spend
+
+The à-trous filter is Dammertz, SVGF-flavoured: 5x5 B3-spline taps at a
+doubling stride, edge-stopped on normal, relative depth and *demodulated
+luminance*, with the luminance tolerance scaled by the estimator's own
+variance — 3x3-prefiltered, because a noisy error bar makes the weight jitter
+between "trust" and "reject" pixel to pixel. Radiance is divided by albedo
+going in and multiplied back coming out, so a part's colour is never blurred
+into its neighbour's. The device port in `history.wgsl` is the same filter
+weight for weight, and `tests/gpu_denoise.rs` pins it over `AnalyticGeometry`:
+with a one-sample history the two frames come out **byte-identical**.
+
+What is new is that the filter's *cost* falls as a pixel converges, not just
+its strength. `resolve` always faded the filtered result out against the
+temporal mean, but a faded filter costs exactly what a full one does, and the
+widest iteration — stride 16, a 65-pixel footprint — is 25 scattered taps.
+Now the per-pixel iteration *budget* falls too (`gpu::atrous_iters_for`, and
+its mirror in the shader), full at a single sample so parity survives, none
+at `count_cutoff`. RMSE against a 512-sample reference, in 8-bit codes:
+
+| samples | raw | denoised | iterations/pixel |
+|---|---|---|---|
+| 1 | 46.25 | 7.62 | 5 |
+| 4 | 19.14 | 5.66 | 5 |
+| 16 | 8.43 | 5.10 | 3 |
+
+At 16 samples that is 3 iterations where it used to run 5 — 40% of the filter
+gone — for 0.09 of one 8-bit code. The 1- and 4-sample rows are unchanged to
+the digit, because at those counts the budget is still full.
+
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
 `wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other
 Kosm crate.** It is a leaf. And it must compile for the browser, GPU tier
