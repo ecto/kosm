@@ -834,6 +834,61 @@ court: the rim's ellipse stops breaking up, the net's cords read as lines
 rather than dots, and the ball's seams lose their jaggies. Without the flag
 the shot is byte-identical to the one that was there before.
 
+### two more geometries: water, and a scan
+
+The seam earns its keep when something implements it that the renderer was
+never designed around. Two now do, and neither needed a line of the
+integrator.
+
+`HeightField` is a regular `nx × ny` lattice of heights over the `xy` plane —
+the pool's free surface, or terrain. Its primitive is a **cell**, and a cell
+is a bilinear patch rather than two triangles. The patch is the right call
+twice over: the ray–patch equation is a plain quadratic in `t` (surface and
+ray are both linear in `x` and `y`, so their difference is degree two), so a
+hit point lands on the interpolated surface to machine precision instead of to
+a triangulation's chord error; and `kosm-spike`'s pool already marches
+`p.z - surface.height(p.x, p.y)` against a *bilinear* sample of that same
+grid, so triangles would have had the renderer and the simulator looking at
+two different sheets of water.
+
+Water moves, though, and a hierarchy over 65 025 cells is not something to
+rebuild sixty times a second. It does not have to be. The tree's *topology* —
+which cell sits in which leaf — is a partition of indices over a lattice that
+never changes; only the boxes move, and only in `z`. So `Bvh::refit` walks the
+existing tree bottom-up recomputing bounds, no sort, no SAH, no allocation,
+and the frame loop becomes `update_heights` then `refit`. On a 256×256 grid
+that is **0.79 ms against 81.8 ms for a rebuild — 104×**. There is also a fast
+path that skips the tree entirely: `intersect_march` runs a 2D DDA over the
+lattice, testing patches in increasing `t`, which is what a camera ray coming
+down at the water wants.
+
+`Splats` is a cloud of anisotropic Gaussians — a 3DGS scan, the shape
+`tang-3dgs` trains and `ipse-map` will carry. A Gaussian is not a surface, so
+"the hit" has to be defined rather than found: `intersect` reports the
+**maximum-response point**, the `t` where the density along the ray peaks,
+which is closed form for a quadratic exponent (`t* = -dᵀAΔ / dᵀAd`). The
+response there, `α·exp(-½d²)`, is exactly the alpha `tang-3dgs`'s rasteriser
+computes per pixel, only evaluated in 3D against the ray; it rides back in the
+`Hit`'s payload word alongside the splat index, so a compositor does not
+recompute it. Bounds are the 3σ box and the intersector culls at the same 3σ,
+so the tree and the test agree on what exists. Colour stays a call —
+`Splats::colour(i, dir)`, spherical harmonics to degree 3 — because it needs
+the view direction, which a `Hit` does not carry. 100k random splats build in
+148 ms and trace in **4.3 µs/ray**.
+
+#### what a client still cannot do
+
+**Composite a splat cloud.** The geometry is there and `Bvh::trace` hands back
+every splat along a ray sorted by `t`, which is precisely the front-to-back
+order compositing needs — but the integrator has no path that consumes it. The
+missing piece is the walk `C += T·α·c; T *= (1 - α)`, breaking when `T` falls
+under ~1e-4, with the result treated as an **emissive backdrop** rather than a
+BSDF: a scanned cloud has its lighting baked in already, and shading it again
+double-counts. Mixing with analytic geometry is that same walk with one bound
+— find the nearest opaque analytic hit first, composite splats only in front
+of it, then add `T · L_analytic`. Until that lands, a `Splats` in a `Scene`
+traces correctly and shades wrongly, so put one in a scene only to measure it.
+
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
 `wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other
 Kosm crate.** It is a leaf. And it must compile for the browser, GPU tier
