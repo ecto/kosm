@@ -849,6 +849,29 @@ dependencies rather than hard ones, and why the wasm buffer-mapping path uses
 `web-sys`. A renderer that cannot run where the picture is looked at is half a
 renderer.
 
+### using kosm-render from another crate
+
+It carries its own package metadata (`0.1.0`, MIT, a README, keywords) and
+`cargo package -p kosm-render` is clean, so it is a crates.io crate that has
+not been published yet. Until it is, a consumer depends on it by path — but
+declares the version it will want anyway:
+
+```toml
+[workspace.dependencies]
+kosm-render = { path = "/path/to/kosm/crates/kosm-render", version = "0.1.0" }
+```
+
+Cargo uses the path locally and embeds the version when the consumer is
+packaged, so publishing kosm-render means deleting one `path =` in one place.
+That is how vcad does it: the workspace holds the path, and
+`vcad-kernel-raytrace` and `vcad-kernel-gpu` say `kosm-render.workspace = true`.
+
+Two rules come with the dependency. It is a leaf — `tang`, `rayon`, `wgpu`,
+`bytemuck`, `pollster` and nothing else — so a consumer never expects it to
+reach back for a `vcad-*` or `phyz-*` type; the geometry goes *in*, through
+`Geometry`. And it builds for `wasm32-unknown-unknown` with `--features gpu`,
+so anything a consumer adds here must too.
+
 ## building
 
 `vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;

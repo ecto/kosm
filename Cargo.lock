@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "kosm-render"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytemuck",
  "js-sys",
@@ -3453,7 +3453,6 @@ dependencies = [
  "vcad-ir",
  "vcad-kernel-booleans",
  "vcad-kernel-geom",
- "vcad-kernel-gpu",
  "vcad-kernel-math",
  "vcad-kernel-primitives",
  "vcad-kernel-tessellate",

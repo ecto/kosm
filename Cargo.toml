@@ -32,7 +32,9 @@ vcad-kernel-math = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30
 vcad-kernel-primitives = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-primitives" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
-tang         = { path = "/Users/cam/Developer/tang/crates/tang" }
+# The `version` is what `cargo package` embeds for a published crate; the path
+# is this machine's checkout and is what every local build actually uses.
+tang         = { path = "/Users/cam/Developer/tang/crates/tang", version = "0.2" }
 tang-3dgs    = { path = "/Users/cam/Developer/tang/crates/tang-3dgs" }
 ipse-map     = { path = "/Users/cam/Developer/ipse/crates/ipse-map" }
 
