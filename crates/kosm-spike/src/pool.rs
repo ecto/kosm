@@ -30,7 +30,9 @@ use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{Geometry, Model, ModelBuilder, State};
 use tang::Vec3 as V;
 
-use crate::glass::{fresnel, refract, reflect};
+// Snell and Fresnel at the water surface are the same laws the marble's glass
+// obeys, and they live in one place now.
+use kosm_render::optics::{fresnel, reflect, refract};
 
 mod config;
 mod scene;

@@ -26,6 +26,7 @@ image.workspace = true
 rayon = "1"
 rustfft = "6"
 kosm-mpm = { path = "../kosm-mpm" }
+kosm-render = { path = "../kosm-render" }
 tang.workspace = true
 tang-3dgs.workspace = true
 ipse-map.workspace = true

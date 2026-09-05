@@ -23,6 +23,7 @@ use phyz_diff::FinalStateObjective;
 use phyz_math::SpatialTransformExt;
 use phyz_model::{GeomInstance, Geometry};
 use phyz_world::CameraIntrinsics;
+use crate::analytic::Analytic;
 use crate::glass::{self, Glass};
 use tang::{Dual, Mat3, Scalar, Vec3};
 
@@ -390,6 +391,98 @@ pub fn render(scene: &Scene<f64>, pose: &CameraPose, intr: &CameraIntrinsics) ->
         }
     }
     img
+}
+
+// ---- the beauty pass -------------------------------------------------------
+//
+// The caster above is the *derivative*: generic over `tang::Scalar`, one
+// bounce, a lamp of finite size, and no Monte Carlo anywhere, because a
+// stochastic estimator has no useful dual. The picture the level ships is not
+// that. It is `kosm-render`'s path tracer — multiple bounces, importance
+// sampling, MIS against real softboxes — over the very same colliders, told to
+// it through [`crate::analytic`]. Two renderers, one geometry, and each doing
+// the thing it is good at.
+
+/// `kosm-render`'s camera from phyz's pose and intrinsics.
+///
+/// phyz's optical frame is +z forward, +x right, +y *down*; the tracer's
+/// screen basis is +y up, so the up vector is the negated optical y.
+pub fn camera(pose: &CameraPose, intr: &CameraIntrinsics) -> kosm_render::Camera {
+    let axis = |x: f64, y: f64, z: f64| {
+        let v = pose.world_from_optical * phyz_math::Vec3::new(x, y, z);
+        kosm_render::Vec3::new(v.x, v.y, v.z)
+    };
+    let eye = kosm_render::Point3::new(pose.position.x, pose.position.y, pose.position.z);
+    let vfov = 2.0 * (0.5 * intr.height as f64 / intr.fy).atan();
+    kosm_render::Camera::from_basis(
+        eye,
+        axis(0.0, 0.0, 1.0),
+        axis(1.0, 0.0, 0.0),
+        -axis(0.0, 1.0, 0.0),
+        vfov.to_degrees(),
+        1.0,
+    )
+}
+
+/// The level as `kosm-render` sees it: the track's colliders and the marble,
+/// each an analytic object with its own material, under a studio rig.
+pub fn picture(
+    track: &phyz_math::SpatialTransform,
+    colliders: &[GeomInstance],
+    marble: phyz_math::Vec3,
+    marble_r: f64,
+) -> kosm_render::Scene<Analytic> {
+    use std::sync::Arc;
+    let track_geom = Analytic::from_colliders(track, colliders);
+    // The rig is sized on the track, not on the marble, or the key light ends
+    // up inside the plate.
+    let mut bounds = kosm_render::Aabb::empty();
+    for i in 0..kosm_render::Geometry::len(&track_geom) {
+        bounds.include(&kosm_render::Geometry::bounds(&track_geom, i));
+    }
+    let centre = bounds.center();
+    let radius = 0.5
+        * ((bounds.max.x - bounds.min.x).powi(2)
+            + (bounds.max.y - bounds.min.y).powi(2)
+            + (bounds.max.z - bounds.min.z).powi(2))
+        .sqrt();
+    let objects = vec![
+        kosm_render::Object::new(
+            Arc::new(kosm_render::Bvh::build(track_geom)),
+            // the printed track: a matte, slightly warm plastic
+            kosm_render::Pbr::plastic([0.42, 0.40, 0.36], 0.55, 0.0),
+        ),
+        kosm_render::Object::new(
+            Arc::new(kosm_render::Bvh::build(Analytic::ball(marble, marble_r))),
+            // the marble: a clearcoated bead, so the rig reads on it
+            kosm_render::Pbr::plastic([0.80, 0.82, 0.86], 0.06, 1.0),
+        ),
+    ];
+    kosm_render::Scene {
+        objects,
+        lights: kosm_render::studio_rig(centre, radius),
+        env: kosm_render::Environment::default(),
+        ground: None,
+        sun: None,
+    }
+}
+
+/// One beauty frame of the level at `state`, path-traced.
+pub fn beauty(
+    track: &phyz_math::SpatialTransform,
+    colliders: &[GeomInstance],
+    marble: phyz_math::Vec3,
+    marble_r: f64,
+    pose: &CameraPose,
+    intr: &CameraIntrinsics,
+    spp: u32,
+) -> image::RgbaImage {
+    let scene = picture(track, colliders, marble, marble_r);
+    let cam = camera(pose, intr);
+    let opts = kosm_render::PathTraceOptions { spp, ..Default::default() };
+    let film = kosm_render::render(&scene, &cam, intr.width, intr.height, &opts);
+    let px = film.to_srgb8(0.7, false);
+    image::RgbaImage::from_raw(film.width, film.height, px).expect("film is width x height x 4")
 }
 
 /// The plate pixels whose primary hit lies within `radius` of `target`

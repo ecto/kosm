@@ -31,7 +31,7 @@ use std::path::Path;
 use level::{DT, Level, MM, MarbleLevel, Tilt, tilted};
 
 use phyz::Simulator;
-use phyz_camera::{CameraPose, RenderScene, RgbdCamera, SceneOptions};
+use phyz_camera::CameraPose;
 use phyz_contact::{ContactMaterial, ContactSolverConfig, find_contacts};
 use phyz_diff::{
     ConvexContactRollout, FinalStateObjective, convex_adjoint_gradient, convex_rollout_objective,
@@ -39,7 +39,7 @@ use phyz_diff::{
 use phyz_math::{DVec, GRAVITY, Mat3, SpatialInertia, SpatialTransform, SpatialTransformExt, Vec3};
 use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
-use phyz_world::{CameraIntrinsics, Scene, SensorContext};
+use phyz_world::CameraIntrinsics;
 use vcad_ir::Document;
 
 const MARBLE: usize = 0;
@@ -345,16 +345,18 @@ fn render(model: &Model, state: &State, path: &Path) -> anyhow::Result<()> {
 
 fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::Lamp, f64)>) -> anyhow::Result<()> {
     let intr = CameraIntrinsics::from_vfov(800, 600, 0.75, 0.05, 5.0);
-    let mut cam = RgbdCamera::new(intr)?;
-    let scene = Scene::empty();
-    let ctx = SensorContext::free_flight(model, state, &scene);
-    let rs = RenderScene::from_context(&ctx, &SceneOptions::new());
     let target = Vec3::new(0.0, 0.0, 0.25);
     let pose = CameraPose::look_at(target + Vec3::new(-0.05, -0.42, 0.28), target, Vec3::z());
-    let frame = cam.render(&rs, &pose)?;
-    let rgba = frame.color_cpu().ok_or_else(|| anyhow::anyhow!("no cpu colour buffer"))?;
-    let mut img = image::RgbaImage::from_raw(frame.width(), frame.height(), rgba.to_vec())
-        .ok_or_else(|| anyhow::anyhow!("frame size mismatch"))?;
+    // The beauty pass is kosm-render's path tracer over the level's own
+    // colliders (`frame::picture`), not a rasteriser: the marble's silhouette
+    // is a sphere at any zoom and its shadow is traced, not composited. The
+    // caster in `frame.rs` stays where it is — it is the gradient.
+    let r = match model.bodies[MARBLE].geometry {
+        Some(Geometry::Sphere { radius }) => radius,
+        _ => 0.0,
+    };
+    let c = Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]);
+    let mut img = frame::beauty(&track_xform(model), &model.bodies[TRACK].collisions, c, r, &pose, &intr, 96);
     if let Some((l, r)) = lamp {
         let c = Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]);
         lamp::draw(&mut img, &pose, &intr, l, &track_xform(model), c, r);
