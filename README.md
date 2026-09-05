@@ -209,7 +209,7 @@ level scaled to the K1 inside a 16 × 9 m shed — half pipe, mezzanine, two
 quarter pipes either side of an open door, a platform, a bent rail, kickers,
 box piles, a ledge, and the building itself. One root per piece, each with a
 material name; roots whose material begins `no-collide` (roof, trusses,
-skylight, clerestory, door frame, the wall above the brick skirt) are drawn
+skylight, glazing, piers, door frame, the wall above the brick skirt) are drawn
 but never baked, so the SDF stops at the metre of wall the K1 can hit
 instead of following the roof to the ridge. The bake writes
 `parts/<root>.stl` and a `parts.json` of names, materials and colours, and
