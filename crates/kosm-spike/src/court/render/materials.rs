@@ -35,8 +35,15 @@ fn court(name: &str) -> Option<Pbr> {
         "rim" => p([0.72, 0.20, 0.04], 0.32, 0.55),
         // the lines and the painted key: flat latex on wood
         "paint" => p([0.78, 0.78, 0.75], 0.40, 0.25),
-        // a ball is rubber, pebbled, barely glossy
+        // a ball is rubber, pebbled, barely glossy; its seams are black channels
         "ball" => p([0.58, 0.24, 0.08], 0.62, 0.10),
+        "ball-seams" | "seam" => p([0.03, 0.025, 0.02], 0.70, 0.0),
+        // the lane, painted a team colour under the same lacquer
+        "key" => p([0.10, 0.18, 0.45], 0.35, 0.60),
+        // wall padding: vinyl over foam
+        "pad" => p([0.10, 0.20, 0.52], 0.55, 0.15),
+        // the floor beyond the maple: sealed concrete
+        "floor" => p([0.46, 0.46, 0.45], 0.80, 0.05),
         // a net: nylon cord
         "net" => p([0.86, 0.86, 0.83], 0.65, 0.0),
         // the room

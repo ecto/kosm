@@ -56,9 +56,9 @@ impl Placed {
 pub struct Scene {
     /// The level's roots and the gym, already placed.
     statics: Vec<Placed>,
-    /// The ball's own solid, centred on the origin, and its material.
-    ball: Arc<Bvh>,
-    ball_pbr: Pbr,
+    /// The ball's own appearance, centred on the origin: its solid and its
+    /// seams, each with a material, drawn once per ball at that ball's pose.
+    ball: Vec<(Arc<Bvh>, Pbr)>,
     /// BVHs for `Court::extras`, kept across frames so a net that only moves
     /// is not rebuilt. Keyed by the solid's identity.
     extras: HashMap<usize, Arc<Bvh>>,
@@ -84,7 +84,7 @@ impl Scene {
         );
 
         let mut statics = Vec::new();
-        let mut ball = None;
+        let mut ball: Vec<(Arc<Bvh>, Pbr)> = Vec::new();
         let mut authored_room = false;
         for (part, root) in evaluated.parts.iter().zip(&doc.roots) {
             let name = root.material.as_str();
@@ -97,10 +97,10 @@ impl Scene {
                 anyhow::bail!("the court's `{name}` root has no traceable geometry");
             }
             let bvh = Arc::new(bvh);
-            // a `ball` root is not part of the court: it is the ball's own
-            // appearance, drawn once per ball at that ball's pose
-            if name == "ball" {
-                ball = Some(bvh);
+            // a `ball` root (and its `ball-seams`) is not part of the court: it
+            // is the ball's own appearance, drawn once per ball at that ball's pose
+            if matches!(name, "ball" | "ball-seams" | "seam") {
+                ball.push((bvh, materials::pbr(&doc, name)));
                 continue;
             }
             statics.push(Placed { bvh, pbr: materials::pbr(&doc, name), to_world: Transform::identity() });
@@ -149,16 +149,17 @@ impl Scene {
         }
 
         // a ball root is the ball; without one, a sphere of the right size
-        let ball = match ball {
-            Some(b) => b,
-            None => Arc::new(build_bvh(&Solid::sphere(scene.ball_r * PER_M, 64))),
-        };
+        if ball.is_empty() {
+            ball.push((
+                Arc::new(build_bvh(&Solid::sphere(scene.ball_r * PER_M, 64))),
+                materials::pbr(&doc, "ball"),
+            ));
+        }
 
         let env = a.parameter_or("env_radiance", 0.05) as f32;
         Ok(Self {
             statics,
             ball,
-            ball_pbr: materials::pbr(&doc, "ball"),
             extras: HashMap::new(),
             lights,
             env: Environment::constant([env; 3]),
@@ -178,11 +179,9 @@ impl Scene {
             let c = court.centre(k) * PER_M;
             // `rotation` is world → body; an object → world placement is its transpose
             let r = court.rotation(k).transpose();
-            objects.push(Object::placed(
-                self.ball.clone(),
-                self.ball_pbr,
-                rigid(&r, c.x, c.y, c.z),
-            ));
+            for (bvh, pbr) in &self.ball {
+                objects.push(Object::placed(bvh.clone(), *pbr, rigid(&r, c.x, c.y, c.z)));
+            }
         }
         for extra in &court.extras {
             let key = Arc::as_ptr(&extra.solid) as usize;
