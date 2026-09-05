@@ -29,11 +29,25 @@
 //! device, so a moved camera uploads an all-restart mask — the CPU tier still
 //! carries its samples through a moved camera and this one does not.
 //!
-//! It also owns the scissor, by not using it. `GpuRenderState::set_scissor`
-//! still sizes the *trace*, but vcad's accumulate pass runs over every pixel
-//! of the frame regardless, so it would fold the stale raw sample outside the
-//! rectangle into the history as if it were fresh. Until the accumulate
-//! shader honours the same rectangle, a pass on this tier is a full frame.
+//! It also owns the **scissor**, and now uses it. `GpuRenderState::set_scissor`
+//! used to size the *trace* alone, while vcad's accumulate pass ran over every
+//! pixel of the frame and would have folded the stale raw sample outside the
+//! rectangle into the history as if it were fresh. It honours the same
+//! rectangle now — outside it the mean, the count and the variance are left
+//! exactly as they were, and the resolve pass still covers the frame so the
+//! target texture stays whole. So a pass whose keep mask fits in a box worth
+//! less than half the frame traces and folds that box and nothing else.
+//!
+//! ## the panels are in the picture
+//!
+//! `set_camera_visible_lights` is off in vcad's default state, and with it off
+//! the shader would not shade a light the camera can see. That was the whole
+//! of the closed room's brightness gap: the walls already agreed with the CPU
+//! integrator to 0.04%, and the ten ceiling panels the gym is lit by came back
+//! black. This tier turns it on every pass, along with the level's own
+//! `max_depth` and `ground_enabled = 0` — `GpuRenderState::new` re-derives a
+//! frame-dependent depth and an implicit ground plane, so all three have to be
+//! re-stated on every pass or the two tiers are not tracing the same picture.
 //!
 //! ## residency
 //!
@@ -282,6 +296,7 @@ impl Stage {
         camera: &Camera,
         size: (u32, u32),
         keep: &[u8],
+        scissor: Option<[u32; 4]>,
         samples: u32,
     ) -> anyhow::Result<Arc<wgpu::Texture>> {
         let n = (size.0 as u64) * (size.1 as u64);
@@ -339,15 +354,25 @@ impl Stage {
             state.stylize = 0;
             state.ground_enabled = 0;
             state.max_depth = self.max_depth;
+            // Draw the panels to camera rays. Off by default, and with it off
+            // the shader refused to shade a light it was standing under at
+            // all, which is the whole of the closed room's brightness gap:
+            // the walls already agreed with the CPU integrator to 0.04%, and
+            // the ceiling the picture is lit by was black.
+            state.set_camera_visible_lights(true);
             state.rr_start = DEFAULT_RR_START;
             state.firefly_clamp = DEFAULT_FIREFLY_CLAMP;
             // The same sky the CPU tier integrates against, colours and all.
             if let Environment::Gradient(g) = &self.env {
                 state.set_gradient_env(g);
             }
-            // No scissor: vcad's accumulate pass has no scissor of its own and
-            // would fold the stale raw sample outside the rectangle in as if
-            // it were fresh. See the module docs.
+            // The scissor sizes the trace *and* the fold: vcad's accumulate
+            // pass honours the same rectangle, so every pixel outside keeps
+            // the mean, the count and the variance it had. See the module
+            // docs.
+            if let Some(rect) = scissor {
+                state.set_scissor(rect);
+            }
             self.pipeline
                 .accumulate_and_denoise_resident(
                     &self.ctx,

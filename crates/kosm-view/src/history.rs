@@ -123,6 +123,22 @@ impl View {
         }
     }
 
+    /// The same eye and the same frustum, sampled at a different raster size.
+    ///
+    /// What a resampled history was taken under: the camera did not move, so
+    /// carrying the picture across a size step must not read as a camera move
+    /// — [`History::merge`] compares views, and a view that differs only in
+    /// its raster would send the whole picture through the reprojection with
+    /// old-size pixel coordinates into new-size buffers.
+    pub fn at_size(&self, width: u32, height: u32) -> Self {
+        Self {
+            half_w: self.half_h * (width as f64 / height as f64),
+            width,
+            height,
+            ..*self
+        }
+    }
+
     /// The unit direction through a pixel's centre.
     pub fn ray_dir(&self, px: u32, py: u32) -> Vec3 {
         let sx = 2.0 * ((px as f64 + 0.5) / self.width as f64) - 1.0;
@@ -327,12 +343,86 @@ impl History {
         }
     }
 
-    pub fn size(&self) -> (u32, u32) {
-        self.size
-    }
-
     pub fn mask_fraction(&self) -> f32 {
         self.mask_fraction
+    }
+
+    /// Carry the whole history into a new raster size.
+    ///
+    /// The tuner steps the render size — that is how the window buys a pass
+    /// that fits in thirty milliseconds — and every step used to throw the
+    /// accumulated picture away: a 426→365 step took the mean sample count
+    /// from 599 to 26 and the window went back to looking like a blizzard for
+    /// several seconds. Nothing about a resolution step says the *picture*
+    /// changed, though. It is the same camera looking at the same world; only
+    /// the grid it is sampled on moved.
+    ///
+    /// So every plane is bilinearly resampled — the mean, the alpha, the
+    /// variance and the three guide planes — and the counts with them, rounded
+    /// rather than interpolated because a count is a number of samples and
+    /// there is no such thing as 3.4 of one. Costing a couple of passes over a
+    /// few hundred kilobytes, it is far cheaper than re-converging.
+    ///
+    /// The stored view is re-stated at the new size rather than left alone: it
+    /// records the camera the history was taken under, and the camera did not
+    /// move.
+    pub fn resample(&mut self, size: (u32, u32)) {
+        if size == self.size {
+            return;
+        }
+        let (nw, nh) = size;
+        let n = (nw as usize) * (nh as usize);
+        if n == 0 || self.size.0 == 0 || self.size.1 == 0 {
+            *self = History::new(size);
+            return;
+        }
+        let (ow, oh) = self.size;
+        // Where each new pixel's centre falls on the old grid, and the four
+        // taps around it. Clamped at the edges, which is the right reading of
+        // a picture that has no samples beyond its border.
+        let taps: Vec<(usize, usize, usize, usize, f32, f32)> = (0..n)
+            .map(|i| {
+                let px = (i as u32) % nw;
+                let py = (i as u32) / nw;
+                let fx = ((px as f32 + 0.5) * ow as f32 / nw as f32 - 0.5).max(0.0);
+                let fy = ((py as f32 + 0.5) * oh as f32 / nh as f32 - 0.5).max(0.0);
+                let x0 = (fx.floor() as u32).min(ow - 1);
+                let y0 = (fy.floor() as u32).min(oh - 1);
+                let x1 = (x0 + 1).min(ow - 1);
+                let y1 = (y0 + 1).min(oh - 1);
+                let tx = fx - x0 as f32;
+                let ty = fy - y0 as f32;
+                (
+                    (y0 * ow + x0) as usize,
+                    (y0 * ow + x1) as usize,
+                    (y1 * ow + x0) as usize,
+                    (y1 * ow + x1) as usize,
+                    tx.clamp(0.0, 1.0),
+                    ty.clamp(0.0, 1.0),
+                )
+            })
+            .collect();
+        let lerp = |src: &[f32], lanes: usize| -> Vec<f32> {
+            let mut out = vec![0.0f32; n * lanes];
+            for (i, &(a, b, c, d, tx, ty)) in taps.iter().enumerate() {
+                for l in 0..lanes {
+                    let top = src[a * lanes + l] + (src[b * lanes + l] - src[a * lanes + l]) * tx;
+                    let bot = src[c * lanes + l] + (src[d * lanes + l] - src[c * lanes + l]) * tx;
+                    out[i * lanes + l] = top + (bot - top) * ty;
+                }
+            }
+            out
+        };
+        self.mean = lerp(&self.mean, 3);
+        self.alpha = lerp(&self.alpha, 1);
+        self.normal = lerp(&self.normal, 3);
+        self.depth = lerp(&self.depth, 1);
+        self.albedo = lerp(&self.albedo, 3);
+        self.variance = lerp(&self.variance, 1);
+        let counts: Vec<f32> = self.count.iter().map(|&c| c as f32).collect();
+        self.count = lerp(&counts, 1).into_iter().map(|c| c.round().max(0.0) as u32).collect();
+        self.size = size;
+        self.view = self.view.map(|v| v.at_size(nw, nh));
     }
 
     /// Samples per pixel, averaged over the screen: the number that says
@@ -364,9 +454,8 @@ impl History {
         lights: &[Point3],
         traced: Option<&[[u32; 4]]>,
     ) {
-        if self.size != (film.width, film.height) {
-            *self = History::new((film.width, film.height));
-        }
+        // A size step is a new grid, not a new picture: carry it across.
+        self.resample((film.width, film.height));
         let n = (self.size.0 as usize) * (self.size.1 as usize);
 
         // Which pixels this pass actually re-traced. `None` is the whole
@@ -820,24 +909,71 @@ impl Mask {
     /// pixel went. A camera that did not moved restarts only the rectangles
     /// the world moved under, which is the whole point — the walls keep
     /// accumulating while the balls bounce through them.
-    pub fn keep(&mut self, view: &View, poses: &[Pose], lights: &[Point3], samples: u32) -> Vec<u8> {
+    pub fn keep(&mut self, view: &View, poses: &[Pose], lights: &[Point3], samples: u32) -> Keep {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
         let restart_all = self.view != Some(*view) || self.counts.iter().all(|&c| c == 0);
         let mut keep = vec![u8::from(!restart_all); n];
+        let mut scissor = None;
         if !restart_all {
             let rects = merged(mask_rects(self.size, view, poses, &self.poses, lights));
             paint_zero(&mut keep, self.size, rects.iter().map(|r| r.to_xywh()));
+            // One rectangle over everything that restarted is what a single
+            // scissored dispatch can do, and vcad's accumulate honours the
+            // same rectangle now — every pixel outside keeps its mean, its
+            // count and its variance untouched, so nothing stale is folded in
+            // as fresh. It is only worth taking when it saves more than half
+            // the frame: outside it no pixel gains a sample, and a picture
+            // that is always scissored never converges.
+            if let Some(bbox) = bounding(&rects) {
+                let area = (bbox[2] as usize) * (bbox[3] as usize);
+                if area * 2 < n {
+                    scissor = Some(bbox);
+                }
+            }
         }
         let restarted = keep.iter().filter(|&&k| k == 0).count();
         self.fraction = restarted as f32 / n.max(1) as f32;
         let samples = samples.max(1);
-        for (c, &k) in self.counts.iter_mut().zip(&keep) {
+        // A scissored pass touches nothing outside its rectangle, so nothing
+        // outside it gains a sample either — the mirror of the counts has to
+        // say the same thing the device's own do.
+        for (i, (c, &k)) in self.counts.iter_mut().zip(&keep).enumerate() {
+            let inside = scissor.is_none_or(|s| {
+                let (px, py) = ((i as u32) % self.size.0, (i as u32) / self.size.0);
+                px >= s[0] && px < s[0] + s[2] && py >= s[1] && py < s[1] + s[3]
+            });
+            if !inside {
+                continue;
+            }
             *c = if k == 0 { samples } else { *c + samples };
         }
         self.view = Some(*view);
         self.poses = poses.to_vec();
-        keep
+        Keep { keep, scissor }
     }
+}
+
+/// A keep mask and, when it pays for itself, the one rectangle the pass need
+/// not step outside of.
+pub struct Keep {
+    /// One byte a pixel: 1 to go on accumulating, 0 to start over.
+    pub keep: Vec<u8>,
+    /// `[x, y, w, h]`, or `None` for the whole frame.
+    pub scissor: Option<[u32; 4]>,
+}
+
+/// One rectangle covering all of them.
+fn bounding(rects: &[Rect]) -> Option<[u32; 4]> {
+    let mut it = rects.iter();
+    let first = it.next()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (first.x0, first.y0, first.x1, first.y1);
+    for r in it {
+        x0 = x0.min(r.x0);
+        y0 = y0.min(r.y0);
+        x1 = x1.max(r.x1);
+        y1 = y1.max(r.y1);
+    }
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
 }
 
 /// Zero every pixel inside `rects`, clipped to `size`. The keep mask's one
@@ -873,10 +1009,14 @@ mod tests {
     /// the depth is whatever that plane is at, which is what a reprojection
     /// has to reproduce.
     fn plane_film(view: &View, value: f32) -> Film {
-        let n = (W * H) as usize;
+        plane_film_sized(view, value, W, H)
+    }
+
+    fn plane_film_sized(view: &View, value: f32, w: u32, h: u32) -> Film {
+        let n = (w * h) as usize;
         let mut film = Film {
-            width: W,
-            height: H,
+            width: w,
+            height: h,
             rgb: vec![value; n * 3],
             alpha: vec![1.0; n],
             normal: vec![0.0; n * 3],
@@ -884,9 +1024,9 @@ mod tests {
             albedo: vec![0.5; n * 3],
             variance: vec![0.0; n],
         };
-        for py in 0..H {
-            for px in 0..W {
-                let i = (py * W + px) as usize;
+        for py in 0..h {
+            for px in 0..w {
+                let i = (py * w + px) as usize;
                 let dir = view.ray_dir(px, py);
                 // Plane y = 0, normal -y (towards a camera at negative y).
                 let t = -view.eye.y / dir.y;
@@ -915,6 +1055,33 @@ mod tests {
         assert_eq!(h.mask_fraction(), 0.0);
         // The mean of sixteen identical passes is that pass.
         assert!((h.mean[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// The tuner steps the render size and the picture survives it: the
+    /// counts come across, the mean comes across, and the pass after the step
+    /// goes on accumulating rather than starting from one.
+    #[test]
+    fn a_size_step_keeps_the_picture() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let film = plane_film(&view, 1.0);
+        let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
+        let mut h = History::new((W, H));
+        for _ in 0..40 {
+            h.merge(&film, &view, &poses, &[], None);
+        }
+        assert!((h.mean_samples() - 40.0).abs() < 1e-3);
+
+        // A step to five sixths of the size, as the tuner takes it.
+        let (w2, h2) = (W * 5 / 6, H * 5 / 6);
+        let view2 = View::of(&cam, w2, h2);
+        let film2 = plane_film_sized(&view2, 1.0, w2, h2);
+        h.merge(&film2, &view2, &poses, &[], None);
+        assert_eq!(h.size, (w2, h2));
+        // Forty-one, not one: nothing was thrown away and this pass counted.
+        assert!(h.mean_samples() > 40.0, "mean spp collapsed to {}", h.mean_samples());
+        assert!((h.mean[0] - 1.0).abs() < 1e-4);
+        assert_eq!(h.mask_fraction(), 0.0);
     }
 
     #[test]

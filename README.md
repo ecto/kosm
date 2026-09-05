@@ -394,6 +394,28 @@ moved camera. A masked pass is taken only when it saves more than half the
 frame — the pixels outside it get nothing, and a picture that is always masked
 never converges.
 
+A tuner step is not a new picture, and no longer costs one. The window buys a
+pass that fits in thirty milliseconds with resolution, so the render size moves
+under the accumulator's feet, and every step used to throw the whole history
+away: the log showed the mean sample count fall from 599 to 26 on a 426→365
+step, and the window went back to a blizzard for seconds at a time. The two
+tiers answer that differently, because they have to. On the CPU tier
+`History::resample` bilinearly carries every plane — the mean, the alpha, the
+variance, the three guide planes — and the per-pixel counts with them, rounded,
+because there is no such thing as 3.4 samples; the stored view is re-stated at
+the new raster so the step does not read as a camera move. It costs a couple of
+passes over a few hundred kilobytes and the picture goes straight on
+converging. On the GPU tier there is nothing to resample on this side: the mean
+and the count are in device buffers vcad reallocates on a resize, and reading
+them back to resample them is the one thing that tier exists not to do. So it
+takes the other design — **the size is free to move while it is cheap to move
+it, and frozen once it is dear.** Under `RESIZE_UNTIL` samples a pixel the
+tuner steps the size as it always did; past it the size is left alone and the
+tuner spends its other knobs, the sample count and the scissor. A window's own
+resize is exempt, because there the old picture is of a different window. And
+it un-freezes itself: when the world starts moving the mask restarts pixels,
+the mean falls back under the line, and the size is the tuner's again.
+
 **The GPU tier does none of that on this side, and reads nothing back.** vcad's
 `accumulate_and_denoise_resident` traces the sample, folds it into a mean and
 count that live in device buffers, runs the à-trous filter against the resident
@@ -406,12 +428,23 @@ with, so the two tiers mask on one piece of geometry. Reprojection stays CPU-sid
 only, so a camera move uploads an all-restart mask and the GPU picture loses
 its whole history where the CPU one keeps most of it.
 
-The scissor is gone from that tier, and deliberately. `set_scissor` sizes the
-*trace*, but vcad's accumulate pass walks every pixel of the frame regardless,
-so outside the rectangle it would fold a stale raw sample in as a fresh one.
-Until that shader takes the same rectangle, a GPU pass is a full frame — which
-also means the GPU tier no longer produces the cheap-and-dear pair the cost
-model was fitting a line through. `Cost::terms` now refuses to call two buckets
+The scissor is back on that tier. `set_scissor` used to size the *trace* alone
+while vcad's accumulate pass walked every pixel of the frame, so outside the
+rectangle it would have folded a stale raw sample in as a fresh one; the
+accumulate pass honours the same rectangle now, leaving every pixel outside it
+with the mean, the count and the variance it already had, and the resolve pass
+still covers the frame so the target texture stays whole. So the GPU tier takes
+the same bargain the CPU one does: when the keep mask's bounding box is worth
+less than half the frame, the pass is that box and nothing else. It is armed
+and it is rarely taken on *this* level: a ten-minute session repainted 17–33%
+of the screen on the busy frames, but four balls spread across the court put
+one box around all of them and that box is more than half the frame every time,
+so every pass in the session was a full one. The rule is the same because the
+reason is: outside the box no pixel gains a sample, and a picture
+that is always scissored never converges.
+
+That the GPU tier once had no cheap pass at all is why `Cost::terms` exists in
+its present form. It refuses to call two buckets
 two points until they are `SPREAD` apart: drifted together, they were fitting
 470 ms a megapixel-sample against a real fifty and the window sat at 183×102
 refusing to grow. And a pass now really is `spp` samples: vcad folds one sample
@@ -425,9 +458,12 @@ retired them and the tuner timed `queue.submit`. A pass ends on
 
 What that bought, at a 1280×720 window on a retina display (so 2560×1440
 physical): the GPU tier used to settle at 320×180 with a pass of about 450 ms,
-of which 420 ms was the CPU à-trous filter. It now settles around 365×205 at
-25–30 ms a pass, and takes four samples in about 85 ms — some forty times the
-samples a second, at the same size. It does **not** reach the full window: a
+of which 420 ms was the CPU à-trous filter. It now climbs 256×144 → 284×160 →
+365×205 in the first second, finds 365×205 costs 61 ms against a 30 ms budget,
+steps back to 320×180 at 20–50 ms a pass — and then *stays* there for the rest
+of the session, accumulating past 1700 samples a pixel without one collapse.
+Before the resample and the freeze it lost the lot at every step. It does
+**not** reach the full window: a
 sample measured on this machine costs about 9 ms at 320×180 and 31 ms at
 960×540, so 30 ms buys roughly half a megapixel and no more. The CPU tier is
 unchanged, masked passes and all.
@@ -447,28 +483,38 @@ closed, no ray reaches the environment on either tier, and at
 `env_radiance = 0.05` under ten panels at 18 the environment is not what either
 picture is made of.
 
-The two pictures still do not agree on brightness: over one patch of the +y
-wall the GPU reads 71 to the CPU's 105. It is not the environment, by the test
-above. Nor is it the path budget: the GPU traces *deeper* (6 bounces to the
-CPU's 5), starts Russian roulette later and clamps fireflies higher. The
-difference is in the integrator, and it is vcad's to answer.
+The two pictures agree on brightness now, and the answer was one flag. The GPU
+tier used to read 71 over a patch of the +y wall to the CPU's 105, and it was
+neither the environment nor the path budget: `GpuRenderState` starts with
+camera-visible lights *off*, and with them off the shader would not shade a
+light the camera can see. The walls had always agreed to within a twentieth of
+a per cent; the ten ceiling panels the whole gym is lit by came back black.
+`set_camera_visible_lights(true)`, and the same for two other fields
+`GpuRenderState::new` re-derives every time it is called — `max_depth`, which
+it sets from the frame index, and `ground_enabled`, which the level does not
+want because it authors its own floor — and over the 960×540 still at 32 passes
+the two pictures read:
 
-There is one artifact left, and it is not a packing bug. A faint dark disc
-sits on the +y wall at about x = 265, y = 270 of the 960×540 still, about
-thirty pixels across and now some thirty per cent below its surroundings — the
-device history did not remove it — and the CPU picture has nothing there. Bisecting the packed roots puts it in the *walls*
-root alone: it survives with no balls, no net, no bleachers and one bounce, so
-it is neither a root packed at the origin nor the seams packed twice. Its
-world position is (−848, 8500, 1891) — precisely where the view ray meets that
-wall head on, the camera's own retro-reflection point. A view-dependent term
-in the shader's BRDF that the CPU integrator does not reproduce, then; it is
-in vcad, and this worktree does not touch vcad.
+| patch | CPU | GPU |
+|---|---|---|
+| +y wall | luma 71.4 | 71.7 |
+| ceiling panels | luma 110.6 | 110.9 |
+| floor | luma 69.3 | 69.5 |
+| whole frame | luma 85.17 | 84.99 |
+
+— a fifth of a per cent apart over the frame, with a mean absolute per-pixel
+difference of 1.8 of 255. The dark disc that used to sit on the +y wall at
+x = 265, y = 270 — the camera's own retro-reflection point — is gone too; both
+pictures now read 67.7 there, which vcad's own retro-incidence fix answered and
+this worktree did not touch.
 
 The one readback left in the GPU path is `--shot`'s: N passes through the
 device history and one copy of the target texture out for the PNG. Nothing in
 the window reads back at all. The deforming net still pays for a BVH build
-inside every CPU pass. Evaluating the level takes a few seconds and the window
-is black until it is done; it says so on stderr while it works.
+inside every CPU pass. Evaluating the level takes **a minute or two** on this
+machine — single-threaded, almost all of it in `propagate_boolean` sorting face
+names under `circular_pattern` — and the window is black until it is done; it
+says so on stderr while it works, and a `timeout 90` never gets past it.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
 window, which is how the picture is checked; it uses the GPU tracer unless

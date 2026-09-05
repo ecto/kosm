@@ -184,6 +184,12 @@ pub struct Shot {
     pub traced_px: u64,
     /// Samples behind the average pixel of the picture that came back.
     pub mean_spp: f32,
+    /// Whether stepping the render size would throw the accumulated picture
+    /// away. False on the CPU tier, which resamples its history across a size
+    /// step; true on the GPU one, whose history is in device buffers vcad
+    /// reallocates — nothing on this side can resample them without a
+    /// readback, and the whole point of that tier is that nothing comes back.
+    pub resize_costs_history: bool,
 }
 
 fn options(spp: u32, seed: u64, denoise: bool) -> pathtrace::PathTraceOptions {
@@ -331,9 +337,13 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if job.size.0 == 0 || job.size.1 == 0 {
             continue;
         }
-        if history.size() != job.size {
-            history = History::new(job.size);
-        }
+        // A size step is a new grid, not a new picture. The CPU tier carries
+        // its whole history across — mean, count and guides, bilinearly — so
+        // the tuner can step the resolution without the window going back to
+        // looking like a blizzard. The GPU tier cannot: its history is in
+        // device buffers vcad reallocates on a resize, so there the tuner is
+        // asked not to step a converged picture at all (see `App::image`).
+        history.resample(job.size);
         if mask.size() != job.size {
             mask = Mask::new(job.size);
         }
@@ -350,32 +360,39 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // does the picture look like now, what did it cost, how much of it
         // started over — and the tuner above does not know which one it is
         // talking to.
+        let resize_costs_history = matches!(tracer, Tracer::Gpu(_));
         let (image, mask_frac, mean_spp, traced_px, kind) = match &mut tracer {
             // On the device: one dispatch, four small compute passes, and a
             // texture. No film comes back, so there is nothing here to merge
             // or resolve; the keep mask is the whole of this side's work.
             //
-            // The scissor is not used. It sizes the *trace*, but vcad's
-            // accumulate pass walks every pixel of the frame regardless and
-            // would fold the stale raw sample outside the rectangle in as a
-            // fresh one, so a pass here is always the whole frame.
+            // The scissor is used here too now. vcad's accumulate pass takes
+            // the same rectangle as the trace, so the pixels outside it keep
+            // their mean, their count and their variance — nothing stale is
+            // folded in as fresh — and a pass whose keep mask fits in a box
+            // worth less than half the frame is that box's work.
             Tracer::Gpu(gpu) => {
                 let keep = mask.keep(&view, &poses, &lights, job.spp);
+                let scissored = keep.scissor.map(|r| (r[2] as u64) * (r[3] as u64));
                 match gpu.accumulate(
                     &stage,
                     &job.frame,
                     job.frame_id,
                     &job.camera,
                     job.size,
-                    &keep,
+                    &keep.keep,
+                    keep.scissor,
                     job.spp,
                 ) {
                     Ok(texture) => (
                         viewport::Image::Texture(texture),
                         mask.fraction(),
                         mask.mean_samples(),
-                        frame_px,
-                        "full".to_string(),
+                        scissored.unwrap_or(frame_px),
+                        match scissored {
+                            Some(px) => format!("{:.0}% ", 100.0 * px as f64 / frame_px as f64),
+                            None => "full".to_string(),
+                        },
                     ),
                     Err(error) => {
                         eprintln!("court  gpu: {error}; falling back to the CPU tracer");
@@ -453,6 +470,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             mask: mask_frac,
             mean_spp,
             traced_px,
+            resize_costs_history,
         };
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
@@ -552,7 +570,7 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
     // nothing moves between them. The picture never leaves the device until
     // the last line, which reads the target texture once for the PNG.
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], 1)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1)?;
     }
     let rgba = gpu.read_target()?;
     if let Some(dir) = path.parent() {
@@ -604,6 +622,23 @@ const OUTLIER: f64 = 4.0;
 /// picture is the one thing that does throw the history away, so it is worth
 /// a few passes first.
 const CLIMB_AFTER: u32 = 6;
+
+/// How converged a picture has to be before the tuner stops stepping its
+/// size on a tier that cannot carry a history across the step.
+///
+/// A size step is free when there is nothing to lose and ruinous when there
+/// is. At five samples a pixel, growing the picture costs a frame; at six
+/// hundred it costs a minute of accumulation, and the log showed exactly
+/// that — the mean sample count falling from 599 to 26 on a 426→365 step.
+/// The CPU tier resamples its history and pays neither price. The GPU tier's
+/// history lives in device buffers vcad reallocates on a resize, and reading
+/// them back to resample them is the one thing that tier is built not to do,
+/// so it takes the other design: **the size is free to move while it is cheap
+/// to move it, and frozen once it is dear.** The tuner's other knobs — the
+/// sample count and the scissor — go on working either way, and when the
+/// world starts moving again the mask restarts pixels, the mean falls back
+/// under this line, and the size is the tuner's again.
+const RESIZE_UNTIL: f32 = 48.0;
 
 /// The cost of a pass before one has been timed, in milliseconds per
 /// megapixel per sample. Deliberately pessimistic: the first picture should
@@ -782,6 +817,11 @@ struct App {
     /// How long the last fair pass took, in milliseconds: the climb rule reads
     /// the clock, not the model.
     last_ms: f64,
+    /// Whether the last pass came from a tier that would lose its accumulated
+    /// picture if the size stepped, and how converged that picture is. See
+    /// [`RESIZE_UNTIL`].
+    resize_costs_history: bool,
+    mean_spp: f32,
     /// Consecutive passes that came back at under half the budget. Enough of
     /// them and a size the tuner had sworn off is worth trying again: the
     /// overrun that condemned it may have been the net minting a solid.
@@ -830,6 +870,8 @@ impl App {
             over: 0,
             cheap: 0,
             last_ms: 0.0,
+            resize_costs_history: false,
+            mean_spp: 0.0,
             generation: 0,
             asked: None,
             pending: Some(pending),
@@ -929,6 +971,16 @@ impl App {
             *slot = if *slot > 0.0 { 0.7 * *slot + 0.3 * ms } else { ms };
         }
         true
+    }
+
+    /// Whether a size step would now cost more than it buys.
+    ///
+    /// Only on a tier whose history cannot survive one, and only once that
+    /// history is worth keeping — see [`RESIZE_UNTIL`]. A window's own resize
+    /// is not covered by this: there the old picture is of a different window
+    /// and there is nothing to protect.
+    fn size_is_dear(&self) -> bool {
+        self.resize_costs_history && self.mean_spp >= RESIZE_UNTIL
     }
 
     /// Would a step coarser actually be cheaper? Unknown counts as yes — the
@@ -1043,6 +1095,8 @@ impl viewport::Scene for App {
             // evidence that the picture is worth growing.
             self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS { self.cheap + 1 } else { 0 };
             self.last_ms = shot.ms as f64;
+            self.resize_costs_history = shot.resize_costs_history;
+            self.mean_spp = shot.mean_spp;
             // An overrun is only the size's fault if the size is paying for
             // an appreciable share of the pass. When the fixed cost dominates
             // — the GPU tier, where a pass is mostly the court going up and
@@ -1055,7 +1109,7 @@ impl viewport::Scene for App {
                 if self.over >= 2 {
                     if self.samples > 1 {
                         self.samples = 1;
-                    } else if self.scale < MAX_SCALE {
+                    } else if self.scale < MAX_SCALE && !self.size_is_dear() {
                         self.scale += 1;
                         // This size overran twice: it is not affordable, and
                         // no prediction gets to say otherwise.
@@ -1091,7 +1145,7 @@ impl viewport::Scene for App {
             // once condemned gets another hearing after a longer run of cheap
             // passes, because the pass that condemned it may not have been a
             // render at all.
-            let room = self.last_ms < 0.7 * TARGET_MS;
+            let room = self.last_ms < 0.7 * TARGET_MS && !self.size_is_dear();
             if room && self.scale > self.floor {
                 if self.samples > 1 {
                     self.samples = 1;
