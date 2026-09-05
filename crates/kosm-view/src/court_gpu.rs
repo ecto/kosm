@@ -84,7 +84,9 @@
 //! by the level's `env_radiance` gave the GPU about 45% of the light the CPU's
 //! flat constant gives, because `GpuRenderState` had no way to be told the
 //! gradient's own colours. It has one now — `set_gradient_env` — so this tier
-//! sends the very `Environment::constant(env_radiance)` the CPU tier builds.
+//! sends the very environment the CPU tier builds, and the sun with it: both
+//! come off `render::Scene` rather than being rebuilt from knobs here, so
+//! `sky 1` cannot mean one thing on the CPU and another on the GPU.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,7 +99,7 @@ use vcad_kernel_raytrace::gpu::{
     DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START, GpuAreaLight, GpuCamera, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, GpuScene, HistoryPipeline, RayTracePipeline, ResidentScene,
 };
-use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter};
+use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter, Sun};
 
 use crate::court::Camera;
 
@@ -141,11 +143,12 @@ pub struct Stage {
     /// the uniform jitter every earlier frame was drawn with, so a shot taken
     /// without the flag is the shot that was there before.
     filter: PixelFilter,
-    /// The level's environment, built exactly as `render::Scene` builds the
-    /// CPU tier's: `Environment::constant(env_radiance)`. It reaches the
-    /// shader through `GpuRenderState::set_gradient_env`, so the two tiers are
-    /// lit by the same sky.
+    /// The level's environment and sun, taken off the CPU tier's own
+    /// `render::Scene` rather than rebuilt from the level's knobs. They reach
+    /// the shader through `set_gradient_env` and `set_sun`, so the two tiers
+    /// are lit by the same sky and the same daylight.
     env: Environment,
+    sun: Option<Sun>,
     /// The merged scene for the frame on screen, and which frame that was.
     /// Assembling it is a clone of the statics and a placement per instance,
     /// which costs the same whatever the resolution — so it is done once per
@@ -218,7 +221,6 @@ impl Stage {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         max_depth: u32,
-        env_radiance: f32,
     ) -> anyhow::Result<Self> {
         let ctx = GpuContext {
             device: device.clone(),
@@ -292,7 +294,8 @@ impl Stage {
             scene: None,
             max_depth,
             filter,
-            env: Environment::constant([env_radiance; 3]),
+            env: stage.environment().clone(),
+            sun: stage.sun(),
             resident: None,
             uploaded: None,
             history,
@@ -479,6 +482,9 @@ impl Stage {
             if let Environment::Gradient(g) = &self.env {
                 state.set_gradient_env(g);
             }
+            // …and the same sun, which with `sky 1` is the only thing the
+            // clerestory openings have to let in.
+            state.set_sun(self.sun.as_ref());
             // The scissor sizes the trace *and* the fold: vcad's accumulate
             // pass honours the same rectangle, so every pixel outside keeps
             // the mean, the count and the variance it had. See the module
