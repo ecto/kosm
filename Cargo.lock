@@ -1174,6 +1174,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosm-render"
+version = "0.0.1"
+dependencies = [
+ "rayon",
+ "tang",
+]
+
+[[package]]
 name = "kosm-spike"
 version = "0.0.1"
 dependencies = [
@@ -3430,6 +3438,7 @@ version = "0.9.4"
 dependencies = [
  "bytemuck",
  "js-sys",
+ "kosm-render",
  "rayon",
  "tang",
  "thiserror 2.0.20",

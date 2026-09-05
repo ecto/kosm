@@ -544,6 +544,49 @@ window, which is how the picture is checked; it uses the GPU tracer unless
 `--cpu` says otherwise. `--pool` and `--splash` are gone for now: they were
 egui, and the pool's live tier went with it.
 
+## the light (`crates/kosm-render`)
+
+The renderer moved. It used to live in vcad, as `vcad-kernel-raytrace`: a ray,
+a BVH over B-rep faces, a TLAS over placed instances, and a path tracer on
+top. All of that was written against `BRepSolid`, which meant the only thing
+in this workspace that could be *lit* was a CAD document.
+
+But an engine owns its renderer. Kosm has three kinds of geometry already — a
+vcad solid's analytic faces, a phyz collider, and (soon) a splat — and they
+all want the same light. So the acceleration structures and the integrator are
+now `crates/kosm-render`, generic over one trait:
+
+```rust
+fn len(&self) -> usize;
+fn bounds(&self, i: usize) -> Aabb;
+fn intersect(&self, ray: &Ray, i: usize, t_min: f64, t_max: f64) -> Option<Hit>;
+```
+
+How many primitives you have, where each one is, and what a ray finds when it
+meets one. That is the whole seam. A `Hit` carries the primitive index and
+nothing that names it, so the geometry — not the renderer — says whether index
+7 is a `FaceId`, a triangle or a gaussian.
+
+The geometry stayed with the geometry. `intersect/` (plane, cylinder, sphere,
+cone, torus, bilinear, B-spline) and `trim.rs` are still vcad's, because
+knowing that a ray-sphere hit at *(u, v)* falls outside a trimmed face's
+boundary loop is a B-rep fact, not a lighting one. `vcad-kernel-raytrace` now
+implements the trait over its faces and re-exports `Bvh`, `Ray`, `RayHit`,
+`Tlas` as before; vcad is a client of Kosm's renderer, and the pictures did
+not move.
+
+The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon` and
+later `wgpu` — never on `vcad-*`, `phyz-*`, or any other Kosm crate.** It is a
+leaf. And it must compile for the browser:
+
+```bash
+cargo check -p kosm-render --target wasm32-unknown-unknown
+```
+
+which is why `rayon` is a `cfg(not(target_arch = "wasm32"))` dependency rather
+than a hard one. A renderer that cannot run where the picture is looked at is
+half a renderer.
+
 ## building
 
 `vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;

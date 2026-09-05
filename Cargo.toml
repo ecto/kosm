@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kosm-spike", "crates/kosm-view", "crates/kosm-mpm"]
+members = ["crates/kosm-render", "crates/kosm-spike", "crates/kosm-view", "crates/kosm-mpm"]
 
 [workspace.package]
 version = "0.0.1"
