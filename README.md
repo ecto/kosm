@@ -536,9 +536,9 @@ is one raw sample; what makes one sample a pixel watchable is refusing to throw
 the last frame away. Every pixel keeps a running mean and a count, and when
 something moves the renderer knows which something — the bounding sphere of
 each ball and extra whose pose changed, at its old pose and its new, plus the
-disc its shadow throws from each panel. That mask is geometric, so it reads the
-same on both tiers and the walls accumulate for the whole run while the balls
-bounce through them. It is computed before a ray is cast, from the poses alone.
+disc its shadow throws from each panel. That mask is geometric and it is computed before a ray is cast, from the
+poses alone. It is the **CPU tier's** now: the GPU tier stopped drawing
+rectangles and decides per pixel, on the device (see below).
 
 On the CPU tier the accumulator is `history.rs`: `History::plan` hands the
 renderer disjoint rectangles, `pathtrace::render_into` re-traces exactly those
@@ -605,10 +605,9 @@ the mean falls back under the line, and the size is the tuner's again.
 count that live in device buffers, runs the à-trous filter against the resident
 guide planes and tonemaps into a storage texture — on the viewport's own
 device, which the blit samples directly (`viewport::Image` is bytes *or* a
-texture now; the CPU tier still hands over bytes). What is left on this side is
-the **keep mask**: one byte a pixel, 1 to go on accumulating and 0 to start
-over, built by `history::Mask` from the same `mask_rects` the CPU tier plans
-with, so the two tiers mask on one piece of geometry.
+texture now; the CPU tier still hands over bytes). What was left on this side
+was a **keep mask** — one byte a pixel, 1 to go on accumulating and 0 to start
+over. It is gone; what replaced it is next.
 
 ### the rectangle is not the answer
 
@@ -668,25 +667,58 @@ holds, with the spatial variance switched off: the CPU filter has no such
 estimator, so the two tiers cannot agree byte for byte with it on, and the
 test says so.
 
-What has **not** landed is the viewer's half. `kosm-view` reaches the renderer
-through `vcad-kernel-raytrace`, which pins `kosm-render` to the sibling
-worktree's copy rather than this one, so the viewer cannot be built against
-these passes without a cross-repo manifest change that would land in the
-middle of another agent's work. The rectangle mask therefore still runs the
-GPU tier here; retiring it is `court_gpu.rs` handing `InstanceMotion` over
-instead of `mask_rects`, and the `Mask` staying for the CPU tier alone.
+The viewer's half has landed too. `vcad-kernel-raytrace` points at *this*
+`kosm-render` now, so `court_gpu.rs` hands `InstanceMotion` over instead of a
+mask. Every frame it assembles the merged scene it already assembled, and
+notes for each placed instance — every ball part, every net segment — which
+range of *faces* it owns, because the face index is exactly the primitive id
+the integrator writes into the guide plane. Differencing this frame's poses
+against **the pass the history is in** (not the frame: two passes of one frame
+moved nothing) gives one `prev_T · cur_T⁻¹` per instance that actually moved,
+and the id table points that instance's faces at it. The court itself — a
+hundred and forty-eight solids, eight hundred and eighty-five faces — stays
+`InstanceMotion::STATIC` and costs a lane apiece.
+
+There is no keep mask, no box and no scissor left on that tier: every pass is
+the whole frame, and every pixel decides for itself whether last pass's mean
+is still about the same thing. A camera move goes through the same call — the
+previous camera as `prev_view`, the same motion table — rather than a path of
+its own. The reprojection is offered only when something moved, eye or object:
+a still camera over a still frame, which is what `--shot` is pass after pass,
+would otherwise put every pixel through a depth and normal gate it can only
+lose by, and the many-pass still moved on 37 000 pixels when it did. Skipped,
+`--shot` is the picture it was — max 2 of 255 on five pixels of 480×270, where
+two runs of the *same* binary differ by 4 on twenty-nine.
+
+`--history-cap N`, `--clamp-k K`, `--clamp-reset N` and
+`--no-spatial-variance` are the knobs, over kosm-render's own defaults (64,
+4.0, 2, on). `Mask` and `Keep` stay in `history.rs` for the geometry the CPU
+tier plans with and for the tests that keep it honest; nothing on the GPU tier
+calls them.
+
+`--dump-frames N --at T` is how the absence of the rectangle is checked by
+eye: N consecutive live-tier frames at the level's own frame rate, one pass a
+frame, through the same device history the window uses, written to
+`out/view_seq/`. At 480×270 from t = 0.6 s — three balls rolling, one in
+flight, the net about to be hit — there is no box around anything, no straight
+edge travelling with a ball, and no patch of first-sample grain: the airborne
+ball is round, carries its seams and its shading, and sits where a 32-pass
+still of the same instant puts it. What the live frames do carry is an even
+speckle over the walls, which is one sample a frame filtered, and a slightly
+darker fringe on the ball's shadowed rim. No trail: the balls that look
+smeared into a line are three real balls rolling in a line, and the static
+reference shows the same three.
 
 Reprojection is no longer CPU-side only, and a camera move no longer costs the
 GPU picture its history. vcad grew
 `accumulate_and_denoise_resident_reprojected`, which takes the *previous*
 pass's camera: each pixel is unprojected through this pass's depth, projected
 back into that view, and keeps the mean and count it finds where the surfaces
-agree. So a moved camera now uploads the mask a *still* camera would have got —
-only the rectangles the world moved under — and lets the device settle the
-rest; only disocclusions restart. `--orbit-test` is that claim, scripted:
+agree. So a moved camera uploads no mask at all now and lets the device settle it;
+only disocclusions restart. `--orbit-test` is that claim, scripted:
 converge headlessly, swing the eye three degrees about its target, take one
 more pass and ask the device's own counts what survived. At 320×180 after eight
-passes, **88.8% of the frame kept its history across the move**, where before it
+passes, **87.0% of the frame kept its history across the move**, where before it
 was none of it. The previous camera is offered only when it is worth offering:
 a still-camera pass passes `None` (a view reprojected onto itself is two
 dispatches for nothing) and so does the first pass at a new size, since vcad
@@ -695,7 +727,8 @@ test against. A reprojected pass takes no scissor either — the reprojection
 needs this pass's depth everywhere — and the window's log names it (`a full
 reprojected pass`).
 
-The scissor is back on that tier. `set_scissor` used to size the *trace* alone
+The scissor had a life on that tier and it is over; what follows is what it
+was. `set_scissor` used to size the *trace* alone
 while vcad's accumulate pass walked every pixel of the frame, so outside the
 rectangle it would have folded a stale raw sample in as a fresh one; the
 accumulate pass honours the same rectangle now, leaving every pixel outside it
@@ -708,7 +741,8 @@ of the screen on the busy frames, but four balls spread across the court put
 one box around all of them and that box is more than half the frame every time,
 so every pass in the session was a full one. The rule is the same because the
 reason is: outside the box no pixel gains a sample, and a picture
-that is always scissored never converges.
+that is always scissored never converges. With the mask retired there is
+nothing left to scissor *by*, and the rule is moot on that tier.
 
 That the GPU tier once had no cheap pass at all is why `Cost::terms` exists in
 its present form. It refuses to call two buckets
@@ -725,10 +759,15 @@ retired them and the tuner timed `queue.submit`. A pass ends on
 
 What that bought, at a 1280×720 window on a retina display (so 2560×1440
 physical): the GPU tier used to settle at 320×180 with a pass of about 450 ms,
-of which 420 ms was the CPU à-trous filter. It now climbs 256×144 → 284×160 →
-365×205 in the first second, finds 365×205 costs 61 ms against a 30 ms budget,
-steps back to 320×180 at 20–50 ms a pass — and then *stays* there for the rest
+of which 420 ms was the CPU à-trous filter. It then climbed 256×144 → 284×160 →
+365×205 in the first second, found 365×205 cost 61 ms against a 30 ms budget,
+stepped back to 320×180 at 20–50 ms a pass — and *stayed* there for the rest
 of the session, accumulating past 1700 samples a pixel without one collapse.
+With the mask gone and every pass full-frame it settles higher: a ninety-second
+session opens at 512×288, finds it dear at 48 ms, and holds **426×240 at
+27–30 ms a pass**, the mean history swinging between 9 and 28 samples a pixel
+as the balls move through it — short, because a moving world is what a
+bounded, clamped history is *for*.
 Before the resample and the freeze it lost the lot at every step. It does
 **not** reach the full window: a
 sample measured on this machine costs about 9 ms at 320×180 and 31 ms at
@@ -775,9 +814,13 @@ x = 265, y = 270 — the camera's own retro-reflection point — is gone too; bo
 pictures now read 67.7 there, which vcad's own retro-incidence fix answered and
 this worktree did not touch.
 
-The one readback left in the GPU path is `--shot`'s: N passes through the
-device history and one copy of the target texture out for the PNG. Nothing in
-the window reads back at all. The deforming net still pays for a BVH build
+The readbacks left in the GPU path are two, and neither is a pixel of the
+picture. `--shot` copies the target texture out once at the end for the PNG.
+And the window, at the same two seconds its log line runs on, asks the device
+for its per-pixel counts so the line can say how long the history is and the
+tuner can tell a converged picture from a churning one — the mask used to
+mirror those counts on this side, and with the mask gone there is nothing here
+that knows. A *pass* still reads nothing back. The deforming net still pays for a BVH build
 inside every CPU pass. Evaluating the level takes **a minute or two** on this
 machine — single-threaded, almost all of it in `propagate_boolean` sorting face
 names under `circular_pattern` — and the window is black until it is done; it

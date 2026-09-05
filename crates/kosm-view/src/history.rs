@@ -978,6 +978,14 @@ fn shadow_disc(light: Point3, centre: Point3, radius: f64) -> Option<(Point3, f6
 ///
 /// The answer is a **keep mask**: one byte a pixel, 1 to go on accumulating
 /// and 0 to start that pixel over at this pass's sample.
+///
+/// **The GPU tier no longer asks it.** That tier decides per pixel on the
+/// device, from the previous camera and each instance's own motion, and a
+/// rectangle around a ball is exactly the thing it exists not to draw. What
+/// is left here is the CPU tier's own geometry — [`mask_rects`], which
+/// [`History::plan`] still calls — and this wrapper, which the tests below
+/// keep honest against it.
+#[allow(dead_code)]
 pub struct Mask {
     size: (u32, u32),
     view: Option<View>,
@@ -994,6 +1002,7 @@ pub struct Mask {
     reproject: bool,
 }
 
+#[allow(dead_code)]
 impl Mask {
     pub fn new(size: (u32, u32)) -> Self {
         Self {
@@ -1109,6 +1118,7 @@ impl Mask {
 
 /// A keep mask and, when they pay for themselves, the few boxes the pass need
 /// not step outside of.
+#[allow(dead_code)]
 pub struct Keep {
     /// One byte a pixel: 1 to go on accumulating, 0 to start over.
     pub keep: Vec<u8>,
@@ -1125,6 +1135,7 @@ pub struct Keep {
 }
 
 /// One rectangle covering all of them.
+#[allow(dead_code)]
 fn bounding(rects: &[Rect]) -> Option<[u32; 4]> {
     let mut it = rects.iter();
     let first = it.next()?;

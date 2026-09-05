@@ -23,51 +23,33 @@
 //! device and which the blit samples directly. There is no `Film`, no
 //! readback, and no CPU-side history on this tier at all.
 //!
-//! What this side still owns is the **keep mask**: one byte a pixel, 1 to go
-//! on accumulating and 0 to start over, computed by [`crate::history::Mask`]
-//! from the same geometry the CPU tier masks with.
+//! What this side owns is **what moved**. There is no keep mask left here and
+//! no scissor: every pass is the whole frame, and every pixel decides for
+//! itself whether last pass's mean is still about the same thing.
 //!
-//! A moved camera used to upload an all-restart mask, because reprojection
-//! was the CPU tier's alone and nothing on the device knew where last frame's
-//! pixel had gone. It is on the device now: a pass whose camera moved calls
-//! `accumulate_and_denoise_resident_reprojected` with the previous pass's
-//! camera, and each pixel is unprojected through this pass's depth, projected
-//! back into the previous view, and keeps that pixel's mean and count where
-//! the surfaces agree. The keep mask on such a pass is the *still-camera*
-//! one — only the rectangles the world moved under — and the reprojection
-//! settles the rest. Only disocclusions restart, so an orbit no longer looks
-//! like a frame of noise per mouse move.
+//! The device can carry a pixel across a *camera* move on its own — it has
+//! this pass's depth and both views. It cannot carry it across an *object*
+//! move, because nothing on the device knows the ball is somewhere else than
+//! it was. This module does: it placed it both times. So every frame it notes,
+//! for each placed instance — every ball part, every net segment — the range
+//! of *faces* it owns in the merged scene, because a face index is exactly the
+//! primitive id the integrator writes into the guide planes. Differencing this
+//! frame's poses against **the pass the history is in** gives one
+//! `prev_T · cur_T⁻¹` per instance that actually moved, and `InstanceMotion`'s
+//! id table points that instance's faces at it. The court itself never moves
+//! and stays `InstanceMotion::STATIC`.
 //!
-//! The previous camera is only offered when it is worth offering: a pass whose
-//! camera did not move passes `None` (reprojecting a view onto itself is two
-//! dispatches for nothing), and so does the first pass at a new size, since
-//! vcad reallocates the history on a resize and there is no previous plane to
-//! test against.
+//! It is the pass and not the frame that is differenced because two passes of
+//! one frame moved nothing: the second declares no motion, and the history is
+//! already in its poses.
 //!
-//! It also owns the **scissor**, and now uses it. `GpuRenderState::set_scissor`
-//! used to size the *trace* alone, while vcad's accumulate pass ran over every
-//! pixel of the frame and would have folded the stale raw sample outside the
-//! rectangle into the history as if it were fresh. It honours the same
-//! rectangle now — outside it the mean, the count and the variance are left
-//! exactly as they were, and the resolve pass still covers the frame so the
-//! target texture stays whole. So a pass whose keep mask fits in a box worth
-//! less than half the frame traces and folds that box and nothing else.
+//! The reprojection is offered only when something moved — the eye or an
+//! object. A still camera over a still frame, which is what `--shot` is pass
+//! after pass, would otherwise put every pixel through a depth and normal gate
+//! it can only lose by, for two dispatches and no picture.
 //!
-//! ## one denoise a frame, not one a box
-//!
-//! vcad's scissor is a single rectangle, so `k` dirty boxes are `k` calls.
-//! Fused, that was `k` of *everything*: `k` traces, which is what was wanted,
-//! and also `k` demodulate/à-trous/resolve chains over the whole frame, which
-//! was not — the denoise cannot be scissored (the filter reaches 32 pixels off
-//! a box's edge and the resolve has to leave the texture whole), so a viewer
-//! with four small boxes paid four full-frame filters to show one frame.
-//!
-//! [`Stage::accumulate`] uses vcad's split now: `accumulate_resident` once per
-//! box — trace and fold, both scissored, and the fold's *dispatch* is the
-//! box's workgroups rather than the frame's — then
-//! `denoise_and_resolve_resident` once for the pass. Measured in vcad's own
-//! suite at 512x288 with four boxes of a tenth of the frame each: 5.4 ms fused
-//! against 3.9 ms split. `KOSM_GPU_TIMING` prints the two halves separately.
+//! `--history-cap`, `--clamp-k`, `--clamp-reset` and `--no-spatial-variance`
+//! are the temporal knobs, over kosm-render's own defaults.
 //!
 //! ## the panels are in the picture
 //!
@@ -108,8 +90,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kosm_render::gpu::InstanceMotion;
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
+use vcad_kernel_math::{Point3, Transform};
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_raytrace::gpu::{
     DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START, GpuAreaLight, GpuCamera, GpuDenoiseParams,
@@ -136,6 +120,82 @@ fn pixel_filter_from_args() -> PixelFilter {
         "blackman" | "blackman-harris" | "bh" => PixelFilter::BlackmanHarris,
         _ => PixelFilter::Box,
     }
+}
+
+/// `--key value` or `--key=value`, for the temporal knobs.
+fn flag(key: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix(&format!("--{key}="))
+            .map(str::to_owned)
+            .or_else(|| (a == &format!("--{key}")).then(|| args.get(i + 1).cloned()).flatten())
+    })
+}
+
+/// The temporal knobs, off the command line, over kosm-render's own defaults.
+///
+/// `--history-cap N` bounds the exponential moving average, `--clamp-k K` is
+/// how many standard errors of disagreement between the history and this
+/// pass's neighbourhood it takes to shorten a pixel's history, and
+/// `--no-spatial-variance` turns off SVGF's spatial estimate for the pixels
+/// too young to have an error bar of their own. Defaults are
+/// [`GpuDenoiseParams::default`]'s — 64, 4.0 and on.
+fn denoise_from_args() -> GpuDenoiseParams {
+    let mut d = GpuDenoiseParams::default();
+    if let Some(v) = flag("history-cap").and_then(|v| v.parse::<u32>().ok()) {
+        d.history_cap = v.max(1);
+    }
+    if let Some(v) = flag("clamp-k").and_then(|v| v.parse::<f32>().ok()) {
+        d.clamp_k = v.max(0.0);
+    }
+    if let Some(v) = flag("clamp-reset").and_then(|v| v.parse::<u32>().ok()) {
+        d.clamp_reset = v.max(1);
+    }
+    if std::env::args().any(|a| a == "--no-spatial-variance") {
+        d.spatial_variance = false;
+    }
+    d
+}
+
+/// One placed instance in the merged scene: which faces it owns, and the
+/// pose that put them where they are.
+///
+/// The faces are a contiguous range because `GpuScene::merge` appends, and
+/// the *face index* is the primitive id the integrator writes into the guide
+/// planes — so this range is exactly what
+/// [`InstanceMotion`]'s id table wants filling in.
+#[derive(Clone)]
+struct Placement {
+    faces: (u32, u32),
+    to_world: Transform,
+}
+
+/// A rigid or affine transform as the row-major 3x4 the reprojection reads,
+/// worked out by where it sends the origin and the three axes rather than by
+/// reaching into the matrix.
+fn row_major(t: &Transform) -> [f32; 12] {
+    let o = t.apply_point(&Point3::new(0.0, 0.0, 0.0));
+    let c = |x: f64, y: f64, z: f64| {
+        let p = t.apply_point(&Point3::new(x, y, z));
+        [p.x - o.x, p.y - o.y, p.z - o.z]
+    };
+    let (cx, cy, cz) = (c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0));
+    [
+        cx[0] as f32, cy[0] as f32, cz[0] as f32, o.x as f32, //
+        cx[1] as f32, cy[1] as f32, cz[1] as f32, o.y as f32, //
+        cx[2] as f32, cy[2] as f32, cz[2] as f32, o.z as f32,
+    ]
+}
+
+/// Whether a 3x4 is close enough to the identity that declaring it would be
+/// three more vec4s for nothing. Translations are in millimetres, so a
+/// hundredth of one is well under a pixel at any size this tier renders.
+fn is_identity(m: &[f32; 12]) -> bool {
+    let id = InstanceMotion::IDENTITY;
+    m.iter()
+        .zip(id.iter())
+        .enumerate()
+        .all(|(i, (a, b))| (a - b).abs() <= if i % 4 == 3 { 1e-2 } else { 1e-5 })
 }
 
 /// The court, packed. Built once; every frame after that is placements.
@@ -170,6 +230,17 @@ pub struct Stage {
     /// which costs the same whatever the resolution — so it is done once per
     /// frame and not once per pass, and a paused window pays for it once.
     scene: Option<(u64, GpuScene)>,
+    /// Where every moving instance's faces are in that merged scene, and the
+    /// pose that put them there. Rebuilt with the scene, once a frame.
+    placements: Vec<Placement>,
+    /// How many faces the merged scene has — the length of
+    /// [`InstanceMotion`]'s id table.
+    face_count: u32,
+    /// The placements the *previous pass* folded into the history. What the
+    /// reprojection has to be differenced against is the pass, not the frame:
+    /// two passes of one frame moved nothing, and the second declares no
+    /// motion at all.
+    prev_placements: Option<Vec<Placement>>,
     /// The court on the device. Built on the first pass, kept across every
     /// one after it: a frame rewrites the placements, a pass rewrites the
     /// camera. `uploaded` is the frame whose placements are currently in it.
@@ -196,6 +267,10 @@ pub struct Stage {
     /// The camera the last pass rendered from, and the size it rendered at —
     /// what a reprojected pass unprojects into. `None` until the first pass.
     last_view: Option<((u32, u32), GpuCamera)>,
+    /// The camera that pass was taken from, in the level's own units, so
+    /// "did the camera move?" is answered exactly rather than by comparing
+    /// two packed bases.
+    last_camera: Option<Camera>,
     /// Whether the last pass carried its history across a camera move, and
     /// whether that has ever been said out loud.
     reprojected: bool,
@@ -308,6 +383,9 @@ impl Stage {
             extras: HashMap::new(),
             lights,
             scene: None,
+            placements: Vec::new(),
+            face_count: 0,
+            prev_placements: None,
             max_depth,
             filter,
             env: stage.environment().clone(),
@@ -315,11 +393,12 @@ impl Stage {
             resident: None,
             uploaded: None,
             history,
-            denoise: GpuDenoiseParams::default(),
+            denoise: denoise_from_args(),
             target: None,
             passes: 0,
             size: (0, 0),
             last_view: None,
+            last_camera: None,
             reprojected: false,
             said_reprojected: false,
         })
@@ -331,11 +410,19 @@ impl Stage {
     /// The statics are cloned rather than shared because `merge` re-indexes
     /// what it merges into. That clone is the per-frame cost of doing without
     /// a shader-side instance table, and it is a memcpy of a few arrays.
-    fn at(&mut self, snap: &Snapshot, stage: &render::Scene) -> GpuScene {
+    fn at(&mut self, snap: &Snapshot, stage: &render::Scene) -> (GpuScene, Vec<Placement>) {
         let mut scene = self.statics.clone();
+        // The statics own faces 0..statics.faces.len() and never move, so
+        // they get no placement and their ids stay `InstanceMotion::STATIC`.
+        let mut places: Vec<Placement> = Vec::new();
         for at in stage.ball_placements(snap) {
             for part in &self.ball {
+                let start = scene.faces.len() as u32;
                 scene = scene.merge(part.placed(&at));
+                places.push(Placement {
+                    faces: (start, scene.faces.len() as u32),
+                    to_world: at.clone(),
+                });
             }
         }
         for (solid, pbr, to_world) in stage.extra_parts(snap) {
@@ -349,11 +436,62 @@ impl Stage {
             }
             if let Some(p) = &self.extras[&key] {
                 let placed = p.placed(to_world);
+                let start = scene.faces.len() as u32;
                 scene = scene.merge(placed);
+                places.push(Placement {
+                    faces: (start, scene.faces.len() as u32),
+                    to_world: to_world.clone(),
+                });
             }
         }
         scene.lights = self.lights.clone();
-        scene
+        (scene, places)
+    }
+
+    /// What moved since the pass the history is currently in, packed for the
+    /// reprojection.
+    ///
+    /// One instance slot per thing that actually moved — a ball part, a net
+    /// segment — carrying `prev_T · cur_T⁻¹`, and the id table pointing every
+    /// face of that instance at its slot. Everything else, which is the whole
+    /// court, stays [`InstanceMotion::STATIC`] and costs a lane in the table.
+    ///
+    /// `None` when there is nothing to say: no previous pass, a frame whose
+    /// instances are not the ones the previous pass had (a net that grew a
+    /// segment is a different scene, and the ids are no longer comparable),
+    /// or a second pass of a frame nothing moved in.
+    fn motion(&self) -> (Option<InstanceMotion>, usize) {
+        let Some(prev) = self.prev_placements.as_ref() else {
+            return (None, 0);
+        };
+        let cur = &self.placements;
+        if prev.len() != cur.len() || self.face_count == 0 {
+            return (None, 0);
+        }
+        let mut ids = vec![InstanceMotion::STATIC; self.face_count as usize];
+        let mut mats: Vec<[f32; 12]> = Vec::new();
+        for (p, c) in prev.iter().zip(cur.iter()) {
+            if p.faces != c.faces {
+                return (None, 0);
+            }
+            let Some(inv) = c.to_world.inverse() else {
+                continue;
+            };
+            let m = row_major(&p.to_world.then(&inv));
+            if is_identity(&m) {
+                continue;
+            }
+            let slot = mats.len() as u32;
+            for id in c.faces.0..c.faces.1.min(self.face_count) {
+                ids[id as usize] = slot;
+            }
+            mats.push(m);
+        }
+        if mats.is_empty() {
+            return (None, 0);
+        }
+        let n = mats.len();
+        (Some(InstanceMotion::new(&ids, &mats)), n)
     }
 
     /// One pass, folded in, denoised and tonemapped — on the device.
@@ -365,20 +503,13 @@ impl Stage {
     /// passes. `frame_index` still climbs: it is what moves the shader's
     /// Halton jitter and its RNG, so two passes of one frame are two samples.
     ///
-    /// `keep` is one byte a pixel: 1 to go on accumulating that pixel's mean,
-    /// 0 to start it over at this pass's sample. Empty means keep everything.
-    /// [`crate::history::Mask`] builds it from the poses, before a ray is cast.
-    ///
-    /// `reproject` says the camera moved and the history should follow it
-    /// rather than start over — the previous pass's camera goes to vcad as
-    /// `prev_view` and the device carries every pixel whose surface it can
-    /// find again. It is honoured only when there *is* a previous pass at
-    /// this same size, and only for the pass's first sample: the camera does
-    /// not move between the samples of one pass.
+    /// There is no keep mask and no scissor on this tier any more. What tells
+    /// the history what is still true is the pass itself: the previous
+    /// camera, and [`Stage::motion`]'s per-instance `prev_T · cur_T⁻¹`. Every
+    /// pass is a full-frame pass, and every pixel decides for itself.
     ///
     /// What comes back is the texture the picture is now in, on the viewport's
     /// own device. Nothing was read back to make it.
-    #[allow(clippy::too_many_arguments)]
     pub fn accumulate(
         &mut self,
         stage: &render::Scene,
@@ -386,16 +517,15 @@ impl Stage {
         frame_id: u64,
         camera: &Camera,
         size: (u32, u32),
-        keep: &[u8],
-        boxes: &[[u32; 4]],
         samples: u32,
-        reproject: bool,
     ) -> anyhow::Result<Arc<wgpu::Texture>> {
         let n = (size.0 as u64) * (size.1 as u64);
         anyhow::ensure!(n > 0, "an empty picture");
         let assembled = Instant::now();
         if self.scene.as_ref().is_none_or(|(id, _)| *id != frame_id) {
-            let scene = self.at(snap, stage);
+            let (scene, places) = self.at(snap, stage);
+            self.face_count = scene.faces.len() as u32;
+            self.placements = places;
             self.scene = Some((frame_id, scene));
         }
         let assembly = assembled.elapsed();
@@ -448,9 +578,18 @@ impl Stage {
         // same size can be reprojected from — vcad reallocates the history on
         // a resize, so a stepped size has no previous plane to test against
         // and is a restart whatever the caller asked for.
+        // What moved since the pass the history is in — the balls, the net,
+        // and whether the eye did.
+        let (motion, moving) = self.motion();
+        let camera_moved = self.last_camera != Some(*camera);
+        // The reprojection is worth its two dispatches when something moved.
+        // A still camera over a still frame — which is what `--shot` is, pass
+        // after pass — reprojects a view onto itself for nothing, and asking
+        // for it would put every pixel through a depth and normal gate it can
+        // only lose by.
         let prev_view = self
             .last_view
-            .filter(|(s, _)| reproject && *s == size)
+            .filter(|(s, _)| *s == size && (camera_moved || motion.is_some()))
             .map(|(_, c)| c);
         self.reprojected = prev_view.is_some();
         if self.reprojected && !self.said_reprojected {
@@ -466,21 +605,10 @@ impl Stage {
         let res = self.resident.as_mut().expect("just built");
         // `samples` samples, each its own call: vcad's accumulate folds one
         // raw sample per call, so a pass of several is several calls with a
-        // climbing `frame_index` to move the jitter and the RNG. Only the
-        // first carries the keep mask — the pixels this pass restarts are
-        // restarted once, and the rest of the pass accumulates onto them.
-        // One dispatch per box. vcad's scissor is a single rectangle, so k
-        // boxes are k calls: the *trace* shrinks to each box, though the fold
-        // and the denoise chain behind it do not. An empty list is the whole
-        // frame, in one call, exactly as before.
-        let dispatches: Vec<Option<[u32; 4]>> = if boxes.is_empty() {
-            vec![None]
-        } else {
-            boxes.iter().map(|&b| Some(b)).collect()
-        };
+        // climbing `frame_index` to move the jitter and the RNG. The whole
+        // frame every time — there is no box and no mask left on this tier.
         let mut accumulated = Duration::ZERO;
         for k in 0..samples.max(1) {
-            for (b, rect) in dispatches.iter().enumerate() {
             let box_started = Instant::now();
             self.passes += 1;
             let mut state = GpuRenderState::new(self.passes);
@@ -506,39 +634,25 @@ impl Stage {
             // …and the same sun, which with `sky 1` is the only thing the
             // clerestory openings have to let in.
             state.set_sun(self.sun.as_ref());
-            // The scissor sizes the trace *and* the fold: vcad's accumulate
-            // pass honours the same rectangle, so every pixel outside keeps
-            // the mean, the count and the variance it had. See the module
-            // docs.
-            if let Some(rect) = *rect {
-                state.set_scissor(rect);
-            }
             self.pipeline
-                .accumulate_resident(
+                .accumulate_resident_temporal(
                     &self.ctx,
                     &self.history,
                     res,
                     &cam,
                     state,
-                    // The boxes are disjoint and the fold is scissored, so
-                    // each box restarts its own pixels once and no box can
-                    // touch another's.
-                    if k == 0 { keep } else { &[] },
-                    // Only the first sample of the pass, and only its first
-                    // box: after that the history is already in this pass's
-                    // view. The reprojection gathers over the whole frame and
-                    // every later box reads that gather out of the scratch
-                    // pair, so it is a once-per-pass thing whatever the boxes
-                    // are.
-                    if k == 0 && b == 0 {
-                        prev_view.as_ref()
-                    } else {
-                        None
-                    },
+                    // No keep mask: every pixel keeps what it has until the
+                    // reprojection cannot find it or the clamp shortens it.
+                    &[],
+                    // Only the first sample of the pass reprojects. After it
+                    // the history is already in this pass's view, and the
+                    // camera does not move between the samples of one pass.
+                    if k == 0 { prev_view.as_ref() } else { None },
+                    &denoise,
+                    if k == 0 { motion.as_ref() } else { None },
                 )
                 .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
             accumulated += box_started.elapsed();
-            }
         }
 
         // With no sync here `accumulated` is the cost of *submitting* the box
@@ -573,22 +687,26 @@ impl Stage {
         if timing {
             eprintln!(
                 "court  gpu: {}\u{d7}{} pass \u{2014} {:.1} ms assembling, {:.1} ms uploading, \
-                 {:.1} ms tracing ({} box{} \u{d7} {} sample{}, {:.1} ms tracing and \
+                 {:.1} ms tracing ({} sample{}, {} moving instance{}, {:.1} ms tracing and \
                  accumulating, {:.1} ms denoising once)",
                 size.0,
                 size.1,
                 assembly.as_secs_f64() * 1e3,
                 upload.as_secs_f64() * 1e3,
                 traced.elapsed().as_secs_f64() * 1e3,
-                dispatches.len(),
-                if dispatches.len() == 1 { "" } else { "es" },
                 samples.max(1),
                 if samples.max(1) == 1 { "" } else { "s" },
+                moving,
+                if moving == 1 { "" } else { "s" },
                 accumulated.as_secs_f64() * 1e3,
                 denoise_time.as_secs_f64() * 1e3,
             );
         }
         self.last_view = Some((size, cam));
+        self.last_camera = Some(*camera);
+        // What the *next* pass differences against. The history is now in
+        // this pass's poses, whatever the frame does after it.
+        self.prev_placements = Some(self.placements.clone());
         Ok(texture)
     }
 

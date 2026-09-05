@@ -59,7 +59,7 @@ use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
 use crate::court_gpu;
-use crate::history::{History, Mask, Plan, Pose, View};
+use crate::history::{History, Plan, Pose, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -334,14 +334,10 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
     // frame's mean is still true for.
     let mut current: Option<Job> = None;
     let mut history = History::new((0, 0));
-    // The GPU tier reprojects on the device, so a camera move is masked like
-    // a still-camera pass there; the CPU tier reprojects in `History` and its
-    // mask is only about the world.
-    let mut mask = if matches!(tracer, Tracer::Gpu(_)) {
-        Mask::reprojecting((0, 0))
-    } else {
-        Mask::new((0, 0))
-    };
+    // The device's own mean history length, read back at most every two
+    // seconds and only for the log and the resize freeze — a pass still reads
+    // nothing back.
+    let mut gpu_mean_spp = 0.0f32;
     // The CPU tier's frame, kept between passes: `render_into` patches it, so
     // the pixels a masked pass did not touch are last pass's and not black.
     let mut film = pathtrace::Film::new(0, 0);
@@ -377,20 +373,10 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // device buffers vcad reallocates on a resize, so there the tuner is
         // asked not to step a converged picture at all (see `App::image`).
         history.resample(job.size);
-        if mask.size() != job.size {
-            mask = if matches!(tracer, Tracer::Gpu(_)) {
-                Mask::reprojecting(job.size)
-            } else {
-                Mask::new(job.size)
-            };
-        }
         if (film.width, film.height) != job.size {
             film = pathtrace::Film::new(job.size.0, job.size.1);
         }
         let lap = Instant::now();
-        let cam = job.camera.to_pathtrace();
-        let view = View::of(&cam, job.size.0, job.size.1);
-        let poses = poses(&mut stage, &job.frame);
         let frame_px = (job.size.0 as u64) * (job.size.1 as u64);
 
         // A pass, on whichever tier. Both answer the same question — what
@@ -401,62 +387,50 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // Whether this pass carried its history across a camera move, for the
         // log: a moved camera used to repaint the frame and now mostly does
         // not.
-        let mut reprojected = "";
-        let (image, mask_frac, mean_spp, traced_px, kind, share) = match &mut tracer {
-            // On the device: one dispatch, four small compute passes, and a
-            // texture. No film comes back, so there is nothing here to merge
-            // or resolve; the keep mask is the whole of this side's work.
-            //
-            // The scissor is used here too now. vcad's accumulate pass takes
-            // the same rectangle as the trace, so the pixels outside it keep
-            // their mean, their count and their variance — nothing stale is
-            // folded in as fresh — and a pass whose keep mask fits in a box
-            // worth less than half the frame is that box's work.
+        let (image, mask_frac, mean_spp, traced_px, kind) = match &mut tracer {
+            // On the device: one full-frame pass and a texture. Nothing comes
+            // back and there is no mask on this side at all — the history is
+            // carried pixel by pixel, by the previous camera and by each
+            // moving instance's `prev_T \u{b7} cur_T\u{207b}\u{b9}`, and shortened where
+            // this pass's own neighbourhood says it has gone stale.
             Tracer::Gpu(gpu) => {
-                let keep = mask.keep(&view, &poses, &lights, job.spp);
-                // The boxes are disjoint, so their areas simply add.
-                let boxed: u64 = keep
-                    .boxes
-                    .iter()
-                    .map(|r| (r[2] as u64) * (r[3] as u64))
-                    .sum();
-                let nboxes = keep.boxes.len();
                 let pass = gpu.accumulate(
                     &stage,
                     &job.frame,
                     job.frame_id,
                     &job.camera,
                     job.size,
-                    &keep.keep,
-                    &keep.boxes,
                     job.spp,
-                    keep.reproject,
                 );
-                if gpu.reprojected() {
-                    reprojected = " reprojected";
-                }
                 match pass {
-                    Ok(texture) => (
-                        viewport::Image::Texture(texture),
-                        mask.fraction(),
-                        mask.mean_samples(),
-                        if nboxes == 0 { frame_px } else { boxed },
-                        if nboxes == 0 {
-                            "full".to_string()
-                        } else {
-                            format!("{nboxes}-box")
-                        },
-                        if nboxes == 0 {
-                            String::new()
-                        } else {
-                            format!(" ({:.0}%)", 100.0 * boxed as f64 / frame_px as f64)
-                        },
-                    ),
+                    Ok(texture) => {
+                        // The one thing this tier reads back, and only for the
+                        // log line and the tuner's resize freeze: the mean of
+                        // the device's own per-pixel counts, at the same two
+                        // seconds the log runs on.
+                        if said_at.elapsed().as_secs() >= 2 {
+                            if let Ok(counts) = gpu.history_counts() {
+                                if !counts.is_empty() {
+                                    gpu_mean_spp = counts.iter().map(|&c| c as f64).sum::<f64>()
+                                        as f32
+                                        / counts.len() as f32;
+                                }
+                            }
+                        }
+                        (
+                            viewport::Image::Texture(texture),
+                            0.0,
+                            gpu_mean_spp,
+                            // Every pass is the whole frame now, which is what
+                            // the tuner's cost model is fitted against.
+                            frame_px,
+                            "temporal".to_string(),
+                        )
+                    }
                     Err(error) => {
                         eprintln!("court  gpu: {error}; falling back to the CPU tracer");
                         tracer = Tracer::Cpu;
                         history = History::new(job.size);
-                        mask = Mask::new(job.size);
                         film = pathtrace::Film::new(job.size.0, job.size.1);
                         continue;
                     }
@@ -466,6 +440,9 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             // the rectangles it names, and the history folds the film in and
             // denoises it.
             Tracer::Cpu => {
+                let cam = job.camera.to_pathtrace();
+                let view = View::of(&cam, job.size.0, job.size.1);
+                let poses = poses(&mut stage, &job.frame);
                 let seed = 0x5eed_0000
                     ^ (job.generation << 20)
                     ^ (lap.elapsed().as_nanos() as u64)
@@ -521,12 +498,11 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     if full {
                         "full".to_string()
                     } else {
-                        format!("{}-box", plan.rects.len())
-                    },
-                    if full {
-                        String::new()
-                    } else {
-                        format!(" ({:.0}%)", 100.0 * traced_px as f64 / frame_px as f64)
+                        format!(
+                            "{}-box ({:.0}%)",
+                            plan.rects.len(),
+                            100.0 * traced_px as f64 / frame_px as f64
+                        )
                     },
                 )
             }
@@ -543,18 +519,26 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         };
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
+            // The GPU tier has no repainted share to report — nothing on it
+            // repaints a rectangle any more — so it says what the history is
+            // instead: the mean number of samples behind a pixel.
+            let detail = match &tracer {
+                Tracer::Gpu(_) => format!("{:.1} samples a pixel", shot.mean_spp),
+                Tracer::Cpu => format!(
+                    "{:.0}% repainted, {:.1} samples a pixel",
+                    100.0 * shot.mask,
+                    shot.mean_spp
+                ),
+            };
             eprintln!(
-                "court  {} {}×{} at {} spp: {} ms a {}{} pass{}, {:.0}% repainted, {:.1} samples a pixel",
+                "court  {} {}×{} at {} spp: {} ms a {} pass, {}",
                 tracer.name(),
                 job.size.0,
                 job.size.1,
                 job.spp,
                 shot.ms,
                 kind,
-                reprojected,
-                share,
-                100.0 * shot.mask,
-                shot.mean_spp
+                detail
             );
         }
         if out.send(shot).is_err() {
@@ -660,7 +644,7 @@ pub fn still_gpu(
     // nothing moves between them. The picture never leaves the device until
     // the last line, which reads the target texture once for the PNG.
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], &[], 1, false)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, 1)?;
     }
     let rgba = gpu.read_target()?;
     if let Some(dir) = path.parent() {
@@ -694,7 +678,7 @@ pub fn still_gpu(
 /// comes back at one. Before this, every pixel came back at one.
 pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let mut stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
     let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
@@ -718,7 +702,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
 
     let passes = passes.max(1);
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], &[], 1, false)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, 1)?;
     }
     let before = gpu.history_counts()?;
     let converged = before.iter().filter(|&&c| c > 1).count();
@@ -733,38 +717,10 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
             ..camera
         }
     };
-    // The mask a still camera would have given this pass — the world did not
-    // move between the two — and the previous camera to reproject from.
-    let mut mask = Mask::reprojecting(size);
-    let lights = stage.light_centres();
-    let poses = poses(&mut stage, &frame);
-    let _ = mask.keep(
-        &View::of(&camera.to_pathtrace(), size.0, size.1),
-        &poses,
-        &lights,
-        passes,
-    );
-    let keep = mask.keep(
-        &View::of(&moved.to_pathtrace(), size.0, size.1),
-        &poses,
-        &lights,
-        1,
-    );
-    anyhow::ensure!(
-        keep.reproject,
-        "a moved camera should ask for a reprojected pass"
-    );
-    gpu.accumulate(
-        &stage,
-        &frame,
-        0,
-        &moved,
-        size,
-        &keep.keep,
-        &keep.boxes,
-        1,
-        keep.reproject,
-    )?;
+    // One more pass, from the moved eye. There is no mask to build: the
+    // previous camera goes to the device on its own and every pixel is asked
+    // whether the surface under it is the one it had.
+    gpu.accumulate(&stage, &frame, 0, &moved, size, 1)?;
     anyhow::ensure!(gpu.reprojected(), "the pass should have reprojected");
 
     let after = gpu.history_counts()?;
@@ -776,6 +732,79 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
         size.1,
         100.0 * converged as f64 / n as f64,
         100.0 * kept as f64 / n as f64,
+    );
+    Ok(())
+}
+
+/// A short sequence of *live-tier* frames, headless, with the history running
+/// through them.
+///
+/// `--shot` is one frame folded many times and says nothing about motion.
+/// This is the other half: the court is stepped to `t` and then frame by
+/// frame at the level's own frame rate, one pass a frame, through the same
+/// device history the window uses — so what lands in `dir` is what the window
+/// would have shown, grain, ghosting and all. It is how the rectangle's
+/// absence is checked by eye.
+pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> anyhow::Result<()> {
+    let scene = CourtScene::bundled()?;
+    let stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let a = &scene.authored;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+    )?;
+    let t = if t < 0.0 {
+        a.parameter_or("still_t", 0.95)
+    } else {
+        t
+    };
+    let mut court = Court::from_scene(&scene)?;
+    while court.time() < t {
+        court.step();
+    }
+    std::fs::create_dir_all(dir)?;
+    let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
+    // The window is never cold when the balls are in flight — it has been
+    // converging on the frames before this one — so the sequence starts the
+    // way the window would: a few passes on the first frame, and then one a
+    // frame like a live tier.
+    let warm = Frame::of(&court);
+    for _ in 0..8 {
+        gpu.accumulate(&stage, &warm, 0, &camera, size, 1)?;
+    }
+    let t0 = Instant::now();
+    for k in 0..n.max(1) {
+        if k > 0 {
+            for _ in 0..steps_per_frame {
+                court.step();
+            }
+        }
+        let frame = Frame::of(&court);
+        let lap = Instant::now();
+        gpu.accumulate(&stage, &frame, k as u64 + 1, &camera, size, 1)?;
+        let rgba = gpu.read_target()?;
+        let path = dir.join(format!("frame_{k:02}.png"));
+        image::RgbaImage::from_raw(size.0, size.1, rgba)
+            .ok_or_else(|| anyhow::anyhow!("the target texture is the wrong size"))?
+            .save(&path)?;
+        println!(
+            "court  frame {k:02}  t = {:.3} s  {} ms a temporal pass  \u{2192} {}",
+            court.time(),
+            lap.elapsed().as_millis(),
+            path.display()
+        );
+    }
+    println!(
+        "court  {} frames at {}\u{d7}{} in {:.1} s",
+        n.max(1),
+        size.0,
+        size.1,
+        t0.elapsed().as_secs_f64()
     );
     Ok(())
 }
