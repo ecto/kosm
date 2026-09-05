@@ -7,6 +7,7 @@ description = "The window: a wgpu surface, a blitted image, and nothing else on 
 
 [dependencies]
 kosm-spike = { path = "../kosm-spike" }
+kosm-render = { path = "../kosm-render", features = ["gpu"] }
 # the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
 wgpu = "30"
 winit = "0.30"
@@ -18,6 +19,14 @@ phyz-math.workspace = true
 tang.workspace = true
 anyhow = "1"
 log = "0.4"
+# The skatepark's ride viewer (`--ride`, `--live`) is an egui app from main; it
+# is behind a feature so the default binary stays the bare viewport.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"], optional = true }
+egui = { version = "0.36", optional = true }
+ipse-map = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
 # The GPU tracer runs on the viewport's own device: vcad is on wgpu 30 now,
 # so the surface and the path tracer are one set of wgpu types.
 vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
@@ -25,3 +34,6 @@ vcad-kernel-gpu = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/
 vcad-kernel-math.workspace = true
 vcad-kernel.workspace = true
 vcad-eval.workspace = true
+[features]
+default = []
+ride = ["dep:eframe", "dep:egui", "dep:ipse-map", "dep:serde", "dep:serde_json"]

@@ -12,6 +12,7 @@
 //! kosm-view --cpu               the CPU integrator, not the GPU tracer
 //! kosm-view --shot out/x.png    one still, no window
 //! kosm-view --orbit-test        what a camera move costs the GPU history
+//! kosm-view --dump-frames 6     six live frames, with the history, to out/view_seq
 //! ```
 //!
 //! It opens live: the simulation runs in wall-clock time and the window shows
@@ -24,6 +25,17 @@ mod court;
 mod court_gpu;
 mod history;
 mod viewport;
+// The skatepark's ride viewer from main is an egui app; it rides along behind
+// the `ride` feature so the default binary stays the bare viewport.
+#[cfg(feature = "ride")]
+mod live;
+#[cfg(feature = "ride")]
+mod ride;
+
+/// The ipse tree the live recorder lives in — it resolves its assets against
+/// its own cwd, so the child is run from there.
+#[cfg(feature = "ride")]
+const IPSE: &str = "/Users/cam/Developer/ipse";
 
 /// Warnings from wgpu and vcad, on stderr; anything quieter is noise.
 struct Stderr;
@@ -63,6 +75,40 @@ fn main() -> anyhow::Result<()> {
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
 
+    // `--ride <ride.json>` plays a recorded rollout, `--live` streams one from
+    // a child simulator: the skatepark's viewer, when built with `--features ride`.
+    #[cfg(feature = "ride")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+        let source = if let Some(i) = args.iter().position(|a| a == "--ride") {
+            let Some(path) = args.get(i + 1) else {
+                eprintln!("--ride wants a path to a ride.json");
+                std::process::exit(2);
+            };
+            Some(ride::Source::File(path.into()))
+        } else if args.iter().any(|a| a == "--live") {
+            let (cmd, cwd) = match after("--live-cmd") {
+                Some(c) => (c.split_whitespace().map(str::to_string).collect(), std::env::current_dir().unwrap_or_else(|_| ".".into())),
+                None => (vec![format!("{IPSE}/target/release/examples/k1_skatepark_ride"), "--stream".into()], std::path::PathBuf::from(IPSE)),
+            };
+            let num = |flag: &str, d: f64| after(flag).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let mut extra = Vec::new();
+            for flag in ["--policy", "--scenario"] {
+                if let Some(v) = after(flag) {
+                    extra.push(flag.to_string());
+                    extra.push(v);
+                }
+            }
+            Some(ride::Source::Live(ride::LiveOpts { cmd, cwd, shove: num("--shove", 8.0), shove_at: num("--shove-at", 0.5), duration: num("--duration", 6.0), extra }))
+        } else {
+            None
+        };
+        if let Some(source) = source {
+            return ride::run(source);
+        }
+    }
+
     // `--shot <path>` renders one frame with the same producer the window
     // uses and writes it, no window: the picture, testable.
     if let Some(path) = arg("shot") {
@@ -85,6 +131,16 @@ fn main() -> anyhow::Result<()> {
                 court::still(path, t, size, spp)
             }
         };
+    }
+    // `--dump-frames N --at T` writes N consecutive live-tier frames, with the
+    // history running through them, so the temporal accumulation can be
+    // looked at rather than argued about.
+    if let Some(n) = parse::<u32>("dump-frames") {
+        let width: u32 = parse("width").unwrap_or(480);
+        let size = (width, (width * 9 / 16).max(1));
+        let t: f64 = parse("at").unwrap_or(-1.0);
+        let dir = arg("out").unwrap_or_else(|| "out/view_seq".into());
+        return court::dump_frames(std::path::Path::new(&dir), t, size, n);
     }
     // `--orbit-test` is the reprojection, scripted: converge headlessly, swing
     // the camera a few degrees, take one more pass, and say how much of the

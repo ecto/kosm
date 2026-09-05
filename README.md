@@ -393,6 +393,65 @@ start of the step rather than off the free velocity with `g·dt` already in it
 benchmark in `phyz/tests/contact_physics_benchmarks.rs` is now a Newton gate
 rather than a guard on the measured shortfall.
 
+
+### the skatepark
+
+`kosm-spike --skatepark [level]` is a training level for the Booster K1 in
+`../ipse`, which already has the skateboard rig and a K1 that rides it on a
+flat floor. Its terrain is an `ipse-map` directory — a collision mesh and a
+signed-distance grid baked from it — that a scenario file points at, so the
+park is authored here as vcad geometry
+([`levels/skatepark.loon`](levels/skatepark.loon): a mini ramp, one solid, the
+transition radius, lip, width, flat, deck and coping as `defparam`s) and
+baked with ipse-map's own baker into `out/maps/skatepark/` (`mesh.stl`,
+`sdf.bin`, `map.toml`, `park.svg`, and a `scenario.toml` that stands the K1
+on its board on the flat and shoves it at the transition). The field is
+sampled along the ideal arc and reported against the analytic circle: 2.5 mm
+at 10 mm cells, which is vcad's tessellation of the cylinder, not the bake.
+
+The check is the court's e² test for a ramp. A wheel-sized solid sphere is
+set on one transition and released, and rolled on the baked map through the
+same SDF contact path the K1's feet use. Rolling without slip, its centre
+reaches the flat at `v² = 10/7 · g · Δ` and climbs the far wall back to the
+height it left. Measured: 2.480 m/s against 2.483 predicted, the far wall to
+99.7 % of the release height, zero lateral drift. `tests/skatepark.rs` pins
+all three.
+
+Two engine bugs surfaced and were fixed in the stack this depends on. In
+ipse-map, a point far past the SDF's volume saturated the `as usize` cast and
+`ix + 1` wrapped to 0 in release, passing the bounds check and indexing off
+the end of the grid. In phyz, a free joint's linear velocity is stored in the
+body frame, and its Coriolis term `−ω × v` — the frame turning, not a force —
+was integrated by explicit Euler, which turns *and* stretches: `|v|` grows by
+`(ω dt)² / 2` a step, invisible on a trunk and a runaway on a 27 mm wheel at
+74 rad/s (the wheel reached 45 m/s on the flat). The fix strips that term
+from `aba`'s acceleration before the contact solve, which was assembled in
+the start-of-step frame, and turns the solved velocity into the end-of-step
+frame exactly afterwards; the adjoint carries the turn's tangent. Tests:
+`phyz/tests/spinning_free_body.rs`, `ipse-map` `sdf::tests::outside_is_none`.
+
+`levels/warehouse.loon` is the same machinery at level scale: THPS1's first
+level scaled to the K1 inside a 16 × 9 m shed — half pipe, mezzanine, two
+quarter pipes either side of an open door, a platform, a bent rail, kickers,
+box piles, a ledge, and the building itself. One root per piece, each with a
+material name; roots whose material begins `no-collide` (roof, trusses,
+skylight, glazing, piers, door frame, the wall above the brick skirt) are drawn
+but never baked, so the SDF stops at the metre of wall the K1 can hit
+instead of following the roof to the ridge. The bake writes
+`parts/<root>.stl` and a `parts.json` of names, materials and colours, and
+the ride recorder draws the level from those rather than from one grey mesh.
+20 mm cells over that volume is 372 MB of f32, so the level asks for 25 mm
+(191 MB, 18 s). `tests/warehouse.rs` pins the quarter pipe against
+10/7 · g · Δ, the kicker against the height a wheel rolled at it reaches,
+and the rail against the radius the field puts around its axis.
+
+```bash
+cargo run --release -p kosm-spike -- --skatepark
+cargo run --release -p kosm-spike -- --skatepark levels/warehouse.loon
+open out/maps/skatepark/park.svg
+cd ../ipse && cargo run -p ipse-sim --bin train -- ../kosm/out/maps/skatepark/scenario.toml
+```
+
 ## the sound (`audio.rs`)
 
 Nothing is sampled. `audio.rs` asks `vcad-kernel-acoustics` for the level's
@@ -1430,6 +1489,37 @@ Two rules come with the dependency. It is a leaf — `tang`, `rayon`, `wgpu`,
 reach back for a `vcad-*` or `phyz-*` type; the geometry goes *in*, through
 `Geometry`. And it builds for `wasm32-unknown-unknown` with `--features gpu`,
 so anything a consumer adds here must too.
+
+`cargo run --release -p kosm-view -- --ride <ride.json>` plays a recorded
+rollout instead of simulating one — a Booster K1 riding a skatepark, say.
+The file (`docs/ride-format.md`) carries its own meshes (binary STL, box,
+sphere, cylinder), the fixed scenery, one actor per moving body and a pose
+per actor per frame, so playback touches no solver: play, pause, scrub the
+frame slider, pick a playback speed, and the camera orbits whatever actor
+`track` names (drag to orbit, scroll to zoom, z up). Rendering is a plain
+instanced rasterizer (`ride.rs`, `ride.wgsl`) — flat normals, one sun, a sky
+ambient, no culling, because authored STLs are wound however they were wound.
+`--shot=out.png --frame=N` draws one frame offscreen and quits, which is how
+the mode is checked without a screen.
+
+`cargo run --release -p kosm-view -- --live` runs the rollout instead of
+reading one: the ipse recorder
+(`target/release/examples/k1_skatepark_ride --stream`, run from
+`/Users/cam/Developer/ipse` because it resolves `objects/skateboard` against
+the cwd) streams the ride on stdout — the header first, then one frame per
+line — and a reader thread appends frames as they land while its stderr goes
+straight to ours. `--live-cmd "<program and args>"` swaps in another streamer,
+split on whitespace, run from the current directory. The transport gains
+"follow live" (on by default), a shove peak (N·s), a shove time and a
+duration, and a "restart" button that kills the child and re-runs it with
+those values on an empty timeline; the status line reads
+`live: 123 frames, t = 2.05 s, child running`. Playback stays paced by the
+ride's own `dt` even though the recorder runs several times faster than real
+time, so following live rides the frontier of arrived frames rather than
+jumping to it, and pausing or scrubbing back works while frames keep
+arriving. Closing the window kills the child. `--shot`/`--frame` work here
+too: the window waits for that frame (or for the child to end) before it
+draws and quits.
 
 ## building
 

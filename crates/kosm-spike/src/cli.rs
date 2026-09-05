@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 const DEFAULT_LEVEL: &str = "levels/marble.loon";
 const DEFAULT_FRAMES: usize = 150;
+const DEFAULT_SKATEPARK: &str = "levels/skatepark.loon";
 
 pub use crate::pool::PoolRenderer;
 
@@ -17,6 +18,7 @@ pub enum Command {
     Pool { frames: usize, renderer: PoolRenderer },
     Splash { frames: usize },
     Splat { ply: PathBuf },
+    Skatepark { level: PathBuf },
 }
 
 impl Command {
@@ -58,6 +60,9 @@ impl Command {
             }
             "--splash" => Ok(Self::Splash {
                 frames: frames(args.next()),
+            }),
+            "--skatepark" => Ok(Self::Skatepark {
+                level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_SKATEPARK.into()),
             }),
             "--splat" => {
                 let ply = args
