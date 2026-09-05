@@ -209,18 +209,29 @@ impl Scene {
                 objects.push(Object::placed(bvh.clone(), *pbr, rigid(&r, c.x, c.y, c.z)));
             }
         }
+        // BVHs for the extras, kept from frame to frame by the solid's
+        // identity — and dropped when a solid stops being handed to us, so a
+        // net that mints a new cylinder now and then does not grow this forever.
+        let mut seen: HashMap<usize, Arc<Bvh>> = HashMap::with_capacity(snap.extras.len());
         for extra in &snap.extras {
             let key = Arc::as_ptr(&extra.solid) as usize;
-            let bvh = self
-                .extras
-                .entry(key)
-                .or_insert_with(|| Arc::new(build_bvh(&extra.solid)))
-                .clone();
+            let bvh = match seen.get(&key) {
+                Some(b) => b.clone(),
+                None => {
+                    let b = self
+                        .extras
+                        .remove(&key)
+                        .unwrap_or_else(|| Arc::new(build_bvh(&extra.solid)));
+                    seen.insert(key, b.clone());
+                    b
+                }
+            };
             if bvh.root().is_none() {
                 continue;
             }
             objects.push(Object::placed(bvh, materials::pbr(&self.doc, &extra.material), extra.to_world.clone()));
         }
+        self.extras = seen;
         pathtrace::Scene {
             objects,
             lights: self.lights.clone(),

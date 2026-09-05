@@ -72,8 +72,12 @@ pub struct Net {
 /// pulls it back, and how many passes.
 const MAX_STRETCH: f64 = 0.02;
 const RELAX_PASSES: usize = 2;
-/// Cylinders are cached per this much length; 0.2 mm is finer than the eye.
-const LENGTH_BUCKET_MM: f64 = 0.2;
+/// Cylinders are cached per this much length. A cord is held within 2% of
+/// its rest length, about a millimetre, so at 2 mm each cord lands in one or
+/// two buckets for the whole run and the renderer's per-solid BVH cache
+/// actually hits; at 0.2 mm every sway minted a new solid, a new BVH, and a
+/// 20 s frame. Two millimetres on a 5 mm cord is not visible.
+const LENGTH_BUCKET_MM: f64 = 2.0;
 
 impl Net {
     /// Hang a net on the scene's rim, or `None` if the level asked for no
