@@ -3,13 +3,11 @@
 //! Three threads. The simulation steps on its own and hands over one snapshot
 //! per frame, so the timeline is a recording; the renderer turns the frame
 //! under the cursor into a picture, pass by pass; the viewport blits whatever
-//! the renderer last handed back. Nothing in the picture is hand-written
-//! geometry. The level's roots are evaluated once by `vcad_eval` into BRep `Solid`s,
-//! each gets a `vcad_kernel_raytrace::Bvh`, and the frame is a
-//! `vcad_kernel_raytrace::pathtrace::Scene`: those BVHs as `Object`s with a
-//! material per root name, the balls as `Object::placed` at their poses, and
-//! the level's ceiling panels as `AreaLight`s. Nothing here describes a
-//! shape; the CAD file does.
+//! the renderer last handed back. The picture is the court's own,
+//! `kosm_spike::court::render`: the level's roots evaluated by vcad into BRep
+//! solids with one BVH each, materials by root name, the balls and the net
+//! placed where phyz has them, the panels as area lights. This file owns the
+//! window's camera and the pace; nothing here describes a shape or a material.
 //!
 //! ## why the CPU tier
 //!
@@ -32,46 +30,27 @@
 //! the CLI's reference tier uses, at fewer samples.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::Arc;
 use std::time::Instant;
 
+use kosm_spike::court::render::{self, Snapshot};
 use kosm_spike::court::{Court, CourtScene};
-use kosm_spike::scene::MM;
-use phyz_math::{Mat3, Vec3};
-use vcad_kernel::Solid;
-use vcad_kernel_math::{Point3, Transform, Vec3 as KVec3};
-use vcad_kernel_raytrace::pathtrace::{self, AreaLight, Environment, Film, Object, Pbr};
-use vcad_kernel_raytrace::Bvh;
+use vcad_kernel_math::{Point3, Vec3 as KVec3};
+use vcad_kernel_raytrace::pathtrace::{self, Film};
 
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
 
-/// One ball at one instant, in simulation units (metres).
-#[derive(Clone, Copy)]
-pub struct BallPose {
-    pub centre: Vec3,
-    /// The ball's body frame, for a seamed ball's texture.
-    pub rot: Mat3,
-}
-
-/// One frame of the recording. The court itself never moves, so it is built
-/// once and lives in the renderer; a frame is only where the balls are.
-#[derive(Clone)]
-pub struct Frame {
-    pub balls: Vec<BallPose>,
-}
-
-impl Frame {
-    fn take(court: &Court) -> Self {
-        Self { balls: (0..court.bodies()).map(|k| BallPose { centre: court.centre(k), rot: court.rotation(k) }).collect() }
-    }
-}
+/// One frame of the recording: where everything that moves is. The court
+/// itself never moves, so it is built once and lives in the renderer.
+pub type Frame = Snapshot;
 
 /// The court, stepping on its own thread, in wall-clock time: each frame is
 /// due at its own moment and the solver takes fixed `dt` steps to reach it.
 /// A machine that cannot keep up runs slow — the catch-up is capped, so a
-/// late frame never asks for the work of every frame it missed.
+/// late frame never asks for the work of every frame it missed. It does not
+/// stop: the level's `t_end` is the recording's length, not the world's, and
+/// a live window keeps its world running. `frames > 0` caps it, for a test.
 ///
 /// There is no status panel to say any of this, so what it has to say it says
 /// on stderr.
@@ -84,13 +63,16 @@ fn simulate(tx: Sender<Frame>, frames: usize) {
         Ok(court) => court,
         Err(error) => return eprintln!("court: could not build the court: {error}"),
     };
-    let frames = if frames > 0 { frames } else { scene.frames() };
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
     // At most four frames of solving for one frame of wall clock.
     let cap = 4 * steps_per_frame;
-    let _ = tx.send(Frame::take(&court));
+    let _ = tx.send(Frame::of(&court));
     let start = Instant::now();
-    for k in 1..=frames {
+    let mut said = false;
+    for k in 1.. {
+        if frames > 0 && k > frames {
+            break;
+        }
         let due = k as f64 / scene.fps;
         if let Some(nap) = std::time::Duration::from_secs_f64(due).checked_sub(start.elapsed()) {
             std::thread::sleep(nap);
@@ -100,11 +82,14 @@ fn simulate(tx: Sender<Frame>, frames: usize) {
             court.step();
             steps += 1;
         }
-        if tx.send(Frame::take(&court)).is_err() {
+        if tx.send(Frame::of(&court)).is_err() {
             return;
         }
+        if !said && court.time() >= scene.t_end {
+            said = true;
+            eprintln!("court  {:.2} s simulated in {:.1} s; still running", court.time(), start.elapsed().as_secs_f64());
+        }
     }
-    eprintln!("court  {frames} frames, {:.2} s simulated in {:.1} s", court.time(), start.elapsed().as_secs_f64());
 }
 
 // ---- the picture ------------------------------------------------------------
@@ -118,6 +103,18 @@ pub struct Camera {
     pub exposure: f32,
 }
 
+/// The camera the level asks for, in its `cam_*` knobs.
+fn authored_camera(scene: &CourtScene) -> Camera {
+    let a = &scene.authored;
+    let k = |name: &str, fallback: f64| a.parameter_or(name, fallback);
+    Camera {
+        eye: KVec3::new(k("cam_x_mm", -800.0), k("cam_y_mm", -5600.0), k("cam_z_mm", 1900.0)),
+        target: KVec3::new(k("cam_at_x_mm", 900.0), k("cam_at_y_mm", 300.0), k("cam_at_z_mm", 1900.0)),
+        fov_deg: k("cam_vfov_deg", 42.0),
+        exposure: k("exposure", 1.0) as f32,
+    }
+}
+
 impl Camera {
     fn to_pathtrace(self) -> pathtrace::Camera {
         pathtrace::Camera::look_at(
@@ -129,166 +126,13 @@ impl Camera {
     }
 }
 
-/// A material for a root's name. The level names its roots; this is the only
-/// place the viewer decides what those names look like.
-fn material_for(name: &str) -> Pbr {
-    match name {
-        // lacquered maple: a warm dielectric under a gloss coat
-        "maple" => Pbr { clearcoat: 0.7, clearcoat_roughness: 0.06, ..Pbr::plastic([0.55, 0.34, 0.16], 0.35, 0.7) },
-        // the backboard. `Pbr` has no transmission, so tempered glass reads
-        // here as a pale, very glossy sheet rather than a see-through one.
-        "glass" => Pbr { clearcoat: 1.0, clearcoat_roughness: 0.02, ..Pbr::plastic([0.78, 0.82, 0.84], 0.06, 1.0) },
-        "rim" => Pbr::plastic([0.72, 0.22, 0.05], 0.28, 0.5),
-        "steel" => Pbr::metal([0.58, 0.59, 0.61], 0.35),
-        "paint" => Pbr::plastic([0.85, 0.85, 0.86], 0.5, 0.2),
-        "ball" | "ball-seams" | "seam" => ball_material(),
-        _ => Pbr::plastic([0.55, 0.56, 0.58], 0.45, 0.1),
-    }
-}
-
-fn ball_material() -> Pbr {
-    Pbr::plastic([0.52, 0.20, 0.07], 0.62, 0.05)
-}
-
-/// The court, evaluated: every static root's BVH with its material, the
-/// ball's own solid, the gym, and the panels. Built once.
-pub struct Stage {
-    /// Static geometry: a BVH, a material, and where it sits.
-    statics: Vec<(Arc<Bvh>, Pbr, Transform)>,
-    /// The ball's appearance: the level's own `ball` roots if it has any (each
-    /// with its material), otherwise one sphere of the ball's radius.
-    ball: Vec<(Arc<Bvh>, Pbr)>,
-    lights: Vec<AreaLight>,
-    pub camera: Camera,
-    /// A moment of the recording the level suggests looking at, in seconds.
-    pub still_t: f64,
-    pub prims: usize,
-}
-
-impl Stage {
-    /// Evaluate the level and build everything that does not move.
-    pub fn build(scene: &CourtScene) -> anyhow::Result<Self> {
-        let a = &scene.authored;
-        let mm = |k: &str| a.parameter(k);
-        let evaluated = vcad_eval::evaluate_document(&a.document, &vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() })
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        anyhow::ensure!(
-            evaluated.parts.len() == a.document.roots.len(),
-            "the court evaluated to {} parts for {} roots",
-            evaluated.parts.len(),
-            a.document.roots.len()
-        );
-
-        let mut statics = Vec::new();
-        let mut ball = Vec::new();
-        for part in &evaluated.parts {
-            let Some(brep) = part.solid.as_ref().and_then(|s| s.as_brep()) else {
-                continue;
-            };
-            let bvh = Arc::new(Bvh::build(brep));
-            let mat = material_for(&part.material);
-            match part.material.as_str() {
-                // the ball's own appearance, placed at each ball's pose
-                "ball" | "ball-seams" | "seam" => ball.push((bvh, mat)),
-                _ => statics.push((bvh, mat, Transform::identity())),
-            }
-        }
-        if ball.is_empty() {
-            let sphere = Solid::sphere(mm("ball_r_mm")?, 48);
-            let brep = sphere.as_brep().ok_or_else(|| anyhow::anyhow!("the ball sphere has no BRep"))?;
-            ball.push((Arc::new(Bvh::build(brep)), ball_material()));
-        }
-
-        // the gym the level describes: walls a margin outside the slab, a
-        // floor under it and a ceiling over it, all vcad boxes.
-        let (wx, wy) = (0.5 * mm("court_x_mm")? + mm("gym_margin_mm")?, 0.5 * mm("court_y_mm")? + mm("gym_margin_mm")?);
-        let h = mm("gym_h_mm")?;
-        let t = 100.0;
-        let wall = Pbr::plastic([0.44, 0.45, 0.48], 0.7, 0.0);
-        let ceiling = Pbr::plastic([0.66, 0.67, 0.68], 0.85, 0.0);
-        let under = Pbr::plastic([0.30, 0.31, 0.33], 0.8, 0.0);
-        let mut push_box = |c: [f64; 3], half: [f64; 3], mat: Pbr| -> anyhow::Result<()> {
-            let solid = Solid::cube(2.0 * half[0], 2.0 * half[1], 2.0 * half[2])
-                .translate(c[0] - half[0], c[1] - half[1], c[2] - half[2]);
-            let brep = solid.as_brep().ok_or_else(|| anyhow::anyhow!("a gym box has no BRep"))?;
-            statics.push((Arc::new(Bvh::build(brep)), mat, Transform::identity()));
-            Ok(())
-        };
-        push_box([wx + t, 0.0, 0.5 * h], [t, wy + 2.0 * t, 0.5 * h + t], wall)?;
-        push_box([-wx - t, 0.0, 0.5 * h], [t, wy + 2.0 * t, 0.5 * h + t], wall)?;
-        push_box([0.0, wy + t, 0.5 * h], [wx + 2.0 * t, t, 0.5 * h + t], wall)?;
-        push_box([0.0, -wy - t, 0.5 * h], [wx + 2.0 * t, t, 0.5 * h + t], wall)?;
-        push_box([0.0, 0.0, -21.0], [wx, wy, 20.0], under)?;
-        push_box([0.0, 0.0, h + t], [wx, wy, t], ceiling)?;
-
-        // the panels: the only light there is, facing down from the ceiling.
-        let (rows, cols) = (a.parameter("light_rows")?.max(1.0) as usize, a.parameter("light_cols")?.max(1.0) as usize);
-        let (lw, ll) = (mm("light_w_mm")?, mm("light_l_mm")?);
-        let e = a.parameter_or("light_radiance", 18.0) as f32;
-        let mut lights = Vec::new();
-        for i in 0..cols {
-            for j in 0..rows {
-                let x = (i as f64 + 0.5) / cols as f64 * 2.0 * wx - wx;
-                let y = (j as f64 + 0.5) / rows as f64 * 2.0 * wy - wy;
-                lights.push(AreaLight {
-                    center: Point3::new(x, y, h - 5.0),
-                    // u × v = −z: the emitting face looks at the floor.
-                    u: KVec3::new(0.5 * lw, 0.0, 0.0),
-                    v: KVec3::new(0.0, -0.5 * ll, 0.0),
-                    emission: [e, e, e],
-                });
-            }
-        }
-
-        let prims = statics.len() + ball.len();
-        Ok(Self {
-            statics,
-            ball,
-            lights,
-            camera: Camera {
-                eye: KVec3::new(mm("cam_x_mm")?, mm("cam_y_mm")?, mm("cam_z_mm")?),
-                target: KVec3::new(mm("cam_at_x_mm")?, mm("cam_at_y_mm")?, mm("cam_at_z_mm")?),
-                fov_deg: a.parameter_or("cam_vfov_deg", 42.0),
-                exposure: a.parameter_or("exposure", 1.0) as f32,
-            },
-            still_t: a.parameter_or("still_t", 0.95),
-            prims,
-        })
-    }
-
-    pub fn load() -> anyhow::Result<Self> {
-        Self::build(&CourtScene::bundled()?)
-    }
-
-    /// The scene at one frame: the static objects, plus the ball's solid
-    /// placed at each ball's pose. Metres become millimetres here and
-    /// nowhere else.
-    pub fn scene(&self, balls: &[BallPose]) -> pathtrace::Scene {
-        let mut objects: Vec<Object> = self
-            .statics
-            .iter()
-            .map(|(bvh, mat, xf)| Object::placed(bvh.clone(), *mat, xf.clone()))
-            .collect();
-        for pose in balls {
-            let c = pose.centre / MM;
-            let place = Transform {
-                matrix: tang::Mat4::from_rotation_translation(pose.rot, KVec3::new(c.x, c.y, c.z)),
-            };
-            for (bvh, mat) in &self.ball {
-                objects.push(Object::placed(bvh.clone(), *mat, place.clone()));
-            }
-        }
-        pathtrace::Scene { objects, lights: self.lights.clone(), env: Environment::default(), ground: None }
-    }
-}
-
 // ---- the renderer, on its own thread ---------------------------------------
 
 /// What the window asks for: a frame, a camera, a size, and how much to spend.
 #[derive(Clone)]
 pub struct Job {
     pub generation: u64,
-    pub balls: Vec<BallPose>,
+    pub frame: Frame,
     pub camera: Camera,
     pub size: (u32, u32),
     pub spp: u32,
@@ -386,11 +230,11 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
     // window is black until it is done. Say so, or it looks broken.
     eprintln!("court  evaluating the level…");
     let t0 = Instant::now();
-    let stage = match Stage::load() {
+    let mut stage = match CourtScene::bundled().and_then(|s| render::Scene::new(&s)) {
         Ok(stage) => stage,
         Err(error) => return eprintln!("court: could not build the picture: {error}"),
     };
-    eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.prims, stage.lights.len(), t0.elapsed().as_secs_f64());
+    eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.static_count(), stage.light_count(), t0.elapsed().as_secs_f64());
 
     let mut current: Option<Job> = None;
     let mut accum: Option<Accum> = None;
@@ -430,7 +274,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
         }
         let lap = Instant::now();
         let opts = options(job.spp, 0x5eed_0000 ^ (job.generation << 20) ^ acc.passes as u64, true);
-        let scene = stage.scene(&job.balls);
+        let scene = stage.at_snapshot(&job.frame);
         let film = pathtrace::render(&scene, &job.camera.to_pathtrace(), job.size.0, job.size.1, &options(job.spp, opts.seed, false));
         acc.add(film);
         let rgba = acc.resolve(job.camera.exposure, &opts);
@@ -456,17 +300,18 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
 /// picture testable.
 pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let stage = Stage::build(&scene)?;
-    let t = if t < 0.0 { stage.still_t } else { t };
+    let mut stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let t = if t < 0.0 { scene.authored.parameter_or("still_t", 0.95) } else { t };
     let mut court = Court::from_scene(&scene)?;
     while court.time() < t {
         court.step();
     }
-    let frame = Frame::take(&court);
+    let frame = Frame::of(&court);
     let t0 = Instant::now();
-    let picture = stage.scene(&frame.balls);
-    let film = pathtrace::render(&picture, &stage.camera.to_pathtrace(), size.0, size.1, &options(spp, 0x5eed_1234, true));
-    let rgba = film.to_srgb8(stage.camera.exposure, false);
+    let picture = stage.at_snapshot(&frame);
+    let film = pathtrace::render(&picture, &camera.to_pathtrace(), size.0, size.1, &options(spp, 0x5eed_1234, true));
+    let rgba = film.to_srgb8(camera.exposure, false);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -477,7 +322,7 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
         "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} at {spp} spp in {:.1} s → {}",
         court.time(),
         frame.balls.len(),
-        stage.prims,
+        stage.static_count(),
         size.0,
         size.1,
         t0.elapsed().as_secs_f64(),
@@ -637,7 +482,7 @@ impl App {
         self.generation += 1;
         let job = Job {
             generation: self.generation,
-            balls: frame.balls.clone(),
+            frame: frame.clone(),
             camera: self.camera,
             size: self.size(),
             spp: self.samples,
@@ -738,22 +583,12 @@ pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
-    let camera = CourtScene::bundled()
-        .and_then(|s| {
-            let a = &s.authored;
-            Ok(Camera {
-                eye: KVec3::new(a.parameter("cam_x_mm")?, a.parameter("cam_y_mm")?, a.parameter("cam_z_mm")?),
-                target: KVec3::new(a.parameter("cam_at_x_mm")?, a.parameter("cam_at_y_mm")?, a.parameter("cam_at_z_mm")?),
-                fov_deg: a.parameter_or("cam_vfov_deg", 42.0),
-                exposure: a.parameter_or("exposure", 1.0) as f32,
-            })
-        })
-        .unwrap_or(Camera {
-            eye: KVec3::new(-800.0, -5600.0, 1900.0),
-            target: KVec3::new(900.0, 300.0, 1900.0),
-            fov_deg: 40.0,
-            exposure: 1.0,
-        });
+    let camera = CourtScene::bundled().map(|s| authored_camera(&s)).unwrap_or(Camera {
+        eye: KVec3::new(-800.0, -5600.0, 1900.0),
+        target: KVec3::new(900.0, 300.0, 1900.0),
+        fov_deg: 40.0,
+        exposure: 1.0,
+    });
 
     viewport::run("Kosm view — the court", (1280, 720), App::new(rx, shot_rx, job_tx, camera, spp))
 }

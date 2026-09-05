@@ -32,11 +32,32 @@ use vcad_kernel_raytrace::Bvh;
 
 pub use vcad_kernel_raytrace::pathtrace::{Camera, Film};
 
+use super::parts::PlacedSolid;
 use super::{Court, CourtScene};
 use crate::scene::MM;
+use phyz_math::{Mat3, Vec3 as PVec3};
 
 /// Metres (phyz) to millimetres (vcad). The only unit conversion in the picture.
 const PER_M: f64 = 1.0 / MM;
+
+/// Everything in the court that moves, at one instant: each ball's centre
+/// (metres) and world → body rotation, and whatever else the court carries
+/// for the picture. A frame of a recording is one of these; the static half
+/// of the picture never needs the `Court` itself.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub balls: Vec<(PVec3, Mat3)>,
+    pub extras: Vec<PlacedSolid>,
+}
+
+impl Snapshot {
+    pub fn of(court: &Court) -> Self {
+        Self {
+            balls: (0..court.bodies()).map(|k| (court.centre(k), court.rotation(k))).collect(),
+            extras: court.extras.clone(),
+        }
+    }
+}
 
 /// One traceable thing: a BVH, what it is made of, and where it sits.
 struct Placed {
@@ -174,16 +195,21 @@ impl Scene {
     /// Everything that moves crosses the unit boundary here: a ball's centre
     /// is phyz metres, and `PER_M` is what makes it a vcad millimetre.
     pub fn at(&mut self, court: &Court) -> pathtrace::Scene {
+        self.at_snapshot(&Snapshot::of(court))
+    }
+
+    /// The picture at a recorded instant; see [`Snapshot`].
+    pub fn at_snapshot(&mut self, snap: &Snapshot) -> pathtrace::Scene {
         let mut objects: Vec<Object> = self.statics.iter().map(Placed::object).collect();
-        for k in 0..court.bodies() {
-            let c = court.centre(k) * PER_M;
+        for (centre, rot) in &snap.balls {
+            let c = *centre * PER_M;
             // `rotation` is world → body; an object → world placement is its transpose
-            let r = court.rotation(k).transpose();
+            let r = rot.transpose();
             for (bvh, pbr) in &self.ball {
                 objects.push(Object::placed(bvh.clone(), *pbr, rigid(&r, c.x, c.y, c.z)));
             }
         }
-        for extra in &court.extras {
+        for extra in &snap.extras {
             let key = Arc::as_ptr(&extra.solid) as usize;
             let bvh = self
                 .extras
