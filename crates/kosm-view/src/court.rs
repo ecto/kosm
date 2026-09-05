@@ -359,7 +359,7 @@ const GUESS: f64 = 750.0;
 /// not part of it — that is only the window buying itself a better picture of
 /// the same subject, and it must not read as motion.
 #[derive(Clone, PartialEq, Eq)]
-struct Subject(usize, [i64; 7], (u32, u32));
+struct Subject(u64, [i64; 7], (u32, u32));
 
 /// What was last asked for: a subject, at a size, at a sample count.
 #[derive(Clone, PartialEq, Eq)]
@@ -460,10 +460,35 @@ impl App {
         }
     }
 
+    /// What the frame under the cursor looks like, to the millimetre: two
+    /// frames of a world at rest are the same subject, however many arrive,
+    /// so a live window whose balls have stopped still gets to accumulate.
+    fn frame_key(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: i64| {
+            h ^= v as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        if let Some(frame) = self.frames.get(self.cursor) {
+            for (c, _) in &frame.balls {
+                mix((c.x * 1e3).round() as i64);
+                mix((c.y * 1e3).round() as i64);
+                mix((c.z * 1e3).round() as i64);
+            }
+            for extra in &frame.extras {
+                let m = &extra.to_world.matrix;
+                mix((m[(0, 3)]).round() as i64);
+                mix((m[(1, 3)]).round() as i64);
+                mix((m[(2, 3)]).round() as i64);
+            }
+        }
+        h
+    }
+
     fn subject(&self) -> Subject {
         let c = &self.camera;
         Subject(
-            self.cursor,
+            self.frame_key(),
             [
                 c.eye.x as i64,
                 c.eye.y as i64,
