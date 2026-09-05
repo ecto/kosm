@@ -308,7 +308,14 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
     // frame's mean is still true for.
     let mut current: Option<Job> = None;
     let mut history = History::new((0, 0));
-    let mut mask = Mask::new((0, 0));
+    // The GPU tier reprojects on the device, so a camera move is masked like
+    // a still-camera pass there; the CPU tier reprojects in `History` and its
+    // mask is only about the world.
+    let mut mask = if matches!(tracer, Tracer::Gpu(_)) {
+        Mask::reprojecting((0, 0))
+    } else {
+        Mask::new((0, 0))
+    };
     // The CPU tier's frame, kept between passes: `render_into` patches it, so
     // the pixels a masked pass did not touch are last pass's and not black.
     let mut film = pathtrace::Film::new(0, 0);
@@ -345,7 +352,11 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // asked not to step a converged picture at all (see `App::image`).
         history.resample(job.size);
         if mask.size() != job.size {
-            mask = Mask::new(job.size);
+            mask = if matches!(tracer, Tracer::Gpu(_)) {
+                Mask::reprojecting(job.size)
+            } else {
+                Mask::new(job.size)
+            };
         }
         if (film.width, film.height) != job.size {
             film = pathtrace::Film::new(job.size.0, job.size.1);
@@ -361,6 +372,10 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // started over — and the tuner above does not know which one it is
         // talking to.
         let resize_costs_history = matches!(tracer, Tracer::Gpu(_));
+        // Whether this pass carried its history across a camera move, for the
+        // log: a moved camera used to repaint the frame and now mostly does
+        // not.
+        let mut reprojected = "";
         let (image, mask_frac, mean_spp, traced_px, kind) = match &mut tracer {
             // On the device: one dispatch, four small compute passes, and a
             // texture. No film comes back, so there is nothing here to merge
@@ -374,7 +389,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             Tracer::Gpu(gpu) => {
                 let keep = mask.keep(&view, &poses, &lights, job.spp);
                 let scissored = keep.scissor.map(|r| (r[2] as u64) * (r[3] as u64));
-                match gpu.accumulate(
+                let pass = gpu.accumulate(
                     &stage,
                     &job.frame,
                     job.frame_id,
@@ -383,7 +398,12 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     &keep.keep,
                     keep.scissor,
                     job.spp,
-                ) {
+                    keep.reproject,
+                );
+                if gpu.reprojected() {
+                    reprojected = " reprojected";
+                }
+                match pass {
                     Ok(texture) => (
                         viewport::Image::Texture(texture),
                         mask.fraction(),
@@ -475,13 +495,14 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
             eprintln!(
-                "court  {} {}×{} at {} spp: {} ms a {} pass, {:.0}% repainted, {:.1} samples a pixel",
+                "court  {} {}×{} at {} spp: {} ms a {}{} pass, {:.0}% repainted, {:.1} samples a pixel",
                 tracer.name(),
                 job.size.0,
                 job.size.1,
                 job.spp,
                 shot.ms,
                 kind,
+                reprojected,
                 100.0 * shot.mask,
                 shot.mean_spp
             );
@@ -570,7 +591,7 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
     // nothing moves between them. The picture never leaves the device until
     // the last line, which reads the target texture once for the PNG.
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1, false)?;
     }
     let rgba = gpu.read_target()?;
     if let Some(dir) = path.parent() {
@@ -588,6 +609,77 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
         size.1,
         t0.elapsed().as_secs_f64(),
         path.display()
+    );
+    Ok(())
+}
+
+/// A scripted orbit, headless: converge, move the camera, and ask the device
+/// what the move cost.
+///
+/// The claim this checks is the one the reprojection exists for. `passes`
+/// samples are folded at the level's own camera; the eye is then orbited
+/// `deg` about its target and one more pass is taken, with the same keep mask
+/// a *still* camera would have got and the previous pass's camera as the view
+/// to reproject from. A pixel that kept its history comes back with more
+/// samples than the one this pass just gave it; a pixel the move disoccluded
+/// comes back at one. Before this, every pixel came back at one.
+pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Result<()> {
+    let scene = CourtScene::bundled()?;
+    let mut stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let a = &scene.authored;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking().map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+        a.parameter_or("env_radiance", 0.05) as f32,
+    )?;
+    let t = if t < 0.0 { a.parameter_or("still_t", 0.95) } else { t };
+    let mut court = Court::from_scene(&scene)?;
+    while court.time() < t {
+        court.step();
+    }
+    let frame = Frame::of(&court);
+
+    let passes = passes.max(1);
+    for _ in 0..passes {
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1, false)?;
+    }
+    let before = gpu.history_counts()?;
+    let converged = before.iter().filter(|&&c| c > 1).count();
+
+    // The same eye, swung `deg` about the target in the floor plane.
+    let moved = {
+        let d = camera.eye - camera.target;
+        let a = deg.to_radians();
+        let (s, c) = (a.sin(), a.cos());
+        Camera {
+            eye: camera.target + KVec3::new(d.x * c - d.y * s, d.x * s + d.y * c, d.z),
+            ..camera
+        }
+    };
+    // The mask a still camera would have given this pass — the world did not
+    // move between the two — and the previous camera to reproject from.
+    let mut mask = Mask::reprojecting(size);
+    let lights = stage.light_centres();
+    let poses = poses(&mut stage, &frame);
+    let _ = mask.keep(&View::of(&camera.to_pathtrace(), size.0, size.1), &poses, &lights, passes);
+    let keep = mask.keep(&View::of(&moved.to_pathtrace(), size.0, size.1), &poses, &lights, 1);
+    anyhow::ensure!(keep.reproject, "a moved camera should ask for a reprojected pass");
+    gpu.accumulate(&stage, &frame, 0, &moved, size, &keep.keep, keep.scissor, 1, keep.reproject)?;
+    anyhow::ensure!(gpu.reprojected(), "the pass should have reprojected");
+
+    let after = gpu.history_counts()?;
+    let kept = after.iter().filter(|&&c| c > 1).count();
+    let n = after.len().max(1);
+    println!(
+        "court  orbit: {}\u{d7}{} \u{2014} {passes} passes, then {deg}\u{b0}: {:.1}% of the frame had a history, {:.1}% kept it across the move",
+        size.0,
+        size.1,
+        100.0 * converged as f64 / n as f64,
+        100.0 * kept as f64 / n as f64,
     );
     Ok(())
 }

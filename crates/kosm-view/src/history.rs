@@ -871,6 +871,11 @@ pub struct Mask {
     /// the picture has converged without reading the device back.
     counts: Vec<u32>,
     fraction: f32,
+    /// Whether the consumer reprojects its history on the device. With it on
+    /// a camera move is no longer a restart: the mask names only the
+    /// rectangles the *world* moved under, exactly as on a still-camera pass,
+    /// and vcad's reprojection pass decides which pixels survive the move.
+    reproject: bool,
 }
 
 impl Mask {
@@ -881,7 +886,13 @@ impl Mask {
             poses: Vec::new(),
             counts: vec![0; (size.0 as usize) * (size.1 as usize)],
             fraction: 1.0,
+            reproject: false,
         }
+    }
+
+    /// The same mask, for a consumer that reprojects on the device.
+    pub fn reprojecting(size: (u32, u32)) -> Self {
+        Self { reproject: true, ..Self::new(size) }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -904,14 +915,22 @@ impl Mask {
     /// The keep mask for a pass of `samples` samples, and a note that it was
     /// taken.
     ///
-    /// A camera that moved restarts *everything*: reprojection is still the
-    /// CPU tier's alone, and nothing on the device knows where last frame's
-    /// pixel went. A camera that did not moved restarts only the rectangles
-    /// the world moved under, which is the whole point — the walls keep
-    /// accumulating while the balls bounce through them.
+    /// A camera that did not move restarts only the rectangles the world
+    /// moved under, which is the whole point — the walls keep accumulating
+    /// while the balls bounce through them.
+    ///
+    /// A camera that *moved* depends on who is asking. Without device
+    /// reprojection nothing downstream knows where last frame's pixel went,
+    /// so the move restarts everything. With it (see [`Mask::reprojecting`])
+    /// the move is masked exactly like a still-camera pass and vcad's
+    /// reprojection decides what survives — but the pass goes over the whole
+    /// frame, since every pixel is looking somewhere new, so no scissor is
+    /// offered on a move.
     pub fn keep(&mut self, view: &View, poses: &[Pose], lights: &[Point3], samples: u32) -> Keep {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
-        let restart_all = self.view != Some(*view) || self.counts.iter().all(|&c| c == 0);
+        let moved = self.view.is_some() && self.view != Some(*view);
+        let empty = self.view.is_none() || self.counts.iter().all(|&c| c == 0);
+        let restart_all = empty || (moved && !self.reproject);
         let mut keep = vec![u8::from(!restart_all); n];
         let mut scissor = None;
         if !restart_all {
@@ -923,11 +942,14 @@ impl Mask {
             // count and its variance untouched, so nothing stale is folded in
             // as fresh. It is only worth taking when it saves more than half
             // the frame: outside it no pixel gains a sample, and a picture
-            // that is always scissored never converges.
-            if let Some(bbox) = bounding(&rects) {
-                let area = (bbox[2] as usize) * (bbox[3] as usize);
-                if area * 2 < n {
-                    scissor = Some(bbox);
+            // that is always scissored never converges. A moved camera takes
+            // none: the reprojection needs this pass's depth everywhere.
+            if !moved {
+                if let Some(bbox) = bounding(&rects) {
+                    let area = (bbox[2] as usize) * (bbox[3] as usize);
+                    if area * 2 < n {
+                        scissor = Some(bbox);
+                    }
                 }
             }
         }
@@ -949,7 +971,7 @@ impl Mask {
         }
         self.view = Some(*view);
         self.poses = poses.to_vec();
-        Keep { keep, scissor }
+        Keep { keep, scissor, reproject: moved && self.reproject && !empty }
     }
 }
 
@@ -960,6 +982,12 @@ pub struct Keep {
     pub keep: Vec<u8>,
     /// `[x, y, w, h]`, or `None` for the whole frame.
     pub scissor: Option<[u32; 4]>,
+    /// The camera moved and the consumer reprojects: this pass should carry
+    /// its history across the move rather than restart it. Note the counts
+    /// this mask mirrors are optimistic on such a pass — the device restarts
+    /// the pixels the reprojection could not match and this side cannot know
+    /// which those were.
+    pub reproject: bool,
 }
 
 /// One rectangle covering all of them.
@@ -1105,6 +1133,43 @@ mod tests {
         let outside = h.count.iter().filter(|&&c| c == 9).count();
         assert_eq!(inside + outside, (W * H) as usize);
         assert!(inside > 0 && outside > 0);
+    }
+
+    /// The GPU tier's mask, across a camera move. Without device
+    /// reprojection a move restarts the frame; with it the move is masked
+    /// like a still-camera pass — only the world's own rectangles — and asks
+    /// for the reprojection instead. Neither offers a scissor on the move:
+    /// every pixel is looking somewhere new.
+    #[test]
+    fn a_moved_camera_restarts_or_reprojects() {
+        let a = camera(Point3::new(0.0, -3000.0, 0.0));
+        let va = View::of(&a, W, H);
+        let b = camera(Point3::new(200.0, -3000.0, 0.0));
+        let vb = View::of(&b, W, H);
+        let poses = [Pose::still([0.0, 0.0, 500.0], 100.0)];
+        let n = (W * H) as usize;
+
+        let mut plain = Mask::new((W, H));
+        let _ = plain.keep(&va, &poses, &[], 1);
+        let moved = plain.keep(&vb, &poses, &[], 1);
+        assert_eq!(moved.keep.iter().filter(|&&k| k == 0).count(), n, "a move is a restart");
+        assert!(!moved.reproject);
+        assert!(moved.scissor.is_none());
+
+        let mut device = Mask::reprojecting((W, H));
+        let _ = device.keep(&va, &poses, &[], 1);
+        let moved = device.keep(&vb, &poses, &[], 1);
+        assert!(moved.reproject, "a moved camera should ask to be reprojected");
+        assert!(moved.scissor.is_none(), "a reprojected pass needs this pass's depth everywhere");
+        let restarted = moved.keep.iter().filter(|&&k| k == 0).count();
+        assert!(restarted < n / 2, "the mask should be the world's patch, not the frame: {restarted}");
+
+        // The first pass is still a restart, reprojection or not: there is no
+        // history behind it to carry.
+        let mut fresh = Mask::reprojecting((W, H));
+        let first = fresh.keep(&va, &poses, &[], 1);
+        assert_eq!(first.keep.iter().filter(|&&k| k == 0).count(), n);
+        assert!(!first.reproject);
     }
 
     #[test]

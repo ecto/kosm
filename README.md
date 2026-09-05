@@ -430,9 +430,26 @@ device, which the blit samples directly (`viewport::Image` is bytes *or* a
 texture now; the CPU tier still hands over bytes). What is left on this side is
 the **keep mask**: one byte a pixel, 1 to go on accumulating and 0 to start
 over, built by `history::Mask` from the same `mask_rects` the CPU tier plans
-with, so the two tiers mask on one piece of geometry. Reprojection stays CPU-side
-only, so a camera move uploads an all-restart mask and the GPU picture loses
-its whole history where the CPU one keeps most of it.
+with, so the two tiers mask on one piece of geometry.
+
+Reprojection is no longer CPU-side only, and a camera move no longer costs the
+GPU picture its history. vcad grew
+`accumulate_and_denoise_resident_reprojected`, which takes the *previous*
+pass's camera: each pixel is unprojected through this pass's depth, projected
+back into that view, and keeps the mean and count it finds where the surfaces
+agree. So a moved camera now uploads the mask a *still* camera would have got —
+only the rectangles the world moved under — and lets the device settle the
+rest; only disocclusions restart. `--orbit-test` is that claim, scripted:
+converge headlessly, swing the eye three degrees about its target, take one
+more pass and ask the device's own counts what survived. At 320×180 after eight
+passes, **88.8% of the frame kept its history across the move**, where before it
+was none of it. The previous camera is offered only when it is worth offering:
+a still-camera pass passes `None` (a view reprojected onto itself is two
+dispatches for nothing) and so does the first pass at a new size, since vcad
+reallocates the history on a resize and there is no previous depth plane to
+test against. A reprojected pass takes no scissor either — the reprojection
+needs this pass's depth everywhere — and the window's log names it (`a full
+reprojected pass`).
 
 The scissor is back on that tier. `set_scissor` used to size the *trace* alone
 while vcad's accumulate pass walked every pixel of the frame, so outside the

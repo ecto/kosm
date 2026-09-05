@@ -11,6 +11,7 @@
 //! kosm-view                     the court, in a window
 //! kosm-view --cpu               the CPU integrator, not the GPU tracer
 //! kosm-view --shot out/x.png    one still, no window
+//! kosm-view --orbit-test        what a camera move costs the GPU history
 //! ```
 //!
 //! It opens live: the simulation runs in wall-clock time and the window shows
@@ -80,6 +81,16 @@ fn main() -> anyhow::Result<()> {
                 court::still(path, t, size, spp)
             }
         };
+    }
+    // `--orbit-test` is the reprojection, scripted: converge headlessly, swing
+    // the camera a few degrees, take one more pass, and say how much of the
+    // frame kept its history across the move.
+    if std::env::args().any(|a| a == "--orbit-test" || a.starts_with("--orbit-test=")) {
+        let width: u32 = parse("width").unwrap_or(480);
+        let size = (width, (width * 9 / 16).max(1));
+        let t: f64 = parse("at").unwrap_or(-1.0);
+        let deg: f64 = arg("orbit-test").and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        return court::orbit_test(t, size, parse("spp").unwrap_or(8), deg);
     }
     // `--cpu` pins the CPU integrator; without it the window uses the GPU
     // tracer when the adapter and the court allow it.

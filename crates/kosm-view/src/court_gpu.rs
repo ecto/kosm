@@ -25,9 +25,24 @@
 //!
 //! What this side still owns is the **keep mask**: one byte a pixel, 1 to go
 //! on accumulating and 0 to start over, computed by [`crate::history::Mask`]
-//! from the same geometry the CPU tier masks with. Reprojection is not on the
-//! device, so a moved camera uploads an all-restart mask — the CPU tier still
-//! carries its samples through a moved camera and this one does not.
+//! from the same geometry the CPU tier masks with.
+//!
+//! A moved camera used to upload an all-restart mask, because reprojection
+//! was the CPU tier's alone and nothing on the device knew where last frame's
+//! pixel had gone. It is on the device now: a pass whose camera moved calls
+//! `accumulate_and_denoise_resident_reprojected` with the previous pass's
+//! camera, and each pixel is unprojected through this pass's depth, projected
+//! back into the previous view, and keeps that pixel's mean and count where
+//! the surfaces agree. The keep mask on such a pass is the *still-camera*
+//! one — only the rectangles the world moved under — and the reprojection
+//! settles the rest. Only disocclusions restart, so an orbit no longer looks
+//! like a frame of noise per mouse move.
+//!
+//! The previous camera is only offered when it is worth offering: a pass whose
+//! camera did not move passes `None` (reprojecting a view onto itself is two
+//! dispatches for nothing), and so does the first pass at a new size, since
+//! vcad reallocates the history on a resize and there is no previous plane to
+//! test against.
 //!
 //! It also owns the **scissor**, and now uses it. `GpuRenderState::set_scissor`
 //! used to size the *trace* alone, while vcad's accumulate pass ran over every
@@ -135,6 +150,13 @@ pub struct Stage {
     /// of the same frame are two different samples.
     passes: u32,
     size: (u32, u32),
+    /// The camera the last pass rendered from, and the size it rendered at —
+    /// what a reprojected pass unprojects into. `None` until the first pass.
+    last_view: Option<((u32, u32), GpuCamera)>,
+    /// Whether the last pass carried its history across a camera move, and
+    /// whether that has ever been said out loud.
+    reprojected: bool,
+    said_reprojected: bool,
 }
 
 /// One solid, packed with its material. A packed scene carries a single
@@ -246,6 +268,9 @@ impl Stage {
             target: None,
             passes: 0,
             size: (0, 0),
+            last_view: None,
+            reprojected: false,
+            said_reprojected: false,
         })
     }
 
@@ -294,6 +319,13 @@ impl Stage {
     /// 0 to start it over at this pass's sample. Empty means keep everything.
     /// [`crate::history::Mask`] builds it from the poses, before a ray is cast.
     ///
+    /// `reproject` says the camera moved and the history should follow it
+    /// rather than start over — the previous pass's camera goes to vcad as
+    /// `prev_view` and the device carries every pixel whose surface it can
+    /// find again. It is honoured only when there *is* a previous pass at
+    /// this same size, and only for the pass's first sample: the camera does
+    /// not move between the samples of one pass.
+    ///
     /// What comes back is the texture the picture is now in, on the viewport's
     /// own device. Nothing was read back to make it.
     #[allow(clippy::too_many_arguments)]
@@ -307,6 +339,7 @@ impl Stage {
         keep: &[u8],
         scissor: Option<[u32; 4]>,
         samples: u32,
+        reproject: bool,
     ) -> anyhow::Result<Arc<wgpu::Texture>> {
         let n = (size.0 as u64) * (size.1 as u64);
         anyhow::ensure!(n > 0, "an empty picture");
@@ -347,6 +380,19 @@ impl Stage {
             size.1,
         );
         let denoise = GpuDenoiseParams { exposure: camera.exposure, ..self.denoise };
+        // The view the history is currently in. Only a previous pass at the
+        // same size can be reprojected from — vcad reallocates the history on
+        // a resize, so a stepped size has no previous plane to test against
+        // and is a restart whatever the caller asked for.
+        let prev_view = self
+            .last_view
+            .filter(|(s, _)| reproject && *s == size)
+            .map(|(_, c)| c);
+        self.reprojected = prev_view.is_some();
+        if self.reprojected && !self.said_reprojected {
+            self.said_reprojected = true;
+            eprintln!("court  gpu: the history follows the camera — passes on a moved camera reproject");
+        }
         let traced = Instant::now();
         let res = self.resident.as_mut().expect("just built");
         // `samples` samples, each its own call: vcad's accumulate folds one
@@ -383,7 +429,7 @@ impl Stage {
                 state.set_scissor(rect);
             }
             self.pipeline
-                .accumulate_and_denoise_resident(
+                .accumulate_and_denoise_resident_reprojected(
                     &self.ctx,
                     &self.history,
                     res,
@@ -392,6 +438,9 @@ impl Stage {
                     if k == 0 { keep } else { &[] },
                     &denoise,
                     &view,
+                    // Only the first sample of the pass: after it the history
+                    // is already in this pass's view.
+                    if k == 0 { prev_view.as_ref() } else { None },
                 )
                 .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
         }
@@ -414,7 +463,13 @@ impl Stage {
                 traced.elapsed().as_secs_f64() * 1e3,
             );
         }
+        self.last_view = Some((size, cam));
         Ok(texture)
+    }
+
+    /// Whether the last pass carried its history across a camera move.
+    pub fn reprojected(&self) -> bool {
+        self.reprojected
     }
 
     /// Filter every pass at full strength, however many samples a pixel has.
@@ -460,6 +515,20 @@ impl Stage {
     ///
     /// The one readback on this tier, and it is not in the window: `--shot`
     /// takes its passes and then asks once, for the PNG.
+    /// The device's own sample count for every pixel, read back.
+    ///
+    /// Nothing in the render path wants this — a pass reads nothing back —
+    /// but a test that asks what a camera move cost has to ask the device,
+    /// since the host's mirror of the counts cannot know which pixels the
+    /// reprojection failed to match.
+    pub fn history_counts(&mut self) -> anyhow::Result<Vec<u32>> {
+        let res = self.resident.as_mut().ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
+        let hist = pollster::block_on(self.pipeline.read_history(&self.ctx, res))
+            .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("no history yet"))?;
+        Ok(hist.count)
+    }
+
     pub fn read_target(&self) -> anyhow::Result<Vec<u8>> {
         let (texture, _) = self.target.as_ref().ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
         let (w, h) = self.size;
