@@ -148,8 +148,9 @@ sun is a real 0.6° disc. Tonemapping is `kosm-render`'s ACES rather than the
 pool's filmic curve, which needs about a stop of headroom (exposure 0.35) to
 keep the deck off the clip point.
 
-**The caustic does not survive the port, and that is the interesting
-result.** The reference tracer's `Caustic` grid is a *forward* transport step
+**The caustic did not survive the port, and then it did — by a second pass,
+not by more samples.** The reference tracer's `Caustic` grid is a *forward*
+transport step
 — sun rays pushed through the surface by Snell's law and binned where they
 land — bolted onto a backward tracer, and it exists precisely because a
 unidirectional tracer cannot find the sun through moving water. Two things
@@ -169,12 +170,29 @@ floor with no ring structure at all — 0.1 expected sun hits per pixel. A
 readable caustic would need 10^4-10^5 spp, hours to a day per frame. It is
 unusable, and no sample count fixes it.
 
-What `kosm-render` would need is a way to connect a shading point to a light
-*through* a refractive interface: NEE that refracts the shadow ray and
-carries the Fresnel and Jacobian terms, manifold next-event estimation to
-solve for the specular chain, or — the cheap and honest answer for this
-scene — a photon-mapped caustic pass, which is what the reference's `Caustic`
-grid already is. Until then the legacy renderer stays the default. Foam is
+**The verdict, updated.** The diagnosis above is unchanged and so is the
+conclusion drawn from it: no sample count fixes this. What fixed it is
+`kosm_render::caustics` — a photon-mapped caustic pass, which is the cheap and
+honest answer for this scene and, not coincidentally, what the reference's
+`Caustic` grid already was. Same physics, general machinery: sun photons
+aimed at the water, pushed through the surface by the BSDF's own refraction,
+deposited into a world-space grid, read back as direct light. NEE still treats
+the water as opaque, so the two do not double count.
+
+Measured at 1280×720, 64 spp, frame 0 (ambient ripple, no impact yet), over a
+patch of tile floor: mean sRGB **59.6 → 78.8** and standard deviation **9.5 →
+15.9**. The floor is no longer "perfectly smooth and perfectly caustic-free" —
+it is brighter, because the sun now reaches it at all, and it is dappled,
+because the ripple focuses. After the melon lands (frame 36) the expanding
+rings throw a matching ring of light onto the tiles, the same structure the
+legacy tracer's grid draws in the same frame, softer at the edges because a
+6 cm gather radius is a blur where a binned grid is not. The pass costs
+**1.4 s of a 30.4 s frame** — about 5% — for 2M photons over the whole pool.
+`KOSM_PHOTONS=0` restores the caustic-free render this section used to
+describe.
+
+The legacy renderer stays the default: foam, the crowd and its filmic curve
+are still its own. Foam is
 skipped as well (it is a coverage field that whitens the surface shade, and
 `Pbr` has no per-point channel a client can drive without textures), as is
 the crowd (raymarched SDFs in the reference); droplets do port, as small
@@ -1290,6 +1308,17 @@ without the map.
 **CPU only this round.** The GPU integrator ignores the map: there is no
 buffer upload and no device-side gather, so `--features gpu` renders the same
 scene without its caustic. That is a real gap and not a rounding of one.
+
+**Where it shows up.** The pool's tiles (see `### the pool` — mean sRGB 59.6 →
+78.8, standard deviation 9.5 → 15.9 over a patch of floor, at 5% of the frame
+time) and the marble's beauty frame, where the bead now throws a bright spot
+onto the plate under it instead of a plain shadow — over the 16x12 px patch
+directly beneath the bead, mean sRGB **134.9 -> 154.8** and peak **166 ->
+198**. That spot is the one
+`light.rs` has traced since the beginning — 472k rays × 5 spectral bands, peak
+368× direct, 13.3 mm rms spread — except that `light.rs` computes a number for
+the optimiser and this puts it in the picture, through the same N-BK7
+Sellmeier curve.
 
 Cost is `photons`, a gather `radius` and `max_bounces`. Photons are shot in
 parallel with one seeded stream each, so the pass is deterministic however
