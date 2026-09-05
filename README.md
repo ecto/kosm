@@ -944,12 +944,13 @@ The renderer knows which is which, and it knows *before* it traces anything:
   lighting going stale under a surface that did not move.
 
 `gpu/budget.rs` and `gpu/shaders/budget.wgsl` turn those into a per-pixel
-**sample budget** `b(p)` in four compute passes at the head of the frame:
+**sample budget** `b(p)` in five compute passes at the head of the frame:
 one for the three drives, two to dilate the motion drive over the à-trous
 filter's own footprint — a moved ball drags its shadow, its bounce and
-everything the filter will reach for — and one to normalise so the frame's
-total is exactly the tuner's `rays_per_frame`. Directing the samples never
-spends more of them. It moves them from the wall to the ball.
+everything the filter will reach for — one to normalise so the frame's total is
+exactly the tuner's `rays_per_frame`, and one to turn `b(p)` into the set of
+trace rounds each pixel takes. Directing the samples never spends more of
+them. It moves them from the wall to the ball.
 
 The formula the numbers below came out of, per pixel:
 
@@ -983,55 +984,102 @@ together, and all three were wrong in the first version:
 
 **Deterministic or stochastic.** The natural thing is for `accumulate` to loop
 `b(p)` samples at pixel `p`, and that needs the *trace* to loop per pixel. The
-integrator takes one sample per invocation per dispatch and changing that is a
-line in `integrator.wgsl`, which this does not touch. So the pass is split into
-rounds instead, and on round `r` a pixel takes its sample or does not.
+integrator takes one sample per invocation per dispatch, so the pass is split
+into rounds instead, and on round `r` a pixel takes its sample or does not.
 
 Not by a coin, though — that was the second thing measured and rejected.
 A coin at probability `b/rounds` is unbiased in the *mean*, which is all an
 unbiasedness argument covers; but a pixel's error goes as `1/sqrt(count)`, and
 `1/sqrt` is convex, so a count that scatters around `b` is worse than a count
 that *is* `b`. On the fixture it gave up a third of what the feature was
-buying. The rounds are **stratified** instead: walk `[u, u+b)` in steps of
-`b/rounds` and take a round each time the walk crosses an integer, with a
-per-pixel dither `u`. The pixel takes exactly `floor(b)` or `ceil(b)` rounds,
-the expectation is still exactly `b`, and the count never strays by more than
-one. Nothing is reweighted by `1/p`: the selection never looks at the sample's
-value, so the mean over what was folded is unbiased on its own, and a
-reweighting would only add variance.
+buying. So a pixel takes exactly `floor(b)` rounds and one more with
+probability `frac(b)` — the expectation is still exactly `b`, and the count
+never strays by more than one. Nothing is reweighted by `1/p`: the selection
+never looks at the sample's value, so the mean over what was folded is unbiased
+on its own, and a reweighting would only add variance.
+
+**And the rounds a pixel takes are chosen so the trace can skip them.** This is
+where the feature stopped being a tax. The selection used to be made inside
+`accumulate`, one round at a time, *after* the trace: every round traced the
+whole frame and the fold threw away the samples the budget had not asked for.
+Four rounds of rays to place one frame's worth of samples — the placement was
+directed and the cost was not.
+
+It is decided in a fifth pass now, `budget_select`, once, for every round at
+once, and written where the trace can read it: guide plane 3 of the
+depth/normal buffer, one word a pixel, bit `r` set when the pixel folds round
+`r`. It rides in that buffer rather than in a binding of its own because the
+integrator already binds all ten storage buffers a browser guarantees — the
+same reason ReSTIR's reservoirs live there. `integrator.wgsl` reads that word
+at the top of its entry point and returns before casting a ray; `accumulate`
+reads the *same* word rather than re-deriving it, so the two can never
+disagree about which rounds a pixel took.
+
+Two details decide whether that saves any time at all, and neither is about
+rays:
+
+* **which** rounds. A GPU traces a workgroup, not a pixel. The certain
+  `floor(b)` rounds are therefore the *low* ones — a busy pixel takes round 0
+  and up, never a round drawn at random — so the rounds a tile is busy on are
+  a prefix, and the tail of the frame is the handful of tiles with real work
+  left in them.
+* **whose** dither. The fractional round's coin is the **8x8 tile's**, not the
+  pixel's, and so is the starvation floor's phase. A per-pixel coin scatters
+  the selected pixels evenly over the frame, which puts one in every workgroup
+  and makes every workgroup run: the skip saves the rays and none of the time.
+  Keyed on the tile, a converged patch of wall decides together. Measured, that
+  one change was the difference between a 15% saving and a 45% one.
+
+What is given up is the fine-grained decorrelation of neighbouring pixels'
+round sets. Each pixel still takes `floor(b)` or `ceil(b)` rounds, so the
+counts and the budget's accounting are untouched; the equal-samples ratio moved
+from 0.80 to 0.83.
+
+Round 0 is the exception to the skip. The history pass reprojects *every*
+pixel through this frame's guide planes, folded or not, so a skipped pixel
+cannot be left holding last frame's primary hit. On round 0 the pixels the mask
+skips run **guides-only**: the ray, the guide planes, and none of the shading,
+which is where a path sample's cost is. It measures at about 4 ms of the pass.
 
 A pixel that skips every round still has its history *committed* — a pixel that
 skipped a frame the camera moved on would otherwise silently lose the history
 the reprojection carried onto it.
 
 **Nothing starves.** `budget_floor_k` guarantees every pixel a sample once
-every k frames, on a phase of its own so the cost is spread rather than
-periodic — and the guarantee is taken deterministically, on the round
-`pixel % rounds`, because a guarantee that holds two frames in three is not a
-guarantee.
+every k frames, on its tile's phase so the cost is spread rather than periodic
+— and the guarantee is taken deterministically, because a guarantee that holds
+two frames in three is not a guarantee. The phase is the tile's for the same
+reason the dither is: a floor scattered pixel by pixel puts one floored pixel
+in every workgroup of the frame, and a workgroup with one pixel in it costs
+what a full one does.
 
-`tests/gpu_sample_budget.rs` pins the four claims on a sphere over a plane at
+`tests/gpu_sample_budget.rs` pins six claims on a sphere over a plane at
 64x64, and these are its numbers:
 
 * with the scene static and no motion table at all, the frame's budget totals
-  **4091 samples against a target of 4096** — 0.12% — and the noisiest quarter
-  of the frame by its own relative error bar gets **1.59 samples/pixel against
-  0.85** for the calmest;
-* with one ball moving, the ball's own pixels get **2.70 samples/pixel**, the
-  neighbourhood the filter will drag with it **2.60**, and the rest of the
-  frame **0.35** — a factor of eight;
+  **4094 samples against a target of 4096** — 0.05% — and the noisiest quarter
+  of the frame by its own relative error bar gets **1.71 samples/pixel against
+  0.66** for the calmest;
+* with one ball moving, the ball's own pixels get **2.72 samples/pixel**, the
+  neighbourhood the filter will drag with it **2.69**, and the rest of the
+  frame **0.32** — a factor of eight;
 * from a converged frame, sixteen frames of a ball crossing it at **equal
-  samples folded per frame**: RMSE against a 512-sample reference of **0.0660
-  uniform against 0.0529 directed, a ratio of 0.80**. Split, that is the ball
-  0.121 → 0.107 and everything else 0.053 → 0.039 — the background improves
+  samples folded per frame**: RMSE against a 512-sample reference of **0.0658
+  uniform against 0.0547 directed, a ratio of 0.83**. Split, that is the ball
+  0.121 → 0.102 and everything else 0.053 → 0.044 — the background improves
   too, because what it was short of was not rays but rays *where the clamp had
   just thrown a history away*;
-* and over one floor period, **0 of 4096 pixels** go untouched.
+* over one floor period, **0 of 4096 pixels** go untouched;
+* a budgeted frame skips **2318 of 4096 pixels entirely**, and every pixel the
+  ball has just moved onto still reads the ball's distance in the guide plane
+  to within 1.2% of a CPU sphere intersection — skipped or not;
+* and the skip folds what the fold used to fold, bit for bit.
 
 `kosm-view --budget` turns it on in the viewer; `--budget=0.4` names the bias,
 where 0 is the uniform spend the window always had and 1 is entirely where the
-budget says. `--budget-rounds` (4), `--budget-radius` (32 pixels) and
-`--budget-floor` (16 frames) are the rest of it.
+budget says. `--budget-rounds` (4), `--budget-radius` (32 pixels),
+`--budget-floor` (16 frames) and `--rays-per-frame` (one a pixel) are the rest
+of it.
 
 `--dump-frames 60 --at 0.4 --width 640`, with and without: at frame 8, where
 the history is still short, the directed frames are better everywhere at once —
@@ -1042,12 +1090,28 @@ cleaner, the shadows on the floor crisper, and the far wall carries a little
 more grain than the uniform run left it, because that is where the samples came
 from.
 
-The honest cost, today: the pass takes **155 ms against 39 ms** at 640x360,
-because it is four full-frame trace rounds to place the same 230,400 folded
-samples. The budget directs *placement*; it cannot yet withhold a ray, because
-the trace dispatch has no per-pixel skip. One `if` in `integrator.wgsl` — read
-the budget, return early — makes the rays dispatched equal the samples folded
-and the whole thing free. That line is deliberately not written here.
+The cost. A directed pass at 640x360 used to take **3.4 uniform passes** to
+place one sample a pixel — 155 ms against 39 on a cold machine, four full-frame
+trace rounds for 230,400 folded samples. With the skip it takes **2.1**, and
+what it buys with the difference is samples: a directed pass placing **three**
+samples a pixel now costs the same 3.4 passes the one-sample pass used to. The
+frame that bought one directed sample buys three.
+
+At equal *time*, though — three directed samples against the four flat ones the
+same time buys — the two are a wash on the fixture (a ratio of 1.01): a fourth
+flat sample is worth about what directing three is. The win is at equal
+samples, which is the 0.83 above, and in no longer paying four rounds of rays
+for one round of samples. `--rays-per-frame N` names the samples a pixel, so
+both halves of that can be measured from the command line.
+
+The one thing the skip changes that the fold did not: a skipped pixel's raw
+sample and its guide planes go stale by a round. The neighbourhood clamp reads
+its neighbours' raw samples, so a clamped pixel now sees each neighbour's most
+recent sample rather than this round's — an equally good independent sample of
+the same pixel, and not the same float.
+`the_skip_folds_the_same_samples` pins both ends of that: bit for bit over one
+budgeted frame with the clamp off, and 0.028 RMSE over eight frames with it on,
+against the 0.066 either arm carries against the converged reference.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
 window, which is how the picture is checked; it uses the GPU tracer unless
