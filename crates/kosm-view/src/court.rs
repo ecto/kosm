@@ -199,18 +199,27 @@ fn poses(stage: &mut render::Scene, snap: &Snapshot) -> Vec<Pose> {
             radius: r,
         });
     }
+    // The extras are one thing, not a hundred and sixty-eight: the net is a
+    // hundred and sixty-eight cords, and a mask that took each cord's sphere
+    // and each cord's ten shadow discs covered the screen every pass the net
+    // so much as swayed. One bounding sphere over all of them, and its shadow,
+    // is what the eye needs repainted.
+    let mut spheres: Vec<(Point3, f64)> = Vec::with_capacity(snap.extras.len());
     for extra in &snap.extras {
-        let Some((c, radius)) = stage.extra_sphere(extra) else { continue };
-        let m = &extra.to_world.matrix;
-        out.push(Pose {
-            centre: [c.x, c.y, c.z],
-            rot: [
-                m[(0, 0)], m[(0, 1)], m[(0, 2)], //
-                m[(1, 0)], m[(1, 1)], m[(1, 2)], //
-                m[(2, 0)], m[(2, 1)], m[(2, 2)],
-            ],
-            radius,
-        });
+        if let Some((c, radius)) = stage.extra_sphere(extra) {
+            spheres.push((Point3::new(c.x, c.y, c.z), radius));
+        }
+    }
+    if !spheres.is_empty() {
+        let n = spheres.len() as f64;
+        let cx = spheres.iter().map(|(c, _)| c.x).sum::<f64>() / n;
+        let cy = spheres.iter().map(|(c, _)| c.y).sum::<f64>() / n;
+        let cz = spheres.iter().map(|(c, _)| c.z).sum::<f64>() / n;
+        let radius = spheres
+            .iter()
+            .map(|(c, r)| ((c.x - cx).powi(2) + (c.y - cy).powi(2) + (c.z - cz).powi(2)).sqrt() + r)
+            .fold(0.0, f64::max);
+        out.push(Pose { centre: [cx, cy, cz], rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], radius });
     }
     out
 }
