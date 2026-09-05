@@ -403,7 +403,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // log: a moved camera used to repaint the frame and now mostly does
         // not.
         let mut reprojected = "";
-        let (image, mask_frac, mean_spp, traced_px, kind) = match &mut tracer {
+        let (image, mask_frac, mean_spp, traced_px, kind, share) = match &mut tracer {
             // On the device: one dispatch, four small compute passes, and a
             // texture. No film comes back, so there is nothing here to merge
             // or resolve; the keep mask is the whole of this side's work.
@@ -415,7 +415,13 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             // worth less than half the frame is that box's work.
             Tracer::Gpu(gpu) => {
                 let keep = mask.keep(&view, &poses, &lights, job.spp);
-                let scissored = keep.scissor.map(|r| (r[2] as u64) * (r[3] as u64));
+                // The boxes are disjoint, so their areas simply add.
+                let boxed: u64 = keep
+                    .boxes
+                    .iter()
+                    .map(|r| (r[2] as u64) * (r[3] as u64))
+                    .sum();
+                let nboxes = keep.boxes.len();
                 let pass = gpu.accumulate(
                     &stage,
                     &job.frame,
@@ -423,7 +429,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     &job.camera,
                     job.size,
                     &keep.keep,
-                    keep.scissor,
+                    &keep.boxes,
                     job.spp,
                     keep.reproject,
                 );
@@ -435,10 +441,16 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                         viewport::Image::Texture(texture),
                         mask.fraction(),
                         mask.mean_samples(),
-                        scissored.unwrap_or(frame_px),
-                        match scissored {
-                            Some(px) => format!("{:.0}% ", 100.0 * px as f64 / frame_px as f64),
-                            None => "full".to_string(),
+                        if nboxes == 0 { frame_px } else { boxed },
+                        if nboxes == 0 {
+                            "full".to_string()
+                        } else {
+                            format!("{nboxes}-box")
+                        },
+                        if nboxes == 0 {
+                            String::new()
+                        } else {
+                            format!(" ({:.0}%)", 100.0 * boxed as f64 / frame_px as f64)
                         },
                     ),
                     Err(error) => {
@@ -510,7 +522,12 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     if full {
                         "full".to_string()
                     } else {
-                        format!("{:.0}% ", 100.0 * traced_px as f64 / frame_px as f64)
+                        format!("{}-box", plan.rects.len())
+                    },
+                    if full {
+                        String::new()
+                    } else {
+                        format!(" ({:.0}%)", 100.0 * traced_px as f64 / frame_px as f64)
                     },
                 )
             }
@@ -528,7 +545,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
             eprintln!(
-                "court  {} {}×{} at {} spp: {} ms a {}{} pass, {:.0}% repainted, {:.1} samples a pixel",
+                "court  {} {}×{} at {} spp: {} ms a {}{} pass{}, {:.0}% repainted, {:.1} samples a pixel",
                 tracer.name(),
                 job.size.0,
                 job.size.1,
@@ -536,6 +553,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                 shot.ms,
                 kind,
                 reprojected,
+                share,
                 100.0 * shot.mask,
                 shot.mean_spp
             );
@@ -644,7 +662,7 @@ pub fn still_gpu(
     // nothing moves between them. The picture never leaves the device until
     // the last line, which reads the target texture once for the PNG.
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1, false)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], &[], 1, false)?;
     }
     let rgba = gpu.read_target()?;
     if let Some(dir) = path.parent() {
@@ -703,7 +721,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
 
     let passes = passes.max(1);
     for _ in 0..passes {
-        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], None, 1, false)?;
+        gpu.accumulate(&stage, &frame, 0, &camera, size, &[], &[], 1, false)?;
     }
     let before = gpu.history_counts()?;
     let converged = before.iter().filter(|&&c| c > 1).count();
@@ -746,7 +764,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
         &moved,
         size,
         &keep.keep,
-        keep.scissor,
+        &keep.boxes,
         1,
         keep.reproject,
     )?;
@@ -990,6 +1008,16 @@ struct App {
     /// How long the last fair pass took, in milliseconds: the climb rule reads
     /// the clock, not the model.
     last_ms: f64,
+    /// The same clock, kept twice, because a masked pass and a full one are
+    /// not the same pass. Now that a masked pass is a handful of boxes rather
+    /// than the frame, it can be several times cheaper — and a climb rule
+    /// that reads that cheapness buys a picture the next full pass cannot
+    /// afford. So the *size* is bought with `full_ms`, which is what a grown
+    /// picture will actually have to pay, and the *sample count* with
+    /// `masked_ms`, which is what most passes cost while the world is moving.
+    /// Zero means not yet measured, and the raw last pass stands in.
+    full_ms: f64,
+    masked_ms: f64,
     /// Whether the last pass came from a tier that would lose its accumulated
     /// picture if the size stepped, and how converged that picture is. See
     /// [`RESIZE_UNTIL`].
@@ -1043,6 +1071,8 @@ impl App {
             over: 0,
             cheap: 0,
             last_ms: 0.0,
+            full_ms: 0.0,
+            masked_ms: 0.0,
             resize_costs_history: false,
             mean_spp: 0.0,
             generation: 0,
@@ -1147,11 +1177,13 @@ impl App {
         if ms > OUTLIER * self.cost.predict(work).max(1.0) {
             return false;
         }
-        self.cost.observe(work, ms);
         // Only a full pass says anything about what a *size* costs; a masked
-        // one traced a patch whose size is the world's business, not the
-        // tuner's.
+        // one traced a box whose size is the world's business, not the
+        // tuner's, and folding its cheapness into the model that picks the
+        // resolution is how the window talks itself into a picture it cannot
+        // afford the moment the boxes stop paying.
         if shot.traced_px >= (shot.size.0 as u64) * (shot.size.1 as u64) {
+            self.cost.observe(work, ms);
             let slot = &mut self.seen[(self.scale as usize).min(MAX_SCALE as usize + 1)];
             *slot = if *slot > 0.0 {
                 0.7 * *slot + 0.3 * ms
@@ -1160,6 +1192,26 @@ impl App {
             };
         }
         true
+    }
+
+    /// What a full pass costs, for the knob that decides how big the picture
+    /// is. Falls back to the last pass until a full one has been timed.
+    fn size_ms(&self) -> f64 {
+        if self.full_ms > 0.0 {
+            self.full_ms
+        } else {
+            self.last_ms
+        }
+    }
+
+    /// What a pass costs as passes actually come, for the knob that decides
+    /// how many samples one carries.
+    fn samples_ms(&self) -> f64 {
+        if self.masked_ms > 0.0 {
+            self.masked_ms
+        } else {
+            self.last_ms
+        }
     }
 
     /// Whether a size step would now cost more than it buys.
@@ -1295,6 +1347,12 @@ impl viewport::Scene for App {
                 0
             };
             self.last_ms = shot.ms as f64;
+            let ema = |e: f64, ms: f64| if e > 0.0 { 0.7 * e + 0.3 * ms } else { ms };
+            if shot.traced_px >= (shot.size.0 as u64) * (shot.size.1 as u64) {
+                self.full_ms = ema(self.full_ms, shot.ms as f64);
+            } else {
+                self.masked_ms = ema(self.masked_ms, shot.ms as f64);
+            }
             self.resize_costs_history = shot.resize_costs_history;
             self.mean_spp = shot.mean_spp;
             // An overrun is only the size's fault if the size is paying for
@@ -1345,7 +1403,7 @@ impl viewport::Scene for App {
             // once condemned gets another hearing after a longer run of cheap
             // passes, because the pass that condemned it may not have been a
             // render at all.
-            let room = self.last_ms < 0.7 * TARGET_MS && !self.size_is_dear();
+            let room = self.size_ms() < 0.7 * TARGET_MS && !self.size_is_dear();
             if room && self.scale > self.floor {
                 if self.samples > 1 {
                     self.samples = 1;
@@ -1360,7 +1418,7 @@ impl viewport::Scene for App {
                 self.scale -= 1;
                 self.samples = 1;
                 self.cheap = 0;
-            } else if self.last_ms * 2.0 < TARGET_MS && self.samples < self.spp {
+            } else if self.samples_ms() * 2.0 < TARGET_MS && self.samples < self.spp {
                 self.samples = (self.samples * 2).min(self.spp);
             }
             self.quiet = 0;

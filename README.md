@@ -410,6 +410,36 @@ moved camera. A masked pass is taken only when it saves more than half the
 frame — the pixels outside it get nothing, and a picture that is always masked
 never converges.
 
+One box was not enough. The change rects used to be reduced to a single
+bounding box, and with four balls spread across the court that box is most of
+the frame: it never cleared the half-frame bar, so every pass went full. They
+are clustered into at most **four** boxes now — greedily, merging the pair
+whose union adds the least area until the count fits, and merging a pair whose
+union adds nothing even when it already does. The cover is re-merged after
+every step, so what comes out is always disjoint and both tiers can add the
+areas up. Each box is its own scissored dispatch on the GPU tier and its own
+rectangle in `render_into` on the CPU tier, and the log names them: `14 ms a
+2-box pass (17%)` against `32 ms a full pass` at the same size, or `19 ms a
+1-box pass (1%)` against `87 ms` at four samples. A camera move still takes a
+full pass — the reprojection needs this pass's depth everywhere — and the pass
+after it is boxed again.
+
+The budget is four because a dispatch is not free. vcad scissors the *trace*,
+but the reproject, accumulate, demodulate, à-trous and resolve passes behind it
+are still dispatched over the whole frame, and the keep mask is re-uploaded
+with them, so past a handful of boxes that fixed part outgrows the rays a
+tighter cover saves. Splitting the fold from the filter — an
+`accumulate_resident(scissor)` per box and one `denoise_and_resolve` for the
+frame — is what would make many boxes cheap, and it is kosm-render's to give:
+`HistoryPipeline`'s five passes are private and only the fused
+`accumulate_and_denoise_resident` is public.
+
+And the tuner keeps two clocks. A boxed pass can be four times cheaper than a
+full one, and a climb rule reading that cheapness buys a picture the next full
+pass cannot afford — so the *size* is decided from the full-pass time, and only
+full passes feed the cost model the size is chosen from, while the *sample
+count* is decided from the masked one.
+
 A tuner step is not a new picture, and no longer costs one. The window buys a
 pass that fits in thirty milliseconds with resolution, so the render size moves
 under the accumulator's feet, and every step used to throw the whole history

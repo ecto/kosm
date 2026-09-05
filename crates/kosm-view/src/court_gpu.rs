@@ -368,7 +368,7 @@ impl Stage {
         camera: &Camera,
         size: (u32, u32),
         keep: &[u8],
-        scissor: Option<[u32; 4]>,
+        boxes: &[[u32; 4]],
         samples: u32,
         reproject: bool,
     ) -> anyhow::Result<Arc<wgpu::Texture>> {
@@ -447,7 +447,17 @@ impl Stage {
         // climbing `frame_index` to move the jitter and the RNG. Only the
         // first carries the keep mask — the pixels this pass restarts are
         // restarted once, and the rest of the pass accumulates onto them.
+        // One dispatch per box. vcad's scissor is a single rectangle, so k
+        // boxes are k calls: the *trace* shrinks to each box, though the fold
+        // and the denoise chain behind it do not. An empty list is the whole
+        // frame, in one call, exactly as before.
+        let dispatches: Vec<Option<[u32; 4]>> = if boxes.is_empty() {
+            vec![None]
+        } else {
+            boxes.iter().map(|&b| Some(b)).collect()
+        };
         for k in 0..samples.max(1) {
+            for (b, rect) in dispatches.iter().enumerate() {
             self.passes += 1;
             let mut state = GpuRenderState::new(self.passes);
             // A photoreal viewport: no edge overlay, no stylisation, and no
@@ -473,7 +483,7 @@ impl Stage {
             // pass honours the same rectangle, so every pixel outside keeps
             // the mean, the count and the variance it had. See the module
             // docs.
-            if let Some(rect) = scissor {
+            if let Some(rect) = *rect {
                 state.set_scissor(rect);
             }
             self.pipeline
@@ -483,14 +493,24 @@ impl Stage {
                     res,
                     &cam,
                     state,
+                    // The boxes are disjoint and the fold is scissored, so
+                    // each box restarts its own pixels once and no box can
+                    // touch another's.
                     if k == 0 { keep } else { &[] },
                     &denoise,
                     &view,
-                    // Only the first sample of the pass: after it the history
-                    // is already in this pass's view.
-                    if k == 0 { prev_view.as_ref() } else { None },
+                    // Only the first sample of the pass, and only its first
+                    // box: after that the history is already in this pass's
+                    // view. A reprojected pass is a full pass anyway, so
+                    // there is only ever the one box here.
+                    if k == 0 && b == 0 {
+                        prev_view.as_ref()
+                    } else {
+                        None
+                    },
                 )
                 .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
+            }
         }
 
         // Wait for the passes to land. Not a readback — no pixel comes back —
