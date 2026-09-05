@@ -702,6 +702,60 @@ What the tests pin:
 | `sampling_every_lobe_recovers_the_evaluated_albedo` | `E[f/pdf]` lands on the evaluator's own quadrature for every lobe |
 | `tests/gpu_bsdf.rs` | the WGSL port agrees with the Rust across a 1728-case parameter sweep (worst relative disagreement 6e-7), the device's sample PDF equals its eval PDF, and the furnace closes on the GPU's own table interpolation |
 
+#### thin-film iridescence
+
+A soap bubble, an oil slick on wet tarmac and the straw-to-blue run of colours
+on tempered steel are one phenomenon: a film thin enough that the wave
+reflected off its top and the wave that went through it, bounced off the
+substrate and came back out are still coherent. They interfere — constructively
+at the wavelengths where the optical path difference is a whole number of them,
+destructively in between — so the reflectance stops being a smooth Fresnel
+curve in λ and becomes a comb, and the comb slides as the angle changes because
+the path difference does.
+
+Belcour and Barla's "A Practical Extension to Microfacet Theory for the
+Modeling of Varying Iridescence" (SIGGRAPH 2017) is the model. The Airy
+summation over the film's infinitely many internal bounces is exact and cheap;
+what is expensive is integrating the resulting comb against the three CIE
+curves. Their observation is that you never have to: the summation's terms are
+pure cosines in the path difference, so the integral wants the *Fourier
+transform* of the colour matching functions at that frequency — and CIE 1931
+fitted as a handful of Gaussians has one in closed form. That is
+`optics::sensitivity`: six constants, no tables, and it ports to WGSL verbatim
+like the rest of the spectral code.
+
+| parameter | meaning |
+|---|---|
+| `thin_film_thickness` | OpenPBR's, in nanometres. `0` is no film and the default. A soap film runs 100–1000 nm, an oxide on steel 20–80, an AR coating a quarter of a wavelength |
+| `thin_film_ior` | OpenPBR's `thin_film_ior`, default 1.5. The film sits between the outside and the substrate, and its contrast against both is what sets the strength |
+
+The film modulates the **specular lobe's Fresnel**, and that is one line in one
+place, so it colours the dielectric `F0` path and the metal path alike — a
+metal's `f0` *is* its base colour, and an oxide over steel composes exactly
+that way. It is a function of the half-vector cosine, so it is exactly as
+reciprocal as the lobe it sits on, which `an_iridescent_bsdf_is_reciprocal`
+holds it to by measuring the *same material without the film* as its bar.
+
+**A path that already carries a hero wavelength does not want the colour
+integral.** It wants the reflectance at its own λ, so it gets it: the series is
+geometric and sums in closed form, which is both cheaper and exact rather than
+truncated at two harmonics. `thin_film_thickness = 0` returns the plain Schlick
+`fresnel` itself and not a limit of the film model that happens to be close, so
+a material without a film is bit-for-bit what it was — and the court's CPU shot
+is byte-identical across this change.
+
+What the tests pin:
+
+| test | what it holds |
+|---|---|
+| `a_three_hundred_nanometre_film_matches_the_analytic_airy` | a 300 nm n = 1.34 film on glass, at 450/550/650 nm, within 1% of the textbook Airy formula written from *amplitude* coefficients — a different derivation, not the same series rearranged |
+| `a_zero_thickness_film_is_the_plain_fresnel_bit_for_bit` | no film is `assert_eq!`, not "close" |
+| `a_film_never_reflects_more_than_it_receives` | every channel in [0, 1] over thickness × film index × angle × substrate `F0` |
+| `an_iridescent_bsdf_is_reciprocal` | the film adds no asymmetry the compensated GGX beneath it did not already have |
+| `an_iridescent_lobe_stays_under_one` | hemispherical albedo ≤ 1 for a white metal at three thicknesses and three roughnesses, RGB and hero paths both |
+| `a_film_in_the_visible_band_is_chromatic` | a 320 nm film is not grey — otherwise none of this bought anything |
+| `tests/gpu_bsdf.rs` | the sweep grew films over dielectrics and metals and a hero-wavelength axis: 4680 cases, worst relative disagreement 9.4e-6 |
+
 #### transmission and dispersion
 
 Glass is a fifth lobe: a **rough dielectric** (Walter et al. 2007) sharing the
