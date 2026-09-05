@@ -43,6 +43,7 @@ use std::sync::Arc;
 use kosm_render::geometry::Geometry;
 use kosm_render::heightfield::HeightField;
 use kosm_render::math::{Aabb, Point3, Transform, Vec3};
+use kosm_render::caustics::{self, CausticMap, CausticOptions};
 use kosm_render::pathtrace::{
     Camera, Environment, GradientEnv, Object, PathTraceOptions, Pbr, Scene, Sun,
 };
@@ -632,6 +633,47 @@ pub fn options(seed: u64) -> PathTraceOptions {
     }
 }
 
+/// How the caustic pass is shot for a pool frame, or `None` to skip it.
+///
+/// This is the answer to the question this module was written to ask. A
+/// backward tracer cannot find the sun through moving water — that is not a
+/// sample-count problem, it is a geometry problem, and `### the pool` in the
+/// README spent a while establishing it. The caustic pass goes the other way:
+/// sun photons through the surface by the same Snell's law the reference
+/// tracer's [`Caustic`](crate::pool::Caustic) grid uses, deposited where they
+/// land. Same physics, general machinery.
+///
+/// The gather radius is 6 cm, a little coarser than the reference grid's
+/// cells, and the photon count is what buys the rings their contrast.
+/// `KOSM_PHOTONS=0` turns the pass off and restores the caustic-free render
+/// the README describes.
+pub fn caustic_options(seed: u64) -> Option<CausticOptions> {
+    let photons = std::env::var("KOSM_PHOTONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000_000usize);
+    if photons == 0 {
+        return None;
+    }
+    Some(CausticOptions {
+        photons,
+        radius: Some(
+            std::env::var("KOSM_CAUSTIC_RADIUS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.06),
+        ),
+        seed: seed ^ 0xca05_71c5,
+        ..Default::default()
+    })
+}
+
+/// Shoot the caustic pass over a frame's scene, if it is enabled.
+pub fn caustics_for(scene: &Scene<PoolGeom>, seed: u64) -> Option<CausticMap> {
+    let opts = caustic_options(seed)?;
+    Some(caustics::trace(scene, &opts))
+}
+
 /// Render one snapshot. Tonemapping is `kosm-render`'s ACES, not the pool's
 /// filmic curve: ACES desaturates and darkens the bright blues a little
 /// relative to the reference, so the two stills are not pixel-comparable
@@ -643,12 +685,14 @@ pub fn render_snapshot(
     seed: u64,
 ) -> image::RgbaImage {
     let picture = scene.scene(snapshot);
-    let film = kosm_render::render(
+    let map = caustics_for(&picture, seed);
+    let film = kosm_render::pathtrace::render_with_caustics(
         &picture,
         &camera(view),
         view.width,
         view.height,
         &options(seed),
+        map.as_ref(),
     );
     // The sky is the reference tracer's sky at full strength and the sun is
     // a real sun, so linear radiance off the deck runs well over 1. ACES

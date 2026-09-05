@@ -142,16 +142,16 @@
 ; walls are closed solids, so what you get is a row of sun patches thrown from
 ; the window openings onto the floor and the bleachers.
 ;
-; The band is a real *opening*, not glass, and that is a renderer's decision
-; showing through the level. Next-event estimation is an any-hit shadow ray:
-; anything the ray touches occludes, a thin dielectric included. With glass in
-; the band, the sun could only ever be found by a BSDF-sampled path that
-; happened to refract through a pane and then wander into a 0.27° cone — one
-; ray in tens of thousands — and 32 passes of that is salt-and-pepper, not
-; daylight. An opening lets NEE see the sun directly and it converges in a
-; handful of passes. Real gyms have glass; when kosm-render learns to carry a
-; shadow ray through a thin dielectric, the panes come back and this comment
-; goes away.
+; The band is glazed. It was a bare opening for a while, and that was a
+; renderer's decision showing through the level: next-event estimation used an
+; any-hit shadow ray, so anything the ray touched occluded, a thin dielectric
+; included. With glass in the band the sun could only be found by a BSDF path
+; that happened to refract through a pane and then wander into a 0.27° cone —
+; one ray in tens of thousands, which over 32 passes is salt-and-pepper, not
+; daylight. kosm-render now carries a shadow ray *through* a thin dielectric,
+; attenuated by `1 - F(cos)`, so NEE sees the sun through the glass and the
+; band converges in the same handful of passes an opening did, about four
+; percent dimmer.
 [defparam sky 1.0]               ; 0: the old constant grey. 1: sky gradient + sun
 [defparam sky_zenith 1.1]        ; radiance straight up (a blue-tinted hue)
 [defparam sky_horizon 1.6]       ; radiance at the horizon (near-white)
@@ -177,11 +177,10 @@
 [let room-x [+ [* 2.0 gym-hx] [* 2.0 wall_t_mm]]]
 [let room-y [+ [* 2.0 gym-hy] [* 2.0 wall_t_mm]]]
 
-; a window band high on the two long walls: real openings, above everything a
-; ball can reach. The band is a gap in the wall — a course below the sill, a
-; course above the head, and a pier between each pair of openings — so the sky
-; and the sun outside actually get in. See `sky`, above, for why it is a hole
-; and not a pane of glass.
+; a window band high on the two long walls, above everything a ball can reach.
+; The wall itself is a gap — a course below the sill, a course above the head,
+; and a pier between each pair of openings — and the openings are filled with
+; glass. See `sky`, above.
 [defparam window_n 8.0]
 [defparam window_w_mm 1800.0]
 [defparam window_h_mm 1400.0]
@@ -254,7 +253,21 @@
     [translate 0.0 bleacher-y0 [/ bleacher_rise_mm 2.0]
       [box-c bleacher_len_mm bleacher_run_mm bleacher_rise_mm]]]]
 
+; the glazing: one pane per opening, on the wall's centreline. 20 mm boxes,
+; which is thicker than the glass they stand for — the `window` material is
+; `thin_walled`, so the daylight arrives undisplaced rather than refracted
+; twice through a slab it is not really twenty millimetres of.
+[defparam pane_t_mm 20.0]
+[let pane [box-c window_w_mm pane_t_mm window_h_mm]]
+[let glazing-wall [fn [y]
+  [linear-pattern 1.0 0.0 0.0 window_n window-pitch
+    [translate window-x0 y [+ window_sill_mm [/ window_h_mm 2.0]] pane]]]]
+[let panes
+  [union [glazing-wall wall-off-y]
+         [glazing-wall [* -1.0 wall-off-y]]]]
+
 [root walls "wall"]
+[root panes "window"]
 [root ceiling "ceiling"]
 [root floor "floor"]
 [root pads "pad"]

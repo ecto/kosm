@@ -937,13 +937,10 @@ existing scene where it was. The cost is noise: one hero wavelength, not four
 with spectral MIS, and the sRGB response has negative lobes, so a single sample
 can land negative in a channel. The mean is right; the variance is the price.
 
-**NEE does not go through glass.** `occluded()` treats a transmissive surface
-as an opaque blocker, which is the standard choice — a shadow ray has no way to
-find the bent path a refraction would have taken, and pretending otherwise adds
-bias, not caustics. So caustics here come only from BSDF-sampled paths that
-happen to land on an emitter, and they converge slowly. The MIS weights stay
-consistent because both strategies agree that the light was not reachable: the
-NEE sample returns zero and the BSDF path carries the full contribution.
+**NEE through glass has its own section now** — see *light through glass* and
+*caustics* below. The short version: a shadow ray goes *through* a thin pane,
+attenuated; a refracting solid still blocks it, and a photon pass carries that
+light instead.
 
 What the tests pin, on top of the table above:
 
@@ -967,6 +964,154 @@ What is *still* not here: **iridescence** (thin films), **BSSRDF** —
 shadow or through a thin part — **nested dielectrics** (one medium slot, so a
 bubble inside glass gets the outer medium wrong), and **spectral MIS** (the
 hero wavelength has no companion wavelengths).
+
+### light through glass
+
+A shadow ray used to stop at anything it touched. `Scene::occluded` was a
+material-blind any-hit test, so a window pane was a brick wall: next-event
+estimation found a blocker, returned black, and the only way light got into a
+glazed room was a BSDF path that happened to refract through the pane and then
+wander into the sun's 0.27° cone. That is one ray in tens of thousands, which
+over the passes a frame gets is salt-and-pepper, not daylight — and it is why
+`levels/court.loon` had its clerestory band cut open as a *hole* for a while,
+with a comment saying so.
+
+A thin sheet is not a blocker, it is a filter. `occluded` is now
+`shadow_transmittance`, which returns *how much* survives the trip rather than
+whether anything is in the way:
+
+* an opaque surface, or a refracting **solid**, blocks as before — `None`;
+* a `thin_walled` transmissive sheet is crossed, multiplying the ray's
+  throughput by `transmission · (1 − F(cos θ))`;
+* at most **four** sheets per shadow ray. A window is one pane, a double
+  glazing two, a display case four; past that the light is not meaningfully
+  getting through, and the cap is also what bounds the traversal.
+
+The Fresnel factor is deliberately `1 − F` and not `(1 − F)²`. This renderer's
+thin-walled lobe is a *single* interface with `R + T = 1` — refract in and
+straight back out, no interior, no lateral offset — and
+`dielectric_eval`'s thin-walled branch applies exactly that factor to a
+BSDF-sampled path. A shadow ray that disagreed by a second `(1 − F)` would make
+the two strategies estimate different integrals, and MIS would then double count
+the refracted path in one direction and lose energy in the other. Agreement is
+the requirement; the second interface is an approximation this renderer's sheet
+does not make anywhere else, so it is not made here either.
+
+A **frosted** pane still blocks. A rough sheet scatters, and the straight-line
+shadow ray is only the right answer in the smooth limit, so the transmittance
+tapers to zero as the specular lobe opens up (`1 − alpha`). Clear glass at
+`roughness 0.02` loses 0.04% to that taper; a fully rough pane loses all of it
+and behaves exactly as it did before.
+
+Both tiers. `gpu/shaders/integrator.wgsl` has the same function with the same
+cap and the same factor, and `tests/gpu_pane.rs` holds the device to it.
+
+| test | what it holds |
+|---|---|
+| `next_event_passes_through_a_thin_pane` | a panel light behind a pane lights a Lambertian point at `(1 − F)` of the open irradiance, within 2% |
+| `a_converged_render_through_a_pane_matches_the_single_strategy` | the *combined* NEE + BSDF estimator lands on the same factor within 3% — which is the MIS consistency check: if the two strategies disagreed, the combination would not |
+| `a_shadow_ray_gives_up_past_the_sheet_cap` | five stacked panes is opaque |
+| `a_frosted_pane_still_blocks_the_shadow_ray` | the smooth-limit approximation refuses to be used outside it |
+| `an_opaque_scene_occludes_exactly_as_the_any_hit_test_did` | 4000 random rays against an opaque scene, hit for hit — the bit-identity guarantee for every render that predates panes |
+| `tests/gpu_pane.rs` | the device lights a floor through a pane at `(1 − F)`, within 2% |
+
+The court's clerestory is glazed again, and the `sky 1` still reads the same
+brightness it did with bare openings, four percent down.
+
+### caustics
+
+The other half of the problem is the half a shadow ray cannot be talked into.
+A *thin* pane does not bend the line to the light measurably, which is why the
+attenuation trick above is legitimate. A glass ball, or a metre of moving
+water, bends it completely: the light that arrives came in along a refracted
+path, and there is no straight line to attenuate. `### the pool` spent a while
+establishing that this is not a sample-count problem — at 1024 spp with the
+clamp off, the pool floor's caustic was isolated single-sample specks with no
+ring structure at all.
+
+So `kosm_render::caustics` goes the other way. Forward light transport, the
+direction photons actually travel:
+
+1. **Emit at the glass.** Photons come off each light aimed into the cone that
+   subtends the refractive geometry's bounds — a cosine-weighted point and a
+   cone direction for an area light, a disc covering the bounds for the sun.
+   Aiming is importance sampling, not a cheat: the photon's power carries the
+   cone's solid angle, so the estimator is the one a full-hemisphere emission
+   would give and simply spends none of its budget on photons that were never
+   going to reach the glass. A photon whose first hit is not transmissive is
+   dropped.
+2. **Follow it with the camera path's own BSDF.** Refraction, reflection,
+   Beer–Lambert inside the medium, and dispersion — a photon that meets a
+   dispersive material draws a hero wavelength and deposits RGB through
+   `spectrum::hero_weight`, the same fan the backward tracer uses. No
+   correction factor is needed for importance transport, because
+   `dielectric_eval` already cancels Walter's `η_t²` against the `1/η²`
+   radiance compression, so what it returns is the symmetric quantity.
+3. **Deposit at the first diffuse surface**, into a world-space hash grid of
+   splats. Not a per-object texel grid: the grid does not care what shape the
+   receiver is, needs no parameterisation and no projection onto a dominant
+   plane, and a pool floor with a drain and a step in it is exactly where a
+   projected grid goes wrong. The kernel is constant over the gather disc —
+   `Φ/(π r²)` — which conserves energy exactly, so the energy test below tests
+   the pass and not a kernel's normalisation.
+4. **Read it as direct light.** At a diffuse hit the integrator adds
+   `albedo/π × E(x)` from the map.
+
+**Nothing is counted twice, and the rule is one line.** A photon is written
+into the map only if its history included a transmissive event on geometry that
+is **not** thin-walled. Every unit of light is claimed by exactly one
+estimator: unobstructed light and light through a pane belong to NEE (which now
+sees through panes); light through a refracting solid or a water surface
+belongs to the map, and a shadow ray still treats those as opaque, so NEE
+contributes nothing along those directions.
+
+**Energy.** A flat glass slab at normal incidence has an analytic
+transmittance, `(1 − F)² = 0.9216` at n = 1.5, and the pass reproduces it to
+within 5% — which exercises the emission disc's normalisation and area, the aim
+at the bounds, the first-hit filter, the walk through two interfaces and the
+deposit, all at once. A glass ball under a straight-down sun of irradiance 1
+takes in π (its silhouette) and deposits **2.656, or 84.5%** — the Fresnel loss
+over two interfaces plus total internal reflection at the rim — concentrating
+it into a spot of **102** at the paraxial focus, a hundred times the sun's own
+irradiance. Floor out of the ball's reach renders pixel-for-pixel as it did
+without the map.
+
+**CPU only this round.** The GPU integrator ignores the map: there is no
+buffer upload and no device-side gather, so `--features gpu` renders the same
+scene without its caustic. That is a real gap and not a rounding of one.
+
+Cost is `photons`, a gather `radius` and `max_bounces`. Photons are shot in
+parallel with one seeded stream each, so the pass is deterministic however
+rayon schedules it — the same property the pixel loop has, for the same reason.
+
+### fireflies, and what the clamp is allowed to eat
+
+The default `firefly_clamp` is an absolute cap in radiance units: any direct
+estimate past depth 0 is truncated to 12. Cheap, effective, and biased in a way
+that does not matter for a studio render — but it is a fixed number against a
+quantity whose scale is the scene's, so a bright scene has its highlights
+shaved and a dim one keeps its fireflies. In the pool it was worse than that:
+the sun's radiance there is about 9000, so every path that *did* find the sun
+through the water was scaled down 750× before averaging. The caustic was not
+merely noisy, it was clamped to nothing.
+
+Two changes:
+
+* **The caustic map is never clamped.** It is a density estimate over many
+  photons, not a Monte Carlo spike; it has no long tail to cut, and clamping a
+  focused spot is indistinguishable from deleting it. The map's contribution is
+  added outside the clamp.
+* **`firefly_clamp_relative`** clamps against the pixel's own running mean
+  instead of a fixed number: `8.0` lets through any sample within eight times
+  the brightness the pixel has settled on, and cuts the rest. Scale-free, so
+  the same value works on a sunlit court and a dim pool, and it adapts to the
+  pixel rather than to the scene — a pixel inside a caustic has a high running
+  mean and keeps its energy, a pixel in shadow does not. It does not engage
+  until `firefly_clamp_warmup` (16) samples have landed, because the first few
+  have no mean to speak of.
+
+`firefly_clamp_relative` defaults to `None`, which leaves the absolute clamp in
+charge and every render that predates the field bit-identical.
 
 ### the GPU tier
 

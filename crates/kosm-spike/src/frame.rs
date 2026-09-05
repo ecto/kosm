@@ -486,7 +486,35 @@ pub fn beauty(
     let scene = picture(track, colliders, marble, marble_r);
     let cam = camera(pose, intr);
     let opts = kosm_render::PathTraceOptions { spp, ..Default::default() };
-    let film = kosm_render::render(&scene, &cam, intr.width, intr.height, &opts);
+    // The bead's own caustic, shot forward. `light.rs` has traced this
+    // spot since the beginning — five spectral bands from the lamp, through
+    // the marble, onto the plate — but it is a bespoke tracer whose answer
+    // is a number for the optimiser, not pixels in the beauty frame. The
+    // path tracer could never find it: a shadow ray from the plate to a
+    // softbox is blocked by the bead, and the refracted path that actually
+    // carries the light is not something next-event estimation can draw.
+    //
+    // The gather radius is a sixth of the bead, coarse enough that 400k
+    // photons fill it and fine enough that the spot is a spot.
+    let caustics = kosm_render::caustics::trace(
+        &scene,
+        &kosm_render::caustics::CausticOptions {
+            photons: std::env::var("KOSM_PHOTONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(400_000),
+            radius: Some(marble_r * 0.15),
+            ..Default::default()
+        },
+    );
+    let film = kosm_render::pathtrace::render_with_caustics(
+        &scene,
+        &cam,
+        intr.width,
+        intr.height,
+        &opts,
+        (!caustics.is_empty()).then_some(&caustics),
+    );
     let px = film.to_srgb8(0.7, false);
     image::RgbaImage::from_raw(film.width, film.height, px).expect("film is width x height x 4")
 }
