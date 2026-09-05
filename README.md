@@ -227,6 +227,31 @@ push (2.2 m in 2.2 s on a flat floor) and a robot's foot never notices. The
 frame is the splat, rendered by tang-3dgs, with the path drawn on the floor.
 Set `KOSM_MAP` to another map directory.
 
+The same frame is now also rendered by kosm-render (`out/garage/frame_kosm.png`,
+and a close-up `frame_kosm_close.png`), from the *same* 274 499 Gaussians: the
+cloud goes in as `Scene::splats` and the marble as an analytic glass sphere
+inside it, with a black environment so that every photon in the picture came
+from the capture. The two backdrops agree — the same red car, the same open
+floor, the same needles where the training grew them — which they should,
+because it is one set of Gaussians composited two ways: the rasteriser
+projects each one to a 2D footprint and sorts by depth, we take each one's
+alpha at the ray's maximum-response point in 3D and sort by `t`. Where they
+differ is exposure: our walk reaches every Gaussian within 3σ of the ray, and
+the sum of those alphas runs a little hot, so the bright floor blooms where
+the rasteriser's tiled 2D footprints stay inside the clamp. And where the
+rasterised frame pastes the marble over the picture, this one has the marble
+*in* it — the glass takes its reflection and its refraction from the room's
+own radiance, which is what "an environment with depth" buys. At 3.4 m a 1 cm
+marble is ten pixels, so `frame_kosm_close.png` is a 6 cm ball seen from 80 cm
+instead: a dark sphere with a bright rim where the lit wall is, its darkness
+the floor it is refracting. That frame also shows the two honest limits of
+this. A capture has no hole in it where you put something, so the segment
+*inside* the ball composites the floor Gaussians the ball is standing among —
+the cloud is a volume and the marble shares space with it. And at 80 cm the
+capture is mush, exactly as `ipse-map`'s own warning says: the SDF exists
+because the splat stops being a picture of anything close up. 24 spp at
+800×600 takes about 50 s on the CPU tier (`KOSM_GARAGE_SPP` to change it).
+
 ### the lamp
 
 `lamp.rs` puts a point lamp in the room and changes the objective to "the
@@ -1665,18 +1690,39 @@ so the tree and the test agree on what exists. Colour stays a call —
 the view direction, which a `Hit` does not carry. 100k random splats build in
 148 ms and trace in **4.3 µs/ray**.
 
-#### what a client still cannot do
+#### what a client can do now: composite a splat cloud
 
-**Composite a splat cloud.** The geometry is there and `Bvh::trace` hands back
-every splat along a ray sorted by `t`, which is precisely the front-to-back
-order compositing needs — but the integrator has no path that consumes it. The
-missing piece is the walk `C += T·α·c; T *= (1 - α)`, breaking when `T` falls
-under ~1e-4, with the result treated as an **emissive backdrop** rather than a
-BSDF: a scanned cloud has its lighting baked in already, and shading it again
-double-counts. Mixing with analytic geometry is that same walk with one bound
-— find the nearest opaque analytic hit first, composite splats only in front
-of it, then add `T · L_analytic`. Until that lands, a `Splats` in a `Scene`
-traces correctly and shades wrongly, so put one in a scene only to measure it.
+A `Scene` may carry `splats: Option<Arc<Bvh<Splats>>>`, and the integrator
+consumes it. On **every ray segment** — the camera ray and each bounce ray
+alike — `splats::composite` gathers the cloud front to back up to whatever the
+segment ran into and walks `C += T·α·c(dir); T *= (1 - α)`, stopping when `T`
+falls under 1e-4. The radiance is added as emission (`L += throughput·C`) and
+the rest of the path is scaled by what got through (`throughput *= T`), so
+splats in front of a wall veil it and splats behind it are never reached.
+Shadow rays multiply their transmittance by the same accumulation, which is
+why a captured wall stops a light and reconstruction dust does not.
+
+The model, stated once: **a splat cloud is emissive and absorbing.** Its
+colours already contain the lighting of the room it was captured in, so it is
+never shaded, never receives light, and spawns no secondary rays — shading it
+again would double-count. What that makes it, for the integrator, is **an
+environment with depth**: like a lat-long `EnvMap` it supplies the radiance
+for a ray that finds no analytic surface, so a marble dropped inside one picks
+up reflections and diffuse bounce from the real room; unlike one it also
+occupies space, so it can stand in front of things as well as behind them.
+
+The limitation that comes with it: **the splat field is not importance
+sampled.** There is no `Environment::sample` aimed at it and no MIS strategy
+for its bright spots, so its indirect light arrives only on BSDF-sampled
+bounce rays. A smooth or specular surface under a captured room is clean at
+low sample counts; a rough diffuse one under a small bright window is noisy —
+the same trade, for the same reason, as the analytic `GradientEnv`. The gather
+also pays a sorted `Bvh::trace` per segment rather than an any-hit test, which
+is what makes the CPU tier the tier this ships on. And a cloud is a volume,
+not a shell: an analytic object placed inside one shares space with whatever
+Gaussians are already there, so the segments *through* a glass sphere pick up
+the cloud the sphere is standing in. There is no carving, and that is a
+statement about the capture rather than about the integrator.
 
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
 `wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other

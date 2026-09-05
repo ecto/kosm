@@ -193,28 +193,20 @@ pub fn roll(model: &Model, garage: &Garage, at: (f64, f64), seconds: f64, materi
     Ok((path, state))
 }
 
-/// Render the splat from `eye` looking at `target`, RGB f32 row-major.
-pub fn render_splat(
-    garage: &Garage,
-    eye: Vec3,
-    target: Vec3,
-    fx: f64,
-    width: u32,
-    height: u32,
-) -> anyhow::Result<(Vec<f32>, usize)> {
-    // KOSM_SPLAT picks another .ply in the map directory (the map ships several
-    // trainings: splat7k is the dense uncleaned one, splat_clean0.12 the most pruned).
+/// The map's Gaussian cloud, with the load-time pruning knobs applied.
+///
+/// KOSM_SPLAT picks another .ply in the map directory (the map ships several
+/// trainings: splat7k is the dense uncleaned one, splat_clean0.12 the most
+/// pruned). A sparse-view training grows needles (extreme anisotropy),
+/// floaters (huge scale) and dust (near-zero opacity); all three are cosmetic
+/// to remove with KOSM_SPLAT_MAX_ANISO / _MAX_SCALE / _MIN_OPACITY, and none
+/// of them are what the SDF stands on.
+pub fn load_cloud(garage: &Garage) -> anyhow::Result<tang_3dgs::GaussianCloud> {
     let path = match std::env::var("KOSM_SPLAT") {
         Ok(name) => garage.map.dir.join(name),
         Err(_) => garage.map.splat_path().ok_or_else(|| anyhow::anyhow!("map has no splat"))?,
     };
     let mut cloud = tang_3dgs::load_ply(&path).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    // KOSM_SPLAT_MAX_SCALE (metres) drops the floaters: gaussians larger than
-    // this are made transparent. The dense training has a few metres-wide ones
-    // parked in front of every camera.
-    // Load-time pruning knobs. A sparse-view training grows needles (extreme
-    // anisotropy), floaters (huge scale) and dust (near-zero opacity); all
-    // three are cosmetic to remove and none are what the SDF stands on.
     let env = |k: &str, default: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(default);
     let (max_scale, max_aniso, min_opacity) = (env("KOSM_SPLAT_MAX_SCALE", f32::INFINITY), env("KOSM_SPLAT_MAX_ANISO", f32::INFINITY), env("KOSM_SPLAT_MIN_OPACITY", 0.0));
     if max_scale.is_finite() || max_aniso.is_finite() || min_opacity > 0.0 {
@@ -230,6 +222,108 @@ pub fn render_splat(
         }
         eprintln!("garage splat: pruned {big} wider than {max_scale} m, {needle} with anisotropy over {max_aniso}, {dust} under opacity {min_opacity}");
     }
+    Ok(cloud)
+}
+
+/// The same cloud behind kosm-render's [`Splats`] seam.
+///
+/// The only work is undoing the trainer's activations — scales are stored as
+/// logs and opacities as logits, and `Splats::from_parts` wants neither — and
+/// reinterpreting `sh_coeffs`, which is already coefficient-major RGB, as the
+/// `[f32; 3]` triples that constructor reads. Nothing is resampled: the
+/// rasteriser and the tracer are handed the *same* Gaussians, so any
+/// difference in the two pictures is a difference in compositing math and
+/// not in the data.
+pub fn splats_of(cloud: &tang_3dgs::GaussianCloud) -> kosm_render::Splats {
+    let scales: Vec<[f32; 3]> = cloud.scales.iter().map(|s| s.map(f32::exp)).collect();
+    let opacities: Vec<f32> = cloud.opacities.iter().map(|o| 1.0 / (1.0 + (-o).exp())).collect();
+    let sh: Vec<[f32; 3]> = cloud.sh_coeffs.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    kosm_render::Splats::from_parts(&cloud.positions, &scales, &cloud.rotations, &opacities, &sh)
+}
+
+/// The garage as kosm-render sees it: the captured cloud as the environment,
+/// the marble as analytic glass inside it, path traced.
+///
+/// This is the same frame `render_splat` rasterises, through the other
+/// renderer. The splat backdrop is composited per ray at each Gaussian's
+/// maximum-response point instead of by projecting it to a 2D footprint, and
+/// the marble is *in* the cloud rather than pasted over it: the room's own
+/// radiance is what reflects off it, refracts through it, and lights the
+/// floor patch under it, because to the integrator the splat field is an
+/// environment that happens to have depth.
+///
+/// Returns the 8-bit RGBA frame and how many Gaussians it traced. Tonemapping
+/// is deliberately *not* applied: a captured cloud's colours are already
+/// display-referred, so a straight clamp is what makes this comparable to the
+/// rasteriser's output pixel for pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn render_kosm(
+    cloud: &tang_3dgs::GaussianCloud,
+    marble: Vec3,
+    radius: f64,
+    eye: Vec3,
+    target: Vec3,
+    vfov: f64,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(image::RgbaImage, usize)> {
+    use std::sync::Arc;
+
+    let splats = splats_of(cloud);
+    let count = splats.count();
+    let splats = Arc::new(kosm_render::Bvh::build(splats));
+
+    // A glass marble: it shows the room twice over, once reflected off the
+    // front and once refracted through the middle, and both of those images
+    // can only come from the capture.
+    let ball = Arc::new(kosm_render::Bvh::build(kosm_render::Analytic::sphere(
+        kosm_render::Point3::new(marble.x, marble.y, marble.z),
+        radius,
+    )));
+    let scene = kosm_render::Scene {
+        objects: vec![kosm_render::Object::new(ball, kosm_render::Pbr::glass(1.52, 0.02))],
+        lights: Vec::new(),
+        // Black at infinity: every photon in this frame came from the
+        // capture. Anything the marble shows that is not black is the garage.
+        env: kosm_render::Environment::constant([0.0; 3]),
+        sun: None,
+        ground: None,
+        splats: Some(splats),
+    };
+    let camera = kosm_render::Camera::look_at(
+        kosm_render::Point3::new(eye.x, eye.y, eye.z),
+        kosm_render::Point3::new(target.x, target.y, target.z),
+        Vec3::z(),
+        vfov.to_degrees(),
+    );
+    let spp = std::env::var("KOSM_GARAGE_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let opts = kosm_render::PathTraceOptions {
+        spp,
+        max_depth: 6,
+        // The cloud is the only illuminant and it is not importance sampled,
+        // so the estimator is BSDF-only; the denoiser earns its keep here.
+        denoise: true,
+        ..Default::default()
+    };
+    let film = kosm_render::render(&scene, &camera, width, height, &opts);
+    let mut img = image::RgbaImage::new(width, height);
+    for (i, px) in img.pixels_mut().enumerate() {
+        let c = |k: usize| (film.rgb[i * 3 + k].clamp(0.0, 1.0) * 255.0) as u8;
+        *px = image::Rgba([c(0), c(1), c(2), 255]);
+    }
+    Ok((img, count))
+}
+
+/// Render the splat from `eye` looking at `target`, RGB f32 row-major.
+pub fn render_splat(
+    garage: &Garage,
+    eye: Vec3,
+    target: Vec3,
+    fx: f64,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(Vec<f32>, usize)> {
+    let cloud = load_cloud(garage)?;
     let camera = tang_3dgs::Camera::look_at(
         [eye.x as f32, eye.y as f32, eye.z as f32],
         [target.x as f32, target.y as f32, target.z as f32],

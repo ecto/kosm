@@ -470,6 +470,7 @@ pub fn picture(
         env: kosm_render::Environment::default(),
         ground: None,
         sun: None,
+        splats: None,
     }
 }
 

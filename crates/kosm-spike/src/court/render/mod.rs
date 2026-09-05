@@ -314,6 +314,7 @@ impl Scene {
             // the panels, and — with `sky` on — whatever the clerestory lets in
             sun: self.sun,
             ground: self.ground,
+            splats: None,
         }
     }
 

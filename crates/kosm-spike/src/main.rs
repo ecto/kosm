@@ -844,6 +844,7 @@ fn garage_stage(level: &Level, map_dir: &Path, out: &Path) -> anyhow::Result<()>
     };
     let target = Vec3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, 0.0);
     let t1 = std::time::Instant::now();
+    let cloud = garage::load_cloud(&g)?;
     let (rgb, count) = garage::render_splat(&g, eye, target, intr.fx, w, h)?;
     let mut img = image::RgbaImage::new(w, h);
     for (i, px) in img.pixels_mut().enumerate() {
@@ -867,6 +868,20 @@ fn garage_stage(level: &Level, map_dir: &Path, out: &Path) -> anyhow::Result<()>
     fs::create_dir_all(&gd)?;
     img.save(gd.join("frame.png"))?;
     println!("garage frame: {count} gaussians rendered by tang-3dgs in {} ms, marble composited over {hits} pixels → {}/frame.png", t1.elapsed().as_millis(), gd.display());
+    // the same frame through kosm-render: the cloud composited per ray as an
+    // environment with depth, with the marble *in* it rather than over it.
+    let t2 = std::time::Instant::now();
+    let (kimg, kcount) = garage::render_kosm(&cloud, b, r, eye, target, 0.75, w, h)?;
+    kimg.save(gd.join("frame_kosm.png"))?;
+    // and a close-up, because at 3.4 m a 1 cm marble is ten pixels: this is
+    // the frame where "the marble is *in* the garage" is a claim you can see.
+    // The ball is 6 cm here rather than the level's 1 cm, and the camera is
+    // 80 cm off it: close enough to read the reflection, far enough that the
+    // capture has not yet dissolved into the mush it becomes inside a metre.
+    let ceye = b + Vec3::new(-0.42, -0.56, 0.34);
+    let (cimg, _) = garage::render_kosm(&cloud, b + Vec3::new(0.0, 0.0, 0.05), 0.06, ceye, b, 0.7, 600, 450)?;
+    cimg.save(gd.join("frame_kosm_close.png"))?;
+    println!("garage frame: the same {kcount} gaussians path traced by kosm-render in {} s — splats composited at each ray's max-response point, glass marble lit by the capture → {}/frame_kosm.png and frame_kosm_close.png", t2.elapsed().as_secs_f64(), gd.display());
     let _ = state;
     Ok(())
 }

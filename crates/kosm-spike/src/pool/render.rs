@@ -556,6 +556,7 @@ impl PoolRenderScene {
             }),
             sun: Some(sun()),
             ground: None,
+            splats: None,
         }
     }
 
