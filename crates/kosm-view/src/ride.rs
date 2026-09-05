@@ -786,7 +786,14 @@ impl RideApp {
             accum: 0.0,
             camera: Camera { eye: V::new(0.0, -2.0, 1.0), target: V::new(0.0, 0.0, 0.0), vfov: 0.9 },
             // 25° up, 2.2 m back, looking along +x at the actor
-            orbit: (-2.2, 25f64.to_radians(), 2.2),
+            // `--orbit=az_deg,el_deg,dist_m` frames a shot without a hand on the mouse.
+            orbit: std::env::args()
+                .find_map(|a| a.strip_prefix("--orbit=").map(str::to_owned))
+                .and_then(|v| {
+                    let f: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                    (f.len() == 3).then(|| (f[0].to_radians(), f[1].to_radians(), f[2]))
+                })
+                .unwrap_or((-2.2, 25f64.to_radians(), 2.2)),
             shot,
             shot_frame: frame,
             shot_now: None,
