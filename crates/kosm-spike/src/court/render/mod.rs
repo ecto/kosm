@@ -74,7 +74,7 @@ impl Scene {
     pub fn new(scene: &CourtScene) -> anyhow::Result<Self> {
         let a = &scene.authored;
         let doc = a.document.clone();
-        let evaluated = vcad_eval::evaluate_document(&doc, &vcad_eval::EvalOptions::default())
+        let evaluated = vcad_eval::evaluate_document(&doc, &vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         anyhow::ensure!(
             evaluated.parts.len() == doc.roots.len(),

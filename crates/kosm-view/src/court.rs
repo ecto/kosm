@@ -170,7 +170,7 @@ impl Stage {
     pub fn build(scene: &CourtScene) -> anyhow::Result<Self> {
         let a = &scene.authored;
         let mm = |k: &str| a.parameter(k);
-        let evaluated = vcad_eval::evaluate_document(&a.document, &vcad_eval::EvalOptions::default())
+        let evaluated = vcad_eval::evaluate_document(&a.document, &vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         anyhow::ensure!(
             evaluated.parts.len() == a.document.roots.len(),
