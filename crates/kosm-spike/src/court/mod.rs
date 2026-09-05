@@ -195,10 +195,17 @@ pub struct Court {
     /// Solids the picture draws that the physics does not own — the net, a
     /// strand, a decal — placed in millimetres. Empty unless something fills it.
     pub extras: Vec<parts::PlacedSolid>,
+    /// The velocity of each solid in `extras`, metres per second, paired with
+    /// it index for index. The net's cords carry their nodes' velocity; an
+    /// extra that is not the net's is still.
+    pub extra_vel: Vec<Vec3>,
     pub net: Option<net::Net>,
     material: ContactMaterial,
     sim: Simulator,
     ball_r: f64,
+    /// The solver's step, seconds. The picture needs it to read a velocity
+    /// back into a displacement: see `render::Snapshot::ball_displacement`.
+    dt: f64,
     n_balls: usize,
     q_pos: Vec<usize>,
     v_lin: Vec<usize>,
@@ -273,6 +280,7 @@ impl Court {
         let sim = Simulator::new().with_contact_config(ContactSolverConfig::simulation());
         let net = net::Net::from_scene(scene)?;
         let extras = net.as_ref().map(|n| n.placed_solids(n.cord_mm)).unwrap_or_default();
+        let extra_vel = net.as_ref().map(|n| n.placed_velocities()).unwrap_or_default();
 
         Ok(Self {
             model,
@@ -282,10 +290,12 @@ impl Court {
             hoop: scene.hoop,
             shot,
             extras,
+            extra_vel,
             net,
             material: scene.material(),
             sim,
             ball_r: r,
+            dt: scene.dt,
             n_balls: n,
             q_pos,
             v_lin,
@@ -305,6 +315,32 @@ impl Court {
     pub fn velocity(&self, ball: usize) -> Vec3 {
         let v = self.v_lin[ball];
         Vec3::new(self.state.v[v], self.state.v[v + 1], self.state.v[v + 2])
+    }
+
+    /// A ball's linear velocity in **world** axes, m/s.
+    ///
+    /// `velocity` is the free joint's own, which phyz keeps in body axes; for
+    /// a ball with backspin those are not the world's, and the picture wants
+    /// the world's. `rotation` is world → body, so its transpose is the way
+    /// back.
+    pub fn world_velocity(&self, ball: usize) -> Vec3 {
+        self.rotation(ball).transpose() * self.velocity(ball)
+    }
+
+    /// A ball's angular velocity in world axes, rad/s.
+    pub fn world_angular_velocity(&self, ball: usize) -> Vec3 {
+        self.rotation(ball).transpose() * self.angular_velocity(ball)
+    }
+
+    /// A ball's angular velocity, rad/s, from the free joint's angular half.
+    pub fn angular_velocity(&self, ball: usize) -> Vec3 {
+        let v = self.v_lin[ball] - 3;
+        Vec3::new(self.state.v[v], self.state.v[v + 1], self.state.v[v + 2])
+    }
+
+    /// The solver's step, seconds.
+    pub fn dt(&self) -> f64 {
+        self.dt
     }
 
     pub fn centres(&self) -> Vec<Vec3> {
@@ -359,6 +395,7 @@ impl Court {
                 (0..self.n_balls).map(|k| (self.centre(k), self.velocity(k), self.ball_r)).collect();
             net.step(&balls);
             self.extras = net.placed_solids(net.cord_mm);
+            self.extra_vel = net.placed_velocities();
             self.net = Some(net);
         }
     }

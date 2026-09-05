@@ -3,7 +3,23 @@
 //! Three threads. The simulation steps on its own and hands over one snapshot
 //! per frame, so the timeline is a recording; the renderer turns the frame
 //! under the cursor into a picture, pass by pass; the viewport blits whatever
-//! the renderer last handed back. The picture is the court's own,
+//! the renderer last handed back.
+//!
+//! ## the world is computed, not predicted
+//!
+//! The frame under the cursor is not the newest frame there is. A pass costs
+//! about ten times what a step of the court costs, so presenting the newest
+//! frame presents a moment that is already a render old. Instead every frame
+//! carries the wall-clock moment it is *for* ([`Timed`]), the window measures
+//! the latency it actually has — a frame's moment against the blit of its
+//! picture — and hands that back to the simulation as a head start. The
+//! simulation runs that far ahead and the window asks for the frame due when
+//! the picture will be on the glass.
+//!
+//! Nothing here interpolates and nothing here predicts. The court is
+//! deterministic: the frame the renderer aims at is the frame the simulation
+//! would have reached anyway, computed early. Paused, the head start is zero.
+//! `KOSM_NO_LOOKAHEAD=1` puts the old pace back for comparison. The picture is the court's own,
 //! `kosm_spike::court::render`: the level's roots evaluated by vcad into BRep
 //! solids with one BVH each, materials by root name, the balls and the net
 //! placed where phyz has them, the panels as area lights. This file owns the
@@ -50,8 +66,10 @@
 //! gain nothing and a picture that is always masked never converges — so the
 //! bounces buy cheap passes and the quiet between them buys full ones.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kosm_spike::court::render::{self, Snapshot};
 use kosm_spike::court::{Court, CourtScene};
@@ -68,6 +86,48 @@ use crate::viewport;
 /// itself never moves, so it is built once and lives in the renderer.
 pub type Frame = Snapshot;
 
+/// A frame and the wall-clock moment it is *for*.
+///
+/// The recording used to be a bare list and the window showed its last entry.
+/// That is the frame the simulation has *already* reached, and by the time a
+/// pass of it is on the glass it is one render behind the world. A frame that
+/// knows when it is due can be asked for early instead.
+#[derive(Clone)]
+struct Timed {
+    frame: Frame,
+    /// When this frame should be on the glass.
+    due: Instant,
+}
+
+/// How far ahead of the wall clock the simulation is allowed to run, in
+/// microseconds, and the one number the window writes for it. The window
+/// measures what a picture actually costs between a frame's moment and its
+/// blit, and asks the simulation for exactly that much of a head start.
+///
+/// It is a head start and not a prediction. The court is deterministic and
+/// costs about a millisecond of solver for thirty of render, so the frame the
+/// renderer aims at is *computed* — the same state the simulation would reach
+/// on its own clock, arrived at early.
+type Lookahead = Arc<AtomicU64>;
+
+/// The most the simulation will run ahead: four frames. Past that a pause or
+/// a stall would have it solving a world nobody is going to see.
+const MAX_LOOKAHEAD: Duration = Duration::from_millis(80);
+
+/// How far behind the wall clock the simulation will chase before it gives up
+/// chasing.
+///
+/// A render spike — the net minting a hundred solids and their BVHs — can
+/// take the core out from under the solver for a few frames. The debt that
+/// leaves is permanent if the frame numbering is nailed to a fixed origin:
+/// every frame after it is due in the past, the window is handed a stale
+/// moment however early it asks, and the measured latency climbs without
+/// bound. It was climbing: a session that had been holding 30 ms would find
+/// the simulation a second behind and stay there. So past this much slip the
+/// clock is re-based — **the world runs slow rather than behind**, which is
+/// what the capped catch-up already says about the solver.
+const MAX_SLIP: Duration = Duration::from_millis(120);
+
 /// The court, stepping on its own thread, in wall-clock time: each frame is
 /// due at its own moment and the solver takes fixed `dt` steps to reach it.
 /// A machine that cannot keep up runs slow — the catch-up is capped, so a
@@ -75,9 +135,15 @@ pub type Frame = Snapshot;
 /// stop: the level's `t_end` is the recording's length, not the world's, and
 /// a live window keeps its world running. `frames > 0` caps it, for a test.
 ///
+/// What is new is *when* it does the work. A frame due at `start + k/fps` is
+/// solved `lookahead` early, so that by the time the renderer has finished a
+/// pass of it the moment it was for has arrived. Nothing about the frame
+/// changes — the same `dt` steps to the same sim time — only the wall clock
+/// it is computed on. The simulation never waits for the renderer.
+///
 /// There is no status panel to say any of this, so what it has to say it says
 /// on stderr.
-fn simulate(tx: Sender<Frame>, frames: usize) {
+fn simulate(tx: Sender<Timed>, frames: usize, lookahead: Lookahead) {
     let scene = match CourtScene::bundled() {
         Ok(scene) => scene,
         Err(error) => return eprintln!("court: could not load the scene: {error}"),
@@ -89,31 +155,76 @@ fn simulate(tx: Sender<Frame>, frames: usize) {
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
     // At most four frames of solving for one frame of wall clock.
     let cap = 4 * steps_per_frame;
-    let _ = tx.send(Frame::of(&court));
-    let start = Instant::now();
+    let mut start = Instant::now();
+    let _ = tx.send(Timed { frame: Frame::of(&court), due: start });
     let mut said = false;
+    let mut solved = Duration::ZERO;
+    let mut snapped = Duration::ZERO;
+    let mut said_at = Instant::now();
+    let mut said_k = 0usize;
+    let mut slipped = Duration::ZERO;
+    let mut slips = 0u32;
     for k in 1.. {
         if frames > 0 && k > frames {
             break;
         }
-        let due = k as f64 / scene.fps;
-        if let Some(nap) = std::time::Duration::from_secs_f64(due).checked_sub(start.elapsed()) {
+        let due_t = k as f64 / scene.fps;
+        let mut due = start + Duration::from_secs_f64(due_t);
+        let now = Instant::now();
+        if now > due + MAX_SLIP {
+            slipped += now.duration_since(due);
+            slips += 1;
+            start = now - Duration::from_secs_f64(due_t);
+            due = now;
+        }
+        let ahead = Duration::from_micros(lookahead.load(Ordering::Relaxed)).min(MAX_LOOKAHEAD);
+        if let Some(nap) = due
+            .checked_sub(ahead)
+            .and_then(|at| at.checked_duration_since(Instant::now()))
+        {
             std::thread::sleep(nap);
         }
+        let lap = Instant::now();
         let mut steps = 0;
-        while court.time() + 0.5 * scene.dt < due && steps < cap {
+        while court.time() + 0.5 * scene.dt < due_t && steps < cap {
             court.step();
             steps += 1;
         }
-        if tx.send(Frame::of(&court)).is_err() {
+        solved += lap.elapsed();
+        let snap = Instant::now();
+        if tx.send(Timed { frame: Frame::of(&court), due }).is_err() {
             return;
+        }
+        snapped += snap.elapsed();
+        if said_at.elapsed().as_secs() >= 2 {
+            let f = (k - said_k) as f64;
+            eprintln!(
+                "court  sim: {:.2} ms solving, {:.2} ms snapshotting a frame; {:.0} frames a second of wall clock{}",
+                solved.as_secs_f64() * 1e3 / f,
+                snapped.as_secs_f64() * 1e3 / f,
+                f / said_at.elapsed().as_secs_f64(),
+                if slips > 0 {
+                    format!(
+                        "; slipped {slips}\u{d7} ({:.0} ms given up on)",
+                        slipped.as_secs_f64() * 1e3
+                    )
+                } else {
+                    String::new()
+                },
+            );
+            said_at = Instant::now();
+            said_k = k;
+            solved = Duration::ZERO;
+            snapped = Duration::ZERO;
+            slipped = Duration::ZERO;
+            slips = 0;
         }
         if !said && court.time() >= scene.t_end {
             said = true;
             eprintln!(
                 "court  {:.2} s simulated in {:.1} s; still running",
                 court.time(),
-                start.elapsed().as_secs_f64()
+                start.elapsed().as_secs_f64(),
             );
         }
     }
@@ -174,6 +285,11 @@ pub struct Job {
     pub camera: Camera,
     pub size: (u32, u32),
     pub spp: u32,
+    /// The wall-clock moment this frame is *for*. It rides through the
+    /// renderer untouched and comes back on the [`Shot`], which is the whole
+    /// of how the window measures what it costs to show a moment: the frame's
+    /// due time against the instant its picture is handed to the blit.
+    pub due: Instant,
 }
 
 /// What comes back: the picture at the requested size, and what the pass cost
@@ -202,6 +318,8 @@ pub struct Shot {
     /// reallocates — nothing on this side can resample them without a
     /// readback, and the whole point of that tier is that nothing comes back.
     pub resize_costs_history: bool,
+    /// The due time of the frame this pass was of.
+    pub due: Instant,
 }
 
 fn options(spp: u32, seed: u64, denoise: bool) -> pathtrace::PathTraceOptions {
@@ -516,6 +634,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
             mean_spp,
             traced_px,
             resize_costs_history,
+            due: job.due,
         };
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
@@ -987,10 +1106,10 @@ struct Ask(u64, [i64; 7], (u32, u32), u32);
 /// The court on screen. It owns the recording and the camera and decides what
 /// to ask the render thread for; the picture itself is the render thread's.
 struct App {
-    rx: Receiver<Frame>,
+    rx: Receiver<Timed>,
     shots: Receiver<Shot>,
     jobs: Sender<Job>,
-    frames: Vec<Frame>,
+    frames: Vec<Timed>,
     cursor: usize,
     /// Following the simulation as it happens. The window opens this way and
     /// space comes back to it; pausing is the exception.
@@ -1062,18 +1181,44 @@ struct App {
     pending: Option<(Receiver<Job>, Sender<Shot>)>,
     /// Forced by `--cpu`: never hand the render thread a device.
     cpu_only: bool,
+
+    // ---- the pace ----------------------------------------------------------
+    /// What the window tells the simulation to run ahead by, in microseconds.
+    /// Written here, read on the simulation thread.
+    lookahead: Lookahead,
+    /// Milliseconds between a frame's due moment and the blit of its picture,
+    /// as a moving average. This is the number the whole of the lookahead is
+    /// for: it is the latency a viewer sees, and the head start that cancels
+    /// it is exactly its own size.
+    latency_ms: f64,
+    /// The worst one seen since the last pacing line.
+    worst_ms: f64,
+    /// Frames the simulation produced that no pass was ever taken of, and
+    /// moments the window wanted a frame for that the simulation had not
+    /// reached yet.
+    dropped: u64,
+    late: u64,
+    /// One frame of the recording, in wall-clock time, learned from the first
+    /// two frames rather than re-read off the level.
+    gap: Duration,
+    said_pace: Instant,
+    /// `KOSM_NO_LOOKAHEAD=1`: present the newest frame the simulation has,
+    /// the way the window used to. Kept so the two can be measured against
+    /// each other in one session rather than argued about.
+    no_lookahead: bool,
 }
 
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        rx: Receiver<Frame>,
+        rx: Receiver<Timed>,
         shots: Receiver<Shot>,
         jobs: Sender<Job>,
         camera: Camera,
         spp: u32,
         pending: (Receiver<Job>, Sender<Shot>),
         cpu_only: bool,
+        lookahead: Lookahead,
     ) -> Self {
         let mut app = Self {
             rx,
@@ -1105,6 +1250,14 @@ impl App {
             asked: None,
             pending: Some(pending),
             cpu_only,
+            lookahead,
+            latency_ms: 0.0,
+            worst_ms: 0.0,
+            dropped: 0,
+            late: 0,
+            gap: Duration::from_millis(16),
+            said_pace: Instant::now(),
+            no_lookahead: std::env::var("KOSM_NO_LOOKAHEAD").is_ok(),
         };
         app.orbit = app.orbit_from_camera();
         app
@@ -1285,18 +1438,71 @@ impl App {
         )
     }
 
+    /// Which frame the window is *for* right now.
+    ///
+    /// Not the newest one the simulation has — that one is already in the
+    /// past by the time a pass of it exists. The window aims at the moment
+    /// the picture will actually be on the glass, which is now plus the
+    /// latency it has measured, and takes the simulation's own frame for that
+    /// moment. The simulation has been told to run that far ahead, so the
+    /// frame is normally there; when it is not, the window falls back to the
+    /// newest it has and counts the starve.
+    ///
+    /// Nothing here interpolates. Every frame presented is a frame the solver
+    /// took `dt` steps to reach — the world is computed, not predicted.
+    fn pace(&mut self, n: usize) {
+        let want = if self.no_lookahead {
+            n - 1
+        } else {
+            let deadline = Instant::now() + self.head_start();
+            match self.frames.iter().rposition(|f| f.due <= deadline) {
+                Some(k) => {
+                    // Short by more than a frame: the simulation has not
+                    // reached the moment the picture is for, and the window
+                    // shows the newest real frame instead. Being short by
+                    // *less* than a frame is the steady state and not news —
+                    // the frame it would have wanted is the one it is holding.
+                    if k == n - 1 && self.frames[k].due + self.gap < deadline {
+                        self.late += 1;
+                    }
+                    k
+                }
+                None => 0,
+            }
+        };
+        // Frames the simulation produced that no pass was ever taken of. A
+        // dropped frame is not a stutter — the next frame presented is still
+        // the right frame for its moment — but it is work thrown away and the
+        // log says how much.
+        if want > self.cursor + 1 {
+            self.dropped += (want - self.cursor - 1) as u64;
+        }
+        self.cursor = want;
+    }
+
+    /// The head start the simulation is asked for: the latency actually
+    /// measured, capped, and nothing at all while paused — a paused window
+    /// renders the frame under the cursor and has no future to reach for.
+    fn head_start(&self) -> Duration {
+        if !self.live || self.no_lookahead {
+            return Duration::ZERO;
+        }
+        Duration::from_micros((self.latency_ms.max(0.0) * 1e3) as u64).min(MAX_LOOKAHEAD)
+    }
+
     fn ask(&mut self) {
-        let Some(frame) = self.frames.get(self.cursor) else {
+        let Some(timed) = self.frames.get(self.cursor) else {
             return;
         };
         self.generation += 1;
         let job = Job {
             generation: self.generation,
             frame_id: self.frame_id(),
-            frame: frame.clone(),
+            frame: timed.frame.clone(),
             camera: self.camera,
             size: self.size(),
             spp: self.samples,
+            due: timed.due,
         };
         let _ = self.jobs.send(job);
         self.asked = Some(self.ask_key());
@@ -1347,11 +1553,16 @@ impl viewport::Scene for App {
 
     fn image(&mut self) -> Option<viewport::Image> {
         while let Ok(frame) = self.rx.try_recv() {
+            if let Some(prev) = self.frames.last() {
+                if self.frames.len() == 1 {
+                    self.gap = frame.due.saturating_duration_since(prev.due);
+                }
+            }
             self.frames.push(frame);
         }
         let n = self.frames.len();
         if self.live && n > 0 {
-            self.cursor = n - 1;
+            self.pace(n);
         }
         // Every shot is shown, even one the window has already moved past: a
         // pass takes longer than a redraw, so refusing stale ones would leave
@@ -1359,6 +1570,16 @@ impl viewport::Scene for App {
         let mut newest = None;
         while let Ok(shot) = self.shots.try_recv() {
             let fair = self.tune(&shot);
+            // What this picture cost the viewer: from the moment its frame is
+            // *for* to the moment it goes to the blit. `image` is called from
+            // the redraw, so now is that moment.
+            let ms = Instant::now().saturating_duration_since(shot.due).as_secs_f64() * 1e3;
+            self.latency_ms = if self.latency_ms > 0.0 {
+                0.8 * self.latency_ms + 0.2 * ms
+            } else {
+                ms
+            };
+            self.worst_ms = self.worst_ms.max(ms);
             newest = Some(shot.image);
             if !fair {
                 continue;
@@ -1449,6 +1670,31 @@ impl viewport::Scene for App {
             }
             self.quiet = 0;
         }
+        // The one number the simulation thread reads. Paused, it is zero.
+        self.lookahead
+            .store(self.head_start().as_micros() as u64, Ordering::Relaxed);
+        if self.said_pace.elapsed().as_secs() >= 2 {
+            self.said_pace = Instant::now();
+            let lead = self.frames.last().map_or(0.0, |f| {
+                let now = Instant::now();
+                f.due.saturating_duration_since(now).as_secs_f64() * 1e3
+                    - now.saturating_duration_since(f.due).as_secs_f64() * 1e3
+            });
+            eprintln!(
+                "court  pace: {:.0} ms presented latency (worst {:.0}), {:.0} ms head start, \
+                 the sim {:.0} ms ahead; {} dropped, {} late{}",
+                self.latency_ms,
+                self.worst_ms,
+                self.head_start().as_secs_f64() * 1e3,
+                lead,
+                self.dropped,
+                self.late,
+                if self.no_lookahead { " (lookahead off)" } else { "" },
+            );
+            self.dropped = 0;
+            self.late = 0;
+            self.worst_ms = 0.0;
+        }
         if n > 0 && self.asked != Some(self.ask_key()) {
             self.ask();
         }
@@ -1465,7 +1711,9 @@ pub fn run(frames: usize, spp: u32, cpu_only: bool) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || simulate(tx, frames));
+    let lookahead: Lookahead = Arc::new(AtomicU64::new(0));
+    let sim_lookahead = lookahead.clone();
+    std::thread::spawn(move || simulate(tx, frames, sim_lookahead));
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
@@ -1489,6 +1737,7 @@ pub fn run(frames: usize, spp: u32, cpu_only: bool) -> anyhow::Result<()> {
             spp,
             (job_rx, shot_tx),
             cpu_only,
+            lookahead,
         ),
     )
 }

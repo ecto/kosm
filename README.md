@@ -512,6 +512,49 @@ frame never asks for the work of every frame it missed — and the window shows
 the frame it is on. Space pauses; space again rejoins the simulation where it
 has got to.
 
+### the world is computed, not predicted
+
+A game renderer that wants to hide its own latency guesses: it estimates
+motion from screen space and interpolates frames it never rendered. This one
+owns the physics, so it does neither. The court costs about **3 ms of solver
+for a frame that costs 30 ms of render**, so the cheap half is told to run
+early: the window measures the time between a frame's own moment and the blit
+of its picture, hands that number to the simulation as a head start, and then
+asks for the frame due at *the moment the picture will be on the glass* rather
+than the newest frame there is. The simulation is deterministic, so that frame
+is not a prediction — it is the frame, taken in `dt` steps to its own time,
+just computed early. `--at`-style stepping and the lookahead reach the same
+state bit for bit, and a test says so. Measured on this machine, over the same
+minute of the same level: **59 ms of presented latency before, 31 ms after**,
+with the pass time unchanged at ~30 ms. Paused, the head start is zero — the
+window renders the frame under the cursor and has no future to reach for.
+
+Motion vectors come from the same place. The frames are real frames, the
+reprojection differences the pose the *previous pass* was folded at against
+this one's, and `Snapshot` now carries each ball's world-frame linear and
+angular velocity and each net cord's alongside the poses — so a displacement
+can be read straight out of the physics. It is exact, not an estimate: the
+solver advances a position by the velocity at the end of each step, so the
+trapezoid of two frames' velocities plus half a step of their difference is
+the displacement the solver actually applied, and for a ball in flight the two
+agree to 1e-16 m. That is what `Snapshot::ball_displacement` is, and what
+`velocity_is_the_motion_vector` checks.
+
+Nothing blocks: the simulation never waits for the renderer, the window
+presents at the display's refresh with the newest completed picture, and the
+frames that go by unrendered are counted rather than hidden — `court pace:`
+says the latency, the head start, how far ahead the simulation is, and how
+many frames were dropped and how many moments arrived late, every two seconds.
+A pass that overruns a refresh still leaves the picture smooth in *time* —
+every frame presented is a real frame at its right moment — and only coarser
+in pixels, which is the trade the tuner was already making. If a render spike
+takes the core out from under the solver, the simulation gives up the debt
+rather than chasing it: past 120 ms of slip the clock is re-based, so the
+world runs slow rather than permanently behind. (Chasing it was worth a
+second of latency in a session that had been holding thirty milliseconds.)
+`KOSM_NO_LOOKAHEAD=1` puts the old behaviour back, so the two can be measured
+against each other in one sitting.
+
 The picture is not written by the viewer. The level's roots are evaluated once
 by `vcad-eval` into BRep solids, and every frame is that geometry with the
 balls and the net where phyz has them, a material per root name, and the

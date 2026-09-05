@@ -343,6 +343,22 @@ impl Net {
         out
     }
 
+    /// The velocity of each solid `placed_solids` emits, metres per second:
+    /// the mean of its two nodes'. Paired with `placed_solids` cord for cord,
+    /// degenerate cords skipped the same way, so the two vectors index alike.
+    pub fn placed_velocities(&self) -> Vec<Vec3> {
+        let mut out = Vec::with_capacity(self.cords.len());
+        for cord in &self.cords {
+            let d = (self.nodes[cord.b] - self.nodes[cord.a]) / MM;
+            let len = d.norm();
+            if !len.is_finite() || len < 1e-6 {
+                continue;
+            }
+            out.push(0.5 * (self.vel[cord.a] + self.vel[cord.b]));
+        }
+        out
+    }
+
     /// A cylinder of this length, from the cache if the length has been seen
     /// (bucketed: the segments repeat, and a fresh BRep per segment per frame
     /// is the expensive part).

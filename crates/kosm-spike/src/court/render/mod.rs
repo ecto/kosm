@@ -50,16 +50,64 @@ pub const PER_M: f64 = 1.0 / MM;
 /// of the picture never needs the `Court` itself.
 #[derive(Clone)]
 pub struct Snapshot {
+    /// The simulation's own clock at this instant, seconds.
+    pub t: f64,
+    /// The solver's step, seconds. Kept because a velocity only reads back
+    /// into a displacement if the quadrature the integrator used is known —
+    /// see [`Snapshot::ball_displacement`].
+    pub dt: f64,
     pub balls: Vec<(PVec3, Mat3)>,
+    /// Each ball's linear and angular velocity at `t`, in **world** axes,
+    /// m/s and rad/s (phyz keeps the free joint's in body axes). The
+    /// physics has them; the picture no longer has to guess at motion from
+    /// two poses and a frame number.
+    pub vel: Vec<(PVec3, PVec3)>,
     pub extras: Vec<PlacedSolid>,
+    /// The velocity of each extra, paired with `extras` index for index.
+    pub extra_vel: Vec<PVec3>,
 }
 
 impl Snapshot {
     pub fn of(court: &Court) -> Self {
         Self {
+            t: court.time(),
+            dt: court.dt(),
             balls: (0..court.bodies()).map(|k| (court.centre(k), court.rotation(k))).collect(),
+            vel: (0..court.bodies())
+                .map(|k| (court.world_velocity(k), court.world_angular_velocity(k)))
+                .collect(),
             extras: court.extras.clone(),
+            extra_vel: court.extra_vel.clone(),
         }
+    }
+
+    /// How far ball `k` moved between `prev` and this snapshot, in metres,
+    /// **from the two velocities alone** — no pose is read.
+    ///
+    /// The solver advances a position by the velocity at the *end* of each
+    /// step, so over a run of steps at constant acceleration the exact sum is
+    /// the trapezoid of the endpoint velocities plus half a step of the
+    /// velocity they differ by. That is not an approximation and not an
+    /// extrapolation: for a ball in flight it agrees with the integrator to
+    /// the last bit, which is what makes a motion vector *exact* rather than
+    /// estimated. A ball that touched something in the interval did not have
+    /// a constant acceleration, and there the poses are what to difference.
+    pub fn ball_displacement(&self, prev: &Snapshot, k: usize) -> PVec3 {
+        let span = self.t - prev.t;
+        let (v0, v1) = (prev.vel[k].0, self.vel[k].0);
+        (v0 + v1) * (0.5 * span) + (v1 - v0) * (0.5 * self.dt)
+    }
+
+    /// Where ball `k` was `back` seconds before this snapshot, from this
+    /// snapshot's velocity and acceleration implied by `prev`. Used only when
+    /// there is no real previous frame to difference against.
+    pub fn ball_centre_before(&self, prev: &Snapshot, k: usize, back: f64) -> PVec3 {
+        let span = self.t - prev.t;
+        let (v0, v1) = (prev.vel[k].0, self.vel[k].0);
+        // the acceleration the interval actually had, and the same quadrature
+        let a = if span.abs() > 1e-12 { (v1 - v0) / span } else { PVec3::zeros() };
+        let v_back = v1 - a * back;
+        self.balls[k].0 - ((v_back + v1) * (0.5 * back) + (v1 - v_back) * (0.5 * self.dt))
     }
 }
 

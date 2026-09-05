@@ -241,6 +241,12 @@ pub struct Stage {
     /// two passes of one frame moved nothing, and the second declares no
     /// motion at all.
     prev_placements: Option<Vec<Placement>>,
+    /// How many of `placements` are ball parts. They come first, they are the
+    /// same count every frame, and the net's are what changes — so when the
+    /// two passes' instance lists do not line up, this is how much of them
+    /// still does.
+    ball_places: usize,
+    prev_ball_places: usize,
     /// The court on the device. Built on the first pass, kept across every
     /// one after it: a frame rewrites the placements, a pass rewrites the
     /// camera. `uploaded` is the frame whose placements are currently in it.
@@ -386,6 +392,8 @@ impl Stage {
             placements: Vec::new(),
             face_count: 0,
             prev_placements: None,
+            ball_places: 0,
+            prev_ball_places: 0,
             max_depth,
             filter,
             env: stage.environment().clone(),
@@ -425,6 +433,7 @@ impl Stage {
                 });
             }
         }
+        self.ball_places = places.len();
         for (solid, pbr, to_world) in stage.extra_parts(snap) {
             let key = solid as *const Solid as usize;
             if !self.extras.contains_key(&key) {
@@ -465,12 +474,26 @@ impl Stage {
             return (None, 0);
         };
         let cur = &self.placements;
-        if prev.len() != cur.len() || self.face_count == 0 {
+        if self.face_count == 0 {
             return (None, 0);
         }
+        // The instance lists line up frame to frame while the net keeps the
+        // same number of cords. When it does not — a cord went degenerate and
+        // was dropped — the balls still line up, and they are the part of the
+        // picture the eye is following. Reprojecting them and leaving the net
+        // to the per-pixel clamp keeps a history that used to be thrown away
+        // whole. The ball parts are the head of both lists, in the order
+        // `at` merged them.
+        let paired = if prev.len() == cur.len() {
+            cur.len()
+        } else if self.prev_ball_places == self.ball_places && self.ball_places > 0 {
+            self.ball_places
+        } else {
+            return (None, 0);
+        };
         let mut ids = vec![InstanceMotion::STATIC; self.face_count as usize];
         let mut mats: Vec<[f32; 12]> = Vec::new();
-        for (p, c) in prev.iter().zip(cur.iter()) {
+        for (p, c) in prev.iter().take(paired).zip(cur.iter().take(paired)) {
             if p.faces != c.faces {
                 return (None, 0);
             }
@@ -707,6 +730,7 @@ impl Stage {
         // What the *next* pass differences against. The history is now in
         // this pass's poses, whatever the frame does after it.
         self.prev_placements = Some(self.placements.clone());
+        self.prev_ball_places = self.ball_places;
         Ok(texture)
     }
 
