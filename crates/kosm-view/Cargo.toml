@@ -3,13 +3,14 @@ name = "kosm-view"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The window: play, scrub and inspect a Kosm simulation; export is a button"
+description = "The window: a wgpu surface, a blitted image, and nothing else on it"
 
 [dependencies]
 kosm-spike = { path = "../kosm-spike" }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-bytemuck = { version = "1", features = ["derive"] }
-egui = "0.36"
+# the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
 image.workspace = true
 phyz-math.workspace = true
 tang.workspace = true

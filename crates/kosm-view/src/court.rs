@@ -1,9 +1,10 @@
-//! The court in the window: `kosm-view --court`.
+//! The court in the window: `kosm-view`.
 //!
-//! Same shape as the pool viewer — the simulation runs on its own thread and
-//! hands over one snapshot per frame, the window keeps every snapshot so the
-//! timeline is a recording — but the picture is not hand-written geometry.
-//! The level's roots are evaluated once by `vcad_eval` into BRep `Solid`s,
+//! Three threads. The simulation steps on its own and hands over one snapshot
+//! per frame, so the timeline is a recording; the renderer turns the frame
+//! under the cursor into a picture, pass by pass; the viewport blits whatever
+//! the renderer last handed back. Nothing in the picture is hand-written
+//! geometry. The level's roots are evaluated once by `vcad_eval` into BRep `Solid`s,
 //! each gets a `vcad_kernel_raytrace::Bvh`, and the frame is a
 //! `vcad_kernel_raytrace::pathtrace::Scene`: those BVHs as `Object`s with a
 //! material per root name, the balls as `Object::placed` at their poses, and
@@ -13,29 +14,27 @@
 //! ## why the CPU tier
 //!
 //! `vcad-kernel-raytrace` has a `gpu` feature, and it does compile in this
-//! workspace — but it pins **wgpu 23**, while `eframe` 0.36 (and its
-//! `egui-wgpu`) is on **wgpu 30**. Two major versions of wgpu are two
-//! unrelated sets of types: the `Device`, `Queue`, `Buffer` and `Texture`
-//! egui hands a paint callback cannot be passed to `RayTracePipeline`, and a
-//! texture the tracer wrote cannot be sampled by egui's renderer. There is no
-//! conversion; they are different crates that happen to share a name. So the
-//! GPU tracer could only run on a *second*, headless wgpu-23 device with a
-//! full CPU readback per frame — which is not "render into an egui texture",
-//! and whose scene format (`GpuScene::from_brep`, one merged BRep with no
+//! workspace — but it pins **wgpu 23**, while the viewport's surface is on
+//! **wgpu 30**. Two major versions of wgpu are two unrelated sets of types:
+//! the `Device`, `Queue`, `Buffer` and `Texture` the surface hands out cannot
+//! be passed to `RayTracePipeline`, and a texture the tracer wrote cannot be
+//! sampled by the blit. There is no conversion; they are different crates
+//! that happen to share a name. So the GPU tracer could only run on a
+//! *second*, headless wgpu-23 device with a full CPU readback per frame —
+//! and its scene format (`GpuScene::from_brep`, one merged BRep with no
 //! per-instance transform) would force the whole court to be rebuilt and
 //! re-uploaded every time a ball moves.
 //!
-//! So this is the CPU path tracer, `pathtrace::render`, run small (320×180 by
-//! default) on a worker thread and accumulated progressively: passes keep
-//! being added to the same frame while nothing changes, and the accumulator
-//! is thrown away the moment the cursor, the camera or the panel size moves.
-//! It is the same integrator the reference tier uses, at fewer samples.
+//! So this is the CPU path tracer, `pathtrace::render`, run small on a worker
+//! thread and accumulated progressively: passes keep being added to the same
+//! frame while nothing changes, and the accumulator is thrown away the moment
+//! the cursor, the camera or the window size moves. It is the same integrator
+//! the CLI's reference tier uses, at fewer samples.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
-use eframe::egui;
 use kosm_spike::court::{Court, CourtScene};
 use kosm_spike::scene::MM;
 use phyz_math::{Mat3, Vec3};
@@ -44,14 +43,7 @@ use vcad_kernel_math::{Point3, Transform, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace::{self, AreaLight, Environment, Film, Object, Pbr};
 use vcad_kernel_raytrace::Bvh;
 
-/// What the simulation or the renderer is doing, for the window to show.
-type Status = Arc<Mutex<String>>;
-
-fn set(status: &Status, s: String) {
-    if let Ok(mut g) = status.lock() {
-        *g = s;
-    }
-}
+use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
 
@@ -59,67 +51,60 @@ fn set(status: &Status, s: String) {
 #[derive(Clone, Copy)]
 pub struct BallPose {
     pub centre: Vec3,
-    pub velocity: Vec3,
     /// The ball's body frame, for a seamed ball's texture.
     pub rot: Mat3,
 }
 
-/// One frame of the recording: the ball poses and the time, nothing else.
-/// The court itself never moves, so it is built once and lives in the
-/// renderer.
+/// One frame of the recording. The court itself never moves, so it is built
+/// once and lives in the renderer; a frame is only where the balls are.
 #[derive(Clone)]
 pub struct Frame {
-    pub time: f64,
     pub balls: Vec<BallPose>,
-    /// When the shot's centre passed down through the rim, if it has.
-    pub made_at: Option<f64>,
-    /// Which ball is the shot, if there is one.
-    pub shot: Option<usize>,
-    pub sim_ms: u128,
 }
 
 impl Frame {
-    fn take(court: &Court, sim_ms: u128) -> Self {
-        Self {
-            time: court.time(),
-            balls: (0..court.bodies())
-                .map(|k| BallPose { centre: court.centre(k), velocity: court.velocity(k), rot: court.rotation(k) })
-                .collect(),
-            made_at: court.made_at,
-            shot: court.shot,
-            sim_ms,
-        }
+    fn take(court: &Court) -> Self {
+        Self { balls: (0..court.bodies()).map(|k| BallPose { centre: court.centre(k), rot: court.rotation(k) }).collect() }
     }
 }
 
-/// The court, stepping on its own thread.
-fn simulate(tx: Sender<Frame>, status: Status, frames: usize) {
+/// The court, stepping on its own thread, in wall-clock time: each frame is
+/// due at its own moment and the solver takes fixed `dt` steps to reach it.
+/// A machine that cannot keep up runs slow — the catch-up is capped, so a
+/// late frame never asks for the work of every frame it missed.
+///
+/// There is no status panel to say any of this, so what it has to say it says
+/// on stderr.
+fn simulate(tx: Sender<Frame>, frames: usize) {
     let scene = match CourtScene::bundled() {
         Ok(scene) => scene,
-        Err(error) => return set(&status, format!("could not load the court scene: {error}")),
+        Err(error) => return eprintln!("court: could not load the scene: {error}"),
     };
     let mut court = match Court::from_scene(&scene) {
         Ok(court) => court,
-        Err(error) => return set(&status, format!("could not build the court: {error}")),
+        Err(error) => return eprintln!("court: could not build the court: {error}"),
     };
     let frames = if frames > 0 { frames } else { scene.frames() };
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
-    let _ = tx.send(Frame::take(&court, 0));
-    for k in 0..frames {
-        let t0 = Instant::now();
-        for _ in 0..steps_per_frame {
-            court.step();
+    // At most four frames of solving for one frame of wall clock.
+    let cap = 4 * steps_per_frame;
+    let _ = tx.send(Frame::take(&court));
+    let start = Instant::now();
+    for k in 1..=frames {
+        let due = k as f64 / scene.fps;
+        if let Some(nap) = std::time::Duration::from_secs_f64(due).checked_sub(start.elapsed()) {
+            std::thread::sleep(nap);
         }
-        let ms = t0.elapsed().as_millis();
-        set(
-            &status,
-            format!("frame {} of {frames} · {ms} ms per frame · t {:.2} s", k + 1, court.time()),
-        );
-        if tx.send(Frame::take(&court, ms)).is_err() {
+        let mut steps = 0;
+        while court.time() + 0.5 * scene.dt < due && steps < cap {
+            court.step();
+            steps += 1;
+        }
+        if tx.send(Frame::take(&court)).is_err() {
             return;
         }
     }
-    set(&status, format!("{frames} frames, {:.2} s simulated", court.time()));
+    eprintln!("court  {frames} frames, {:.2} s simulated in {:.1} s", court.time(), start.elapsed().as_secs_f64());
 }
 
 // ---- the picture ------------------------------------------------------------
@@ -311,12 +296,11 @@ pub struct Job {
     pub passes: u32,
 }
 
-/// What comes back: RGBA at the requested size, and how it was paid for.
+/// What comes back: RGBA at the requested size, and what the pass cost at
+/// what sample count. The window sizes itself by those numbers.
 pub struct Shot {
-    pub generation: u64,
     pub size: (u32, u32),
     pub rgba: Vec<u8>,
-    pub passes: u32,
     pub spp: u32,
     pub ms: u128,
 }
@@ -397,17 +381,23 @@ impl Accum {
 
 /// The renderer: build the stage once, then keep adding passes to whatever
 /// the window last asked for.
-fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, status: Status) {
-    set(&status, "evaluating the level".into());
+fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
+    // Evaluating the level and building its BVHs takes minutes, and the
+    // window is black until it is done. Say so, or it looks broken.
+    eprintln!("court  evaluating the level…");
     let t0 = Instant::now();
     let stage = match Stage::load() {
         Ok(stage) => stage,
-        Err(error) => return set(&status, format!("could not build the court's picture: {error}")),
+        Err(error) => return eprintln!("court: could not build the picture: {error}"),
     };
-    set(&status, format!("{} vcad solids, {} panels, in {:.1} s", stage.prims, stage.lights.len(), t0.elapsed().as_secs_f64()));
+    eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.prims, stage.lights.len(), t0.elapsed().as_secs_f64());
 
     let mut current: Option<Job> = None;
     let mut accum: Option<Accum> = None;
+    // What the last stderr line said, and when: the window is retuning itself
+    // constantly and the interesting thing is the resolution it settles on.
+    let mut said: Option<((u32, u32), u32)> = None;
+    let mut said_at = Instant::now();
     loop {
         // Take the newest request; anything older is already stale.
         let mut latest = None;
@@ -444,14 +434,15 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, status: Status) {
         let film = pathtrace::render(&scene, &job.camera.to_pathtrace(), job.size.0, job.size.1, &options(job.spp, opts.seed, false));
         acc.add(film);
         let rgba = acc.resolve(job.camera.exposure, &opts);
-        let shot = Shot {
-            generation: job.generation,
-            size: job.size,
-            rgba,
-            passes: acc.passes,
-            spp: job.spp,
-            ms: lap.elapsed().as_millis(),
-        };
+        let shot = Shot { size: job.size, rgba, spp: job.spp, ms: lap.elapsed().as_millis() };
+        if said != Some((job.size, job.spp)) || said_at.elapsed().as_secs() >= 2 {
+            said = Some((job.size, job.spp));
+            said_at = Instant::now();
+            eprintln!(
+                "court  {}×{} at {} spp: {} ms a pass, {} accumulated",
+                job.size.0, job.size.1, job.spp, shot.ms, acc.passes
+            );
+        }
         if out.send(shot).is_err() {
             return;
         }
@@ -471,7 +462,7 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
     while court.time() < t {
         court.step();
     }
-    let frame = Frame::take(&court, 0);
+    let frame = Frame::take(&court);
     let t0 = Instant::now();
     let picture = stage.scene(&frame.balls);
     let film = pathtrace::render(&picture, &stage.camera.to_pathtrace(), size.0, size.1, &options(spp, 0x5eed_1234, true));
@@ -497,68 +488,91 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
 
 // ---- the window -------------------------------------------------------------
 
+/// What a pass may cost: one frame at thirty a second. The window buys that
+/// with resolution — it renders the window's pixel size over an integer
+/// divisor and lets the blit upscale — and with samples, one per pass while
+/// anything is moving.
+const TARGET_MS: f64 = 30.0;
+
+/// The coarsest the picture is allowed to get — a thirty-second of the window
+/// on each side, which on a retina window is still a couple of hundred pixels
+/// wide. A machine slower than that drops frames instead of blurring further.
+const MAX_SCALE: u32 = 32;
+
+/// Passes to sit on one picture before asking for a larger one. Growing the
+/// picture throws the accumulator away, so it is worth a few passes first.
+const CLIMB_AFTER: u32 = 6;
+
+/// The cost of a pass before one has been timed, in milliseconds per
+/// megapixel per sample. Deliberately pessimistic: the first picture should
+/// be small and quick, not right.
+const GUESS: f64 = 750.0;
+
+/// What the picture is *of*: the frame, the camera to the millimetre, and the
+/// window. A change here came from the viewer or from the solver, and the
+/// accumulator is worthless. How big to render it and at how many samples is
+/// not part of it — that is only the window buying itself a better picture of
+/// the same subject, and it must not read as motion.
+#[derive(Clone, PartialEq, Eq)]
+struct Subject(usize, [i64; 7], (u32, u32));
+
+/// What was last asked for: a subject, at a size, at a sample count.
+#[derive(Clone, PartialEq, Eq)]
+struct Ask(Subject, (u32, u32), u32);
+
+/// The court on screen. It owns the recording and the camera and decides what
+/// to ask the render thread for; the picture itself is the render thread's.
 struct App {
     rx: Receiver<Frame>,
     shots: Receiver<Shot>,
     jobs: Sender<Job>,
-    sim_status: Status,
-    render_status: Status,
     frames: Vec<Frame>,
     cursor: usize,
-    playing: bool,
-    follow: bool,
+    /// Following the simulation as it happens. The window opens this way and
+    /// space comes back to it; pausing is the exception.
+    live: bool,
     orbit: (f64, f64, f64),
     camera: Camera,
     /// The camera the level asks for, to go back to.
-    authored_camera: Camera,
-    stale: bool,
-    texture: Option<egui::TextureHandle>,
-    shown: Option<(u64, u32, u32)>,
-    generation: u64,
-    asked: Option<(usize, [i64; 7], (u32, u32))>,
-    size: (u32, u32),
+    authored: Camera,
+    /// The window, in physical pixels.
+    window: (u32, u32),
+    /// What the window's size is divided by to get the render size.
+    scale: u32,
+    /// Samples a pass now, and the most it is allowed to ask for.
+    samples: u32,
     spp: u32,
-    passes: u32,
-    last_ms: u128,
-    play_t0: f64,
-    play_from: usize,
+    /// The measured cost of a pass, in milliseconds per megapixel per sample.
+    cost: f64,
+    /// The subject the renderer is working on, and the passes that have
+    /// landed since the window last changed what it was asking for.
+    subject: Option<Subject>,
+    settled: u32,
+    generation: u64,
+    asked: Option<Ask>,
 }
 
 impl App {
-    fn new(
-        rx: Receiver<Frame>,
-        shots: Receiver<Shot>,
-        jobs: Sender<Job>,
-        sim_status: Status,
-        render_status: Status,
-        camera: Camera,
-        size: (u32, u32),
-        spp: u32,
-    ) -> Self {
+    fn new(rx: Receiver<Frame>, shots: Receiver<Shot>, jobs: Sender<Job>, camera: Camera, spp: u32) -> Self {
         let mut app = Self {
             rx,
             shots,
             jobs,
-            sim_status,
-            render_status,
             frames: Vec::new(),
             cursor: 0,
-            playing: true,
-            follow: true,
+            live: true,
             orbit: (0.0, 0.0, 0.0),
             camera,
-            authored_camera: camera,
-            stale: false,
-            texture: None,
-            shown: None,
+            authored: camera,
+            window: (1280, 720),
+            scale: 4,
+            samples: 1,
+            spp: spp.max(1),
+            cost: GUESS,
+            subject: None,
+            settled: 0,
             generation: 0,
             asked: None,
-            size,
-            spp,
-            passes: 64,
-            last_ms: 0,
-            play_t0: 0.0,
-            play_from: 0,
         };
         app.orbit = app.orbit_from_camera();
         app
@@ -576,11 +590,34 @@ impl App {
         self.camera.eye = t + KVec3::new(dist * el.cos() * az.cos(), dist * el.cos() * az.sin(), dist * el.sin());
     }
 
-    /// A cheap identity for "the same picture": the frame, the camera to the
-    /// millimetre, and the panel size.
-    fn key(&self) -> (usize, [i64; 7], (u32, u32)) {
+    /// The render size: the window over the divisor, never degenerate.
+    fn size(&self) -> (u32, u32) {
+        ((self.window.0 / self.scale).max(32), (self.window.1 / self.scale).max(18))
+    }
+
+    /// One pass at one sample, in milliseconds, at this divisor.
+    fn pass_ms(&self, scale: u32) -> f64 {
+        let (w, h) = ((self.window.0 / scale).max(32), (self.window.1 / scale).max(18));
+        self.cost * w as f64 * h as f64 / 1e6
+    }
+
+    /// The largest picture whose pass is predicted to fit in a frame.
+    fn affordable(&self) -> u32 {
+        (1..MAX_SCALE).find(|s| self.pass_ms(*s) <= TARGET_MS).unwrap_or(MAX_SCALE)
+    }
+
+    /// Re-estimate the cost of a pixel from a pass that actually happened. A
+    /// slow mean: one odd pass should not resize the picture.
+    fn tune(&mut self, shot: &Shot) {
+        let work = shot.size.0 as f64 * shot.size.1 as f64 / 1e6 * shot.spp.max(1) as f64;
+        if work > 0.0 {
+            self.cost = 0.7 * self.cost + 0.3 * (shot.ms as f64 / work);
+        }
+    }
+
+    fn subject(&self) -> Subject {
         let c = &self.camera;
-        (
+        Subject(
             self.cursor,
             [
                 c.eye.x as i64,
@@ -591,7 +628,7 @@ impl App {
                 c.target.z as i64,
                 (c.fov_deg * 100.0) as i64,
             ],
-            self.size,
+            self.window,
         )
     }
 
@@ -602,179 +639,102 @@ impl App {
             generation: self.generation,
             balls: frame.balls.clone(),
             camera: self.camera,
-            size: self.size,
-            spp: self.spp,
-            passes: if self.playing { 1 } else { self.passes },
+            size: self.size(),
+            spp: self.samples,
+            // Keep going on this subject until the picture has converged,
+            // then go quiet rather than burn a core on nothing. A live frame
+            // supersedes it long before that.
+            passes: 256,
         };
         let _ = self.jobs.send(job);
-        self.asked = Some(self.key());
+        self.asked = Some(Ask(self.subject(), self.size(), self.samples));
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, root: &mut egui::Ui, _f: &mut eframe::Frame) {
-        let ctx = root.ctx().clone();
-        while let Ok(f) = self.rx.try_recv() {
-            self.frames.push(f);
-        }
-        let n = self.frames.len();
-        if self.playing && n > 0 {
-            if self.follow {
-                self.cursor = n - 1;
-            } else {
-                let t = ctx.input(|i| i.time);
-                self.cursor = (((t - self.play_t0) * 30.0) as usize + self.play_from).min(n - 1);
+impl viewport::Scene for App {
+    fn event(&mut self, event: viewport::Event) {
+        use viewport::{Event, Key};
+        match event {
+            Event::Resized(px) => self.window = px,
+            Event::Drag(dx, dy) => {
+                self.orbit.0 -= dx * 0.005;
+                self.orbit.1 = (self.orbit.1 + dy * 0.005).clamp(-0.2, 1.4);
+                self.apply_orbit();
             }
-        }
-        // Every shot is shown, even one the window has already moved past: a
-        // pass takes longer than a UI frame, so refusing stale ones would
-        // leave the panel blank for the whole of playback.
-        while let Ok(shot) = self.shots.try_recv() {
-            let img = egui::ColorImage::from_rgba_unmultiplied([shot.size.0 as usize, shot.size.1 as usize], &shot.rgba);
-            match &mut self.texture {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture("court", img, egui::TextureOptions::LINEAR)),
+            Event::Zoom(ticks) => {
+                self.orbit.2 = (self.orbit.2 * (1.0 - ticks * 0.08)).clamp(1000.0, 40000.0);
+                self.apply_orbit();
             }
-            self.shown = Some((shot.generation, shot.passes, shot.spp));
-            self.stale = shot.generation != self.generation;
-            self.last_ms = shot.ms;
-        }
-
-        egui::Panel::top("bar").show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("the court");
-                ui.separator();
-                if ui.button(if self.playing { "⏸ pause" } else { "▶ play" }).clicked() {
-                    self.playing = !self.playing;
-                    if self.playing {
-                        self.follow = self.cursor + 1 >= n;
-                        self.play_t0 = ctx.input(|i| i.time);
-                        self.play_from = self.cursor;
-                    }
-                    self.asked = None;
+            // Live is the resting state: unpausing rejoins the simulation
+            // where it has got to, not where the cursor was left.
+            Event::Key(Key::Space) => self.live = !self.live,
+            Event::Key(Key::Left) => {
+                if !self.live {
+                    self.cursor = self.cursor.saturating_sub(1);
                 }
-                ui.checkbox(&mut self.follow, "follow live");
-                ui.separator();
-                if n > 0 {
-                    let mut c = self.cursor;
-                    if ui.add(egui::Slider::new(&mut c, 0..=n - 1).text("frame")).changed() {
-                        self.cursor = c;
-                        self.playing = false;
-                        self.follow = false;
-                    }
-                }
-                ui.separator();
-                let mut spp = self.spp;
-                if ui.add(egui::Slider::new(&mut spp, 1..=16).text("spp/pass")).changed() {
-                    self.spp = spp;
-                    self.asked = None;
-                }
-                let mut w = self.size.0;
-                if ui.add(egui::Slider::new(&mut w, 160..=960).text("width")).changed() {
-                    self.size = (w, (w * 9 / 16).max(1));
-                }
-            });
-        });
-
-        egui::Panel::right("inspector").default_size(320.0).show(root, |ui| {
-            ui.heading("inspector");
-            ui.label(format!("recorded {n} frames"));
-            if let Ok(s) = self.sim_status.lock() {
-                ui.label(s.as_str());
             }
-            ui.separator();
-            ui.label("picture: vcad, path traced on the CPU");
-            if let Ok(s) = self.render_status.lock() {
-                ui.label(s.as_str());
-            }
-            ui.label(format!("{}×{} · {} ms a pass", self.size.0, self.size.1, self.last_ms));
-            match self.shown {
-                Some((_, passes, spp)) => ui.label(format!(
-                    "{} samples ({passes} × {spp} spp){}",
-                    passes * spp,
-                    if self.stale { " · catching up" } else { "" }
-                )),
-                None => ui.label("no frame yet"),
-            };
-            ui.separator();
-            if let Some(f) = self.frames.get(self.cursor) {
-                ui.label(format!("t = {:.3} s   sim {} ms/frame", f.time, f.sim_ms));
-                for (k, b) in f.balls.iter().enumerate() {
-                    let tag = if Some(k) == f.shot { "shot" } else { "ball" };
-                    ui.label(format!(
-                        "{tag} {k}  ({:+.2}, {:+.2}, {:.2}) m   {:.2} m/s",
-                        b.centre.x,
-                        b.centre.y,
-                        b.centre.z,
-                        b.velocity.norm()
-                    ));
+            Event::Key(Key::Right) => {
+                if !self.live {
+                    self.cursor = (self.cursor + 1).min(self.frames.len().saturating_sub(1));
                 }
-                ui.separator();
-                match (f.shot, f.made_at) {
-                    (Some(_), Some(t)) => ui.colored_label(egui::Color32::from_rgb(120, 220, 130), format!("made at {t:.2} s")),
-                    (Some(_), None) if f.time > 2.0 => ui.label("not through the hoop yet"),
-                    (Some(_), None) => ui.label("in the air"),
-                    _ => ui.label("no shot in this level"),
-                };
             }
-            ui.separator();
-            ui.label("camera: drag to orbit, scroll to zoom");
-            ui.label(format!("eye ({:.0}, {:.0}, {:.0}) mm", self.camera.eye.x, self.camera.eye.y, self.camera.eye.z));
-            if ui.button("back to the level's camera").clicked() {
-                self.camera = self.authored_camera;
+            Event::Key(Key::Home) => {
+                self.camera = self.authored;
                 self.orbit = self.orbit_from_camera();
             }
-        });
+        }
+    }
 
-        egui::CentralPanel::default().show(root, |ui| {
-            let avail = ui.available_size();
-            let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-            let size = if avail.x / avail.y > aspect { egui::vec2(avail.y * aspect, avail.y) } else { egui::vec2(avail.x, avail.x / aspect) };
-            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::drag());
-            if resp.dragged() {
-                let d = resp.drag_delta();
-                self.orbit.0 -= d.x as f64 * 0.005;
-                self.orbit.1 = (self.orbit.1 + d.y as f64 * 0.005).clamp(-0.2, 1.4);
-                self.apply_orbit();
+    fn image(&mut self) -> Option<viewport::Image> {
+        while let Ok(frame) = self.rx.try_recv() {
+            self.frames.push(frame);
+        }
+        let n = self.frames.len();
+        if self.live && n > 0 {
+            self.cursor = n - 1;
+        }
+        // Every shot is shown, even one the window has already moved past: a
+        // pass takes longer than a redraw, so refusing stale ones would leave
+        // the window blank for the whole of playback.
+        let mut newest = None;
+        while let Ok(shot) = self.shots.try_recv() {
+            self.tune(&shot);
+            self.settled += 1;
+            newest = Some(viewport::Image { size: shot.size, rgba: shot.rgba });
+        }
+        // A new subject — the solver moved the balls, or the viewer moved the
+        // camera — is worth only what a frame can pay for, at one sample.
+        // An old one has stopped moving, whether because it is paused or
+        // because the solver has fallen behind the clock, and every few
+        // passes it buys back a step of resolution and then its samples.
+        let subject = self.subject();
+        if self.subject.as_ref() != Some(&subject) {
+            self.subject = Some(subject);
+            self.settled = 0;
+            self.scale = self.affordable();
+            self.samples = 1;
+        } else if self.settled >= CLIMB_AFTER && (self.scale > 1 || self.samples < self.spp) {
+            if self.scale > 1 {
+                self.scale -= 1;
+            } else {
+                self.samples = self.spp;
             }
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if resp.hovered() && scroll.abs() > 0.0 {
-                self.orbit.2 = (self.orbit.2 * (1.0 - scroll as f64 * 0.002)).clamp(1000.0, 40000.0);
-                self.apply_orbit();
-            }
-            match &self.texture {
-                Some(t) => {
-                    ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                }
-                None => {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(18));
-                    let msg = self.render_status.lock().map(|s| s.clone()).unwrap_or_default();
-                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(16.0), egui::Color32::from_gray(170));
-                }
-            }
-        });
-
-        if n > 0 && self.asked.as_ref() != Some(&self.key()) {
+            self.settled = 0;
+        }
+        if n > 0 && self.asked != Some(Ask(self.subject(), self.size(), self.samples)) {
             self.ask();
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        newest
     }
 }
 
-/// `kosm-view --court`: the court, live.
-pub fn run(frames: usize, size: (u32, u32), spp: u32) -> eframe::Result<()> {
+/// `kosm-view`: the court, live.
+pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
-    let sim_status: Status = Default::default();
-    let render_status: Status = Default::default();
-    set(&sim_status, "loading the court".into());
-    set(&render_status, "evaluating the level".into());
-
-    let s = sim_status.clone();
-    std::thread::spawn(move || simulate(tx, s, frames));
-    let s = render_status.clone();
-    std::thread::spawn(move || render_worker(job_rx, shot_tx, s));
+    std::thread::spawn(move || simulate(tx, frames));
+    std::thread::spawn(move || render_worker(job_rx, shot_tx));
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
@@ -795,13 +755,5 @@ pub fn run(frames: usize, size: (u32, u32), spp: u32) -> eframe::Result<()> {
             exposure: 1.0,
         });
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 800.0]).with_title("Kosm view — the court"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Kosm view",
-        options,
-        Box::new(move |_cc| Ok(Box::new(App::new(rx, shot_rx, job_tx, sim_status, render_status, camera, size, spp)))),
-    )
+    viewport::run("Kosm view — the court", (1280, 720), App::new(rx, shot_rx, job_tx, camera, spp))
 }
