@@ -1,6 +1,6 @@
 # Skatepark: a mini ramp the K1 can stand on
 
-Date: 2026-09-05. Status: agreed, building.
+Date: 2026-09-05. Status: built (see README, "the skatepark").
 
 ## Purpose
 
