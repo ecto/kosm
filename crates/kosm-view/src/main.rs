@@ -18,6 +18,7 @@
 //! Escape to quit.
 
 mod court;
+mod history;
 mod viewport;
 
 /// Warnings from wgpu and vcad, on stderr; anything quieter is noise.

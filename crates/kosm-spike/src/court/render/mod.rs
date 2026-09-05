@@ -38,7 +38,7 @@ use crate::scene::MM;
 use phyz_math::{Mat3, Vec3 as PVec3};
 
 /// Metres (phyz) to millimetres (vcad). The only unit conversion in the picture.
-const PER_M: f64 = 1.0 / MM;
+pub const PER_M: f64 = 1.0 / MM;
 
 /// Everything in the court that moves, at one instant: each ball's centre
 /// (metres) and world → body rotation, and whatever else the court carries
@@ -237,6 +237,45 @@ impl Scene {
     /// How many light panels the level asked for.
     pub fn light_count(&self) -> usize {
         self.lights.len()
+    }
+
+    /// Where the light panels are, in millimetres. A reprojecting renderer
+    /// needs them to know where a moving ball's shadow lands.
+    pub fn light_centres(&self) -> Vec<Point3> {
+        self.lights.iter().map(|l| l.center).collect()
+    }
+
+    /// The ball's own bounding radius in millimetres, from its solid.
+    pub fn ball_radius_mm(&self) -> f64 {
+        self.ball
+            .iter()
+            .filter_map(|(bvh, _)| bvh.bounds())
+            .map(|b| {
+                let d = b.max - b.min;
+                0.5 * (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// A world-space bounding sphere for one extra, in millimetres: its BVH's
+    /// bounds carried through its placement. Builds (and caches) the BVH the
+    /// same way drawing it would.
+    pub fn extra_sphere(&mut self, extra: &PlacedSolid) -> Option<(Point3, f64)> {
+        let key = Arc::as_ptr(&extra.solid) as usize;
+        let bvh = self
+            .extras
+            .entry(key)
+            .or_insert_with(|| Arc::new(build_bvh(&extra.solid)))
+            .clone();
+        let b = bvh.bounds()?;
+        let c = Point3::new(
+            0.5 * (b.min.x + b.max.x),
+            0.5 * (b.min.y + b.max.y),
+            0.5 * (b.min.z + b.max.z),
+        );
+        let d = b.max - b.min;
+        let r = 0.5 * (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+        Some((extra.to_world.apply_point(&c), r))
     }
 }
 

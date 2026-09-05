@@ -366,11 +366,35 @@ level's ceiling panels as the only lights. It is the CPU path tracer, on a
 third thread, and it is asked for something it can finish in about 30 ms: the
 window's pixel size over an integer divisor, one sample a pass, with the
 divisor retuned from the pass times actually measured and the blit upscaling
-whatever comes back. When nothing is moving the passes accumulate on the same
-picture and the divisor walks back down to 1, so a paused frame resolves to
-the window's own resolution. The chosen size and the pass time go to stderr.
+whatever comes back. The chosen size and the pass time go to stderr.
 `vcad-kernel-raytrace`'s `gpu` feature pins wgpu 23 and the surface is on wgpu
 30, so that tracer cannot be handed this device.
+
+One sample a pixel is a blizzard, and the thing that makes it watchable is not
+spending more — it is `history.rs` refusing to throw the last frame away. Every
+pixel keeps a running mean and the count behind it, and a pass is merged into
+that rather than replacing it. When the camera moves, each new pixel unprojects
+its own hit — vcad's `Film::depth` is the distance from the eye along the
+primary ray, so `eye + dir · depth` is the world point and no matrix is
+inverted — projects it back through the previous camera, and keeps the samples
+it finds there if the distance agrees to two per cent and the normals to a dot
+product of 0.9. When something moves, the renderer already knows which
+something: the bounding sphere of every ball and every extra whose pose changed
+is projected to a screen rectangle at both its old and its new pose, and so is
+the disc its shadow throws on the floor from each ceiling panel. The union of
+those rectangles is the only part of the picture that starts over. So the walls
+and the floor keep accumulating for the whole run while the balls bounce
+through them, the denoiser is blended out pixel by pixel as counts climb past
+thirty-two, and the divisor only walks back down to 1 — the window's own
+resolution — while the mask is empty. Resolution, pass time, the mask's share
+of the screen and the mean samples a pixel go to stderr every couple of
+seconds. What the mask does not yet buy is fewer rays: `pathtrace::render`
+renders a whole frame and has no sub-rectangle entry point, so the pass costs
+the same either way. A `render_into(&mut Film, &[Rect])` beside it is the next
+multiplier, and it lives in vcad, not here. What does dominate, once the ball
+is in the net, is the net: it hands the renderer fresh solids as it deforms and
+each one pays for a BVH build inside the pass, which is why the tuner refuses
+to believe a pass more than four times its own prediction.
 
 The window is black for the first few minutes: evaluating the level is a pile
 of CSG booleans in `vcad-kernel-booleans`, and the picture cannot start until

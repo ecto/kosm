@@ -24,10 +24,13 @@
 //! re-uploaded every time a ball moves.
 //!
 //! So this is the CPU path tracer, `pathtrace::render`, run small on a worker
-//! thread and accumulated progressively: passes keep being added to the same
-//! frame while nothing changes, and the accumulator is thrown away the moment
-//! the cursor, the camera or the window size moves. It is the same integrator
-//! the CLI's reference tier uses, at fewer samples.
+//! thread — the same integrator the CLI's reference tier uses, at one sample a
+//! pass. What it hands back is never thrown away wholesale: [`crate::history`]
+//! keeps a running mean and a sample count per pixel, reprojects them through a
+//! moved camera, and discards only the pixels a moved ball, its shadow, or a
+//! moved extra actually landed on. This file's job is the pace — how big to ask
+//! for, at how many samples, and when the measurement was fair enough to
+//! believe.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
@@ -35,8 +38,9 @@ use std::time::Instant;
 use kosm_spike::court::render::{self, Snapshot};
 use kosm_spike::court::{Court, CourtScene};
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
-use vcad_kernel_raytrace::pathtrace::{self, Film};
+use vcad_kernel_raytrace::pathtrace;
 
+use crate::history::{History, Pose, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -136,8 +140,6 @@ pub struct Job {
     pub camera: Camera,
     pub size: (u32, u32),
     pub spp: u32,
-    /// Passes to accumulate before the renderer goes quiet.
-    pub passes: u32,
 }
 
 /// What comes back: RGBA at the requested size, and what the pass cost at
@@ -147,6 +149,10 @@ pub struct Shot {
     pub rgba: Vec<u8>,
     pub spp: u32,
     pub ms: u128,
+    /// The share of the screen this pass had to start over on.
+    pub mask: f32,
+    /// Samples behind the average pixel of the picture that came back.
+    pub mean_spp: f32,
 }
 
 fn options(spp: u32, seed: u64, denoise: bool) -> pathtrace::PathTraceOptions {
@@ -162,65 +168,39 @@ fn options(spp: u32, seed: u64, denoise: bool) -> pathtrace::PathTraceOptions {
     }
 }
 
-/// A running mean over passes, plus the guide buffers of the last one.
-struct Accum {
-    sum: Vec<f32>,
-    alpha: Vec<f32>,
-    normal: Vec<f32>,
-    depth: Vec<f32>,
-    albedo: Vec<f32>,
-    variance: Vec<f32>,
-    size: (u32, u32),
-    passes: u32,
-}
-
-impl Accum {
-    fn new(size: (u32, u32)) -> Self {
-        let n = (size.0 * size.1) as usize;
-        Self {
-            sum: vec![0.0; n * 3],
-            alpha: vec![0.0; n],
-            normal: vec![0.0; n * 3],
-            depth: vec![0.0; n],
-            albedo: vec![0.0; n * 3],
-            variance: vec![0.0; n],
-            size,
-            passes: 0,
-        }
+/// The poses of everything that moves in a snapshot, in millimetres — what
+/// the history needs to know which pixels the world changed under.
+fn poses(stage: &mut render::Scene, snap: &Snapshot) -> Vec<Pose> {
+    let r = stage.ball_radius_mm();
+    let mut out = Vec::with_capacity(snap.balls.len() + snap.extras.len());
+    for (centre, rot) in &snap.balls {
+        let c = *centre * render::PER_M;
+        // world → body; the placement is its transpose, but for "did it turn?"
+        // either reading answers the same question.
+        out.push(Pose {
+            centre: [c.x, c.y, c.z],
+            rot: [
+                rot[(0, 0)], rot[(0, 1)], rot[(0, 2)], //
+                rot[(1, 0)], rot[(1, 1)], rot[(1, 2)], //
+                rot[(2, 0)], rot[(2, 1)], rot[(2, 2)],
+            ],
+            radius: r,
+        });
     }
-
-    fn add(&mut self, film: Film) {
-        for (s, v) in self.sum.iter_mut().zip(&film.rgb) {
-            *s += v;
-        }
-        for (s, v) in self.alpha.iter_mut().zip(&film.alpha) {
-            *s += v;
-        }
-        self.normal = film.normal;
-        self.depth = film.depth;
-        self.albedo = film.albedo;
-        self.variance = film.variance;
-        self.passes += 1;
+    for extra in &snap.extras {
+        let Some((c, radius)) = stage.extra_sphere(extra) else { continue };
+        let m = &extra.to_world.matrix;
+        out.push(Pose {
+            centre: [c.x, c.y, c.z],
+            rot: [
+                m[(0, 0)], m[(0, 1)], m[(0, 2)], //
+                m[(1, 0)], m[(1, 1)], m[(1, 2)], //
+                m[(2, 0)], m[(2, 1)], m[(2, 2)],
+            ],
+            radius,
+        });
     }
-
-    /// The mean so far, denoised, as sRGB bytes.
-    fn resolve(&self, exposure: f32, opts: &pathtrace::PathTraceOptions) -> Vec<u8> {
-        let k = 1.0 / self.passes.max(1) as f32;
-        let mut film = Film {
-            width: self.size.0,
-            height: self.size.1,
-            rgb: self.sum.iter().map(|v| v * k).collect(),
-            alpha: self.alpha.iter().map(|v| v * k).collect(),
-            normal: self.normal.clone(),
-            depth: self.depth.clone(),
-            albedo: self.albedo.clone(),
-            variance: self.variance.iter().map(|v| v * k).collect(),
-        };
-        if opts.denoise {
-            pathtrace::denoise(&mut film, opts);
-        }
-        film.to_srgb8(exposure, false)
-    }
+    out
 }
 
 /// The renderer: build the stage once, then keep adding passes to whatever
@@ -236,11 +216,13 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
     };
     eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.static_count(), stage.light_count(), t0.elapsed().as_secs_f64());
 
+    let lights = stage.light_centres();
+
+    // The history is the picture. A job is only ever "this snapshot, this
+    // camera, this size, one sample" — nothing here is allowed to decide that
+    // the last frame was worthless. The history decides that, per pixel.
     let mut current: Option<Job> = None;
-    let mut accum: Option<Accum> = None;
-    // What the last stderr line said, and when: the window is retuning itself
-    // constantly and the interesting thing is the resolution it settles on.
-    let mut said: Option<((u32, u32), u32)> = None;
+    let mut history = History::new((0, 0));
     let mut said_at = Instant::now();
     loop {
         // Take the newest request; anything older is already stale.
@@ -252,45 +234,63 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
                 Err(TryRecvError::Disconnected) => return,
             }
         }
-        let idle = latest.is_none()
-            && current.as_ref().map(|j| accum.as_ref().map_or(false, |a| a.passes >= j.passes)).unwrap_or(true);
-        if idle {
+        // Nothing new and nothing to converge on: wait rather than spin.
+        if latest.is_none() && current.is_none() {
             match jobs.recv() {
                 Ok(job) => latest = Some(job),
                 Err(_) => return,
             }
         }
         if let Some(job) = latest {
-            accum = None;
             current = Some(job);
         }
         let Some(job) = current.clone() else { continue };
         if job.size.0 == 0 || job.size.1 == 0 {
             continue;
         }
-        let acc = accum.get_or_insert_with(|| Accum::new(job.size));
-        if acc.size != job.size {
-            *acc = Accum::new(job.size);
+        if history.size() != job.size {
+            history = History::new(job.size);
         }
         let lap = Instant::now();
-        let opts = options(job.spp, 0x5eed_0000 ^ (job.generation << 20) ^ acc.passes as u64, true);
+        let cam = job.camera.to_pathtrace();
+        let view = View::of(&cam, job.size.0, job.size.1);
+        let poses = poses(&mut stage, &job.frame);
+        let seed = 0x5eed_0000 ^ (job.generation << 20) ^ (lap.elapsed().as_nanos() as u64) ^ passes_seed(&history);
         let scene = stage.at_snapshot(&job.frame);
-        let film = pathtrace::render(&scene, &job.camera.to_pathtrace(), job.size.0, job.size.1, &options(job.spp, opts.seed, false));
-        acc.add(film);
-        let rgba = acc.resolve(job.camera.exposure, &opts);
-        let shot = Shot { size: job.size, rgba, spp: job.spp, ms: lap.elapsed().as_millis() };
-        if said != Some((job.size, job.spp)) || said_at.elapsed().as_secs() >= 2 {
-            said = Some((job.size, job.spp));
+        let film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &options(job.spp, seed, false));
+        history.merge(&film, &view, &poses, &lights);
+        let opts = options(job.spp, seed, true);
+        let rgba = history.resolve(job.camera.exposure, &opts);
+        let shot = Shot {
+            size: job.size,
+            rgba,
+            spp: job.spp,
+            ms: lap.elapsed().as_millis(),
+            mask: history.mask_fraction(),
+            mean_spp: history.mean_samples(),
+        };
+        if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
             eprintln!(
-                "court  {}×{} at {} spp: {} ms a pass, {} accumulated",
-                job.size.0, job.size.1, job.spp, shot.ms, acc.passes
+                "court  {}×{} at {} spp: {} ms a pass, {:.0}% repainted, {:.1} samples a pixel",
+                job.size.0,
+                job.size.1,
+                job.spp,
+                shot.ms,
+                100.0 * shot.mask,
+                shot.mean_spp
             );
         }
         if out.send(shot).is_err() {
             return;
         }
     }
+}
+
+/// A seed that moves with the history, so a converging picture keeps drawing
+/// fresh samples rather than the same one over and over.
+fn passes_seed(history: &History) -> u64 {
+    (history.mean_samples() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 // ---- one still, no window ---------------------------------------------------
@@ -344,8 +344,22 @@ const TARGET_MS: f64 = 30.0;
 /// wide. A machine slower than that drops frames instead of blurring further.
 const MAX_SCALE: u32 = 32;
 
+/// How much of the screen may be repainting and still count as quiet. Not
+/// zero: a court with twenty balls in flight and a net swinging never has an
+/// empty mask, and waiting for one would pin the window at its coarsest size
+/// forever. What the climb is really waiting for is evidence that most of the
+/// frame is being *kept* — that growing the picture is not throwing away a
+/// history that was about to be discarded anyway.
+const QUIET_MASK: f32 = 0.35;
+
+/// How far past the prediction a pass has to be before it is not a render at
+/// all. The net's BVH rebuilds land two orders of magnitude out; a genuinely
+/// mispredicted render never does.
+const OUTLIER: f64 = 4.0;
+
 /// Passes to sit on one picture before asking for a larger one. Growing the
-/// picture throws the accumulator away, so it is worth a few passes first.
+/// picture is the one thing that does throw the history away, so it is worth
+/// a few passes first.
 const CLIMB_AFTER: u32 = 6;
 
 /// The cost of a pass before one has been timed, in milliseconds per
@@ -353,17 +367,12 @@ const CLIMB_AFTER: u32 = 6;
 /// be small and quick, not right.
 const GUESS: f64 = 750.0;
 
-/// What the picture is *of*: the frame, the camera to the millimetre, and the
-/// window. A change here came from the viewer or from the solver, and the
-/// accumulator is worthless. How big to render it and at how many samples is
-/// not part of it — that is only the window buying itself a better picture of
-/// the same subject, and it must not read as motion.
+/// What was last asked for: the frame, the camera to the millimetre, the size,
+/// and the sample count. Not a *subject* any more — nothing about a change
+/// here throws the picture away, because the history keeps whatever survives
+/// it. This exists only so the window does not re-send an identical job.
 #[derive(Clone, PartialEq, Eq)]
-struct Subject(u64, [i64; 7], (u32, u32));
-
-/// What was last asked for: a subject, at a size, at a sample count.
-#[derive(Clone, PartialEq, Eq)]
-struct Ask(Subject, (u32, u32), u32);
+struct Ask(u64, [i64; 7], (u32, u32), u32);
 
 /// The court on screen. It owns the recording and the camera and decides what
 /// to ask the render thread for; the picture itself is the render thread's.
@@ -380,8 +389,10 @@ struct App {
     camera: Camera,
     /// The camera the level asks for, to go back to.
     authored: Camera,
-    /// The window, in physical pixels.
+    /// The window, in physical pixels, and the size the tuner last sized
+    /// itself for. A resize is the one thing that starts the climb over.
     window: (u32, u32),
+    sized: (u32, u32),
     /// What the window's size is divided by to get the render size.
     scale: u32,
     /// Samples a pass now, and the most it is allowed to ask for.
@@ -389,10 +400,12 @@ struct App {
     spp: u32,
     /// The measured cost of a pass, in milliseconds per megapixel per sample.
     cost: f64,
-    /// The subject the renderer is working on, and the passes that have
-    /// landed since the window last changed what it was asking for.
-    subject: Option<Subject>,
-    settled: u32,
+    /// Consecutive passes that came back cheap and with an empty mask: the
+    /// window only buys a bigger picture when the world has stopped repainting
+    /// itself.
+    quiet: u32,
+    /// Consecutive passes that overran the budget. One is noise.
+    over: u32,
     generation: u64,
     asked: Option<Ask>,
 }
@@ -410,12 +423,13 @@ impl App {
             camera,
             authored: camera,
             window: (1280, 720),
+            sized: (0, 0),
             scale: 4,
             samples: 1,
             spp: spp.max(1),
             cost: GUESS,
-            subject: None,
-            settled: 0,
+            quiet: 0,
+            over: 0,
             generation: 0,
             asked: None,
         };
@@ -451,50 +465,40 @@ impl App {
         (1..MAX_SCALE).find(|s| self.pass_ms(*s) <= TARGET_MS).unwrap_or(MAX_SCALE)
     }
 
-    /// Re-estimate the cost of a pixel from a pass that actually happened. A
-    /// slow mean: one odd pass should not resize the picture.
-    fn tune(&mut self, shot: &Shot) {
+    /// Re-estimate the cost of a pixel from a pass that actually happened, and
+    /// say whether the pass counts as a fair measurement at all.
+    ///
+    /// The court's net hands the renderer fresh solids as it deforms, and the
+    /// first pass to see one pays for its BVH inside the timing. That is a
+    /// build, not a render, and it is orders of magnitude out — folding it in
+    /// would collapse the picture to its coarsest size and keep it there for
+    /// the rest of the session. So a pass more than [`OUTLIER`] times the
+    /// standing prediction is thrown away whole: it neither retunes the cost
+    /// nor counts as an overrun.
+    fn tune(&mut self, shot: &Shot) -> bool {
         let work = shot.size.0 as f64 * shot.size.1 as f64 / 1e6 * shot.spp.max(1) as f64;
-        if work > 0.0 {
-            self.cost = 0.7 * self.cost + 0.3 * (shot.ms as f64 / work);
+        if work <= 0.0 {
+            return false;
         }
+        let measured = shot.ms as f64 / work;
+        if measured > OUTLIER * self.cost {
+            return false;
+        }
+        self.cost = 0.7 * self.cost + 0.3 * measured;
+        true
     }
 
-    /// What the frame under the cursor looks like, to a couple of
-    /// centimetres: two frames of a world at rest — or creeping, a ball
-    /// rolling out its last millimetres, a net swaying — are the same
-    /// subject, however many arrive, so a live window gets to accumulate
-    /// while nothing the eye would notice is happening. A creeping ball still
-    /// crosses a cell now and then and the picture starts over; that is the
-    /// price of not having motion vectors yet.
-    fn frame_key(&self) -> u64 {
-        const CELL_M: f64 = 0.02;
-        const CELL_MM: f64 = 20.0;
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |v: i64| {
-            h ^= v as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        };
-        if let Some(frame) = self.frames.get(self.cursor) {
-            for (c, _) in &frame.balls {
-                mix((c.x / CELL_M).round() as i64);
-                mix((c.y / CELL_M).round() as i64);
-                mix((c.z / CELL_M).round() as i64);
-            }
-            for extra in &frame.extras {
-                let m = &extra.to_world.matrix;
-                mix((m[(0, 3)] / CELL_MM).round() as i64);
-                mix((m[(1, 3)] / CELL_MM).round() as i64);
-                mix((m[(2, 3)] / CELL_MM).round() as i64);
-            }
-        }
-        h
+    /// Which frame of the recording the cursor is on. That is the whole of
+    /// what the renderer needs to identify it — there is no hashing of ball
+    /// positions any more, because a moved ball no longer costs the picture.
+    fn frame_id(&self) -> u64 {
+        self.cursor as u64
     }
 
-    fn subject(&self) -> Subject {
+    fn ask_key(&self) -> Ask {
         let c = &self.camera;
-        Subject(
-            self.frame_key(),
+        Ask(
+            self.frame_id(),
             [
                 c.eye.x as i64,
                 c.eye.y as i64,
@@ -504,7 +508,8 @@ impl App {
                 c.target.z as i64,
                 (c.fov_deg * 100.0) as i64,
             ],
-            self.window,
+            self.size(),
+            self.samples,
         )
     }
 
@@ -517,13 +522,9 @@ impl App {
             camera: self.camera,
             size: self.size(),
             spp: self.samples,
-            // Keep going on this subject until the picture has converged,
-            // then go quiet rather than burn a core on nothing. A live frame
-            // supersedes it long before that.
-            passes: 256,
         };
         let _ = self.jobs.send(job);
-        self.asked = Some(Ask(self.subject(), self.size(), self.samples));
+        self.asked = Some(self.ask_key());
     }
 }
 
@@ -574,30 +575,51 @@ impl viewport::Scene for App {
         // the window blank for the whole of playback.
         let mut newest = None;
         while let Ok(shot) = self.shots.try_recv() {
-            self.tune(&shot);
-            self.settled += 1;
+            let fair = self.tune(&shot);
             newest = Some(viewport::Image { size: shot.size, rgba: shot.rgba });
+            if !fair {
+                continue;
+            }
+            // A pass that blew the budget twice running costs a step of
+            // resolution, or the samples that bought it. A pass that came back
+            // with little of the screen repainted is one more piece of
+            // evidence that the picture is worth growing.
+            if shot.ms as f64 > TARGET_MS * 1.5 {
+                self.over += 1;
+                if self.over >= 2 {
+                    if self.samples > 1 {
+                        self.samples = 1;
+                    } else if self.scale < MAX_SCALE {
+                        self.scale += 1;
+                    }
+                    self.over = 0;
+                }
+                self.quiet = 0;
+            } else if shot.mask <= QUIET_MASK {
+                self.over = 0;
+                self.quiet += 1;
+            } else {
+                self.over = 0;
+                self.quiet = 0;
+            }
         }
-        // A new subject — the solver moved the balls, or the viewer moved the
-        // camera — is worth only what a frame can pay for, at one sample.
-        // An old one has stopped moving, whether because it is paused or
-        // because the solver has fallen behind the clock, and every few
-        // passes it buys back a step of resolution and then its samples.
-        let subject = self.subject();
-        if self.subject.as_ref() != Some(&subject) {
-            self.subject = Some(subject);
-            self.settled = 0;
+        // Only the window's own size resets the climb. Everything else — a
+        // ball crossing the frame, the camera swinging round — is the
+        // history's business now, and it keeps whatever it can.
+        if self.sized != self.window {
+            self.sized = self.window;
             self.scale = self.affordable();
             self.samples = 1;
-        } else if self.settled >= CLIMB_AFTER && (self.scale > 1 || self.samples < self.spp) {
-            if self.scale > 1 {
+            self.quiet = 0;
+        } else if self.quiet >= CLIMB_AFTER && (self.scale > 1 || self.samples < self.spp) {
+            if self.scale > 1 && self.pass_ms(self.scale - 1) <= TARGET_MS {
                 self.scale -= 1;
-            } else {
+            } else if self.scale == 1 {
                 self.samples = self.spp;
             }
-            self.settled = 0;
+            self.quiet = 0;
         }
-        if n > 0 && self.asked != Some(Ask(self.subject(), self.size(), self.samples)) {
+        if n > 0 && self.asked != Some(self.ask_key()) {
             self.ask();
         }
         newest
