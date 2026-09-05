@@ -97,9 +97,28 @@ use vcad_kernel_raytrace::gpu::{
     DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START, GpuAreaLight, GpuCamera, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, GpuScene, HistoryPipeline, RayTracePipeline, ResidentScene,
 };
-use vcad_kernel_raytrace::pathtrace::{Environment, Pbr};
+use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter};
 
 use crate::court::Camera;
+
+/// `--filter box|gaussian|blackman`, read once when the tracer is built.
+///
+/// Box is the default and is the uniform jitter the tracer has always used,
+/// so a shot taken with no flag is bit-for-bit the shot that was there
+/// before. The other two importance-sample a real reconstruction filter,
+/// which costs nothing per sample and shows up on the rim and the net.
+fn pixel_filter_from_args() -> PixelFilter {
+    let want = std::env::args()
+        .skip_while(|a| a != "--filter")
+        .nth(1)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match want.as_str() {
+        "gaussian" => PixelFilter::Gaussian,
+        "blackman" | "blackman-harris" | "bh" => PixelFilter::BlackmanHarris,
+        _ => PixelFilter::Box,
+    }
+}
 
 /// The court, packed. Built once; every frame after that is placements.
 pub struct Stage {
@@ -117,6 +136,11 @@ pub struct Stage {
     extras: HashMap<usize, Option<GpuScene>>,
     lights: Vec<GpuAreaLight>,
     max_depth: u32,
+    /// Where in the pixel a primary ray is aimed. `--filter gaussian` or
+    /// `--filter blackman` picks a real reconstruction filter; the default is
+    /// the uniform jitter every earlier frame was drawn with, so a shot taken
+    /// without the flag is the shot that was there before.
+    filter: PixelFilter,
     /// The level's environment, built exactly as `render::Scene` builds the
     /// CPU tier's: `Environment::constant(env_radiance)`. It reaches the
     /// shader through `GpuRenderState::set_gradient_env`, so the two tiers are
@@ -204,6 +228,7 @@ impl Stage {
             .map_err(|e| anyhow::anyhow!("the tracer's pipeline: {e}"))?;
         let history = HistoryPipeline::new(&ctx)
             .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
+        let filter = pixel_filter_from_args();
 
         // The statics are instances: sixty of the court's bars are one cube,
         // and packing that cube once and placing it sixty times is the whole
@@ -266,6 +291,7 @@ impl Stage {
             lights,
             scene: None,
             max_depth,
+            filter,
             env: Environment::constant([env_radiance; 3]),
             resident: None,
             uploaded: None,
@@ -430,6 +456,7 @@ impl Stage {
             state.stylize = 0;
             state.ground_enabled = 0;
             state.max_depth = self.max_depth;
+            state.set_pixel_filter(self.filter);
             // Draw the panels to camera rays. Off by default, and with it off
             // the shader refused to shade a light it was standing under at
             // all, which is the whole of the closed room's brightness gap:

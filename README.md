@@ -710,6 +710,39 @@ At 16 samples that is 3 iterations where it used to run 5 — 40% of the filter
 gone — for 0.09 of one 8-bit code. The 1- and 4-sample rows are unchanged to
 the digit, because at those counts the budget is still full.
 
+### the pixel filter
+
+Primary rays were jittered uniformly inside the pixel. That is a box filter —
+the worst reconstruction filter there is — and it is why a thin bright feature
+against a dark background stairsteps however many samples it gets: the rim's
+ellipse, the net's cords.
+
+The usual fix carries a per-pixel weight sum, which is a second buffer and a
+different accumulation rule on both tiers. It does not have to. Importance-
+sample the *kernel* — draw the sample position from the filter — and the plain
+mean of the samples already is the filtered estimate. Nothing about the
+accumulation, the device history's running mean, or the variance estimator
+changes; only where in the pixel a ray is aimed.
+
+`PathTraceOptions::filter` takes `PixelFilter::Box` (the default, and
+bit-identical to the old jitter — its warp is `u - 0.5` and the sample
+position was `u`), `Gaussian` (sigma 0.4 px) or `BlackmanHarris`, both over a
+1.5-pixel support. Both invert their own CDF by bisection; the Gaussian's goes
+through `erf` and Blackman-Harris integrates to a sum of sines, so there is no
+table to keep in sync.
+
+The GPU needs no shader change at all. Its sub-pixel jitter is a Halton pair
+computed on the *host*, so `GpuRenderState::set_pixel_filter` warps two
+numbers with the same `PixelFilter::warp` the CPU integrator calls before they
+are uploaded. There is no filter code in WGSL and no way for the two tiers to
+drift — `tests/pixel_filter.rs` pins them to the same function, and pins a
+converged edge to the kernel's analytic footprint.
+
+`kosm-view --shot out/view_court_gpu.png --filter blackman` shows it on the
+court: the rim's ellipse stops breaking up, the net's cords read as lines
+rather than dots, and the ball's seams lose their jaggies. Without the flag
+the shot is byte-identical to the one that was there before.
+
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
 `wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other
 Kosm crate.** It is a leaf. And it must compile for the browser, GPU tier
