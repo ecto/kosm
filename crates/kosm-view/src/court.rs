@@ -779,6 +779,9 @@ struct App {
     quiet: u32,
     /// Consecutive passes that overran the budget. One is noise.
     over: u32,
+    /// How long the last fair pass took, in milliseconds: the climb rule reads
+    /// the clock, not the model.
+    last_ms: f64,
     /// Consecutive passes that came back at under half the budget. Enough of
     /// them and a size the tuner had sworn off is worth trying again: the
     /// overrun that condemned it may have been the net minting a solid.
@@ -826,6 +829,7 @@ impl App {
             quiet: 0,
             over: 0,
             cheap: 0,
+            last_ms: 0.0,
             generation: 0,
             asked: None,
             pending: Some(pending),
@@ -1038,6 +1042,7 @@ impl viewport::Scene for App {
             // with little of the screen repainted is one more piece of
             // evidence that the picture is worth growing.
             self.cheap = if (shot.ms as f64) < 0.5 * TARGET_MS { self.cheap + 1 } else { 0 };
+            self.last_ms = shot.ms as f64;
             // An overrun is only the size's fault if the size is paying for
             // an appreciable share of the pass. When the fixed cost dominates
             // — the GPU tier, where a pass is mostly the court going up and
@@ -1076,19 +1081,29 @@ impl viewport::Scene for App {
             self.floor = 1;
             self.samples = 1;
             self.quiet = 0;
-        } else if self.quiet >= CLIMB_AFTER && (self.scale > self.floor || self.samples < self.spp || self.floor > 1) {
-            if self.scale > self.floor && self.pixel_ms(self.scale - 1) <= self.budget() {
+        } else if self.quiet >= CLIMB_AFTER {
+            // The climb reads the clock, not the model. The model seeds the
+            // first size after a resize and explains an overrun; whether the
+            // next size up is affordable is answered by the passes that just
+            // happened. A quiet run of passes with room under the budget buys
+            // pixels before it buys samples — the same sample count spread
+            // over a bigger picture is what the eye wants first — and a size
+            // once condemned gets another hearing after a longer run of cheap
+            // passes, because the pass that condemned it may not have been a
+            // render at all.
+            let room = self.last_ms < 0.7 * TARGET_MS;
+            if room && self.scale > self.floor {
+                if self.samples > 1 {
+                    self.samples = 1;
+                }
                 self.scale -= 1;
-            } else if self.scale == self.floor && self.floor > 1 && self.cheap >= 2 * CLIMB_AFTER {
-                // Passes here have run at under half the budget for a while:
-                // the size above was condemned by a pass that was not a
-                // render. Give it another hearing.
+            } else if room && self.scale == self.floor && self.floor > 1 && self.cheap >= CLIMB_AFTER {
                 self.floor -= 1;
                 self.scale -= 1;
                 self.samples = 1;
                 self.cheap = 0;
-            } else if self.scale == self.floor && self.samples < self.spp {
-                self.samples = self.spp;
+            } else if self.last_ms * 2.0 < TARGET_MS && self.samples < self.spp {
+                self.samples = (self.samples * 2).min(self.spp);
             }
             self.quiet = 0;
         }
