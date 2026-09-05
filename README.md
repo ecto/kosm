@@ -551,6 +551,72 @@ the **keep mask**: one byte a pixel, 1 to go on accumulating and 0 to start
 over, built by `history::Mask` from the same `mask_rects` the CPU tier plans
 with, so the two tiers mask on one piece of geometry.
 
+### the rectangle is not the answer
+
+That mask is a rectangle, and a rectangle is visible. Every pixel inside the
+box around a ball's old and new pose restarts from one sample — the ball
+itself included, whose shading barely changed — so what travels with the ball
+is a box of grain with a straight edge on it. Real-time tracers do not do
+this; they decide per *pixel* whether last frame's estimate is still about the
+same thing.
+
+kosm-render can do that now, and the whole of it is on the device.
+
+**The guides carry an identity.** The integrator already wrote a normal, a
+depth and an albedo per pixel for the denoiser. It writes the hit's own
+primitive id too, packed into the albedo plane's spare lane — no new buffer, no
+new binding, and the storage-buffer budget untouched.
+
+**The reprojection follows objects, not just the camera.** `InstanceMotion` is
+one frame's answer to "what moved": which instance each primitive belongs to,
+and each instance's `prev_T · cur_T⁻¹`. The reproject pass unprojects a pixel
+through this pass's depth, carries the world point back through *its own
+instance's* transform, projects it through the previous camera, and takes that
+pixel's history where the id, the depth (tangent-plane, as before) and the
+normal all agree. A ball in flight keeps its own shading; the floor uncovered
+behind it has a different id and restarts. Measured over twelve frames of a
+sphere sliding across a plane: the sphere's pixels average ten frames of
+history when the motion is declared and 2.4 when it is not, the plane never
+restarts, and the uncovered trail is the only thing that does.
+
+**The fold is bounded.** A four-hundred-sample running mean cannot be moved by
+what the pixel is seeing now. The history is capped — 64 by default — which
+makes it an exponential moving average with a floor under its weight. Against
+a 640-pass reference a capped 128-pass render is as close as an uncapped one
+(0.0141 against 0.0130), so the still tier loses nothing.
+
+**And what no geometric test can see gets clamped.** A ball leaves its shadow
+behind on a floor that did not move, at the same depth with the same normal
+and the same id. The only witness is this pass's own sample: compare the 3x3
+mean of the *history* against the 3x3 mean of the *raw sample*, and where they
+differ by more than the error bar on nine samples, shorten the history rather
+than trust it. Shortened, not overwritten — snapping the colour to the
+neighbourhood is the usual TAA move and it is biased, and a hundred still
+passes of a biased nudge is a tint. Moving the light rig under a settled
+frame: 27% of the stale lighting gone in four frames, 40% in eight.
+
+**Nothing that restarts shows grain.** A pixel with fewer than four samples has
+no error bar of its own — two moments over one sample are not statistics — so
+it is given SVGF's spatial estimate instead, a 7x7 luminance variance over
+neighbours that pass the same depth and normal gates the filter itself uses.
+The à-trous pass is then wide and correct on the frame the pixel appears. A
+one-sample frame measures *smoother* than a 64-sample one: 10/255 at the 95th
+percentile of the deviation from a pixel's own 3x3 mean, against 11.
+
+`tests/gpu_temporal.rs` is all five of those claims. The CPU-parity test —
+the device à-trous against `pathtrace::denoise`, weight for weight — still
+holds, with the spatial variance switched off: the CPU filter has no such
+estimator, so the two tiers cannot agree byte for byte with it on, and the
+test says so.
+
+What has **not** landed is the viewer's half. `kosm-view` reaches the renderer
+through `vcad-kernel-raytrace`, which pins `kosm-render` to the sibling
+worktree's copy rather than this one, so the viewer cannot be built against
+these passes without a cross-repo manifest change that would land in the
+middle of another agent's work. The rectangle mask therefore still runs the
+GPU tier here; retiring it is `court_gpu.rs` handing `InstanceMotion` over
+instead of `mask_rects`, and the `Mask` staying for the CPU tier alone.
+
 Reprojection is no longer CPU-side only, and a camera move no longer costs the
 GPU picture its history. vcad grew
 `accumulate_and_denoise_resident_reprojected`, which takes the *previous*
