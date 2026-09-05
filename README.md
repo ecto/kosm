@@ -248,8 +248,10 @@ the balls with their contact pose so the seams turn with the backspin, and a
 gym the level describes — walls, a ceiling, rows of light panels that are the
 only light there is. Next-event estimation on the panels, Russian roulette,
 one sample stream per pixel and frame. Lacquered maple planks with the court
-painted on them, a thin dielectric backboard with its square, painted steel,
-pebbled rubber. 960×540 at 64 spp is about 4 s a frame on the CPU; the still
+painted on them, a real glass backboard — full transmission at IOR 1.52, with
+float glass's faint iron green as Beer–Lambert absorption, so the ring's shadow
+and the wall behind read through it — thin-walled clerestory panes, painted
+steel, pebbled rubber. 960×540 at 64 spp is about 4 s a frame on the CPU; the still
 `out/court_still.png` is 1080p at 512 spp, taken at `still_t`. Every knob —
 the balls, the shot, the hoop, the gym, the lights, the camera, the sample
 counts — is a `defparam` in the level. `tests/court.rs` is the rulebook test
@@ -700,10 +702,81 @@ What the tests pin:
 | `sampling_every_lobe_recovers_the_evaluated_albedo` | `E[f/pdf]` lands on the evaluator's own quadrature for every lobe |
 | `tests/gpu_bsdf.rs` | the WGSL port agrees with the Rust across a 1728-case parameter sweep (worst relative disagreement 6e-7), the device's sample PDF equals its eval PDF, and the furnace closes on the GPU's own table interpolation |
 
-What is *not* here yet: **transmission** (the backboard and the windows are
-opaque bright dielectrics, not glass a ray goes through), **iridescence** (thin
-films), and **BSSRDF** — `subsurface` is Disney's local approximation, which
-will not bleed light into a shadow or through a thin part.
+#### transmission and dispersion
+
+Glass is a fifth lobe: a **rough dielectric** (Walter et al. 2007) sharing the
+specular lobe's alpha and its VNDF sampling, with the reflect/transmit split
+taken from the *exact* unpolarised Fresnel equations rather than from Schlick.
+That choice is not fussiness — at a glass/air interface Schlick's error near
+grazing is the difference between a rim that lights up and one that does not,
+and total internal reflection has to be what the same formula returns past the
+critical angle rather than a branch bolted on beside it.
+
+The parameters, all additive and all defaulting to the old behaviour:
+
+| parameter | meaning |
+|---|---|
+| `transmission` | 0..1, OpenPBR's `transmission_weight`. Takes the diffuse and opaque-specular lobes away as it goes, so 1 is pure glass |
+| `ior` | already there; now it is a real index and not only an `F0` |
+| `abbe` | `V_d = (n_d − 1)/(n_F − n_C)`. 0 is no dispersion. Reconstructs a one-term Cauchy `n(λ) = A + B/λ²` — OpenPBR's `specular_ior_dispersion` |
+| `sellmeier` | `Option<([f64;3], [f64;3])>`, a real glass's datasheet. Overrides `abbe`. `spectrum::BK7_SELLMEIER` is the pair the marble's own caustic tracer uses |
+| `attenuation_color` / `attenuation_distance` | Beer–Lambert inside the medium: `σ = ln(1/color)/distance`, applied over each interior segment |
+| `thin_walled` | a sheet with no interior — refract in and straight back out, roughness kept, no lateral offset and no absorption. What a window pane modelled as a 20 mm box actually wants |
+
+**Conventions, because they are the part that goes silently wrong.** `eta` is
+always `n_transmitted / n_incident`, and the integrator computes it from which
+side of the *geometric* normal the ray arrived on, read before the face-forward
+destroys the distinction — so a non-nested solid needs no medium stack at all,
+just one slot recording which material the path is currently inside. Radiance
+carries the camera-path `1/η²` scaling (pbrt's "radiance mode"), which cancels
+Walter's `η_t²` out of the expression entirely; the consequence to hold onto is
+that a *single* interface therefore does not have unit throughput, and it is
+the round trip in and out that is the no-op. Both halves are tested separately.
+
+**Dispersion is one wavelength per path.** A path that meets a dispersive
+material draws a hero wavelength uniformly over 380–780 nm and multiplies its
+RGB throughput, once, by the linear-sRGB colour-matching response normalised so
+that `∫ r̄(λ) dλ = (1,1,1)` — Wyman/Sloan/Shirley's multi-lobe Gaussian fit to
+CIE 1931, twenty lines and no tables, so it ports to WGSL verbatim. Because of
+that normalisation the spectral estimator has the same mean as the RGB one it
+replaced: dispersion only shows up where the geometry downstream genuinely
+depends on λ. A path that meets its first dispersive surface at bounce three
+adopts λ there. **A path that never meets one stays RGB, draws no extra random
+number, and is bit-identical to what it was** — which is what keeps every
+existing scene where it was. The cost is noise: one hero wavelength, not four
+with spectral MIS, and the sRGB response has negative lobes, so a single sample
+can land negative in a channel. The mean is right; the variance is the price.
+
+**NEE does not go through glass.** `occluded()` treats a transmissive surface
+as an opaque blocker, which is the standard choice — a shadow ray has no way to
+find the bent path a refraction would have taken, and pretending otherwise adds
+bias, not caustics. So caustics here come only from BSDF-sampled paths that
+happen to land on an emitter, and they converge slowly. The MIS weights stay
+consistent because both strategies agree that the light was not reachable: the
+NEE sample returns zero and the BSDF path carries the full contribution.
+
+What the tests pin, on top of the table above:
+
+| test | what it holds |
+|---|---|
+| `dielectric_fresnel_at_normal_incidence_is_the_textbook_number` | `((n−1)/(n+1))²` to 1e-6 at n = 1.33, 1.5, 1.52, 1.9, 2.42 |
+| `brewsters_angle_halves_the_unpolarised_reflectance` | at `θ_B = atan(n)` the p-polarised term vanishes, so the average is exactly `R_s/2` |
+| `past_the_critical_angle_everything_reflects` | TIR is the formula's own answer, not a guard |
+| `a_smooth_slab_refracts_at_snells_angle` | sampled through the whole lobe — VNDF facet, Fresnel branch, Walter half-vector — `sin θ_t` matches `sin θ_i / n` to 5e-3 at 10°, 30°, 50°, 70° |
+| `a_rough_glass_sphere_closes_the_furnace` | reflection + transmission in [0.97, 1] at roughness 0.05–0.3 and three incidences, with the η² transport scaling taken back out |
+| `a_slab_is_a_round_trip_no_op` | in and back out returns unit throughput — the other half of the η² convention |
+| `absorption_is_beer_lambert_to_the_letter` | `exp(−σt) == color^(t/d)` to 1e-6, and one attenuation distance reproduces the colour that named it |
+| `a_bk7_prism_spreads_f_to_c_by_the_analytic_angle` | a 60° N-BK7 prism at 45° incidence fans the F (486 nm) and C (656 nm) lines by 0.75°, and the traced spread matches the two-surface analytic `i₁ + i₂ − A` to 2e-3 rad |
+| `the_hero_weights_run_red_to_violet` | 650 nm reads red-dominant, 540 green, 450 blue — the fan comes out in the right order |
+| `hero_weight_integrates_to_white` | the normalisation constants, re-derived by quadrature, to 2e-3 |
+| `the_dielectric_sample_pdf_matches_its_eval_pdf` | the MIS invariant on *both* sides of the surface, thin-walled included |
+| `tests/gpu_bsdf.rs` | the sweep now carries five transmissive materials and sweeps `wi` below the surface too; `gpu_dispersion_matches_the_cpu_reference` pins the device's Sellmeier, Cauchy and CIE fit against the CPU's |
+
+What is *still* not here: **iridescence** (thin films), **BSSRDF** —
+`subsurface` is Disney's local approximation, which will not bleed light into a
+shadow or through a thin part — **nested dielectrics** (one medium slot, so a
+bubble inside glass gets the outer medium wrong), and **spectral MIS** (the
+hero wavelength has no companion wavelengths).
 
 ### the GPU tier
 
