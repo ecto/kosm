@@ -13,49 +13,48 @@
 //! is on wgpu 30 now, so the surface and the tracer are one set of wgpu types
 //! and there is one adapter in the process rather than two.
 //!
-//! What comes out of [`Stage::sample`] is one *raw* sample of linear radiance,
-//! not a picture. The device-side accumulator is cleared before every pass and
-//! read straight back, because the accumulator in this program is
-//! [`crate::history`] — one per-pixel running mean, one geometric change mask,
-//! for both tiers. The shader's own progressive average, its spatial denoise
-//! and its tonemap all happen on the way to the output texture, and that
-//! texture is thrown away.
+//! What comes out of [`Stage::sample`] is one *raw* linear sample of the
+//! frame, with the denoiser's guide planes, packed into the same
+//! `pathtrace::Film` the CPU integrator produces. Nothing accumulates on the
+//! device: the accumulator in this program is [`crate::history`] — one
+//! per-pixel running mean, one geometric change mask, one reprojection — for
+//! both tiers. The shader's own progressive average, its spatial denoise and
+//! its tonemap all happen on the way to an output texture that is thrown
+//! away.
+//!
+//! ## residency
+//!
+//! The court is uploaded once and stays there. `ResidentScene` holds the
+//! surface, face, BVH, material and light buffers; a frame rewrites only the
+//! bytes that moved (`update_scene`, once per *frame*, not once per pass) and
+//! a pass rewrites only the camera and the render state. So a pass is a
+//! dispatch and a readback, not a re-upload of the whole court — which is
+//! what `RayTracePipeline::render_with_render_state` used to make it, and what
+//! the fixed term in the window's cost model was mostly paying for.
+//!
+//! `render_resident_linear` is the exit that makes this usable: it forces the
+//! shader into raw-sample mode and hands back linear radiance plus depth,
+//! normal and albedo, in exactly `pathtrace::render`'s conventions. That is
+//! why the GPU tier now reprojects through a moved camera and runs the à-trous
+//! denoiser, like the CPU one, instead of throwing its whole history away
+//! whenever the camera turns.
 //!
 //! ## what the GPU picture is not
 //!
-//! - The shader's environment is an analytic studio gradient where the CPU's is
-//!   the level's constant grey, and the shader's implicit ground plane is
-//!   switched off because the level authors its own floor while the CPU path
-//!   also gets an infinite one at the slab's underside. Neither shows through a
-//!   closed gym at `env_radiance = 0.05`, but they are why the two images are
-//!   alike and not identical.
 //! - A root with no BRep — the painted markings, which are drawn and not
 //!   modelled — cannot be packed and is not in the GPU picture at all.
-//! - `RayTracePipeline` builds its buffers per call, so every pass re-uploads
-//!   the whole court, and it hands the image back through a CPU readback
-//!   rather than a texture the blit could sample.
-//!
-//!   vcad now has a `ResidentScene` that fixes exactly this — upload once,
-//!   rewrite placements and camera in place, and a `render_resident_into` that
-//!   writes a storage texture the blit could sample with no readback at all.
-//!   It is not used here, and the reason is the *accumulator*. A resident
-//!   scene keeps its `accum` buffer private, and both of its exits
-//!   (`render_resident`, `render_resident_into`) hand back the shader's
-//!   **output texture**: ACES-tonemapped, gamma-encoded, eight bits. This
-//!   tier's contract is one *raw linear* sample per pass, because
-//!   [`crate::history`] is the accumulator for both tiers and the mean of
-//!   tonemapped samples is not the tonemap of their mean. The one call that
-//!   hands back linear radiance is `render_with_render_state`, which takes and
-//!   returns *our* accumulator — so residency of the geometry is what is given
-//!   up to keep the sample honest. Reaching the resident path needs one of two
-//!   things in vcad: a public view of `ResidentScene`'s accum buffer, or a
-//!   compute shader that folds the history (mean and count per pixel, against
-//!   an uploaded mask) on the device so nothing linear ever has to come down.
-//! - There are no guide buffers. The shader writes depth and normals into a
-//!   buffer it allocates itself, without `COPY_SRC` and without returning it,
-//!   so this tier hands the history colour alone — which is why a moved camera
-//!   costs the GPU picture its whole history and only costs the CPU one the
-//!   pixels that failed to reproject.
+//! - The shader's implicit ground plane is switched off because the level
+//!   authors its own floor, while the CPU path also gets an infinite one at
+//!   the slab's underside.
+//! - The environment is the shader's analytic studio gradient scaled by the
+//!   level's `env_radiance`, where the CPU's is that constant flat. Making
+//!   them agree exactly is possible — a 1x1 lat-long map is a constant
+//!   environment the shader will take — and it was tried: at
+//!   `env_radiance = 0.05` in a closed gym lit by ten panels at 18 it changed
+//!   the 960x540 still by **less than one code value anywhere in the frame**,
+//!   and cost 60% more per pass, because an environment *image* is a light
+//!   the shader draws a next-event sample towards on every bounce. So the
+//!   gradient stays. It is not why the two tiers differ in brightness.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -64,10 +63,10 @@ use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_raytrace::gpu::{
-    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, GpuScene, RayTracePipeline,
+    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, GpuScene, RayTracePipeline, ResidentScene,
     DEFAULT_FIREFLY_CLAMP, DEFAULT_RR_START,
 };
-use vcad_kernel_raytrace::pathtrace::Pbr;
+use vcad_kernel_raytrace::pathtrace::{Film, Pbr};
 
 use crate::court::Camera;
 
@@ -87,29 +86,24 @@ pub struct Stage {
     extras: HashMap<usize, Option<GpuScene>>,
     lights: Vec<GpuAreaLight>,
     max_depth: u32,
-    /// The analytic environment's brightness, from the level's `env_radiance`.
-    env_intensity: f32,
+    /// The level's `env_radiance`: the brightness of the shader's analytic
+    /// environment. See [`Stage::new`] for why it is not the CPU's constant.
+    env_radiance: f32,
     /// The merged scene for the frame on screen, and which frame that was.
     /// Assembling it is a clone of the statics and a placement per instance,
     /// which costs the same whatever the resolution — so it is done once per
     /// frame and not once per pass, and a paused window pays for it once.
     scene: Option<(u64, GpuScene)>,
-    /// The shader's accumulator, cleared before every pass and read back
-    /// after it: this is how one raw sample gets off the device. Its staging
-    /// twin is the mappable copy.
-    accum: Option<wgpu::Buffer>,
-    read: Option<wgpu::Buffer>,
+    /// The court on the device. Built on the first pass, kept across every
+    /// one after it: a frame rewrites the placements, a pass rewrites the
+    /// camera. `uploaded` is the frame whose placements are currently in it.
+    resident: Option<ResidentScene>,
+    uploaded: Option<u64>,
     /// Passes since the stage was built. Nothing accumulates across them —
     /// this only drives the shader's jitter and its RNG, so that two passes
     /// of the same frame are two different samples.
     passes: u32,
     size: (u32, u32),
-}
-
-/// One pass off the device: linear radiance and coverage, one sample deep.
-pub struct Sample {
-    pub rgb: Vec<f32>,
-    pub alpha: Vec<f32>,
 }
 
 /// One solid, packed with its material. A packed scene carries a single
@@ -147,7 +141,7 @@ impl Stage {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         max_depth: u32,
-        env_intensity: f32,
+        env_radiance: f32,
     ) -> anyhow::Result<Self> {
         let ctx = GpuContext { device: device.clone(), queue: queue.clone() };
         let pipeline =
@@ -202,9 +196,9 @@ impl Stage {
             lights,
             scene: None,
             max_depth,
-            env_intensity,
-            accum: None,
-            read: None,
+            env_radiance,
+            resident: None,
+            uploaded: None,
             passes: 0,
             size: (0, 0),
         })
@@ -242,24 +236,28 @@ impl Stage {
         scene
     }
 
-    /// One fresh sample of the frame, in linear radiance.
+    /// One fresh sample of the frame, in linear radiance, with guides.
     ///
-    /// The device-side accumulator is zeroed first and read straight back
-    /// afterwards, so what comes out is exactly one pass and nothing older.
-    /// `frame_index` still climbs — it is what moves the shader's Halton
-    /// jitter and its RNG — and with the previous contents zeroed the shader's
-    /// running average degenerates to `sample / frame_index`, which is undone
-    /// here. The output texture, which is where the shader's own denoise and
-    /// tonemap land, is discarded: [`crate::history`] does the accumulating.
+    /// The court is already on the device. A *frame* rewrites the placements
+    /// — `update_scene`, with the clone-and-merge in [`Stage::at`] behind it
+    /// — and a *pass* rewrites the camera and the render state and nothing
+    /// else, so the second and later passes of a still picture cost a
+    /// dispatch and a readback. `frame_index` still climbs: it is what moves
+    /// the shader's Halton jitter and its RNG, so two passes of one frame are
+    /// two samples.
+    ///
+    /// `render_resident_linear` forces raw-sample mode, so what comes back is
+    /// one unweighted sample and not a step of the shader's running average,
+    /// and it fills `depth`, `normal` and `albedo` in `pathtrace::render`'s
+    /// conventions. That is what lets [`crate::history`] reproject this tier
+    /// through a moved camera and denoise it, as it always could the CPU's.
     ///
     /// `scissor` is `[x, y, w, h]`, and it is what makes a pass cost what
-    /// moved. `GpuRenderState::set_scissor` sizes the dispatch to the
-    /// rectangle and offsets every invocation into it, so the shader does the
-    /// work of the rectangle; the readback is trimmed to the rows the
-    /// rectangle spans, which is the other half of the saving, since a pass
-    /// that only touched a band of the screen has no business dragging the
-    /// whole frame back across the bus. Pixels outside come back as the zeros
-    /// the clear left, and the history is told not to look at them.
+    /// moved: the dispatch is sized to the rectangle and every invocation is
+    /// offset into it. **Pixels outside come back stale** — whatever the
+    /// previous pass left in the device's buffers, not zero — which is
+    /// exactly the CPU tier's `render_into` contract, and the history is told
+    /// which rectangle was fresh.
     pub fn sample(
         &mut self,
         stage: &render::Scene,
@@ -268,48 +266,34 @@ impl Stage {
         camera: &Camera,
         size: (u32, u32),
         scissor: Option<[u32; 4]>,
-    ) -> anyhow::Result<Sample> {
+    ) -> anyhow::Result<Film> {
         let n = (size.0 as u64) * (size.1 as u64);
         anyhow::ensure!(n > 0, "an empty picture");
-        if self.size != size {
-            self.size = size;
-            self.accum = None;
-            self.read = None;
-        }
         let assembled = Instant::now();
         if self.scene.as_ref().is_none_or(|(id, _)| *id != frame_id) {
             let scene = self.at(snap, stage);
             self.scene = Some((frame_id, scene));
         }
         let assembly = assembled.elapsed();
-        self.passes += 1;
 
-        // Four floats a pixel — rgb and coverage — which is the layout the
-        // shader's `accum_buffer` has.
-        let bytes = n * 16;
-        if self.accum.is_none() {
-            self.accum = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kosm accumulator"),
-                size: bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.read = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kosm readback"),
-                size: bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
+        let uploaded = Instant::now();
+        let (_, scene) = self.scene.as_ref().expect("just assembled");
+        match &mut self.resident {
+            Some(res) => {
+                res.resize(&self.ctx, size.0, size.1);
+                if self.uploaded != Some(frame_id) || self.size != size {
+                    res.update_scene(&self.ctx, scene);
+                }
+            }
+            None => {
+                self.resident =
+                    Some(self.pipeline.resident_scene(&self.ctx, scene, size.0, size.1));
+            }
         }
-        // Zero it: the shader blends onto whatever is there, and there must be
-        // nothing there.
-        {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            enc.clear_buffer(self.accum.as_ref().expect("just made"), 0, None);
-            self.ctx.queue.submit([enc.finish()]);
-        }
+        self.uploaded = Some(frame_id);
+        self.size = size;
+        let upload = uploaded.elapsed();
+        self.passes += 1;
 
         let mut state = GpuRenderState::new(self.passes);
         // A photoreal viewport: no edge overlay, no stylisation, and no
@@ -320,15 +304,10 @@ impl Stage {
         state.max_depth = self.max_depth;
         state.rr_start = DEFAULT_RR_START;
         state.firefly_clamp = DEFAULT_FIREFLY_CLAMP;
-        state.env_intensity = self.env_intensity;
-        // Rows the pass will actually write, for the readback below.
-        let rows = match scissor {
-            Some(r) if r[2] > 0 && r[3] > 0 => {
-                state.set_scissor(r);
-                (r[1].min(size.1), (r[1].saturating_add(r[3])).min(size.1))
-            }
-            _ => (0, size.1),
-        };
+        state.env_intensity = self.env_radiance;
+        if let Some(r) = scissor.filter(|r| r[2] > 0 && r[3] > 0) {
+            state.set_scissor(r);
+        }
 
         let cam = GpuCamera::new(
             [camera.eye.x as f32, camera.eye.y as f32, camera.eye.z as f32],
@@ -339,92 +318,22 @@ impl Stage {
             size.1,
         );
         let traced = Instant::now();
-        let (_, accum) = {
-            let (_, scene) = self.scene.as_ref().expect("just assembled");
-            pollster::block_on(self.pipeline.render_with_render_state(
-                &self.ctx,
-                scene,
-                &cam,
-                size.0,
-                size.1,
-                self.accum.take(),
-                state,
-            ))
-            .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?
-        };
-        self.accum = Some(accum);
+        let res = self.resident.as_mut().expect("just built");
+        let film =
+            pollster::block_on(self.pipeline.render_resident_linear(&self.ctx, res, &cam, state))
+                .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
 
-        let sample = self.read_back(size, rows)?;
-        // Where a pass goes, when anyone asks. The trace includes the upload
-        // of every buffer and the readback: the pipeline builds its buffers
-        // per call, so a pass pays for the whole scene crossing the bus
-        // whether or not it changed.
+        // Where a pass goes, when anyone asks.
         if std::env::var("KOSM_GPU_TIMING").is_ok() {
             eprintln!(
-                "court  gpu: {}×{} pass — {:.1} ms assembling, {:.1} ms tracing",
+                "court  gpu: {}\u{d7}{} pass \u{2014} {:.1} ms assembling, {:.1} ms uploading, {:.1} ms tracing",
                 size.0,
                 size.1,
                 assembly.as_secs_f64() * 1e3,
+                upload.as_secs_f64() * 1e3,
                 traced.elapsed().as_secs_f64() * 1e3,
             );
         }
-        Ok(sample)
-    }
-
-    /// Copy the accumulator down and undo the shader's `1 / frame_index`.
-    ///
-    /// Only the rows `rows.0 .. rows.1` are copied and mapped: the accumulator
-    /// is row-major, so a scissored pass's rows are one contiguous run, and
-    /// the rest of the frame is left as the zeros the clear put there. The
-    /// history never reads outside the rectangle it asked for.
-    fn read_back(&self, size: (u32, u32), rows: (u32, u32)) -> anyhow::Result<Sample> {
-        let (accum, read) = match (&self.accum, &self.read) {
-            (Some(a), Some(r)) => (a, r),
-            _ => anyhow::bail!("no accumulator to read"),
-        };
-        let n = (size.0 as usize) * (size.1 as usize);
-        let stride = (size.0 as u64) * 16;
-        let (y0, y1) = (rows.0 as u64, rows.1.max(rows.0) as u64);
-        let (offset, span) = (y0 * stride, (y1 - y0) * stride);
-        if span == 0 {
-            return Ok(Sample { rgb: vec![0.0; n * 3], alpha: vec![0.0; n] });
-        }
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(accum, offset, read, offset, span);
-        self.ctx.queue.submit([enc.finish()]);
-
-        let slice = read.slice(offset..offset + span);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("the readback: {e}"))?;
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("the readback never answered"))?
-            .map_err(|e| anyhow::anyhow!("the readback: {e}"))?;
-
-        // `frame_index` was `passes`, and the shader averaged this sample
-        // against a buffer of zeros, so every channel came back divided by it.
-        let k = self.passes.max(1) as f32;
-        let mut rgb = vec![0.0f32; n * 3];
-        let mut alpha = vec![0.0f32; n];
-        {
-            let view = slice.get_mapped_range();
-            let view = view.map_err(|e| anyhow::anyhow!("the readback: {e}"))?;
-            let f: &[f32] = bytemuck::cast_slice(&view);
-            let base = (y0 as usize) * (size.0 as usize);
-            for j in 0..(f.len() / 4) {
-                let i = base + j;
-                for c in 0..3 {
-                    rgb[i * 3 + c] = f[j * 4 + c] * k;
-                }
-                alpha[i] = f[j * 4 + 3] * k;
-            }
-        }
-        read.unmap();
-        Ok(Sample { rgb, alpha })
+        Ok(film)
     }
 }

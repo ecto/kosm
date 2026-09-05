@@ -29,16 +29,15 @@
 //!
 //! Whichever traced it, a pass is **one raw sample** and neither tracer
 //! accumulates. [`crate::history`] does: a running mean and a sample count per
-//! pixel, a reprojection through a moved camera when the pass brought guide
-//! buffers with it, and a geometric mask that throws away only the pixels a
-//! moved ball, its shadow, or a moved extra actually landed on. The GPU tier
-//! has no guides to give — the shader's depth and normals never leave the
-//! device — so its history is mask-only, and a camera that moves costs it the
-//! whole picture where it costs the CPU one a few silhouettes. Both tiers
-//! answer the same `Job` with the same `Shot`, so the window's tuner does not
-//! know which one it is talking to. This file's job is the pace: how big to
-//! ask for, at how many samples, which rectangles, and when a measurement was
-//! fair enough to believe.
+//! pixel, a reprojection through a moved camera, and a geometric mask that
+//! throws away only the pixels a moved ball, its shadow, or a moved extra
+//! actually landed on. Both tiers bring the guide buffers the reprojection
+//! and the denoiser read — vcad's `render_resident_linear` fills them on the
+//! GPU exactly as `pathtrace::render` does on the CPU — and both answer the
+//! same `Job` with the same `Shot`, so the window's tuner does not know which
+//! one it is talking to. This file's job is the pace: how big to ask for, at
+//! how many samples, which rectangles, and when a measurement was fair enough
+//! to believe.
 //!
 //! ## the pass is the mask
 //!
@@ -60,7 +59,7 @@ use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
 use crate::court_gpu;
-use crate::history::{Guides, History, Pose, Plan, View};
+use crate::history::{History, Pose, Plan, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -257,24 +256,6 @@ impl Tracer {
     }
 }
 
-/// A GPU sample, dressed as a `Film` so the history takes it exactly the way
-/// it takes a CPU one. The guide buffers stay zeroed — the tracer has none to
-/// give — and zero depth is vcad's background sentinel, which is the "leave
-/// this pixel alone" the denoiser already knows how to read.
-fn blank_film(size: (u32, u32), sample: court_gpu::Sample) -> pathtrace::Film {
-    let n = (size.0 as usize) * (size.1 as usize);
-    pathtrace::Film {
-        width: size.0,
-        height: size.1,
-        rgb: sample.rgb,
-        alpha: sample.alpha,
-        normal: vec![0.0; n * 3],
-        depth: vec![0.0; n],
-        albedo: vec![0.0; n * 3],
-        variance: vec![0.0; n],
-    }
-}
-
 /// The renderer: build the stage once, then keep adding passes to whatever
 /// the window last asked for.
 fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Device, wgpu::Queue)>) {
@@ -363,10 +344,10 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         let plan: Plan = history.plan(&view, &poses, &lights);
         let frame_px = (job.size.0 as u64) * (job.size.1 as u64);
         // What each tier would actually trace for this plan. The GPU gets one
-        // scissored dispatch over the union — `render_with_render_state`
-        // rebuilds its buffers per call, so a dispatch per rectangle would pay
-        // for the whole court once per rectangle — while the CPU traces the
-        // rectangles themselves.
+        // scissored dispatch over the union — a dispatch per rectangle would
+        // be a readback per rectangle, and the readback is most of what a
+        // pass costs now that the court is resident — while the CPU traces
+        // the rectangles themselves.
         let patch_px: u64 = match &tracer {
             Tracer::Gpu(_) => plan.bbox().map_or(0, |r| (r[2] as u64) * (r[3] as u64)),
             Tracer::Cpu => plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum(),
@@ -381,17 +362,18 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
         let traced_px = if full { frame_px } else { patch_px };
 
-        // One raw sample, whoever traced it: the GPU hands back linear
-        // radiance and nothing else, the CPU fills the guides too.
-        let (guides, traced) = match &mut tracer {
+        // One raw sample, whoever traced it, guides and all: the GPU's
+        // `render_resident_linear` fills depth, normal and albedo in the same
+        // conventions `pathtrace::render` does.
+        let traced = match &mut tracer {
             Tracer::Gpu(gpu) => {
                 let scissor = if full { None } else { plan.bbox() };
                 match gpu.sample(&stage, &job.frame, job.frame_id, &job.camera, job.size, scissor) {
-                    Ok(sample) => {
-                        film = blank_film(job.size, sample);
+                    Ok(sampled) => {
+                        film = sampled;
                         // The scissor is one rectangle, so that rectangle —
                         // not the plan's several — is what came back fresh.
-                        (Guides::None, scissor.map(|r| vec![r]))
+                        scissor.map(|r| vec![r])
                     }
                     Err(error) => {
                         eprintln!("court  gpu: {error}; falling back to the CPU tracer");
@@ -407,23 +389,38 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                 let opts = options(job.spp, seed, false);
                 if full {
                     film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts);
-                    (Guides::Film, None)
+                    None
                 } else {
                     // `render_into` patches the film in place and never
                     // denoises, so the pixels outside the rectangles are still
                     // the previous pass's — which is what the history wants,
                     // since it is about to be told not to look at them.
                     pathtrace::render_into(&scene, &cam, &mut film, &opts, &plan.rects);
-                    (Guides::Film, Some(plan.rects.clone()))
+                    Some(plan.rects.clone())
                 }
             }
         };
-        history.merge(&film, guides, &view, &poses, &lights, traced.as_deref());
-        // Denoise the resolved buffer, blended out as the counts climb. With
-        // no guides the à-trous filter passes every pixel through untouched,
-        // so on the GPU tier this is a no-op rather than a blur.
+        let t_merge = Instant::now();
+        history.merge(&film, &view, &poses, &lights, traced.as_deref());
+        let merge_ms = t_merge.elapsed().as_secs_f64() * 1e3;
+        let t_res = Instant::now();
+        // Denoise the resolved buffer, blended out as the counts climb. Both
+        // tiers bring the guides it stops on now, so this is the same filter
+        // on either.
         let opts = options(job.spp, seed, true);
         let rgba = history.resolve(job.camera.exposure, &opts);
+        // The history's own half of a pass, when anyone asks. It is not
+        // small any more: with guides on both tiers the a-trous filter runs
+        // on every pass, and on the GPU tier it is now the dearest thing in
+        // the loop by an order of magnitude.
+        if std::env::var("KOSM_GPU_TIMING").is_ok() {
+            eprintln!(
+                "court  history: {}\u{d7}{} \u{2014} {merge_ms:.1} ms merging, {:.1} ms resolving",
+                job.size.0,
+                job.size.1,
+                t_res.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         let shot = Shot {
             size: job.size,
             rgba,
@@ -530,27 +527,37 @@ pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) 
     let n = (size.0 as usize) * (size.1 as usize);
     let mut sum = vec![0.0f32; n * 3];
     let mut alpha = vec![0.0f32; n];
+    let mut var = vec![0.0f32; n];
     let passes = passes.max(1);
+    // The last pass's film carries the guides for the whole still — every
+    // pass here is the same frame from the same camera, so they are the same
+    // guides — and the mean goes into it before it is denoised. That is the
+    // window's `History::resolve` in miniature, minus the reprojection there
+    // is nothing here to reproject through.
+    let mut film = pathtrace::Film::new(size.0, size.1);
     for _ in 0..passes {
-        let s = gpu.sample(&stage, &frame, 0, &camera, size, None)?;
-        for (acc, v) in sum.iter_mut().zip(&s.rgb) {
+        film = gpu.sample(&stage, &frame, 0, &camera, size, None)?;
+        for (acc, v) in sum.iter_mut().zip(&film.rgb) {
             *acc += v;
         }
-        for (acc, v) in alpha.iter_mut().zip(&s.alpha) {
+        for (acc, v) in alpha.iter_mut().zip(&film.alpha) {
+            *acc += v;
+        }
+        for (acc, v) in var.iter_mut().zip(&film.variance) {
             *acc += v;
         }
     }
     let k = 1.0 / passes as f32;
-    let film = pathtrace::Film {
-        width: size.0,
-        height: size.1,
-        rgb: sum.iter().map(|v| v * k).collect(),
-        alpha: alpha.iter().map(|v| v * k).collect(),
-        normal: vec![0.0; n * 3],
-        depth: vec![0.0; n],
-        albedo: vec![0.0; n * 3],
-        variance: vec![0.0; n],
-    };
+    for (dst, v) in film.rgb.iter_mut().zip(&sum) {
+        *dst = v * k;
+    }
+    for (dst, v) in film.alpha.iter_mut().zip(&alpha) {
+        *dst = v * k;
+    }
+    for (dst, v) in film.variance.iter_mut().zip(&var) {
+        *dst = v * k;
+    }
+    pathtrace::denoise(&mut film, &options(passes, 0x5eed_1234, true));
     let rgba = film.to_srgb8(camera.exposure, false);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -614,21 +621,37 @@ const SPREAD: f64 = 1.5;
 /// What a pass costs: a fixed part and a per-pixel part.
 ///
 /// One term was never enough. A pass has a floor that does not scale with the
-/// picture at all — the GPU tier re-uploads the whole court and drags the
-/// frame back across the bus whatever its size; the CPU tier rebuilds the
-/// net's BVH and forks a rayon pool. Milliseconds per megapixel per sample
-/// folded that floor into the slope, so the model over-charged a big picture
-/// and under-charged a small one, and the tuner oscillated: grow on a
+/// picture at all — the CPU tier rebuilds the net's BVH and forks a rayon
+/// pool; the GPU tier used to re-upload the whole court and drag the frame
+/// back across the bus whatever its size. Milliseconds per megapixel per
+/// sample folded that floor into the slope, so the model over-charged a big
+/// picture and under-charged a small one, and the tuner oscillated: grow on a
 /// prediction, overrun, shrink, go quiet, grow again.
 ///
-/// So: `ms = fixed + per * work`, where `work` is megapixels actually traced
-/// times samples. Fitting a line needs two points, and the passes supply them
-/// for free now that a masked pass traces a fraction of the frame — the two
-/// buckets below are exponential moving averages of the cheap end and the dear
-/// end of whatever work has been asked for, and the line through them is the
-/// model. Until they are far enough apart to be two points, it degenerates to
-/// the old one-term fit through the origin, which is what a single
-/// measurement can honestly say.
+/// So: `ms = fixed + per * work`. Fitting a line needs two points, and the
+/// passes supply them for free because a masked pass does less work than a
+/// full one — the two buckets below are exponential moving averages of the
+/// cheap end and the dear end of whatever work has been asked for, and the
+/// line through them is the model. Until they are far enough apart to be two
+/// points it degenerates to the old one-term fit through the origin, which is
+/// what a single measurement can honestly say.
+///
+/// ## what `work` counts
+///
+/// **Megapixel-samples touched**, which is the traced patch *plus the whole
+/// frame*. It used to be the traced patch alone, and that was right when the
+/// tracer was the pass. It is not any more. With guides on both tiers the
+/// history denoises every pass, and [`History::resolve`] costs the *frame*
+/// whatever the mask let the tracer skip: measured on the GPU tier at
+/// 512x288, a pass is 25 ms tracing, 5 ms merging and 420 ms resolving, and a
+/// pass that traced 15% of the screen costs the same as a full one.
+///
+/// Charging only the patch made every one of those masked passes look like a
+/// dear pass at a tenth of the work, the fit put all of it in `fixed`, and
+/// `size_matters` below then said — correctly, for the model it was given —
+/// that shrinking the picture would not help. The window sat at 512x288 and
+/// half a second a pass with a 30 ms target. Counting the frame the history
+/// walks puts that cost back on the slope where it belongs.
 #[derive(Clone, Copy)]
 struct Cost {
     lo: Option<(f64, f64)>,
@@ -829,19 +852,21 @@ impl App {
     /// The work a *full* pass at this divisor is, in megapixel-samples. Full,
     /// because that is the pass whose cost decides how big the picture may be:
     /// a masked pass is cheaper by definition and never the thing that has to
-    /// fit.
+    /// fit. The frame counts twice — once traced, once resolved — which is
+    /// what [`Cost`] measures against.
     fn work(&self, scale: u32) -> f64 {
         let (w, h) = ((self.window.0 / scale).max(32), (self.window.1 / scale).max(18));
-        w as f64 * h as f64 / 1e6 * self.samples.max(1) as f64
+        2.0 * w as f64 * h as f64 / 1e6 * self.samples.max(1) as f64
     }
 
     /// The part of a pass at this divisor that the *size* is paying for.
     ///
     /// Only this part answers to resolution. The fixed part is paid whether
-    /// the picture is 512 pixels across or 91 — on the GPU tier it is the
-    /// court crossing the bus and the frame coming back, and it is most of the
-    /// pass — so charging the size for it is what made the old tuner shrink
-    /// the picture to nothing chasing a budget no size could meet.
+    /// the picture is 512 pixels across or 91 — the net's BVH, a rayon pool,
+    /// the dispatch and the readback — so charging the size for it is what
+    /// made the old tuner shrink the picture to nothing chasing a budget no
+    /// size could meet. On the GPU tier that part is now a millisecond or
+    /// two: the court is resident and only the camera moves.
     fn pixel_ms(&self, scale: u32) -> f64 {
         let (_, per) = self.cost.terms();
         per * self.work(scale)
@@ -870,12 +895,14 @@ impl App {
     /// the rest of the session. So a pass more than [`OUTLIER`] times the
     /// standing prediction is thrown away whole: it neither retunes the cost
     /// nor counts as an overrun.
-    /// A pass that traced only a patch is charged for the patch: `traced_px`,
-    /// not the frame. That is what makes the two-term fit possible at all —
-    /// the masked passes and the full ones are the two work levels the line is
-    /// drawn through, with no probe pass and no calibration phase.
+    /// A pass that traced only a patch is charged for the patch *and* for the
+    /// frame the history then walked — see [`Cost`]. Masked and full passes
+    /// are still the two work levels the line is drawn through, with no probe
+    /// pass and no calibration phase; they are just no longer ten times apart
+    /// when the tracer is not what the pass is made of.
     fn tune(&mut self, shot: &Shot) -> bool {
-        let work = shot.traced_px as f64 / 1e6 * shot.spp.max(1) as f64;
+        let frame_px = (shot.size.0 as u64) * (shot.size.1 as u64);
+        let work = (shot.traced_px + frame_px) as f64 / 1e6 * shot.spp.max(1) as f64;
         if work <= 0.0 {
             return false;
         }

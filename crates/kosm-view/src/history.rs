@@ -27,21 +27,19 @@
 //! Because depth is a ray distance, unprojecting is exact and cheap:
 //! `p = eye + normalize(dir(px, py)) * depth`. No matrix inverse anywhere.
 //!
-//! ## a pass without guides
+//! ## both tiers bring them
 //!
-//! The GPU tier has no guide buffers to hand over: the compute shader writes
-//! depth and normals into a buffer it allocates itself, does not mark it
-//! `COPY_SRC` and does not return it. So [`History::merge`] takes a
-//! [`Guides`] flag, and a pass that says [`Guides::None`] is merged on the
-//! strength of the mask alone — which still works, because the mask is
-//! *geometric*: it is computed from where the balls and the net are and where
-//! their shadows fall, not from anything the tracer measured. What is lost is
-//! reprojection. A pixel cannot be carried into a moved camera without knowing
-//! how far away it was, so a camera that moves throws the whole picture away
-//! rather than most of it, and the à-trous filter — which passes a pixel
-//! through untouched wherever `depth` is zero — becomes a no-op. The GPU tier
-//! is therefore sharp and unfiltered at one sample, and starts over on an
-//! orbit; the CPU tier is neither.
+//! They did not always. The GPU tier used to hand over colour alone — the
+//! compute shader wrote depth and normals into a buffer it allocated itself
+//! and never returned — so its history was mask-only: a camera that moved
+//! threw the whole picture away rather than most of it, and the a-trous
+//! filter, which passes a pixel through untouched wherever `depth` is zero,
+//! was a no-op on it.
+//!
+//! vcad's `render_resident_linear` returns the guides in exactly the
+//! conventions above, so [`History::merge`] no longer needs to ask which
+//! tracer it is being fed. Reprojection and denoising are the same code on
+//! either tier.
 //!
 //! ## the mask buys rays now
 //!
@@ -61,19 +59,6 @@
 
 use vcad_kernel_math::{Point3, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film, PathTraceOptions};
-
-/// Whether the pass being merged brought depth, normals and albedo with it.
-///
-/// The CPU integrator fills all three; the GPU tracer returns colour alone.
-/// Without them there is nothing to reproject through and nothing for the
-/// denoiser to stop on, so a moved camera invalidates everything.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Guides {
-    /// `film.depth`, `film.normal` and `film.albedo` are the tracer's.
-    Film,
-    /// Colour only.
-    None,
-}
 
 /// A pixel's history is kept if the reprojected distance agrees to this,
 /// relative.
@@ -373,7 +358,6 @@ impl History {
     pub fn merge(
         &mut self,
         film: &Film,
-        guides: Guides,
         view: &View,
         poses: &[Pose],
         lights: &[Point3],
@@ -410,10 +394,7 @@ impl History {
         match self.view {
             // A moved camera, with depth to unproject through: carry what
             // reprojects. Without it, nothing can be carried at all.
-            Some(old) if old != *view => match guides {
-                Guides::Film => self.reproject(&old, view, film, &mut live),
-                Guides::None => live.iter_mut().for_each(|l| *l = false),
-            },
+            Some(old) if old != *view => self.reproject(&old, view, film, &mut live),
             None => live.iter_mut().for_each(|l| *l = false),
             _ => {}
         }
@@ -443,18 +424,15 @@ impl History {
             }
         }
         // The guides are always the newest pass's: they describe the geometry
-        // the picture is of *now*, and the next reprojection reads them. A
-        // pass with none leaves them zeroed, which is the background sentinel
-        // — the denoiser passes such a pixel through, so it becomes a no-op
-        // rather than a blur with nothing to stop it.
-        // The CPU tier's film is persistent — patched in place by
-        // `render_into` — so its guides describe the whole picture as it now
-        // stands, masked pass or not, and are copied whole.
-        if guides == Guides::Film {
-            self.normal.copy_from_slice(&film.normal);
-            self.depth.copy_from_slice(&film.depth);
-            self.albedo.copy_from_slice(&film.albedo);
-        }
+        // the picture is of *now*, and the next reprojection reads them. Both
+        // tiers keep their film between passes — the CPU patches it in place
+        // with `render_into`, the GPU reads back device buffers a scissored
+        // pass only partly rewrote — so outside a masked rectangle the guides
+        // are still last pass's, which is the same picture. They are copied
+        // whole either way.
+        self.normal.copy_from_slice(&film.normal);
+        self.depth.copy_from_slice(&film.depth);
+        self.albedo.copy_from_slice(&film.albedo);
         self.view = Some(*view);
         self.poses = poses.to_vec();
     }
@@ -658,7 +636,11 @@ impl History {
     /// towards the raw mean as a pixel's count climbs, and a pixel that has
     /// seen [`DENOISE_UNTIL`] samples keeps its own estimate untouched. A wall
     /// that has been accumulating for a minute should not be smeared by a
-    /// filter tuned for one sample.
+    /// filter tuned for one sample — and once *every* pixel has that many, the
+    /// filter is not run at all. It is a fixed cost, 70-90 ms whether the
+    /// picture is 170x96 or 512x288, and a still window reaches
+    /// [`DENOISE_UNTIL`] everywhere in a couple of seconds and would then pay
+    /// it forever for an answer the blend throws away.
     pub fn resolve(&self, exposure: f32, opts: &PathTraceOptions) -> Vec<u8> {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
         let mut film = Film {
@@ -671,7 +653,7 @@ impl History {
             albedo: self.albedo.clone(),
             variance: self.variance.clone(),
         };
-        if opts.denoise {
+        if opts.denoise && self.count.iter().any(|&c| c.max(1) < DENOISE_UNTIL) {
             let mut filtered = Film {
                 width: film.width,
                 height: film.height,
@@ -803,7 +785,7 @@ mod tests {
         let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
         let mut h = History::new((W, H));
         for _ in 0..16 {
-            h.merge(&film, Guides::Film, &view, &poses, &[], None);
+            h.merge(&film, &view, &poses, &[], None);
         }
         for py in 0..H {
             for px in 0..W {
@@ -823,13 +805,13 @@ mod tests {
         let mut h = History::new((W, H));
         let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
         for _ in 0..8 {
-            h.merge(&film, Guides::Film, &view, &at(0.0), &[], None);
+            h.merge(&film, &view, &at(0.0), &[], None);
         }
         let before: Vec<u32> = h.count.clone();
         assert!(before.iter().all(|&c| c == 8));
 
         // Move it half a metre: a real move, but a small one on screen.
-        h.merge(&film, Guides::Film, &view, &at(500.0), &[], None);
+        h.merge(&film, &view, &at(500.0), &[], None);
         let f = h.mask_fraction();
         assert!(f > 0.0 && f < 0.9, "the mask should be a patch, not the screen: {f}");
         let inside = h.count.iter().filter(|&&c| c == 1).count();
@@ -847,7 +829,7 @@ mod tests {
         let mut h = History::new((W, H));
         let poses = [Pose::still([0.0, 0.0, 500.0], 100.0)];
         for _ in 0..8 {
-            h.merge(&plane_film(&va, 1.0), Guides::Film, &va, &poses, &[], None);
+            h.merge(&plane_film(&va, 1.0), &va, &poses, &[], None);
         }
         let b = pathtrace::Camera::look_at(
             Point3::new(200.0, -3000.0, 0.0),
@@ -856,7 +838,7 @@ mod tests {
             45.0,
         );
         let vb = View::of(&b, W, H);
-        h.merge(&plane_film(&vb, 1.0), Guides::Film, &vb, &poses, &[], None);
+        h.merge(&plane_film(&vb, 1.0), &vb, &poses, &[], None);
 
         // The strip that slid in from the edge is new; the rest is carried.
         let kept = h.count.iter().filter(|&&c| c == 9).count();
@@ -878,7 +860,7 @@ mod tests {
         // Nothing in the history yet: the whole frame, because no rectangle
         // describes a picture that does not exist.
         assert!(h.plan(&view, &at(0.0), &[]).full);
-        h.merge(&film, Guides::Film, &view, &at(0.0), &[], None);
+        h.merge(&film, &view, &at(0.0), &[], None);
 
         // A world that did not move asks for nothing — and an empty plan is
         // the caller's cue to render the whole frame and converge.
@@ -907,7 +889,7 @@ mod tests {
         let mut h = History::new((W, H));
         let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
         for _ in 0..8 {
-            h.merge(&plane_film(&view, 1.0), Guides::Film, &view, &at(0.0), &[], None);
+            h.merge(&plane_film(&view, 1.0), &view, &at(0.0), &[], None);
         }
         assert!(h.count.iter().all(|&c| c == 8));
 
@@ -924,7 +906,7 @@ mod tests {
                 }
             }
         }
-        h.merge(&film, Guides::Film, &view, &at(500.0), &[], Some(&plan.rects));
+        h.merge(&film, &view, &at(500.0), &[], Some(&plan.rects));
 
         let mut inside = 0usize;
         for py in 0..H {
@@ -966,7 +948,7 @@ mod tests {
             ]
         };
         let lights = [Point3::new(0.0, 0.0, 6000.0), Point3::new(400.0, 200.0, 6000.0)];
-        h.merge(&plane_film(&view, 1.0), Guides::Film, &view, &at(300.0), &lights, None);
+        h.merge(&plane_film(&view, 1.0), &view, &at(300.0), &lights, None);
         let plan = h.plan(&view, &at(600.0), &lights);
         assert!(!plan.rects.is_empty());
 

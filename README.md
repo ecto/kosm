@@ -368,9 +368,14 @@ the divisor retuned from the times measured.
 Two tracers answer that. `vcad-kernel-raytrace`'s `gpu` feature used to be
 unreachable here — it pinned wgpu 23 while the surface is on wgpu 30 — but vcad
 is on wgpu 30 now (a worktree of it, `claude/wgpu-30`), so the compute tracer
-runs on the window's own device, each solid packed once and every frame only
-saying where its instances are. `--cpu` picks the CPU integrator, which is the
-reference and the fallback.
+runs on the window's own device. The court is *resident* on it: one
+`ResidentScene`, packed once, where a frame rewrites only the placements that
+moved and a pass rewrites only the camera and the render state. A pass used to
+re-upload the whole court and rebuild every buffer and bind group; the 960×540
+still went from 4.40 s for thirty-two passes to 1.39 s, and in the window,
+where the surface and the tracer share a device and a queue, from two to four
+*seconds* a pass to twenty-five milliseconds. `--cpu` picks the CPU
+integrator, which is the reference and the fallback.
 
 Neither accumulates. A pass is one raw sample and `history.rs` is the
 accumulator for both, because one sample a pixel is a blizzard and what makes
@@ -415,18 +420,56 @@ stderr. Under load, that moved the GPU tier from 170×96 to 256×144 at the same
 pass time, and left the CPU tier at its size with masked passes about a third
 off a full one.
 
-A moved camera parts them. The CPU pass brings guide buffers, so a pixel
-unprojects its own hit along `Film::depth`, carries it back through the
-previous camera and keeps what agrees to two per cent of distance and 0.9 of
-normal; its denoiser runs on the resolved buffer, blended out as counts pass
-thirty-two. The shader's depth and normals go into a buffer it neither marks
-copyable nor returns, so the GPU tier hands over colour alone: an orbit costs
-it the whole picture, and its denoise is a no-op.
+A moved camera no longer parts them. Both passes bring guide buffers now —
+vcad's `render_resident_linear` hands back one raw *linear* sample plus depth,
+normal and albedo in exactly `pathtrace::render`'s conventions, where the
+shader's other two exits hand back tonemapped bytes that cannot be averaged or
+reprojected at all. So on either tier a pixel unprojects its own hit along
+`Film::depth`, carries it back through the previous camera and keeps what
+agrees to two per cent of distance and 0.9 of normal, and the à-trous filter
+runs on the resolved buffer, blended out as counts pass thirty-two. An orbit
+used to cost the GPU picture its whole history; it now costs it the pixels
+that failed to reproject.
+
+That has a price, and it is now the pass. The filter is `pathtrace::denoise`
+on the CPU over the whole frame, and at 512×288 a GPU pass measures 25 ms
+tracing, 5 ms merging and **420 ms resolving**. The tuner is told about it:
+`work` counts megapixel-samples *touched*, the traced patch plus the frame the
+history then walks, because a masked pass that traced a sixth of the screen
+still resolves all of it. Charging only the patch put that whole cost in
+`fixed`, where no change of size could reach it, and the window sat at 512×288
+and half a second a pass against a 30 ms target. It now settles around
+320×180, and the filter is skipped outright once every pixel has its
+thirty-two samples. Getting the rest of the way to 30 ms means a denoiser that
+is not a full-frame CPU pass — on the device, or over the mask alone.
 
 It is incomplete elsewhere too. The painted markings have no BRep to pack and
 are CPU-only — the GPU court has no lines on its floor. The ball's seams *are*
 on the GPU again: the shader used to trace a torus wide enough to engulf the
 ball it was drawn on, and vcad's torus intersection is fixed.
+
+The two pictures still do not agree on brightness: the gym's walls read 46 on
+the GPU against the CPU's 79. It is not the environment. The shader's analytic
+studio gradient is a different colour in every direction where the CPU's is
+the level's `env_radiance` flat, so the constant was tried as a 1×1 lat-long
+map — an exact match — and it moved no pixel of the 960×540 still by a single
+code value while costing 60% more per pass, because an environment *image* is
+a light the shader samples towards on every bounce. At `env_radiance = 0.05`
+under ten panels at 18, the environment is not what either picture is made of.
+Nor is it the path budget: the GPU traces *deeper* (6 bounces to the CPU's 5),
+starts Russian roulette later and clamps fireflies higher. The difference is
+in the integrator, and it is vcad's to answer.
+
+There is one artifact left, and it is not a packing bug. A faint dark disc
+sits on the +y wall at about x = 265, y = 270 of the 960×540 still, some six
+per cent below its surroundings and about thirty pixels across, and the CPU
+picture has nothing there. Bisecting the packed roots puts it in the *walls*
+root alone: it survives with no balls, no net, no bleachers and one bounce, so
+it is neither a root packed at the origin nor the seams packed twice. Its
+world position is (−848, 8500, 1891) — precisely where the view ray meets that
+wall head on, the camera's own retro-reflection point. A view-dependent term
+in the shader's BRDF that the CPU integrator does not reproduce, then; it is
+in vcad, and this worktree does not touch vcad.
 
 The pass still re-uploads the court and reads the image back rather than
 sharing a texture with the blit, and this is deliberate rather than pending.
