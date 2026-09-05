@@ -924,6 +924,131 @@ machine — single-threaded, almost all of it in `propagate_boolean` sorting fac
 names under `circular_pattern` — and the window is black until it is done; it
 says so on stderr while it works, and a `timeout 90` never gets past it.
 
+### where the samples go
+
+A game spends its samples uniformly. One ray per pixel per frame, whether the
+pixel is a wall that has looked the same for four hundred frames or the ball
+that crossed it on this one. The wall's ray buys nothing — its mean is already
+inside a display bit — and the ball's one ray is not nearly enough.
+
+The renderer knows which is which, and it knows *before* it traces anything:
+
+* **the physics.** Every instance's transform this frame is already on the
+  device, packed for the reprojection as `InstanceMotion`. With the previous
+  frame's depth plane that is the exact screen-space displacement of the
+  surface under each pixel — a motion vector, not a guess.
+* **the history.** Every pixel carries its own sample count and the variance of
+  its own mean. sigma/sqrt(n) is the error bar another sample would buy down.
+* **the image.** The last raw sample against the running mean — the same
+  disagreement the neighbourhood clamp measures, and the only thing that sees
+  lighting going stale under a surface that did not move.
+
+`gpu/budget.rs` and `gpu/shaders/budget.wgsl` turn those into a per-pixel
+**sample budget** `b(p)` in four compute passes at the head of the frame:
+one for the three drives, two to dilate the motion drive over the à-trous
+filter's own footprint — a moved ball drags its shadow, its bounce and
+everything the filter will reach for — and one to normalise so the frame's
+total is exactly the tuner's `rays_per_frame`. Directing the samples never
+spends more of them. It moves them from the wall to the ball.
+
+The formula the numbers below came out of, per pixel:
+
+```
+error   = min(sigma/(mu*sqrt(n)) / 0.15, 3)          the error bar, bounded
+        + 6 * max(0, (8 - n)/8)                      ...and how little is behind it
+change  = max(0, |L(raw) - L(mean)| / (2*sigma_1) - 1)   in the sample's own sigmas
+motion  = dilate(displacement in pixels / 0.5)       what the physics says
+w       = mix(1, 0.03 + error + 3*motion + 3*change, bias)
+b(p)    = w * rays_per_frame / sum(w),   clamped to the pass's round count
+```
+
+Three things in there were each worth more than the rest of the design put
+together, and all three were wrong in the first version:
+
+* **the short-history term is not a small correction.** A pixel the clamp has
+  just shortened — a floor the ball's shadow has moved off — is holding two
+  samples and is the worst pixel in the frame. Capping its claim at one share,
+  as the error-bar term is capped, told the budget it was no more deserving
+  than a converged neighbour, and the whole feature measured as a rounding
+  error. Six shares, and it measures.
+* **the error-bar term has to be bounded, and its target has to be honest.**
+  Every pixel of a live path-traced frame is over a 2% error bar for a long
+  time, so a term written against 2% pins every pixel to its ceiling and is a
+  flat field wearing a disguise.
+* **disagreement has to be measured in the sample's own sigmas, not as a
+  fraction of the mean.** A 1 spp sample sits half its own magnitude from the
+  truth on a good day, so a relative test reads the Monte Carlo noise on every
+  pixel far louder than the shadow that actually moved, and the budget follows
+  the noise.
+
+**Deterministic or stochastic.** The natural thing is for `accumulate` to loop
+`b(p)` samples at pixel `p`, and that needs the *trace* to loop per pixel. The
+integrator takes one sample per invocation per dispatch and changing that is a
+line in `integrator.wgsl`, which this does not touch. So the pass is split into
+rounds instead, and on round `r` a pixel takes its sample or does not.
+
+Not by a coin, though — that was the second thing measured and rejected.
+A coin at probability `b/rounds` is unbiased in the *mean*, which is all an
+unbiasedness argument covers; but a pixel's error goes as `1/sqrt(count)`, and
+`1/sqrt` is convex, so a count that scatters around `b` is worse than a count
+that *is* `b`. On the fixture it gave up a third of what the feature was
+buying. The rounds are **stratified** instead: walk `[u, u+b)` in steps of
+`b/rounds` and take a round each time the walk crosses an integer, with a
+per-pixel dither `u`. The pixel takes exactly `floor(b)` or `ceil(b)` rounds,
+the expectation is still exactly `b`, and the count never strays by more than
+one. Nothing is reweighted by `1/p`: the selection never looks at the sample's
+value, so the mean over what was folded is unbiased on its own, and a
+reweighting would only add variance.
+
+A pixel that skips every round still has its history *committed* — a pixel that
+skipped a frame the camera moved on would otherwise silently lose the history
+the reprojection carried onto it.
+
+**Nothing starves.** `budget_floor_k` guarantees every pixel a sample once
+every k frames, on a phase of its own so the cost is spread rather than
+periodic — and the guarantee is taken deterministically, on the round
+`pixel % rounds`, because a guarantee that holds two frames in three is not a
+guarantee.
+
+`tests/gpu_sample_budget.rs` pins the four claims on a sphere over a plane at
+64x64, and these are its numbers:
+
+* with the scene static and no motion table at all, the frame's budget totals
+  **4091 samples against a target of 4096** — 0.12% — and the noisiest quarter
+  of the frame by its own relative error bar gets **1.59 samples/pixel against
+  0.85** for the calmest;
+* with one ball moving, the ball's own pixels get **2.70 samples/pixel**, the
+  neighbourhood the filter will drag with it **2.60**, and the rest of the
+  frame **0.35** — a factor of eight;
+* from a converged frame, sixteen frames of a ball crossing it at **equal
+  samples folded per frame**: RMSE against a 512-sample reference of **0.0660
+  uniform against 0.0529 directed, a ratio of 0.80**. Split, that is the ball
+  0.121 → 0.107 and everything else 0.053 → 0.039 — the background improves
+  too, because what it was short of was not rays but rays *where the clamp had
+  just thrown a history away*;
+* and over one floor period, **0 of 4096 pixels** go untouched.
+
+`kosm-view --budget` turns it on in the viewer; `--budget=0.4` names the bias,
+where 0 is the uniform spend the window always had and 1 is entirely where the
+budget says. `--budget-rounds` (4), `--budget-radius` (32 pixels) and
+`--budget-floor` (16 frames) are the rest of it.
+
+`--dump-frames 60 --at 0.4 --width 640`, with and without: at frame 8, where
+the history is still short, the directed frames are better everywhere at once —
+the walls and the bleachers smoother, the net and the rim legible, the balls
+sharp where the uniform run has them furred. By frame 59 the trade has settled
+into what it is for: the moving ball, the net and the backboard are markedly
+cleaner, the shadows on the floor crisper, and the far wall carries a little
+more grain than the uniform run left it, because that is where the samples came
+from.
+
+The honest cost, today: the pass takes **155 ms against 39 ms** at 640x360,
+because it is four full-frame trace rounds to place the same 230,400 folded
+samples. The budget directs *placement*; it cannot yet withhold a ray, because
+the trace dispatch has no per-pixel skip. One `if` in `integrator.wgsl` — read
+the budget, return early — makes the rays dispatched equal the samples folded
+and the whole thing free. That line is deliberately not written here.
+
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
 window, which is how the picture is checked; it uses the GPU tracer unless
 `--cpu` says otherwise. `--pool` and `--splash` are gone for now: they were

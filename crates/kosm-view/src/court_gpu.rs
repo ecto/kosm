@@ -90,7 +90,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kosm_render::gpu::InstanceMotion;
+use kosm_render::gpu::{InstanceMotion, SampleBudget};
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
@@ -163,6 +163,45 @@ fn denoise_from_args() -> GpuDenoiseParams {
         d.spatial_variance = false;
     }
     d
+}
+
+/// The gradient-directed sample budget off the command line.
+///
+/// `--budget` turns it on fully directed; `--budget=0.4` names the bias, where
+/// 0 is the uniform spend the viewer always had and 1 is entirely where the
+/// budget says. `--rays-per-frame N` is the frame's total, in samples folded,
+/// and defaults to one per pixel — the same number a uniform pass folds, so
+/// the flag moves the samples without spending more of them.
+/// `--budget-radius R` is how far a moved instance's drive is dilated, over
+/// the à-trous filter's own 32-pixel footprint, `--budget-floor K` guarantees
+/// every pixel a sample once every K frames, and `--budget-rounds R` is how
+/// many trace rounds a pass is split into — the range a pixel's share can
+/// span, four by default.
+///
+/// Absent, nothing changes: every pixel folds every sample of the pass, which
+/// is what it did before any of this.
+fn budget_from_args() -> Option<SampleBudget> {
+    let asked = std::env::args().any(|a| a == "--budget" || a.starts_with("--budget="));
+    if !asked {
+        return None;
+    }
+    let mut b = SampleBudget {
+        bias: flag("budget")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+        ..SampleBudget::default()
+    };
+    if let Some(v) = flag("budget-radius").and_then(|v| v.parse::<u32>().ok()) {
+        b.radius = v;
+    }
+    if let Some(v) = flag("budget-floor").and_then(|v| v.parse::<u32>().ok()) {
+        b.floor_k = v.max(1);
+    }
+    if let Some(v) = flag("budget-rounds").and_then(|v| v.parse::<u32>().ok()) {
+        b.rounds = v.max(1);
+    }
+    Some(b)
 }
 
 /// ReSTIR DI off the command line.
@@ -355,6 +394,10 @@ pub struct Stage {
     /// converging. A still that stops at thirty-two wants the filter at full
     /// strength instead — see [`Stage::always_denoise`].
     denoise: GpuDenoiseParams,
+    /// The gradient-directed sample budget, or `None` for the uniform spend.
+    budget: Option<SampleBudget>,
+    /// Whether the budget line has been printed.
+    said_budget: bool,
     /// What the pass tonemaps into and the blit samples: an `Rgba8Unorm`
     /// storage texture on the viewport's device, remade only on a resize. It
     /// carries an `Rgba8UnormSrgb` view format because the blit decodes on the
@@ -513,6 +556,8 @@ impl Stage {
             history,
             neural,
             denoise: denoise_from_args(),
+            budget: budget_from_args(),
+            said_budget: false,
             target: None,
             passes: 0,
             size: (0, 0),
@@ -742,7 +787,50 @@ impl Stage {
         // climbing `frame_index` to move the jitter and the RNG. The whole
         // frame every time — there is no box and no mask left on this tier.
         let mut accumulated = Duration::ZERO;
-        for k in 0..samples.max(1) {
+        let asked = samples.max(1);
+
+        // Where this pass's samples go, decided before a ray is traced. The
+        // budget reads the guide planes and the raw sample the *previous*
+        // pass left resident, and the motion table this pass is about to
+        // reproject with — so a ball that is about to move has already asked
+        // for the samples by the time the trace starts.
+        //
+        // The pass folds `asked` samples per pixel on average, exactly as the
+        // uniform loop does, and takes `asked * budget.rounds` rounds to place
+        // them: a pixel cannot be given four times its share out of one round,
+        // and the rounds are where the range comes from. Each round is still a
+        // full-frame trace, because the integrator takes one sample per
+        // invocation and skipping a pixel inside it is not this crate's line
+        // to write — so what `--budget` buys today is *placement* at the cost
+        // of trace dispatches, and it goes free the day the trace can skip.
+        let budget = self.budget.map(|b| SampleBudget {
+            rays_per_frame: (size.0 as f32) * (size.1 as f32) * asked as f32,
+            rounds: asked * b.rounds.max(1),
+            ..b
+        });
+        let rounds = budget.as_ref().map(|b| b.rounds).unwrap_or(asked);
+        if let Some(b) = budget.as_ref() {
+            if !self.said_budget {
+                self.said_budget = true;
+                eprintln!(
+                    "court  gpu: the samples are directed — bias {:.2}, {} rounds, \
+                     {:.0} samples a pass, every pixel served within {} frames",
+                    b.bias, b.rounds, b.rays_per_frame, b.floor_k,
+                );
+            }
+            self.pipeline
+                .budget_frame(
+                    &self.ctx,
+                    &self.history,
+                    res,
+                    &cam,
+                    b,
+                    motion.as_ref(),
+                    self.passes,
+                )
+                .map_err(|e| anyhow::anyhow!("the budget: {e}"))?;
+        }
+        for k in 0..rounds {
             let box_started = Instant::now();
             self.passes += 1;
             let mut state = GpuRenderState::new(self.passes);
@@ -775,24 +863,46 @@ impl Stage {
             if let Some((m, sp, r)) = self.restir {
                 state.set_restir(m, sp, r);
             }
-            self.pipeline
-                .accumulate_resident_temporal(
-                    &self.ctx,
-                    &self.history,
-                    res,
-                    &cam,
-                    state,
-                    // No keep mask: every pixel keeps what it has until the
-                    // reprojection cannot find it or the clamp shortens it.
-                    &[],
-                    // Only the first sample of the pass reprojects. After it
-                    // the history is already in this pass's view, and the
-                    // camera does not move between the samples of one pass.
-                    if k == 0 { prev_view.as_ref() } else { None },
-                    &denoise,
-                    if k == 0 { motion.as_ref() } else { None },
-                )
-                .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
+            match budget.as_ref() {
+                Some(b) => self
+                    .pipeline
+                    .accumulate_resident_round(
+                        &self.ctx,
+                        &self.history,
+                        res,
+                        &cam,
+                        state,
+                        &[],
+                        if k == 0 { prev_view.as_ref() } else { None },
+                        &denoise,
+                        if k == 0 { motion.as_ref() } else { None },
+                        b,
+                        k,
+                        self.passes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?,
+                None => self
+                    .pipeline
+                    .accumulate_resident_temporal(
+                        &self.ctx,
+                        &self.history,
+                        res,
+                        &cam,
+                        state,
+                        // No keep mask: every pixel keeps what it has until
+                        // the reprojection cannot find it or the clamp
+                        // shortens it.
+                        &[],
+                        // Only the first sample of the pass reprojects. After
+                        // it the history is already in this pass's view, and
+                        // the camera does not move between the samples of one
+                        // pass.
+                        if k == 0 { prev_view.as_ref() } else { None },
+                        &denoise,
+                        if k == 0 { motion.as_ref() } else { None },
+                    )
+                    .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?,
+            }
             accumulated += box_started.elapsed();
         }
 
