@@ -180,14 +180,23 @@ impl Stage {
         let history = HistoryPipeline::new(&ctx)
             .map_err(|e| anyhow::anyhow!("the history's pipelines: {e}"))?;
 
+        // The statics are instances: sixty of the court's bars are one cube,
+        // and packing that cube once and placing it sixty times is the whole
+        // point of walking the level to placements. Keyed by the solid's
+        // identity, which is what sharing it made equal.
         let mut dropped = 0usize;
+        let mut by_solid: HashMap<usize, Option<GpuScene>> = HashMap::new();
         let packed: Vec<GpuScene> = stage
             .static_parts()
-            .filter_map(|(solid, pbr, to_world)| match pack(solid, pbr) {
-                Some(s) => Some(s.placed(to_world)),
-                None => {
-                    dropped += 1;
-                    None
+            .filter_map(|(solid, pbr, to_world)| {
+                let key = solid as *const Solid as usize;
+                let base = by_solid.entry(key).or_insert_with(|| pack(solid, pbr));
+                match base {
+                    Some(s) => Some(s.placed(to_world)),
+                    None => {
+                        dropped += 1;
+                        None
+                    }
                 }
             })
             .collect();
@@ -204,7 +213,7 @@ impl Stage {
         // so the seams are packed like any other part.
         let ball: Vec<GpuScene> = stage
             .ball_parts()
-            .filter_map(|(_, solid, pbr)| pack(solid, pbr))
+            .filter_map(|(_, solid, pbr, local)| pack(solid, pbr).map(|s| s.placed(local)))
             .collect();
         anyhow::ensure!(!ball.is_empty(), "the ball does not pack for the GPU");
 

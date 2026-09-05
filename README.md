@@ -247,9 +247,15 @@ in the simulator.
 
 The picture is vcad's. `court/render/` holds no renderer — it assembles a
 scene for `vcad-kernel-raytrace`'s `pathtrace`, the same integrator
-`vcad-render --photoreal` uses. The document's roots are evaluated to vcad
-solids and each gets one BVH over its *untessellated* BRep, so the rim's
-silhouette is the ring the CAD says it is at any resolution, not an
+`vcad-render --photoreal` uses. The document's roots are walked to the placed
+primitives they are unions of, not evaluated to one solid each: a union of
+disjoint solids needs no boolean, so the court's markings are sixty instances
+of a few cubes and the rim twenty-four of one bar, each primitive built once,
+given one BVH over its *untessellated* BRep, and shared by every instance.
+Only a genuinely boolean subtree still goes through `vcad-eval`. That took the
+level's scene from 3.9 s of booleans to nothing measurable, and the markings —
+which used to evaluate to a BRep-less mesh — are on the GPU tier at last. The
+rim's silhouette is still the ring the CAD says it is at any resolution, not an
 approximation the picture keeps separately from the one the physics stands
 on. A root's material name resolves to a PBR through one table: the
 document's own `[material ...]` first, then the court's names (`maple`,

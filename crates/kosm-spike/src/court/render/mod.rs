@@ -20,6 +20,7 @@
 //! or `ceiling`, this stops — the room is then the level's business, and only
 //! the panels stay.
 
+pub mod instances;
 mod materials;
 
 use std::collections::HashMap;
@@ -85,7 +86,7 @@ pub struct Scene {
     statics: Vec<Placed>,
     /// The ball's own appearance, centred on the origin: its solid and its
     /// seams, each with a material, drawn once per ball at that ball's pose.
-    ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr)>,
+    ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr, Transform)>,
     /// BVHs for `Court::extras`, kept across frames so a net that only moves
     /// is not rebuilt. Keyed by the solid's identity.
     extras: HashMap<usize, Arc<Bvh>>,
@@ -101,42 +102,42 @@ impl Scene {
     pub fn new(scene: &CourtScene) -> anyhow::Result<Self> {
         let a = &scene.authored;
         let doc = a.document.clone();
-        let evaluated = vcad_eval::evaluate_document(&doc, &vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() })
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        anyhow::ensure!(
-            evaluated.parts.len() == doc.roots.len(),
-            "the court evaluated to {} parts for {} roots",
-            evaluated.parts.len(),
-            doc.roots.len()
-        );
 
+        // Each root, walked to the placed primitives it is a union of, rather
+        // than evaluated to one solid. Only a genuinely boolean subtree is
+        // evaluated, and only that subtree; see [`instances`].
+        let mut prims = instances::Prims::default();
+        let mut bvhs: HashMap<usize, Arc<Bvh>> = HashMap::new();
         let mut statics = Vec::new();
-        let mut ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr)> = Vec::new();
+        let mut ball: Vec<(String, Arc<Solid>, Arc<Bvh>, Pbr, Transform)> = Vec::new();
         let mut authored_room = false;
-        for (part, root) in evaluated.parts.iter().zip(&doc.roots) {
+        for root in &doc.roots {
             let name = root.material.as_str();
             authored_room |= matches!(name, "wall" | "ceiling");
-            let Some(solid) = part.solid.as_ref() else {
-                anyhow::bail!("the court's `{name}` root evaluated to no solid");
-            };
-            let bvh = build_bvh(solid);
-            if bvh.root().is_none() {
-                anyhow::bail!("the court's `{name}` root has no traceable geometry");
+            let placed = instances::instances(&doc, root.root, &mut prims)?;
+            anyhow::ensure!(!placed.is_empty(), "the court's `{name}` root evaluated to no solid");
+            let pbr = materials::pbr(&doc, name);
+            let mut traceable = 0usize;
+            for inst in placed {
+                // one BVH per distinct solid, shared by every instance of it
+                let bvh = bvhs
+                    .entry(Arc::as_ptr(&inst.solid) as usize)
+                    .or_insert_with(|| Arc::new(build_bvh(&inst.solid)))
+                    .clone();
+                if bvh.root().is_none() {
+                    continue;
+                }
+                traceable += 1;
+                // a `ball` root (and its `ball-seams`) is not part of the court:
+                // it is the ball's own appearance, drawn once per ball at that
+                // ball's pose
+                if matches!(name, "ball" | "ball-seams" | "seam") {
+                    ball.push((name.to_owned(), inst.solid, bvh, pbr, inst.to_world));
+                } else {
+                    statics.push(Placed { solid: inst.solid, bvh, pbr, to_world: inst.to_world });
+                }
             }
-            let bvh = Arc::new(bvh);
-            let solid = Arc::new(solid.clone());
-            // a `ball` root (and its `ball-seams`) is not part of the court: it
-            // is the ball's own appearance, drawn once per ball at that ball's pose
-            if matches!(name, "ball" | "ball-seams" | "seam") {
-                ball.push((name.to_owned(), solid, bvh, materials::pbr(&doc, name)));
-                continue;
-            }
-            statics.push(Placed {
-                solid,
-                bvh,
-                pbr: materials::pbr(&doc, name),
-                to_world: Transform::identity(),
-            });
+            anyhow::ensure!(traceable > 0, "the court's `{name}` root has no traceable geometry");
         }
 
         // the gym: only until the level authors it
@@ -193,6 +194,7 @@ impl Scene {
                 solid.clone(),
                 Arc::new(build_bvh(&solid)),
                 materials::pbr(&doc, "ball"),
+                Transform::identity(),
             ));
         }
 
@@ -224,8 +226,9 @@ impl Scene {
             let c = *centre * PER_M;
             // `rotation` is world → body; an object → world placement is its transpose
             let r = rot.transpose();
-            for (_, _, bvh, pbr) in &self.ball {
-                objects.push(Object::placed(bvh.clone(), *pbr, rigid(&r, c.x, c.y, c.z)));
+            let at = rigid(&r, c.x, c.y, c.z);
+            for (_, _, bvh, pbr, local) in &self.ball {
+                objects.push(Object::placed(bvh.clone(), *pbr, Transform { matrix: at.matrix * local.matrix }));
             }
         }
         // BVHs for the extras, kept from frame to frame by the solid's
@@ -277,8 +280,8 @@ impl Scene {
     /// The ball's own parts — its solid and its seams — centred on the origin,
     /// one copy of each to be placed at every ball's pose, each with the root
     /// material that named it.
-    pub fn ball_parts(&self) -> impl Iterator<Item = (&str, &Solid, Pbr)> {
-        self.ball.iter().map(|(name, s, _, pbr)| (name.as_str(), s.as_ref(), *pbr))
+    pub fn ball_parts(&self) -> impl Iterator<Item = (&str, &Solid, Pbr, &Transform)> {
+        self.ball.iter().map(|(name, s, _, pbr, at)| (name.as_str(), s.as_ref(), *pbr, at))
     }
 
     /// Where each ball is at this instant, as an object → world placement in
@@ -328,7 +331,7 @@ impl Scene {
     pub fn ball_radius_mm(&self) -> f64 {
         self.ball
             .iter()
-            .filter_map(|(_, _, bvh, _)| bvh.bounds())
+            .filter_map(|(_, _, bvh, _, _)| bvh.bounds())
             .map(|b| {
                 let d = b.max - b.min;
                 0.5 * (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
