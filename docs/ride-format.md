@@ -28,6 +28,12 @@ read by `kosm-view --ride <ride.json>`. Metres, z up, quaternions as
 }
 ```
 
+When a level baked by `kosm-spike --skatepark` leaves a `parts.json` beside
+its map, the recorder emits one `fixed` entry per authored root — its own
+STL, its own colour, its root name as the label — instead of the single grey
+`mesh.stl`. Both sets are drawn: a roof the SDF never sees is still a roof.
+Without that file the behaviour is as before.
+
 `scale` on an `stl` mesh multiplies its vertices (the K1's STLs are already in metres).
 `fixed` is drawn once; `actors[i]` is drawn every frame at
 `frame.poses[i]` composed with its offset: `world = pose ∘ offset`.

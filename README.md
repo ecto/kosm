@@ -204,8 +204,24 @@ the start-of-step frame, and turns the solved velocity into the end-of-step
 frame exactly afterwards; the adjoint carries the turn's tangent. Tests:
 `phyz/tests/spinning_free_body.rs`, `ipse-map` `sdf::tests::outside_is_none`.
 
+`levels/warehouse.loon` is the same machinery at level scale: THPS1's first
+level scaled to the K1 inside a 16 × 9 m shed — half pipe, mezzanine, two
+quarter pipes either side of an open door, a platform, a bent rail, kickers,
+box piles, a ledge, and the building itself. One root per piece, each with a
+material name; roots whose material begins `no-collide` (roof, trusses,
+skylight, clerestory, door frame, the wall above the brick skirt) are drawn
+but never baked, so the SDF stops at the metre of wall the K1 can hit
+instead of following the roof to the ridge. The bake writes
+`parts/<root>.stl` and a `parts.json` of names, materials and colours, and
+the ride recorder draws the level from those rather than from one grey mesh.
+20 mm cells over that volume is 372 MB of f32, so the level asks for 25 mm
+(191 MB, 18 s). `tests/warehouse.rs` pins the quarter pipe against
+10/7 · g · Δ, the kicker against the height a wheel rolled at it reaches,
+and the rail against the radius the field puts around its axis.
+
 ```bash
 cargo run --release -p kosm-spike -- --skatepark
+cargo run --release -p kosm-spike -- --skatepark levels/warehouse.loon
 open out/maps/skatepark/park.svg
 cd ../ipse && cargo run -p ipse-sim --bin train -- ../kosm/out/maps/skatepark/scenario.toml
 ```
