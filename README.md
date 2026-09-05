@@ -656,6 +656,30 @@ with the renderer, and `vcad-kernel-gpu` re-exports it, so there is still
 exactly one `GpuContext` in the graph. The 960×540 court still is byte-identical
 across the move.
 
+### the sky, and the sun
+
+`kosm_render::env` builds environments the renderer needs no asset for. Three
+studio HDRIs — `studio`, `softbox`, `overcast` — are *synthesised* rather than
+vendored: no binary blobs in the repo, no third-party licence to track, and
+maps that are exactly as high-frequency as the importance sampler needs to be
+exercised. Real HDRIs load through `env::parse_hdr`, a hand-written Radiance
+RGBE decoder (both scanline encodings), because `image` is not on the
+dependency list and the format is two hundred lines. Both came out of
+`vcad-render::envmap`, which keeps only the CLI shape of `--env` — parsing
+`gradient`, a name or a path is a fact about that binary and nothing else's.
+
+`Scene::sun` is a directional light of finite angular size. An `AreaLight`
+cannot express one (its solid angle falls off with distance) and the analytic
+gradient has no disc in it at all, so daylight through a window had nothing to
+come from. It is stated as **irradiance**, not radiance, so widening
+`angular_radius` softens the shadow terminator without changing the exposure.
+It joins MIS as a strategy of its own on both tiers: NEE samples the cone
+uniformly, a BSDF ray that escapes into it picks the same radiance up under
+the balance heuristic. A 0.5° disc is found by BSDF sampling roughly once in
+fifty thousand rays, which is the whole reason it needs one.
+`tests/gpu_sun.rs` holds both tiers to `E·cos(theta)` on a Lambertian plane —
+measured 0.00–0.02% off the analytic answer at 0°, 30° and 60°.
+
 The rule that keeps it honest: **`kosm-render` depends on `tang`, `rayon`,
 `wgpu`, `bytemuck` and `pollster` — never on `vcad-*`, `phyz-*`, or any other
 Kosm crate.** It is a leaf. And it must compile for the browser, GPU tier

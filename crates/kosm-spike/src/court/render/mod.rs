@@ -259,6 +259,7 @@ impl Scene {
             objects,
             lights: self.lights.clone(),
             env: self.env.clone(),
+            sun: None,
             ground: self.ground,
         }
     }
