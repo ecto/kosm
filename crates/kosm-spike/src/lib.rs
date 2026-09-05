@@ -11,4 +11,5 @@ pub mod light;
 pub mod pool;
 pub mod room;
 pub mod scene;
+pub mod skatepark;
 pub mod splash;

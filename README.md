@@ -168,6 +168,48 @@ a sphere's contact point in the sphere's frame and let the sphere own the
 contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.rs`,
 `phyz-diff/tests/sphere_body_body_adjoint.rs`.
 
+### the skatepark
+
+`kosm-spike --skatepark [level]` is a training level for the Booster K1 in
+`../ipse`, which already has the skateboard rig and a K1 that rides it on a
+flat floor. Its terrain is an `ipse-map` directory — a collision mesh and a
+signed-distance grid baked from it — that a scenario file points at, so the
+park is authored here as vcad geometry
+([`levels/skatepark.loon`](levels/skatepark.loon): a mini ramp, one solid, the
+transition radius, lip, width, flat, deck and coping as `defparam`s) and
+baked with ipse-map's own baker into `out/maps/skatepark/` (`mesh.stl`,
+`sdf.bin`, `map.toml`, `park.svg`, and a `scenario.toml` that stands the K1
+on its board on the flat and shoves it at the transition). The field is
+sampled along the ideal arc and reported against the analytic circle: 2.5 mm
+at 10 mm cells, which is vcad's tessellation of the cylinder, not the bake.
+
+The check is the court's e² test for a ramp. A wheel-sized solid sphere is
+set on one transition and released, and rolled on the baked map through the
+same SDF contact path the K1's feet use. Rolling without slip, its centre
+reaches the flat at `v² = 10/7 · g · Δ` and climbs the far wall back to the
+height it left. Measured: 2.480 m/s against 2.483 predicted, the far wall to
+99.7 % of the release height, zero lateral drift. `tests/skatepark.rs` pins
+all three.
+
+Two engine bugs surfaced and were fixed in the stack this depends on. In
+ipse-map, a point far past the SDF's volume saturated the `as usize` cast and
+`ix + 1` wrapped to 0 in release, passing the bounds check and indexing off
+the end of the grid. In phyz, a free joint's linear velocity is stored in the
+body frame, and its Coriolis term `−ω × v` — the frame turning, not a force —
+was integrated by explicit Euler, which turns *and* stretches: `|v|` grows by
+`(ω dt)² / 2` a step, invisible on a trunk and a runaway on a 27 mm wheel at
+74 rad/s (the wheel reached 45 m/s on the flat). The fix strips that term
+from `aba`'s acceleration before the contact solve, which was assembled in
+the start-of-step frame, and turns the solved velocity into the end-of-step
+frame exactly afterwards; the adjoint carries the turn's tangent. Tests:
+`phyz/tests/spinning_free_body.rs`, `ipse-map` `sdf::tests::outside_is_none`.
+
+```bash
+cargo run --release -p kosm-spike -- --skatepark
+open out/maps/skatepark/park.svg
+cd ../ipse && cargo run -p ipse-sim --bin train -- ../kosm/out/maps/skatepark/scenario.toml
+```
+
 ## the sound (`audio.rs`)
 
 Nothing is sampled. `audio.rs` asks `vcad-kernel-acoustics` for the level's
