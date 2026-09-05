@@ -8,11 +8,13 @@ use std::path::PathBuf;
 const DEFAULT_LEVEL: &str = "levels/marble.loon";
 const DEFAULT_FRAMES: usize = 150;
 
+pub use crate::pool::PoolRenderer;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Marble { level: PathBuf },
     Court { frames: Option<usize> },
-    Pool { frames: usize },
+    Pool { frames: usize, renderer: PoolRenderer },
     Splash { frames: usize },
     Splat { ply: PathBuf },
 }
@@ -34,9 +36,26 @@ impl Command {
             "--court" => Ok(Self::Court {
                 frames: args.next().and_then(|v| v.parse().ok()),
             }),
-            "--pool" => Ok(Self::Pool {
-                frames: frames(args.next()),
-            }),
+            "--pool" => {
+                let rest: Vec<String> = args.collect();
+                let mut count = None;
+                let mut renderer = PoolRenderer::default();
+                let mut it = rest.iter();
+                while let Some(arg) = it.next() {
+                    if arg == "--pool-render" {
+                        let value = it
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--pool-render needs a renderer"))?;
+                        renderer = PoolRenderer::parse(value)?;
+                    } else if count.is_none() {
+                        count = Some(arg.clone());
+                    }
+                }
+                Ok(Self::Pool {
+                    frames: frames(count),
+                    renderer,
+                })
+            }
             "--splash" => Ok(Self::Splash {
                 frames: frames(args.next()),
             }),
@@ -87,15 +106,32 @@ mod tests {
 
     #[test]
     fn pool_commands_keep_the_existing_frame_defaults() {
-        assert_eq!(parse(&["--pool"]).unwrap(), Command::Pool { frames: 150 });
+        assert_eq!(
+            parse(&["--pool"]).unwrap(),
+            Command::Pool { frames: 150, renderer: PoolRenderer::Legacy }
+        );
         assert_eq!(
             parse(&["--splash", "24"]).unwrap(),
             Command::Splash { frames: 24 }
         );
         assert_eq!(
             parse(&["--pool", "not-a-number"]).unwrap(),
-            Command::Pool { frames: 150 }
+            Command::Pool { frames: 150, renderer: PoolRenderer::Legacy }
         );
+    }
+
+    #[test]
+    fn the_pool_renderer_is_legacy_unless_asked_for() {
+        assert_eq!(
+            parse(&["--pool", "3", "--pool-render", "kosm"]).unwrap(),
+            Command::Pool { frames: 3, renderer: PoolRenderer::Kosm }
+        );
+        assert_eq!(
+            parse(&["--pool", "--pool-render", "legacy"]).unwrap(),
+            Command::Pool { frames: 150, renderer: PoolRenderer::Legacy }
+        );
+        assert!(parse(&["--pool", "--pool-render", "opengl"]).is_err());
+        assert!(parse(&["--pool", "--pool-render"]).is_err());
     }
 
     #[test]

@@ -129,6 +129,57 @@ surface onto the tiles each frame, Fresnel sky reflection, refraction into
 water that absorbs red first, and the melon seen through it. 1280×720 at
 ~0.3–1 s a frame on the CPU, encoded with ffmpeg to `out/pool.mp4`.
 
+`--pool-render kosm` runs the same simulation through `kosm-render`'s
+general path tracer instead (`pool/render.rs`), writing `out/pool_kosm/` and
+`out/pool_kosm.mp4`; `legacy` is the default. The pool ports over cleanly as
+geometry: the basin, deck, coping and grandstand are boxes, the tiles a
+two-material checker, the melon a unit-sphere `TriMesh` under a non-uniform
+`Transform` (the TLAS renormalises the local ray and maps the normal by the
+inverse transpose, so a scaled sphere is an honest ellipsoid), and the water
+five `HeightField`s — one fine over the splash, four coarse tiling the rest
+of the pool around it — sampled from `Surface::height`, so the fine grid, the
+far field and the blend between them arrive already resolved. The per-frame
+cost is what the height field was built for: `update_heights` plus
+`Bvh::refit` is **0.3–0.8 ms** for the whole surface, against a 100–180 ms
+rebuild. Water is `transmission: 1`, `ior: 1.333`, `roughness: 0.02`, with
+`attenuation_color` the reference's per-metre `ABSORB` as `exp(-a)` over a
+metre; the sky is a `GradientEnv` of the reference's own two blues and the
+sun is a real 0.6° disc. Tonemapping is `kosm-render`'s ACES rather than the
+pool's filmic curve, which needs about a stop of headroom (exposure 0.35) to
+keep the deck off the clip point.
+
+**The caustic does not survive the port, and that is the interesting
+result.** The reference tracer's `Caustic` grid is a *forward* transport step
+— sun rays pushed through the surface by Snell's law and binned where they
+land — bolted onto a backward tracer, and it exists precisely because a
+unidirectional tracer cannot find the sun through moving water. Two things
+in `kosm-render` stop it. First, `Scene::occluded` is a material-blind
+any-hit test, so the water is an opaque blocker: next-event estimation to the
+sun is rejected at every point on the tiles, and the only surviving path is a
+BSDF bounce off the floor that refracts back up and lands inside a disc of
+3.4e-4 sr — about one cosine-sampled ray in 10^4. Second, the sun's radiance
+is its irradiance over that disc, roughly 9000 in these units, and the
+default `firefly_clamp` is 12: the rare paths that *do* find the sun are
+scaled down 750x before averaging, so the caustic is not merely noisy but
+clamped to nothing. Measured at 640x360: at 64 spp the floor is perfectly
+smooth and perfectly caustic-free; at 1024 spp with the clamp disabled
+(`KOSM_CLAMP=0 KOSM_DENOISE=0`, 304 s for the one frame) the caustic energy
+appears as isolated single-sample specks scattered evenly over the whole
+floor with no ring structure at all — 0.1 expected sun hits per pixel. A
+readable caustic would need 10^4-10^5 spp, hours to a day per frame. It is
+unusable, and no sample count fixes it.
+
+What `kosm-render` would need is a way to connect a shading point to a light
+*through* a refractive interface: NEE that refracts the shadow ray and
+carries the Fresnel and Jacobian terms, manifold next-event estimation to
+solve for the specular chain, or — the cheap and honest answer for this
+scene — a photon-mapped caustic pass, which is what the reference's `Caustic`
+grid already is. Until then the legacy renderer stays the default. Foam is
+skipped as well (it is a coverage field that whitens the surface shade, and
+`Pbr` has no per-point channel a client can drive without textures), as is
+the crowd (raymarched SDFs in the reference); droplets do port, as small
+placed spheres of the same water.
+
 ### the splash
 
 `kosm-spike --splash [frames]` runs the same drop with the water simulated
