@@ -11,12 +11,17 @@ kosm-spike = { path = "../kosm-spike" }
 wgpu = "30"
 winit = "0.30"
 pollster = "0.4"
+# the readback: the accumulator comes down as raw f32 and is cast, not parsed
+bytemuck = "1"
 image.workspace = true
 phyz-math.workspace = true
 tang.workspace = true
 anyhow = "1"
 log = "0.4"
-vcad-kernel-raytrace.workspace = true
+# The GPU tracer runs on the viewport's own device: vcad is on wgpu 30 now,
+# so the surface and the path tracer are one set of wgpu types.
+vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
+vcad-kernel-gpu = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-gpu" }
 vcad-kernel-math.workspace = true
 vcad-kernel.workspace = true
 vcad-eval.workspace = true

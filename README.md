@@ -359,50 +359,51 @@ the frame it is on. Space pauses; space again rejoins the simulation where it
 has got to.
 
 The picture is not written by the viewer. The level's roots are evaluated once
-by `vcad-eval` into BRep solids, each gets a `vcad-kernel-raytrace` BVH, and
-every frame is a `pathtrace::Scene`: those solids as placed objects with a
-material per root name, the ball's solid placed at each ball's pose, and the
-level's ceiling panels as the only lights. It is the CPU path tracer, on a
-third thread, and it is asked for something it can finish in about 30 ms: the
-window's pixel size over an integer divisor, one sample a pass, with the
-divisor retuned from the pass times actually measured and the blit upscaling
-whatever comes back. The chosen size and the pass time go to stderr.
-`vcad-kernel-raytrace`'s `gpu` feature pins wgpu 23 and the surface is on wgpu
-30, so that tracer cannot be handed this device.
+by `vcad-eval` into BRep solids, and every frame is that geometry with the
+balls and the net where phyz has them, a material per root name, and the
+ceiling panels as the only lights. The renderer is asked for what it can finish
+in about 30 ms: the window's size over an integer divisor, one sample a pass,
+the divisor retuned from the times measured.
 
-One sample a pixel is a blizzard, and the thing that makes it watchable is not
-spending more — it is `history.rs` refusing to throw the last frame away. Every
-pixel keeps a running mean and the count behind it, and a pass is merged into
-that rather than replacing it. When the camera moves, each new pixel unprojects
-its own hit — vcad's `Film::depth` is the distance from the eye along the
-primary ray, so `eye + dir · depth` is the world point and no matrix is
-inverted — projects it back through the previous camera, and keeps the samples
-it finds there if the distance agrees to two per cent and the normals to a dot
-product of 0.9. When something moves, the renderer already knows which
-something: the bounding sphere of every ball and every extra whose pose changed
-is projected to a screen rectangle at both its old and its new pose, and so is
-the disc its shadow throws on the floor from each ceiling panel. The union of
-those rectangles is the only part of the picture that starts over. So the walls
-and the floor keep accumulating for the whole run while the balls bounce
-through them, the denoiser is blended out pixel by pixel as counts climb past
-thirty-two, and the divisor only walks back down to 1 — the window's own
-resolution — while the mask is empty. Resolution, pass time, the mask's share
-of the screen and the mean samples a pixel go to stderr every couple of
-seconds. What the mask does not yet buy is fewer rays: `pathtrace::render`
-renders a whole frame and has no sub-rectangle entry point, so the pass costs
-the same either way. A `render_into(&mut Film, &[Rect])` beside it is the next
-multiplier, and it lives in vcad, not here. What does dominate, once the ball
-is in the net, is the net: it hands the renderer fresh solids as it deforms and
-each one pays for a BVH build inside the pass, which is why the tuner refuses
-to believe a pass more than four times its own prediction.
+Two tracers answer that. `vcad-kernel-raytrace`'s `gpu` feature used to be
+unreachable here — it pinned wgpu 23 while the surface is on wgpu 30 — but vcad
+is on wgpu 30 now (a worktree of it, `claude/wgpu-30`), so the compute tracer
+runs on the window's own device, each solid packed once and every frame only
+saying where its instances are. `--cpu` picks the CPU integrator, which is the
+reference and the fallback.
 
-The window is black for the first few minutes: evaluating the level is a pile
-of CSG booleans in `vcad-kernel-booleans`, and the picture cannot start until
-they are done. It says so on stderr while it works.
+Neither accumulates. A pass is one raw sample and `history.rs` is the
+accumulator for both, because one sample a pixel is a blizzard and what makes
+it watchable is refusing to throw the last frame away. Every pixel keeps a
+running mean and its count, and when something moves the renderer knows which
+something: the bounding sphere of each ball and extra whose pose changed, at
+its old pose and its new, plus the disc its shadow throws from each panel.
+Being geometric, that mask reads the same on both tiers, so the walls
+accumulate for the whole run while the balls bounce through them. Resolution,
+tracer, pass time, mask share and mean samples a pixel go to stderr.
+
+A moved camera parts them. The CPU pass brings guide buffers, so a pixel
+unprojects its own hit along `Film::depth`, carries it back through the
+previous camera and keeps what agrees to two per cent of distance and 0.9 of
+normal; its denoiser runs on the resolved buffer, blended out as counts pass
+thirty-two. The shader's depth and normals go into a buffer it neither marks
+copyable nor returns, so the GPU tier hands over colour alone: an orbit costs
+it the whole picture, and its denoise is a no-op.
+
+It is incomplete elsewhere too — the painted markings have no BRep to pack, the
+seams are dropped because the shader traces a torus wide enough to engulf the
+ball, and vcad's pipeline rebuilds its buffers per call, so a pass re-uploads
+the court and reads the image back rather than sharing a texture. That last
+cost barely falls with resolution, which is why the tuner remembers a size that
+overran rather than believe a prediction. Neither tier gets fewer rays out of
+the mask yet, and the deforming net still pays for a BVH build inside every CPU
+pass. Evaluating the level takes a few seconds and the window is black until it
+is done; it says so on stderr while it works.
 
 `kosm-view --shot out/view_court.png` runs the same frame producer with no
-window, which is how the picture is checked. `--pool` and `--splash` are gone
-for now: they were egui, and the pool's live tier went with it.
+window, which is how the picture is checked; it uses the GPU tracer unless
+`--cpu` says otherwise. `--pool` and `--splash` are gone for now: they were
+egui, and the pool's live tier went with it.
 
 ## building
 

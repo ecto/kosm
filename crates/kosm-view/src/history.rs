@@ -27,6 +27,22 @@
 //! Because depth is a ray distance, unprojecting is exact and cheap:
 //! `p = eye + normalize(dir(px, py)) * depth`. No matrix inverse anywhere.
 //!
+//! ## a pass without guides
+//!
+//! The GPU tier has no guide buffers to hand over: the compute shader writes
+//! depth and normals into a buffer it allocates itself, does not mark it
+//! `COPY_SRC` and does not return it. So [`History::merge`] takes a
+//! [`Guides`] flag, and a pass that says [`Guides::None`] is merged on the
+//! strength of the mask alone — which still works, because the mask is
+//! *geometric*: it is computed from where the balls and the net are and where
+//! their shadows fall, not from anything the tracer measured. What is lost is
+//! reprojection. A pixel cannot be carried into a moved camera without knowing
+//! how far away it was, so a camera that moves throws the whole picture away
+//! rather than most of it, and the à-trous filter — which passes a pixel
+//! through untouched wherever `depth` is zero — becomes a no-op. The GPU tier
+//! is therefore sharp and unfiltered at one sample, and starts over on an
+//! orbit; the CPU tier is neither.
+//!
 //! ## what is not here
 //!
 //! vcad's `pathtrace::render` renders a whole frame: it splits `rgb` into
@@ -44,6 +60,19 @@
 
 use vcad_kernel_math::{Point3, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film, PathTraceOptions};
+
+/// Whether the pass being merged brought depth, normals and albedo with it.
+///
+/// The CPU integrator fills all three; the GPU tracer returns colour alone.
+/// Without them there is nothing to reproject through and nothing for the
+/// denoiser to stop on, so a moved camera invalidates everything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Guides {
+    /// `film.depth`, `film.normal` and `film.albedo` are the tracer's.
+    Film,
+    /// Colour only.
+    None,
+}
 
 /// A pixel's history is kept if the reprojected distance agrees to this,
 /// relative.
@@ -285,7 +314,7 @@ impl History {
     /// camera carries its samples across, *then* mask, so a moved ball takes
     /// out the pixels it is in — at both its old and its new pose — whether or
     /// not the camera also moved.
-    pub fn merge(&mut self, film: &Film, view: &View, poses: &[Pose], lights: &[Point3]) {
+    pub fn merge(&mut self, film: &Film, guides: Guides, view: &View, poses: &[Pose], lights: &[Point3]) {
         if self.size != (film.width, film.height) {
             *self = History::new((film.width, film.height));
         }
@@ -294,7 +323,12 @@ impl History {
         // A pixel is live if it has history that survived both tests.
         let mut live: Vec<bool> = self.count.iter().map(|&c| c > 0).collect();
         match self.view {
-            Some(old) if old != *view => self.reproject(&old, view, film, &mut live),
+            // A moved camera, with depth to unproject through: carry what
+            // reprojects. Without it, nothing can be carried at all.
+            Some(old) if old != *view => match guides {
+                Guides::Film => self.reproject(&old, view, film, &mut live),
+                Guides::None => live.iter_mut().for_each(|l| *l = false),
+            },
             None => live.iter_mut().for_each(|l| *l = false),
             _ => {}
         }
@@ -321,10 +355,15 @@ impl History {
             }
         }
         // The guides are always the newest pass's: they describe the geometry
-        // the picture is of *now*, and the next reprojection reads them.
-        self.normal.copy_from_slice(&film.normal);
-        self.depth.copy_from_slice(&film.depth);
-        self.albedo.copy_from_slice(&film.albedo);
+        // the picture is of *now*, and the next reprojection reads them. A
+        // pass with none leaves them zeroed, which is the background sentinel
+        // — the denoiser passes such a pixel through, so it becomes a no-op
+        // rather than a blur with nothing to stop it.
+        if guides == Guides::Film {
+            self.normal.copy_from_slice(&film.normal);
+            self.depth.copy_from_slice(&film.depth);
+            self.albedo.copy_from_slice(&film.albedo);
+        }
         self.view = Some(*view);
         self.poses = poses.to_vec();
     }
@@ -575,7 +614,7 @@ mod tests {
         let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
         let mut h = History::new((W, H));
         for _ in 0..16 {
-            h.merge(&film, &view, &poses, &[]);
+            h.merge(&film, Guides::Film, &view, &poses, &[]);
         }
         for py in 0..H {
             for px in 0..W {
@@ -595,13 +634,13 @@ mod tests {
         let mut h = History::new((W, H));
         let at = |z: f64| [Pose::still([0.0, 0.0, z], 100.0)];
         for _ in 0..8 {
-            h.merge(&film, &view, &at(0.0), &[]);
+            h.merge(&film, Guides::Film, &view, &at(0.0), &[]);
         }
         let before: Vec<u32> = h.count.clone();
         assert!(before.iter().all(|&c| c == 8));
 
         // Move it half a metre: a real move, but a small one on screen.
-        h.merge(&film, &view, &at(500.0), &[]);
+        h.merge(&film, Guides::Film, &view, &at(500.0), &[]);
         let f = h.mask_fraction();
         assert!(f > 0.0 && f < 0.9, "the mask should be a patch, not the screen: {f}");
         let inside = h.count.iter().filter(|&&c| c == 1).count();
@@ -619,7 +658,7 @@ mod tests {
         let mut h = History::new((W, H));
         let poses = [Pose::still([0.0, 0.0, 500.0], 100.0)];
         for _ in 0..8 {
-            h.merge(&plane_film(&va, 1.0), &va, &poses, &[]);
+            h.merge(&plane_film(&va, 1.0), Guides::Film, &va, &poses, &[]);
         }
         let b = pathtrace::Camera::look_at(
             Point3::new(200.0, -3000.0, 0.0),
@@ -628,7 +667,7 @@ mod tests {
             45.0,
         );
         let vb = View::of(&b, W, H);
-        h.merge(&plane_film(&vb, 1.0), &vb, &poses, &[]);
+        h.merge(&plane_film(&vb, 1.0), Guides::Film, &vb, &poses, &[]);
 
         // The strip that slid in from the edge is new; the rest is carried.
         let kept = h.count.iter().filter(|&&c| c == 9).count();

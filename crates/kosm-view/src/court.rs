@@ -9,27 +9,35 @@
 //! placed where phyz has them, the panels as area lights. This file owns the
 //! window's camera and the pace; nothing here describes a shape or a material.
 //!
-//! ## why the CPU tier
+//! ## the two tiers
 //!
-//! `vcad-kernel-raytrace` has a `gpu` feature, and it does compile in this
-//! workspace — but it pins **wgpu 23**, while the viewport's surface is on
-//! **wgpu 30**. Two major versions of wgpu are two unrelated sets of types:
-//! the `Device`, `Queue`, `Buffer` and `Texture` the surface hands out cannot
-//! be passed to `RayTracePipeline`, and a texture the tracer wrote cannot be
-//! sampled by the blit. There is no conversion; they are different crates
-//! that happen to share a name. So the GPU tracer could only run on a
-//! *second*, headless wgpu-23 device with a full CPU readback per frame —
-//! and its scene format (`GpuScene::from_brep`, one merged BRep with no
-//! per-instance transform) would force the whole court to be rebuilt and
-//! re-uploaded every time a ball moves.
+//! `vcad-kernel-raytrace` has a `gpu` feature, and it is on. It used to be
+//! unusable here: it pinned **wgpu 23** while the viewport's surface is on
+//! **wgpu 30**, and two majors of wgpu are two unrelated sets of types — the
+//! `Device` the surface hands out could not be passed to `RayTracePipeline`
+//! at all. vcad is on wgpu 30 now, so the tracer runs on the viewport's own
+//! device (`viewport::Scene::init` hands it over) and there is one adapter in
+//! the process rather than two.
 //!
-//! So this is the CPU path tracer, `pathtrace::render`, run small on a worker
-//! thread — the same integrator the CLI's reference tier uses, at one sample a
-//! pass. What it hands back is never thrown away wholesale: [`crate::history`]
-//! keeps a running mean and a sample count per pixel, reprojects them through a
-//! moved camera, and discards only the pixels a moved ball, its shadow, or a
-//! moved extra actually landed on. This file's job is the pace — how big to ask
-//! for, at how many samples, and when the measurement was fair enough to
+//! The scene format was the other half of it. `GpuScene::from_brep` packed a
+//! merged BRep with no per-instance transform, so a ball moving meant
+//! re-packing the whole court; `GpuScene::placed` is the answer — each solid
+//! packed once, every frame saying only where its instances are. See
+//! `court_gpu.rs`. The CPU integrator, `pathtrace::render`, is the fallback:
+//! `--cpu` asks for it, it is what runs when there is no adapter or the court
+//! will not pack, and it is the reference the GPU picture is checked against.
+//!
+//! Whichever traced it, a pass is **one raw sample** and neither tracer
+//! accumulates. [`crate::history`] does: a running mean and a sample count per
+//! pixel, a reprojection through a moved camera when the pass brought guide
+//! buffers with it, and a geometric mask that throws away only the pixels a
+//! moved ball, its shadow, or a moved extra actually landed on. The GPU tier
+//! has no guides to give — the shader's depth and normals never leave the
+//! device — so its history is mask-only, and a camera that moves costs it the
+//! whole picture where it costs the CPU one a few silhouettes. Both tiers
+//! answer the same `Job` with the same `Shot`, so the window's tuner does not
+//! know which one it is talking to. This file's job is the pace: how big to
+//! ask for, at how many samples, and when a measurement was fair enough to
 //! believe.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -40,7 +48,8 @@ use kosm_spike::court::{Court, CourtScene};
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
-use crate::history::{History, Pose, View};
+use crate::court_gpu;
+use crate::history::{Guides, History, Pose, View};
 use crate::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -136,6 +145,9 @@ impl Camera {
 #[derive(Clone)]
 pub struct Job {
     pub generation: u64,
+    /// Which frame of the recording this is. The GPU stage re-assembles its
+    /// packed scene when this changes, and not when the camera does.
+    pub frame_id: u64,
     pub frame: Frame,
     pub camera: Camera,
     pub size: (u32, u32),
@@ -203,9 +215,45 @@ fn poses(stage: &mut render::Scene, snap: &Snapshot) -> Vec<Pose> {
     out
 }
 
+/// Which tracer a pass came from. Chosen once, at the top of the worker, and
+/// named on stderr so the numbers there are attributable.
+enum Tracer {
+    /// vcad's compute shader, on the window's own device.
+    Gpu(Box<court_gpu::Stage>),
+    /// vcad's CPU integrator.
+    Cpu,
+}
+
+impl Tracer {
+    fn name(&self) -> &'static str {
+        match self {
+            Tracer::Gpu(_) => "gpu",
+            Tracer::Cpu => "cpu",
+        }
+    }
+}
+
+/// A GPU sample, dressed as a `Film` so the history takes it exactly the way
+/// it takes a CPU one. The guide buffers stay zeroed — the tracer has none to
+/// give — and zero depth is vcad's background sentinel, which is the "leave
+/// this pixel alone" the denoiser already knows how to read.
+fn blank_film(size: (u32, u32), sample: court_gpu::Sample) -> pathtrace::Film {
+    let n = (size.0 as usize) * (size.1 as usize);
+    pathtrace::Film {
+        width: size.0,
+        height: size.1,
+        rgb: sample.rgb,
+        alpha: sample.alpha,
+        normal: vec![0.0; n * 3],
+        depth: vec![0.0; n],
+        albedo: vec![0.0; n * 3],
+        variance: vec![0.0; n],
+    }
+}
+
 /// The renderer: build the stage once, then keep adding passes to whatever
 /// the window last asked for.
-fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
+fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Device, wgpu::Queue)>) {
     // Evaluating the level and building its BVHs takes minutes, and the
     // window is black until it is done. Say so, or it looks broken.
     eprintln!("court  evaluating the level…");
@@ -216,11 +264,30 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
     };
     eprintln!("court  {} vcad solids, {} panels, in {:.1} s", stage.static_count(), stage.light_count(), t0.elapsed().as_secs_f64());
 
+    // The GPU tier if the surface handed a device over and the court packs for
+    // it; the CPU integrator otherwise, saying which and why.
+    let scene = CourtScene::bundled().ok();
+    let mut tracer = gpu
+        .and_then(|(device, queue)| {
+            let a = scene.as_ref().map(|s| &s.authored);
+            let depth = a.map_or(6.0, |a| a.parameter_or("max_depth", 6.0)).max(1.0) as u32;
+            let env = a.map_or(0.05, |a| a.parameter_or("env_radiance", 0.05)) as f32;
+            match court_gpu::Stage::new(&stage, &device, &queue, depth, env) {
+                Ok(gpu) => Some(Tracer::Gpu(Box::new(gpu))),
+                Err(error) => {
+                    eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                    None
+                }
+            }
+        })
+        .unwrap_or(Tracer::Cpu);
+    eprintln!("court  the {} path tracer", tracer.name());
+
     let lights = stage.light_centres();
 
     // The history is the picture. A job is only ever "this snapshot, this
-    // camera, this size, one sample" — nothing here is allowed to decide that
-    // the last frame was worthless. The history decides that, per pixel.
+    // camera, this size, one sample" — neither tracer is allowed to decide
+    // that the last frame was worthless. The history decides that, per pixel.
     let mut current: Option<Job> = None;
     let mut history = History::new((0, 0));
     let mut said_at = Instant::now();
@@ -256,9 +323,28 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
         let view = View::of(&cam, job.size.0, job.size.1);
         let poses = poses(&mut stage, &job.frame);
         let seed = 0x5eed_0000 ^ (job.generation << 20) ^ (lap.elapsed().as_nanos() as u64) ^ passes_seed(&history);
-        let scene = stage.at_snapshot(&job.frame);
-        let film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &options(job.spp, seed, false));
-        history.merge(&film, &view, &poses, &lights);
+        // One raw sample, whoever traced it: the GPU hands back linear
+        // radiance and nothing else, the CPU fills the guides too.
+        let (film, guides) = match &mut tracer {
+            Tracer::Gpu(gpu) => match gpu.sample(&stage, &job.frame, job.frame_id, &job.camera, job.size) {
+                Ok(sample) => (blank_film(job.size, sample), Guides::None),
+                Err(error) => {
+                    eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                    tracer = Tracer::Cpu;
+                    history = History::new(job.size);
+                    continue;
+                }
+            },
+            Tracer::Cpu => {
+                let scene = stage.at_snapshot(&job.frame);
+                let opts = options(job.spp, seed, false);
+                (pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts), Guides::Film)
+            }
+        };
+        history.merge(&film, guides, &view, &poses, &lights);
+        // Denoise the resolved buffer, blended out as the counts climb. With
+        // no guides the à-trous filter passes every pixel through untouched,
+        // so on the GPU tier this is a no-op rather than a blur.
         let opts = options(job.spp, seed, true);
         let rgba = history.resolve(job.camera.exposure, &opts);
         let shot = Shot {
@@ -272,7 +358,8 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>) {
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
             eprintln!(
-                "court  {}×{} at {} spp: {} ms a pass, {:.0}% repainted, {:.1} samples a pixel",
+                "court  {} {}×{} at {} spp: {} ms a pass, {:.0}% repainted, {:.1} samples a pixel",
+                tracer.name(),
                 job.size.0,
                 job.size.1,
                 job.spp,
@@ -320,6 +407,76 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
         .save(path)?;
     println!(
         "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} at {spp} spp in {:.1} s → {}",
+        court.time(),
+        frame.balls.len(),
+        stage.static_count(),
+        size.0,
+        size.1,
+        t0.elapsed().as_secs_f64(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// The same still, traced on the GPU. There is no window and so no surface
+/// device, so this asks `vcad-kernel-gpu` for a headless one — the same
+/// adapter, just nobody's surface — and averages `passes` raw samples, which
+/// is what the window does too, only without a mask to complicate it.
+pub fn still_gpu(path: &std::path::Path, t: f64, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
+    let scene = CourtScene::bundled()?;
+    let stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let a = &scene.authored;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking().map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+        a.parameter_or("env_radiance", 0.05) as f32,
+    )?;
+
+    let t = if t < 0.0 { a.parameter_or("still_t", 0.95) } else { t };
+    let mut court = Court::from_scene(&scene)?;
+    while court.time() < t {
+        court.step();
+    }
+    let frame = Frame::of(&court);
+
+    let t0 = Instant::now();
+    let n = (size.0 as usize) * (size.1 as usize);
+    let mut sum = vec![0.0f32; n * 3];
+    let mut alpha = vec![0.0f32; n];
+    let passes = passes.max(1);
+    for _ in 0..passes {
+        let s = gpu.sample(&stage, &frame, 0, &camera, size)?;
+        for (acc, v) in sum.iter_mut().zip(&s.rgb) {
+            *acc += v;
+        }
+        for (acc, v) in alpha.iter_mut().zip(&s.alpha) {
+            *acc += v;
+        }
+    }
+    let k = 1.0 / passes as f32;
+    let film = pathtrace::Film {
+        width: size.0,
+        height: size.1,
+        rgb: sum.iter().map(|v| v * k).collect(),
+        alpha: alpha.iter().map(|v| v * k).collect(),
+        normal: vec![0.0; n * 3],
+        depth: vec![0.0; n],
+        albedo: vec![0.0; n * 3],
+        variance: vec![0.0; n],
+    };
+    let rgba = film.to_srgb8(camera.exposure, false);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    image::RgbaImage::from_raw(size.0, size.1, rgba)
+        .ok_or_else(|| anyhow::anyhow!("the film is the wrong size"))?
+        .save(path)?;
+    println!(
+        "court  t = {:.2} s, {} balls, {} vcad solids; {}×{} over {passes} gpu passes in {:.2} s → {}",
         court.time(),
         frame.balls.len(),
         stage.static_count(),
@@ -395,6 +552,17 @@ struct App {
     sized: (u32, u32),
     /// What the window's size is divided by to get the render size.
     scale: u32,
+    /// The finest divisor not yet known to overrun. The cost model is
+    /// milliseconds per megapixel per sample, which is honest about the CPU
+    /// tracer and a lie about the GPU one: a GPU pass re-uploads the whole
+    /// court and reads the image back whatever its size, so most of its cost
+    /// does not scale with pixels at all. Left to itself the tuner then
+    /// oscillates — it grows the picture on a prediction, overruns, shrinks
+    /// back, goes quiet, grows again — and every step resizes the history and
+    /// throws it away, so the picture never accumulates past one sample. A
+    /// size that has actually overrun is remembered instead, and never
+    /// climbed back into until the window itself changes.
+    floor: u32,
     /// Samples a pass now, and the most it is allowed to ask for.
     samples: u32,
     spp: u32,
@@ -408,10 +576,26 @@ struct App {
     over: u32,
     generation: u64,
     asked: Option<Ask>,
+    /// The render thread's ends of the two channels, held until the surface
+    /// exists. The tracer runs on the *window's* device, and there is no
+    /// device until there is a window — so the thread that would use it
+    /// cannot be started before then.
+    pending: Option<(Receiver<Job>, Sender<Shot>)>,
+    /// Forced by `--cpu`: never hand the render thread a device.
+    cpu_only: bool,
 }
 
 impl App {
-    fn new(rx: Receiver<Frame>, shots: Receiver<Shot>, jobs: Sender<Job>, camera: Camera, spp: u32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        rx: Receiver<Frame>,
+        shots: Receiver<Shot>,
+        jobs: Sender<Job>,
+        camera: Camera,
+        spp: u32,
+        pending: (Receiver<Job>, Sender<Shot>),
+        cpu_only: bool,
+    ) -> Self {
         let mut app = Self {
             rx,
             shots,
@@ -425,6 +609,7 @@ impl App {
             window: (1280, 720),
             sized: (0, 0),
             scale: 4,
+            floor: 1,
             samples: 1,
             spp: spp.max(1),
             cost: GUESS,
@@ -432,6 +617,8 @@ impl App {
             over: 0,
             generation: 0,
             asked: None,
+            pending: Some(pending),
+            cpu_only,
         };
         app.orbit = app.orbit_from_camera();
         app
@@ -518,6 +705,7 @@ impl App {
         self.generation += 1;
         let job = Job {
             generation: self.generation,
+            frame_id: self.frame_id(),
             frame: frame.clone(),
             camera: self.camera,
             size: self.size(),
@@ -529,6 +717,12 @@ impl App {
 }
 
 impl viewport::Scene for App {
+    fn init(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some((jobs, shots)) = self.pending.take() else { return };
+        let gpu = (!self.cpu_only).then(|| (device.clone(), queue.clone()));
+        std::thread::spawn(move || render_worker(jobs, shots, gpu));
+    }
+
     fn event(&mut self, event: viewport::Event) {
         use viewport::{Event, Key};
         match event {
@@ -591,6 +785,9 @@ impl viewport::Scene for App {
                         self.samples = 1;
                     } else if self.scale < MAX_SCALE {
                         self.scale += 1;
+                        // This size overran twice: it is not affordable, and
+                        // no prediction gets to say otherwise.
+                        self.floor = self.scale;
                     }
                     self.over = 0;
                 }
@@ -609,12 +806,13 @@ impl viewport::Scene for App {
         if self.sized != self.window {
             self.sized = self.window;
             self.scale = self.affordable();
+            self.floor = 1;
             self.samples = 1;
             self.quiet = 0;
-        } else if self.quiet >= CLIMB_AFTER && (self.scale > 1 || self.samples < self.spp) {
-            if self.scale > 1 && self.pass_ms(self.scale - 1) <= TARGET_MS {
+        } else if self.quiet >= CLIMB_AFTER && (self.scale > self.floor || self.samples < self.spp) {
+            if self.scale > self.floor && self.pass_ms(self.scale - 1) <= TARGET_MS {
                 self.scale -= 1;
-            } else if self.scale == 1 {
+            } else if self.scale == self.floor {
                 self.samples = self.spp;
             }
             self.quiet = 0;
@@ -627,12 +825,15 @@ impl viewport::Scene for App {
 }
 
 /// `kosm-view`: the court, live.
-pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
+///
+/// The render thread is not started here. It renders on the window's own
+/// device, and the window does not exist yet — `App::init` starts it once the
+/// surface has come up and handed the device over.
+pub fn run(frames: usize, spp: u32, cpu_only: bool) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || simulate(tx, frames));
-    std::thread::spawn(move || render_worker(job_rx, shot_tx));
 
     // The level's camera, without waiting for the renderer's stage: cheap to
     // read, and the window wants it before the first frame arrives.
@@ -643,5 +844,9 @@ pub fn run(frames: usize, spp: u32) -> anyhow::Result<()> {
         exposure: 1.0,
     });
 
-    viewport::run("Kosm view — the court", (1280, 720), App::new(rx, shot_rx, job_tx, camera, spp))
+    viewport::run(
+        "Kosm view — the court",
+        (1280, 720),
+        App::new(rx, shot_rx, job_tx, camera, spp, (job_rx, shot_tx), cpu_only),
+    )
 }

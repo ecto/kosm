@@ -3,11 +3,13 @@
 //! A winit window, a wgpu surface, and one image blitted across it. There are
 //! no panels, no text and no widgets: anything on screen is the scene's own
 //! picture. `viewport.rs` owns the window and the blit; `court.rs` owns the
-//! court — the simulation on one thread, vcad's CPU path tracer on another —
-//! and answers the viewport with the newest picture it has.
+//! court — the simulation on one thread, a path tracer on another (vcad's
+//! compute shader on the window's own device, or its CPU integrator with
+//! `--cpu`) — and answers the viewport with the newest picture it has.
 //!
 //! ```text
 //! kosm-view                     the court, in a window
+//! kosm-view --cpu               the CPU integrator, not the GPU tracer
 //! kosm-view --shot out/x.png    one still, no window
 //! ```
 //!
@@ -18,6 +20,7 @@
 //! Escape to quit.
 
 mod court;
+mod court_gpu;
 mod history;
 mod viewport;
 
@@ -62,7 +65,24 @@ fn main() -> anyhow::Result<()> {
         let size = (width, (width * 9 / 16).max(1));
         // the level's own `still_t` unless asked otherwise
         let t: f64 = parse("at").unwrap_or(-1.0);
-        return court::still(std::path::Path::new(&path), t, size, parse("spp").unwrap_or(32));
+        // The GPU tracer unless asked otherwise: `--cpu` takes the CPU
+        // integrator, which is the reference the GPU picture is checked
+        // against.
+        let path = std::path::Path::new(&path);
+        let spp = parse("spp").unwrap_or(32);
+        if std::env::args().any(|a| a == "--cpu") {
+            return court::still(path, t, size, spp);
+        }
+        return match court::still_gpu(path, t, size, spp) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("court  gpu: {error}; falling back to the CPU tracer");
+                court::still(path, t, size, spp)
+            }
+        };
     }
-    court::run(parse("frames").unwrap_or(0), parse("spp").unwrap_or(4))
+    // `--cpu` pins the CPU integrator; without it the window uses the GPU
+    // tracer when the adapter and the court allow it.
+    let cpu_only = std::env::args().any(|a| a == "--cpu");
+    court::run(parse("frames").unwrap_or(0), parse("spp").unwrap_or(4), cpu_only)
 }
