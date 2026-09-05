@@ -1196,6 +1196,7 @@ dependencies = [
  "image",
  "ipse-map",
  "kosm-mpm",
+ "kosm-render",
  "phyz",
  "phyz-camera",
  "phyz-collision",

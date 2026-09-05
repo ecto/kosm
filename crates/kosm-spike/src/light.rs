@@ -34,27 +34,13 @@ const BANDS: [(f64, [f64; 3]); 5] = [
     (0.650, [1.00, 0.05, 0.05]),
 ];
 
-/// N-BK7 Sellmeier coefficients (Schott datasheet), the dispersion shape.
-const BK7_B: [f64; 3] = [1.039_612_12, 0.231_792_344, 1.010_469_45];
-const BK7_C: [f64; 3] = [0.006_000_698_67, 0.020_017_914_4, 103.560_653];
-const D_LINE_UM: f64 = 0.5876;
+/// How many bands the spectrum is split into.
 pub const BANDS_LEN: usize = 5;
 
-/// Sellmeier index at `lambda_um`, generic.
-pub fn sellmeier<S: Scalar>(lambda_um: f64) -> S {
-    let l2 = lambda_um * lambda_um;
-    let mut n2 = 1.0;
-    for k in 0..3 {
-        n2 += BK7_B[k] * l2 / (l2 - BK7_C[k]);
-    }
-    S::from_f64(n2.sqrt())
-}
-
-/// The marble's index at `lambda_um`: BK7's dispersion shape, shifted so the
-/// d-line index is `nd`. `nd` is the differentiable knob.
-pub fn index<S: Scalar>(nd: S, lambda_um: f64) -> S {
-    nd + sellmeier::<S>(lambda_um) - sellmeier::<S>(D_LINE_UM)
-}
+// Sellmeier's dispersion, and the d-line knob on top of it, are
+// `kosm-render`'s: the shape of a glass's index is optics and not this
+// level's. `light::index` and `light::sellmeier` still name them.
+pub use kosm_render::optics::{D_LINE_UM, index, sellmeier};
 
 /// The caustic a glass sphere throws on the plate: irradiance per band, on a
 /// grid in plate coordinates, plus a shadow-free reference (what the plate

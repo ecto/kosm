@@ -82,6 +82,16 @@ the contact adjoint, "put the shadow here in the image" solves for the release
 point. Only box colliders are rendered so far; the decomposed cup's hull
 pieces are not.
 
+The *beauty* pass is no longer that caster, and no longer a rasteriser either.
+`out/frame_before.png`, `frame_hint.png` and `frame_tilted.png` are
+`kosm-render`'s path tracer — multiple bounces, MIS against three softboxes, a
+real camera — pointed at the level through `analytic.rs`, which implements
+`kosm_render::Geometry` over the derived colliders themselves: oriented boxes,
+spheres and the cup's cylinders, intersected analytically, so the marble is a
+sphere at any zoom and its shadow is traced rather than composited. Two
+renderers, one geometry, each doing what it is good at: a Monte Carlo estimator
+has no useful dual, and the caster that does stays exactly where it was.
+
 ### light as physics
 
 `light.rs` makes the marble glass. Light from the lamp refracts in and out
@@ -576,6 +586,14 @@ The geometry stayed with the geometry too. `intersect/` (plane, cylinder,
 sphere, cone, torus, bilinear, B-spline) and `trim.rs` are still vcad's,
 because knowing that a ray-sphere hit at *(u, v)* falls outside a trimmed
 face's boundary loop is a B-rep fact, not a lighting one.
+Kosm's own tracers are clients too. `kosm-spike/src/analytic.rs` implements the
+trait over the marble level's phyz colliders — box, sphere, cylinder — so the
+marble's beauty pass is the same integrator the court's is. And Snell, Fresnel
+and Sellmeier moved *into* the renderer as `kosm_render::optics`, generic over
+`tang::Scalar` (they are laws at an interface, not facts about one level's
+glass): `glass.rs`, `light.rs` and the pool's water surface all read the one
+copy, and on `Dual` it is still its own derivative.
+
 `vcad-kernel-raytrace` implements the trait over its faces, and `Bvh`, `Tlas`,
 `Instance`, `Object` and `Scene` are aliases for the generic ones with vcad's
 geometry filled in — so `vcad-render --photoreal`, the GPU upload and the

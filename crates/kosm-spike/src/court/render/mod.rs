@@ -260,6 +260,8 @@ impl Scene {
             lights: self.lights.clone(),
             env: self.env.clone(),
             ground: self.ground,
+            // the gym is lit by its panels; there is no sky in it
+            sun: None,
         }
     }
 
