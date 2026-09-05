@@ -8,6 +8,7 @@
 //! Export is the CLI's render, as a button.
 
 mod live;
+mod ride;
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -441,6 +442,19 @@ fn main() -> eframe::Result<()> {
     // Set before the simulation or UI threads exist.
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    // `--ride <ride.json>` plays a recorded rollout instead of simulating a pool
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--ride") {
+        let Some(path) = args.get(i + 1) else {
+            eprintln!("--ride wants a path to a ride.json");
+            std::process::exit(2);
+        };
+        if let Err(e) = ride::run(std::path::Path::new(path)) {
+            eprintln!("ride: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let splash = std::env::args().any(|a| a == "--splash");
     let frames: usize = std::env::args().find_map(|a| a.strip_prefix("--frames=").and_then(|v| v.parse().ok())).unwrap_or(300);
     let (tx, rx) = mpsc::channel();

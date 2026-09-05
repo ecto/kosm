@@ -1573,9 +1573,12 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "ipse-map",
  "kosm-spike",
  "log",
  "phyz-math",
+ "serde",
+ "serde_json",
  "tang",
 ]
 

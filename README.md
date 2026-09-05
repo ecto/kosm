@@ -259,6 +259,18 @@ same CPU tracer the CLI uses, preview size while playing and full size when
 paused; "export mp4" runs the CLI's render. First slice of the viewer plan:
 recording-shaped now, wgpu live rendering and wasm next.
 
+`cargo run --release -p kosm-view -- --ride <ride.json>` plays a recorded
+rollout instead of simulating one — a Booster K1 riding a skatepark, say.
+The file (`docs/ride-format.md`) carries its own meshes (binary STL, box,
+sphere, cylinder), the fixed scenery, one actor per moving body and a pose
+per actor per frame, so playback touches no solver: play, pause, scrub the
+frame slider, pick a playback speed, and the camera orbits whatever actor
+`track` names (drag to orbit, scroll to zoom, z up). Rendering is a plain
+instanced rasterizer (`ride.rs`, `ride.wgsl`) — flat normals, one sun, a sky
+ambient, no culling, because authored STLs are wound however they were wound.
+`--shot=out.png --frame=N` draws one frame offscreen and quits, which is how
+the mode is checked without a screen.
+
 ## building
 
 `vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;
