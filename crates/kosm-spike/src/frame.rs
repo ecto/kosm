@@ -23,7 +23,7 @@ use phyz_diff::FinalStateObjective;
 use phyz_math::SpatialTransformExt;
 use phyz_model::{GeomInstance, Geometry};
 use phyz_world::CameraIntrinsics;
-use crate::analytic::Analytic;
+use kosm_render::analytic::Analytic;
 use crate::glass::{self, Glass};
 use tang::{Dual, Mat3, Scalar, Vec3};
 
@@ -433,7 +433,7 @@ pub fn picture(
     marble_r: f64,
 ) -> kosm_render::Scene<Analytic> {
     use std::sync::Arc;
-    let track_geom = Analytic::from_colliders(track, colliders);
+    let track_geom = crate::analytic::from_colliders(track, colliders);
     // The rig is sized on the track, not on the marble, or the key light ends
     // up inside the plate.
     let mut bounds = kosm_render::Aabb::empty();
@@ -453,7 +453,7 @@ pub fn picture(
             kosm_render::Pbr::plastic([0.42, 0.40, 0.36], 0.55, 0.0),
         ),
         kosm_render::Object::new(
-            Arc::new(kosm_render::Bvh::build(Analytic::ball(marble, marble_r))),
+            Arc::new(kosm_render::Bvh::build(crate::analytic::ball(marble, marble_r))),
             // The marble is glass, and it is the *same* glass `light.rs`
             // traces its caustic through: N-BK7's Sellmeier coefficients, so
             // the beauty frame and the five-band caustic tracer disperse by
