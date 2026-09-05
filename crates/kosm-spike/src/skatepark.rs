@@ -30,6 +30,7 @@ use phyz_model::{Model, State};
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
 use crate::garage::marble_model;
+use crate::materials;
 use crate::scene::{AuthoredScene, MM};
 
 pub const DEFAULT_SKATEPARK_SCENE: &str = "skatepark.loon";
@@ -47,6 +48,15 @@ pub struct SkateparkScene {
     pub deck: f64,
     pub coping_r: f64,
     pub second_side: bool,
+    /// The flat end of the transition the check runs on, and the flat's own
+    /// height there: a level puts its ramp where it likes.
+    pub check_x: f64,
+    pub check_y: f64,
+    pub check_z: f64,
+    /// Where the K1 stands in the scenario, and which way it faces.
+    pub spawn_x: f64,
+    pub spawn_y: f64,
+    pub spawn_yaw_deg: f64,
     pub cell: f64,
     pub pad: f64,
     pub wheel_r: f64,
@@ -74,7 +84,13 @@ impl SkateparkScene {
             flat: a.millimetres("flat_mm")?,
             deck: a.millimetres("deck_mm")?,
             coping_r: a.millimetres("coping_r_mm")?,
-            second_side: a.parameter("second_side")? > 0.5,
+            second_side: a.parameter_or("second_side", 1.0) > 0.5,
+            check_x: a.parameter_or("check_x_mm", a.parameter("flat_mm")? / 2.0) * MM,
+            check_y: a.parameter_or("check_y_mm", 0.0) * MM,
+            check_z: a.parameter_or("check_z_mm", 0.0) * MM,
+            spawn_x: a.parameter_or("spawn_x_mm", 0.0) * MM,
+            spawn_y: a.parameter_or("spawn_y_mm", 0.0) * MM,
+            spawn_yaw_deg: a.parameter_or("spawn_yaw_deg", 0.0),
             cell: a.millimetres("sdf_cell_mm")?,
             pad: a.millimetres("sdf_pad_mm")?,
             wheel_r: a.millimetres("wheel_r_mm")?,
@@ -98,6 +114,17 @@ impl SkateparkScene {
         self.flat / 2.0
     }
 
+    /// The middle of the checked flat: the checked transition starts at
+    /// `check_x` and the flat runs `flat` metres back from it, in −x.
+    pub fn flat_mid(&self) -> f64 {
+        self.check_x - self.half_flat()
+    }
+
+    /// Where the flat ends on `side` (±1) of its middle.
+    pub fn flat_end(&self, side: f64) -> f64 {
+        self.flat_mid() + side * self.half_flat()
+    }
+
     /// Angle of the lip around the transition, from the bottom.
     pub fn lip_angle(&self) -> f64 {
         (1.0 - self.lip / self.tr_r).acos()
@@ -105,7 +132,11 @@ impl SkateparkScene {
 
     /// A point on the +x transition's surface, `theta` around from the bottom.
     pub fn arc_point(&self, side: f64, theta: f64) -> Vec3 {
-        Vec3::new(side * (self.half_flat() + self.tr_r * theta.sin()), 0.0, self.tr_r * (1.0 - theta.cos()))
+        Vec3::new(
+            self.flat_end(side) + side * self.tr_r * theta.sin(),
+            self.check_y,
+            self.check_z + self.tr_r * (1.0 - theta.cos()),
+        )
     }
 
     /// The wheel's release: its centre, sitting on the +x arc with the contact
@@ -113,12 +144,12 @@ impl SkateparkScene {
     pub fn release(&self) -> Vec3 {
         let theta = (1.0 - self.drop / self.tr_r).acos();
         let rho = self.tr_r - self.wheel_r;
-        Vec3::new(self.half_flat() + rho * theta.sin(), 0.0, self.tr_r - rho * theta.cos())
+        Vec3::new(self.check_x + rho * theta.sin(), self.check_y, self.check_z + self.tr_r - rho * theta.cos())
     }
 
     /// How far the wheel's centre falls from release to the flat.
     pub fn centre_drop(&self) -> f64 {
-        self.release().z - self.wheel_r
+        self.release().z - self.check_z - self.wheel_r
     }
 
     /// Speed of a solid sphere rolling without slip after that drop.
@@ -130,37 +161,90 @@ impl SkateparkScene {
         ContactMaterial { friction: self.friction, restitution: 0.0, ..Default::default() }
     }
 
-    /// The park's mesh in metres: every evaluated part's triangles.
-    pub fn triangles(&self) -> anyhow::Result<Vec<[Vec3; 3]>> {
+    /// The park's parts in metres, one per root, in the level's own order.
+    pub fn parts(&self) -> anyhow::Result<Vec<Part>> {
         let opts = vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() };
         let scene = vcad_eval::evaluate_document(&self.authored.document, &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let mut tris = Vec::new();
-        for part in &scene.parts {
+        let names = root_names(self.authored.source());
+        let mut parts = Vec::with_capacity(scene.parts.len());
+        for (i, part) in scene.parts.iter().enumerate() {
             let p = &part.mesh.positions;
             let at = |i: u32| {
                 let i = i as usize * 3;
                 Vec3::new(p[i] as f64, p[i + 1] as f64, p[i + 2] as f64) * MM
             };
-            for t in part.mesh.indices.chunks_exact(3) {
-                tris.push([at(t[0]), at(t[1]), at(t[2])]);
-            }
+            let tris: Vec<[Vec3; 3]> = part.mesh.indices.chunks_exact(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
+            anyhow::ensure!(!tris.is_empty(), "root {i} evaluated to no triangles");
+            parts.push(Part {
+                name: names.get(i).cloned().unwrap_or_else(|| format!("root{i}")),
+                material: part.material.clone(),
+                tris,
+            });
         }
-        anyhow::ensure!(!tris.is_empty(), "the park evaluated to no triangles");
+        anyhow::ensure!(!parts.is_empty(), "the park evaluated to no triangles");
+        Ok(parts)
+    }
+
+    /// The collision set's triangles: every root the bake is allowed to see.
+    pub fn triangles(&self) -> anyhow::Result<Vec<[Vec3; 3]>> {
+        let tris: Vec<[Vec3; 3]> = self.parts()?.iter().filter(|p| p.collides()).flat_map(|p| p.tris.clone()).collect();
+        anyhow::ensure!(!tris.is_empty(), "the park has no collision geometry");
         Ok(tris)
     }
+}
+
+/// One evaluated root: what it is called, what it is made of, its triangles.
+pub struct Part {
+    pub name: String,
+    pub material: String,
+    pub tris: Vec<[Vec3; 3]>,
+}
+
+impl Part {
+    /// Everything but `no-collide` is baked into `mesh.stl` and the SDF.
+    pub fn collides(&self) -> bool {
+        materials::split(&self.material).0
+    }
+
+    /// The colour the window draws it in.
+    pub fn colour(&self) -> [f64; 3] {
+        materials::colour(materials::split(&self.material).1)
+    }
+}
+
+/// The root names, in document order, read off the Loon source: a root is
+/// written `[root <name> "<material>"]` and vcad keeps nothing but the
+/// material, so the name survives only in the text that produced it.
+fn root_names(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("[root "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(|name| name.trim_end_matches(']').to_string())
+        .collect()
 }
 
 /// A baked map directory.
 pub struct Baked {
     pub dir: PathBuf,
     pub tris: usize,
+    /// Drawn roots, collision set and all.
+    pub parts: usize,
     pub sdf: SdfGrid,
 }
 
-/// Bake the park into `dir`: `mesh.stl`, `sdf.bin`, `map.toml`, `park.svg`.
+/// Bake the park into `dir`: `mesh.stl`, `sdf.bin`, `map.toml`, `park.svg`,
+/// and `parts/<root>.stl` + `parts.json` for everything the level draws.
+///
+/// Only roots outside `no-collide` reach `mesh.stl` and the field. The drawn
+/// set is larger — a roof the K1 cannot touch is still a roof — so the two
+/// are written separately rather than one being filtered out of the other.
 pub fn bake(scene: &SkateparkScene, dir: &Path) -> anyhow::Result<Baked> {
     fs::create_dir_all(dir)?;
-    let tris = scene.triangles()?;
+    let parts = scene.parts()?;
+    write_parts(&parts, dir)?;
+    let tris: Vec<[Vec3; 3]> = parts.iter().filter(|p| p.collides()).flat_map(|p| p.tris.clone()).collect();
+    anyhow::ensure!(!tris.is_empty(), "the park has no collision geometry");
     let mesh = {
         let mut vertices = Vec::with_capacity(tris.len() * 3);
         let mut triangles = Vec::with_capacity(tris.len());
@@ -192,7 +276,36 @@ pub fn bake(scene: &SkateparkScene, dir: &Path) -> anyhow::Result<Baked> {
     .map_err(err)?;
     let svg = vcad_render::render_svg_str(&scene.authored.document.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
     fs::write(dir.join("park.svg"), svg)?;
-    Ok(Baked { dir: dir.to_owned(), tris: tris.len(), sdf })
+    Ok(Baked { dir: dir.to_owned(), tris: tris.len(), parts: parts.len(), sdf })
+}
+
+/// `parts/<root>.stl` in metres, one per drawn root, and the `parts.json`
+/// index the ride recorder reads to draw the level in its own colours.
+fn write_parts(parts: &[Part], dir: &Path) -> anyhow::Result<()> {
+    let sub = dir.join("parts");
+    fs::create_dir_all(&sub)?;
+    let err = |e: ipse_map::MapError| anyhow::anyhow!("{e:?}");
+    let mut json = String::from("[\n");
+    for (i, part) in parts.iter().enumerate() {
+        let path = sub.join(format!("{}.stl", part.name));
+        stl::write_binary_stl(&path, &part.tris).map_err(err)?;
+        let abs = fs::canonicalize(&path).unwrap_or(path);
+        let c = part.colour();
+        let comma = if i + 1 < parts.len() { "," } else { "" };
+        json.push_str(&format!(
+            "  {{\"name\": {:?}, \"material\": {:?}, \"path\": {:?},\n   \"colour\": [{:.3}, {:.3}, {:.3}], \"collide\": {}}}{comma}\n",
+            part.name,
+            part.material,
+            abs.display().to_string(),
+            c[0],
+            c[1],
+            c[2],
+            part.collides(),
+        ));
+    }
+    json.push_str("]\n");
+    fs::write(dir.join("parts.json"), json)?;
+    Ok(())
 }
 
 /// How far the baked field is from zero along the ideal arc of each
@@ -260,21 +373,31 @@ pub struct RollReport {
     pub path: Vec<Vec3>,
 }
 
-/// Release the wheel on the +x transition and roll it on the baked map.
+/// Release the wheel on the checked transition and roll it on the baked map.
 pub fn roll(scene: &SkateparkScene, sdf: &SdfGrid) -> anyhow::Result<RollReport> {
+    roll_from(scene, sdf, scene.release(), Vec3::zero(), scene.t_end)
+}
+
+/// The same roll from an arbitrary start: a centre, a velocity, a duration.
+/// The kicker check needs a wheel that is already moving, and a launch is the
+/// same integration as a drop with a different initial condition.
+pub fn roll_from(scene: &SkateparkScene, sdf: &SdfGrid, c0: Vec3, v0: Vec3, t_end: f64) -> anyhow::Result<RollReport> {
     let mut model = marble_model(scene.wheel_r, scene.wheel_mass);
     model.dt = scene.dt;
     let material = scene.material();
     let mut state = model.default_state();
-    let c0 = scene.release();
     state.q[POS] = c0.x;
     state.q[POS + 1] = c0.y;
     state.q[POS + 2] = c0.z;
+    state.v[POS] = v0.x;
+    state.v[POS + 1] = v0.y;
+    state.v[POS + 2] = v0.z;
     let mut cache = ContactCache::new(material.margin.max(1e-3));
-    let steps = (scene.t_end / scene.dt).round() as usize;
+    let steps = (t_end / scene.dt).round() as usize;
     let mut path = Vec::with_capacity(steps);
     let (mut flat_speed, mut drift) = (0.0f64, 0.0f64);
     let mut far_apex: Option<f64> = None;
+    let mid = scene.flat_mid();
     let on_flat = scene.half_flat() - scene.wheel_r;
     let trace = std::env::var_os("KOSM_TRACE").is_some();
     for k in 0..steps {
@@ -288,20 +411,20 @@ pub fn roll(scene: &SkateparkScene, sdf: &SdfGrid) -> anyhow::Result<RollReport>
         }
         anyhow::ensure!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite(), "the roll diverged at t = {:.3} s", state.time);
         let v = Vec3::new(state.v[3], state.v[4], state.v[5]).norm();
-        if p.x.abs() < on_flat {
+        if (p.x - mid).abs() < on_flat {
             flat_speed = flat_speed.max(v);
         }
-        if p.x < -on_flat {
+        if p.x < mid - on_flat {
             far_apex = Some(far_apex.map_or(p.z, |a: f64| a.max(p.z)));
         }
-        drift = drift.max(p.y.abs());
+        drift = drift.max((p.y - scene.check_y).abs());
         path.push(p);
     }
     Ok(RollReport {
         flat_speed,
         predicted_speed: scene.predicted_flat_speed(),
-        far_apex,
-        release_height: c0.z,
+        far_apex: far_apex.map(|a| a - scene.check_z),
+        release_height: c0.z - scene.check_z,
         drift,
         path,
     })
@@ -319,11 +442,11 @@ pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
          [[condition]]\n\
          label = \"flat, shoved toward the transition\"\n\
          map = {map:?}\n\
-         at = [0.0, 0.0, 0.0]\n\
+         at = [{sx}, {sy}, {yaw}]\n\
          duration = 6.0\n\
          \x20 [[condition.thing]]\n\
          \x20 object = \"objects/skateboard\"\n\
-         \x20 at = [0.0, 0.0, 0.0]\n\
+         \x20 at = [{sx}, {sy}, {yaw}]\n\
          \x20 under_robot = true\n\
          \x20 [[condition.shove]]\n\
          \x20 axis = \"sagittal\"\n\
@@ -337,6 +460,9 @@ pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
          seed = 1\n\
          out = \"models/skatepark.policy\"\n",
         map = map_dir.display().to_string(),
+        sx = scene.spawn_x,
+        sy = scene.spawn_y,
+        yaw = scene.spawn_yaw_deg,
         at = scene.shove_at,
         peak = scene.shove_ns,
     )
@@ -348,13 +474,15 @@ pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     for w in &scene.authored.warnings {
         eprintln!("skatepark warning: {w}");
     }
-    let dir = out.join("maps").join("skatepark");
+    let stem = level.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "skatepark".into());
+    let dir = out.join("maps").join(&stem);
     let t0 = std::time::Instant::now();
     let baked = bake(&scene, &dir)?;
     let s = &baked.sdf;
     println!(
-        "skatepark {}: {} tris → {}  sdf {}×{}×{} at {:.0} mm cells ({:.0} MB), baked in {:.1} s",
+        "skatepark {}: {} roots, {} collision tris → {}  sdf {}×{}×{} at {:.0} mm cells ({:.0} MB), baked in {:.1} s",
         level.display(),
+        baked.parts,
         baked.tris,
         dir.display(),
         s.nx,

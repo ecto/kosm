@@ -8,6 +8,7 @@ pub mod garage;
 pub mod glass;
 pub mod lamp;
 pub mod light;
+pub mod materials;
 pub mod pool;
 pub mod room;
 pub mod scene;
