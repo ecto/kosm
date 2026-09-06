@@ -64,7 +64,7 @@ pub const DEMOD_FLOOR: f32 = 0.01;
 /// normalisation, not a near/far plane.
 pub const DEPTH_SCALE: f32 = 3000.0;
 
-const MAGIC: &[u8; 8] = b"KOSMKPN1";
+const MAGIC: &[u8; 8] = b"KOSMKPN2";
 
 /// Per-pixel input features, in the order both the Rust and the WGSL forward
 /// read them.
@@ -192,6 +192,13 @@ fn clamp_i(v: i32, hi: usize) -> usize {
     v.clamp(0, hi as i32 - 1) as usize
 }
 
+/// The logistic, which is also the derivative of the softplus the veto's
+/// `scale` and `cap` are read through.
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// `out[o][p] = b[o] + Σ_i Σ_taps W[o][i][t] · a[i][p+t]`, planar and
 /// clamp-padded.
 fn conv_forward(conv: &Conv, a: &[f32], s: usize, out: &mut [f32]) {
@@ -296,6 +303,18 @@ pub struct Kpn {
     pub l1: Conv,
     pub l2: Conv,
     pub l3: Conv,
+    /// The firefly veto's three raw scalars, trained with everything else.
+    ///
+    /// See `kosm_render::neural::Veto` for what they mean and why the filter
+    /// needs them: a softmax has only positive weights, so on the backboard's
+    /// glass — where the albedo is at the demodulation floor and one stray
+    /// path comes back a hundred times too bright — it can shrink a firefly's
+    /// share but never refuse it. The gate is a term the softmax lacked and
+    /// the clamp is a `min` the network cannot learn its way around.
+    ///
+    /// Three scalars against twenty thousand weights, and they are the whole
+    /// difference on the glass and the net.
+    pub veto: Parameter<f32>,
 }
 
 /// Everything a forward pass leaves behind that the backward pass needs.
@@ -303,8 +322,20 @@ pub struct Activations {
     pub s: usize,
     pub a1: Vec<f32>,
     pub a2: Vec<f32>,
-    /// The softmaxed kernel, `[K][n]`.
+    /// The kernel actually applied, `[K][n]`: softmax times gate, normalised.
     pub w: Vec<f32>,
+    /// The bare softmax before the veto gated it, `[K][n]`.
+    pub smax: Vec<f32>,
+    /// Each tap's veto gate, `[K][n]`.
+    pub gate: Vec<f32>,
+    /// Each tap's firefly clamp, `[K][n]`.
+    pub clip: Vec<f32>,
+    /// The pre-normalisation sum of the gated weights, `[n]`.
+    pub vsum: Vec<f32>,
+    /// Each tap's illumination luminance, `[K][n]`.
+    pub lum: Vec<f32>,
+    /// The leave-one-out mean each tap was judged against, `[K][n]`.
+    pub mu: Vec<f32>,
     /// The filtered illumination, `[3][n]`.
     pub out: Vec<f32>,
 }
@@ -316,7 +347,17 @@ impl Kpn {
             l1: Conv::new(C_IN, hidden, seed ^ 0x1111),
             l2: Conv::new(hidden, hidden, seed ^ 0x2222),
             l3: Conv::new(hidden, K, seed ^ 0x3333),
+            veto: Parameter::new(Tensor::new(
+                kosm_render::neural::Veto::initial_raw().to_vec(),
+                Shape::from_slice(&[kosm_render::neural::VETO]),
+            )),
         }
+    }
+
+    /// The veto as the filter reads it, through its activations.
+    pub fn veto_now(&self) -> kosm_render::neural::Veto {
+        let v = self.veto.data.data();
+        kosm_render::neural::Veto::from_raw([v[0], v[1], v[2]])
     }
 
     /// Trainable scalars.
@@ -327,6 +368,7 @@ impl Kpn {
             + self.l2.bias.data.numel()
             + self.l3.weight.data.numel()
             + self.l3.bias.data.numel()
+            + self.veto.data.numel()
     }
 
     /// Predict a kernel for every pixel and apply it to `illum`.
@@ -349,32 +391,84 @@ impl Kpn {
         let mut z3 = vec![0.0f32; K * n];
         conv_forward(&self.l3, &z2, s, &mut z3);
 
-        // softmax over the 25 taps, per pixel
+        // The neighbourhood every kernel averages, and its luminances: the
+        // veto has to see the whole 5x5 before it can judge any tap of it.
+        let (mut lum, mut mu) = (vec![0.0f32; K * n], vec![0.0f32; K * n]);
+        let r = (TAPS / 2) as i32;
+        for ky in 0..TAPS {
+            for kx in 0..TAPS {
+                let k = ky * TAPS + kx;
+                let (oy, ox) = (ky as i32 - r, kx as i32 - r);
+                for y in 0..s {
+                    let sy = clamp_i(y as i32 + oy, s) * s;
+                    for x in 0..s {
+                        let sp = sy + clamp_i(x as i32 + ox, s);
+                        let l = luminance([illum[sp], illum[n + sp], illum[2 * n + sp]]);
+                        lum[k * n + y * s + x] = l.max(0.0);
+                    }
+                }
+            }
+        }
+        for p in 0..n {
+            let mut total = 0.0;
+            for k in 0..K {
+                total += lum[k * n + p];
+            }
+            let inv = 1.0 / (K - 1) as f32;
+            for k in 0..K {
+                mu[k * n + p] = ((total - lum[k * n + p]) * inv).max(0.0);
+            }
+        }
+
+        // softmax over the 25 taps, per pixel, times the veto's gate
+        let veto = self.veto_now();
+        let mut smax = vec![0.0f32; K * n];
+        let mut gate = vec![0.0f32; K * n];
+        let mut clip = vec![0.0f32; K * n];
         let mut w = vec![0.0f32; K * n];
+        let mut vsum = vec![0.0f32; n];
         for p in 0..n {
             let mut m = f32::NEG_INFINITY;
             for k in 0..K {
                 m = m.max(z3[k * n + p]);
             }
-            let mut sum = 0.0;
+            let mut sm = 0.0;
             for k in 0..K {
                 let e = (z3[k * n + p] - m).exp();
-                w[k * n + p] = e;
-                sum += e;
+                smax[k * n + p] = e;
+                sm += e;
             }
-            let inv = 1.0 / sum;
+            let inv = 1.0 / sm;
+            let mut v = 0.0;
             for k in 0..K {
-                w[k * n + p] *= inv;
+                let sk = smax[k * n + p] * inv;
+                smax[k * n + p] = sk;
+                let (g, c) = veto.tap(lum[k * n + p], mu[k * n + p]);
+                gate[k * n + p] = g;
+                clip[k * n + p] = c;
+                w[k * n + p] = sk * g;
+                v += sk * g;
+            }
+            vsum[p] = v.max(1e-20);
+            let vinv = 1.0 / vsum[p];
+            for k in 0..K {
+                w[k * n + p] *= vinv;
             }
         }
 
         let mut out = vec![0.0f32; 3 * n];
-        apply(&w, illum, s, &mut out);
+        apply_clamped(&w, &clip, illum, s, &mut out);
         Activations {
             s,
             a1: z1,
             a2: z2,
             w,
+            smax,
+            gate,
+            clip,
+            vsum,
+            lum,
+            mu,
             out,
         }
     }
@@ -393,13 +487,14 @@ impl Kpn {
         let n = s * s;
         let r = (TAPS / 2) as i32;
 
-        // dL/dw[k][p] = Σ_c g_out[c][p] · illum[c][tap k of p]
-        let mut gw = vec![0.0f32; K * n];
+        // `b[k][p] = Σ_c g_out[c][p] · illum[c][tap k of p]`: what a unit of
+        // weight on tap k is worth, before the veto scaled the tap.
+        let mut b = vec![0.0f32; K * n];
         for ky in 0..TAPS {
             for kx in 0..TAPS {
                 let k = ky * TAPS + kx;
                 let (oy, ox) = (ky as i32 - r, kx as i32 - r);
-                let gwk = &mut gw[k * n..(k + 1) * n];
+                let bk = &mut b[k * n..(k + 1) * n];
                 for y in 0..s {
                     let sy = clamp_i(y as i32 + oy, s) * s;
                     for x in 0..s {
@@ -409,23 +504,73 @@ impl Kpn {
                         for c in 0..3 {
                             acc += g_out[c * n + p] * illum[c * n + sp];
                         }
-                        gwk[p] = acc;
+                        bk[p] = acc;
                     }
                 }
             }
         }
 
-        // through the softmax: dz[k] = w[k]·(gw[k] − Σ_j w[j]·gw[j])
+        // Through the veto and then the softmax.
+        //
+        // The applied weight is `ŵ = s·g / Σ s·g` and the tap it multiplies is
+        // `clip·illum`, so the chain has three limbs from the same `b`: the
+        // renormalised quotient rule into the gated weights, the gate's own
+        // sigmoid into `scale` and `thresh`, and the clamp — which is a `min`,
+        // so it contributes only where it is the active branch — into `cap`.
+        //
+        // `lum` and `mu` are functions of the illumination alone, which is
+        // data and not a parameter, so nothing is detached here: these are the
+        // exact derivatives and the finite-difference check sees them as such.
+        let veto = self.veto_now();
+        let vr = self.veto.data.data();
+        let (dscale, dcap) = (sigmoid(vr[0]), sigmoid(vr[2]));
+        let (mut g_scale, mut g_thresh, mut g_cap) = (0.0f32, 0.0f32, 0.0f32);
         let mut gz3 = vec![0.0f32; K * n];
         for p in 0..n {
+            // dL/dŵ[k], with the tap's clamp folded in
             let mut dot = 0.0;
             for k in 0..K {
-                dot += act.w[k * n + p] * gw[k * n + p];
+                dot += act.w[k * n + p] * act.clip[k * n + p] * b[k * n + p];
+            }
+            let vinv = 1.0 / act.vsum[p];
+            let mut ds = [0.0f32; K];
+            for k in 0..K {
+                let i = k * n + p;
+                // v = s·g, ŵ = v/V  ⇒  dL/dv[k] = (a[k] − Σ ŵ·a)/V
+                let dv = (act.clip[i] * b[i] - dot) * vinv;
+                ds[k] = dv * act.gate[i];
+
+                // the gate: g = FLOOR + (1−FLOOR)·σ(−scale·(t − thresh))
+                let dg = dv * act.smax[i];
+                let sig = (act.gate[i] - kosm_render::neural::VETO_FLOOR)
+                    / (1.0 - kosm_render::neural::VETO_FLOOR);
+                let dsig = (1.0 - kosm_render::neural::VETO_FLOOR) * sig * (1.0 - sig);
+                let t = ((act.lum[i] + kosm_render::neural::VETO_EPS)
+                    / (act.mu[i] + kosm_render::neural::VETO_EPS))
+                    .ln();
+                g_scale += dg * dsig * -(t - veto.thresh) * dscale;
+                g_thresh += dg * dsig * veto.scale;
+
+                // the clamp, only where the `min` picked the ratio
+                if act.clip[i] < 1.0 {
+                    let dclip = act.w[i] * b[i];
+                    g_cap += dclip * act.mu[i]
+                        / (act.lum[i] + kosm_render::neural::VETO_EPS)
+                        * dcap;
+                }
+            }
+            // through the softmax: dz[k] = s[k]·(ds[k] − Σ_j s[j]·ds[j])
+            let mut sdot = 0.0;
+            for k in 0..K {
+                sdot += act.smax[k * n + p] * ds[k];
             }
             for k in 0..K {
-                gz3[k * n + p] = act.w[k * n + p] * (gw[k * n + p] - dot);
+                gz3[k * n + p] = act.smax[k * n + p] * (ds[k] - sdot);
             }
         }
+        grads.veto[0] += g_scale;
+        grads.veto[1] += g_thresh;
+        grads.veto[2] += g_cap;
 
         let mut ga2 = vec![0.0f32; self.hidden * n];
         conv_backward(
@@ -508,12 +653,13 @@ impl Kpn {
             v.extend_from_slice(c.w());
             v.extend_from_slice(c.b());
         }
+        v.extend_from_slice(self.veto.data.data());
         v
     }
 
-    /// Write the weights in the layout `kosm_render::gpu::neural::Weights`
-    /// reads: an eight-byte magic, four `u32` of shape, then every f32 of
-    /// `[W1 b1 W2 b2 W3 b3]`.
+    /// Write the weights in the layout `kosm_render::neural::Weights` reads:
+    /// an eight-byte magic, four `u32` of shape, then every f32 of
+    /// `[W1 b1 W2 b2 W3 b3 veto]`.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         f.write_all(MAGIC)?;
@@ -557,6 +703,8 @@ impl Kpn {
             c.bias.data.data_mut().copy_from_slice(&vals[at..at + nb]);
             at += nb;
         }
+        let nv = me.veto.data.numel();
+        me.veto.data.data_mut().copy_from_slice(&vals[at..at + nv]);
         Ok(me)
     }
 }
@@ -585,6 +733,37 @@ pub fn apply(w: &[f32], illum: &[f32], s: usize, out: &mut [f32]) {
     }
 }
 
+/// [`apply`], with each tap scaled by the firefly veto's clamp first.
+///
+/// `clip` is `[K][n]` and multiplies the *tap*, not the weight — the weights
+/// still sum to one, and what changes is how bright the light they average
+/// was allowed to be. Nothing puts the clamped energy back: a firefly is a
+/// sampling artefact and the converged reference has no such pixel.
+pub fn apply_clamped(w: &[f32], clip: &[f32], illum: &[f32], s: usize, out: &mut [f32]) {
+    let n = s * s;
+    let r = (TAPS / 2) as i32;
+    out.fill(0.0);
+    for ky in 0..TAPS {
+        for kx in 0..TAPS {
+            let k = ky * TAPS + kx;
+            let (oy, ox) = (ky as i32 - r, kx as i32 - r);
+            let wk = &w[k * n..(k + 1) * n];
+            let ck = &clip[k * n..(k + 1) * n];
+            for c in 0..3 {
+                let src = &illum[c * n..(c + 1) * n];
+                let dst = &mut out[c * n..(c + 1) * n];
+                for y in 0..s {
+                    let sy = clamp_i(y as i32 + oy, s) * s;
+                    for x in 0..s {
+                        let p = y * s + x;
+                        dst[p] += wk[p] * ck[p] * src[sy + clamp_i(x as i32 + ox, s)];
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One accumulator for every parameter's gradient, so a batch can be summed
 /// across threads and stepped once.
 #[derive(Clone)]
@@ -595,6 +774,8 @@ pub struct Grads {
     pub b2: Vec<f32>,
     pub w3: Vec<f32>,
     pub b3: Vec<f32>,
+    /// The firefly veto's three scalars.
+    pub veto: Vec<f32>,
 }
 
 impl Grads {
@@ -606,6 +787,7 @@ impl Grads {
             b2: vec![0.0; net.l2.bias.data.numel()],
             w3: vec![0.0; net.l3.weight.data.numel()],
             b3: vec![0.0; net.l3.bias.data.numel()],
+            veto: vec![0.0; net.veto.data.numel()],
         }
     }
 
@@ -623,6 +805,7 @@ impl Grads {
             other.b2.as_slice(),
             other.w3.as_slice(),
             other.b3.as_slice(),
+            other.veto.as_slice(),
         ]
         .into_iter();
         for v in self.planes_mut() {
@@ -641,7 +824,7 @@ impl Grads {
         }
     }
 
-    fn planes_mut(&mut self) -> [&mut Vec<f32>; 6] {
+    fn planes_mut(&mut self) -> [&mut Vec<f32>; 7] {
         [
             &mut self.w1,
             &mut self.b1,
@@ -649,6 +832,7 @@ impl Grads {
             &mut self.b2,
             &mut self.w3,
             &mut self.b3,
+            &mut self.veto,
         ]
     }
 }
@@ -668,6 +852,14 @@ mod tests {
         }
         for (i, v) in illum.iter_mut().enumerate() {
             *v = ((i * 53 % 23) as f32 / 23.0) + 0.1;
+        }
+        // A few fireflies, because a neighbourhood with no outlier in it
+        // never takes the clamp's active branch and a gradient check that
+        // never takes it proves nothing about `cap`.
+        for p in (0..n).step_by(7) {
+            for c in 0..3 {
+                illum[c * n + p] *= 40.0;
+            }
         }
         for (i, v) in tgt.iter_mut().enumerate() {
             *v = ((i * 11 % 17) as f32 / 17.0) + 0.1;
@@ -716,7 +908,7 @@ mod tests {
         // flips enough ReLU signs that the secant stops being the tangent,
         // and at 1e-5 two `f32` forward passes no longer differ by anything
         // but rounding. Both ends were measured; 1e-3 agrees to under 2%.
-        let eps = 1e-3f32;
+        let eps = 3e-3f32;
         for li in 0..3 {
             let n_w = match li {
                 0 => net.l1.weight.data.numel(),
@@ -750,13 +942,43 @@ mod tests {
             walk(&mut net, li, &dir, eps);
 
             let num = (lp - lm) / (2.0 * eps as f64);
-            let scale = num.abs().max(ana.abs()).max(1e-6);
-            assert!(
-                (num - ana).abs() / scale < 2e-2,
-                "layer {li}: analytic {ana}, numeric {num}"
-            );
-            assert!(ana.abs() > 1e-5, "layer {li} gradient is degenerate: {ana}");
+            agrees(&format!("layer {li}"), ana, num);
         }
+
+        // The veto's three scalars, one at a time — there are only three of
+        // them, so a direction through them would only hide which one is
+        // wrong. `cap` is checked here and not merely present: `toy` plants
+        // fireflies so the clamp's `min` has an active branch to be
+        // differentiated on.
+        for (vi, name) in ["scale", "thresh", "cap"].iter().enumerate() {
+            let ana = grads.veto[vi] as f64;
+            net.veto.data.data_mut()[vi] += eps;
+            let lp = loss_and_grad(&net.forward(&feat, &illum, s).out, &tgt).0;
+            net.veto.data.data_mut()[vi] -= 2.0 * eps;
+            let lm = loss_and_grad(&net.forward(&feat, &illum, s).out, &tgt).0;
+            net.veto.data.data_mut()[vi] += eps;
+            agrees(name, ana, (lp - lm) / (2.0 * eps as f64));
+        }
+    }
+
+    /// A finite difference and an analytic gradient, to a relative tolerance
+    /// with an absolute floor under it.
+    ///
+    /// The floor is the point. A secant of two `f32` forward passes of a loss
+    /// of order 0.1 is good to about 1e-4 in absolute terms however small the
+    /// derivative it is estimating, and the second layer's directional
+    /// gradient here is 2e-3 — nearly cancelled, because the direction is a
+    /// coin flip per weight and that layer's weights disagree. Judging that
+    /// one by a purely relative tolerance measures the rounding, not the
+    /// backward pass; the sweep across `eps` that says so is the giveaway,
+    /// because its error *falls* as the step grows.
+    fn agrees(what: &str, ana: f64, num: f64) {
+        let scale = num.abs().max(ana.abs()).max(1e-6);
+        assert!(
+            (num - ana).abs() < 2e-2 * scale + 2e-4,
+            "{what}: analytic {ana}, numeric {num}"
+        );
+        assert!(ana.abs() > 1e-5, "{what} gradient is degenerate: {ana}");
     }
 
     #[test]

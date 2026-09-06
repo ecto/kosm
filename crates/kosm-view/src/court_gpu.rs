@@ -90,6 +90,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kosm_render::caustics::CausticMap;
 use kosm_render::gpu::{InstanceMotion, SampleBudget};
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
@@ -104,6 +105,7 @@ use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter, Sun};
 // of `gpu` and has no reason to know about this one.
 use kosm_render::gpu::{Guides, History, NeuralDenoiser, NeuralPipeline};
 use kosm_render::neural::Weights;
+use kosm_render::sampler::SamplePattern;
 
 use crate::court::Camera;
 
@@ -150,8 +152,18 @@ fn flag(key: &str) -> Option<String> {
 /// `--variance-gamma G`, `--temporal-filter W`, `--fresh-iters N` and
 /// `--fresh-lum-relax R` are the four stabilizers, zero (or 1 for the relax)
 /// turning each off. Defaults are [`GpuDenoiseParams::default`]'s.
+///
+/// `--no-lobes` filters the summed sample as one buffer, the way the tier
+/// did before the first bounce was split into a diffuse and a specular
+/// half; the window's default is the split.
 fn denoise_from_args() -> GpuDenoiseParams {
-    let mut d = GpuDenoiseParams::default();
+    let mut d = GpuDenoiseParams {
+        lobes: true,
+        ..GpuDenoiseParams::default()
+    };
+    if std::env::args().any(|a| a == "--no-lobes") {
+        d.lobes = false;
+    }
     if let Some(v) = flag("history-cap").and_then(|v| v.parse::<u32>().ok()) {
         d.history_cap = v.max(1);
     }
@@ -258,6 +270,19 @@ fn restir_from_args() -> Option<(u32, u32, f32)> {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(4.0);
     Some((m, spatial, radius))
+}
+
+/// The sample pattern off the command line: `--sampler white` for the hash
+/// the shader always drew from, `--sampler blue` for the blue-noise sampler,
+/// which is the default. See `kosm_render::sampler`.
+fn sampler_from_args() -> SamplePattern {
+    match flag("sampler") {
+        None => SamplePattern::default(),
+        Some(v) => SamplePattern::parse(&v).unwrap_or_else(|| {
+            eprintln!("court  gpu: unknown --sampler {v:?}; white or blue. Using the default.");
+            SamplePattern::default()
+        }),
+    }
 }
 
 /// The court's own trained denoiser, shipped inside the binary.
@@ -378,12 +403,20 @@ pub struct Stage {
     /// ReSTIR DI's `(candidates, spatial passes, radius)`, or `None` for the
     /// next-event path. `--restir` turns it on; see `restir_from_args`.
     restir: Option<(u32, u32, f32)>,
+    /// Where the shader's random numbers come from; see `sampler_from_args`.
+    pattern: SamplePattern,
     /// The level's environment and sun, taken off the CPU tier's own
     /// `render::Scene` rather than rebuilt from the level's knobs. They reach
     /// the shader through `set_gradient_env` and `set_sun`, so the two tiers
     /// are lit by the same sky and the same daylight.
     env: Environment,
     sun: Option<Sun>,
+    /// The level's photon map: the sun through any refracting solid the
+    /// level has, traced once on the CPU off the statics and uploaded with
+    /// the resident scene. Empty for a level with no such glass — the
+    /// court's panes are thin-walled, and next-event estimation already sees
+    /// the sun through those — and then the shader's caustic path stays off.
+    caustics: CausticMap,
     /// The merged scene for the frame on screen, and which frame that was.
     /// Assembling it is a clone of the statics and a placement per instance,
     /// which costs the same whatever the resolution — so it is done once per
@@ -511,6 +544,10 @@ impl Stage {
         if let Some((m, sp, r)) = restir {
             eprintln!("court  gpu: ReSTIR DI on — {m} candidates, {sp} spatial pass(es) at {r} px");
         }
+        let pattern = sampler_from_args();
+        if pattern != SamplePattern::default() {
+            eprintln!("court  gpu: sample pattern {pattern:?}");
+        }
 
         // The statics are instances: sixty of the court's bars are one cube,
         // and packing that cube once and placing it sixty times is the whole
@@ -555,6 +592,23 @@ impl Stage {
             .map(GpuAreaLight::from_area_light)
             .collect();
 
+        // `--no-caustics` leaves the map out: the picture without the sun
+        // through the backboard, for a side-by-side or a timing.
+        let built = Instant::now();
+        let caustics = if std::env::args().any(|a| a == "--no-caustics") {
+            CausticMap::empty()
+        } else {
+            stage.caustic_map()
+        };
+        if !caustics.is_empty() {
+            eprintln!(
+                "court  gpu: caustic map — {} photons at a {:.1} mm radius in {} ms",
+                caustics.len(),
+                caustics.radius(),
+                built.elapsed().as_millis()
+            );
+        }
+
         eprintln!(
             "court  gpu: {kept} solids packed ({dropped} skipped, no BRep), \
              {} surfaces, {} faces, {} bvh nodes, {} panels",
@@ -580,8 +634,10 @@ impl Stage {
             max_depth,
             filter,
             restir,
+            pattern,
             env: stage.environment().clone(),
             sun: stage.sun(),
+            caustics,
             resident: None,
             uploaded: None,
             history,
@@ -750,10 +806,14 @@ impl Stage {
                 }
             }
             None => {
-                self.resident = Some(
-                    self.pipeline
-                        .resident_scene(&self.ctx, scene, size.0, size.1),
-                );
+                let mut res = self
+                    .pipeline
+                    .resident_scene(&self.ctx, scene, size.0, size.1);
+                // Once, with the scene: the map is the level's, not the frame's.
+                if !self.caustics.is_empty() {
+                    res.set_caustics(&self.ctx, Some(&self.caustics));
+                }
+                self.resident = Some(res);
             }
         }
         self.uploaded = Some(frame_id);
@@ -903,6 +963,7 @@ impl Stage {
             if let Some((m, sp, r)) = self.restir {
                 state.set_restir(m, sp, r);
             }
+            state.set_sample_pattern(self.pattern);
             match budget.as_ref() {
                 Some(b) => self
                     .pipeline

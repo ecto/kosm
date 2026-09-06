@@ -380,6 +380,7 @@ fn main() -> anyhow::Result<()> {
             return pool::run(Path::new("out"), frames, 1280, 720, true, cli::PoolRenderer::Legacy);
         }
         cli::Command::Skatepark { level } => return kosm_spike::skatepark::run(&level, Path::new("out")),
+        cli::Command::CourtBake { level } => return court::bake::run(&level, Path::new("out")),
         cli::Command::Splat { ply } => return garage::survey_splat(&ply, Path::new("out/splat"), 960, 720),
         cli::Command::Marble { level } => run_marble(&level),
     }

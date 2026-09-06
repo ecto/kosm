@@ -1080,6 +1080,8 @@ pub fn dump_dataset(
             d.clamp_k = 0.0;
             d.history_cap = u32::MAX;
             d.count_cutoff = u32::MAX;
+            // Converging, not filtering: every sample counts, on both lobes.
+            d.lobes = false;
         }
         gpu.reset_sequence()?;
         // A still camera over a still frame, so every pass is an independent
@@ -1388,6 +1390,9 @@ pub fn denoise_eval(
         d.firefly_k = 0.0;
         d.variance_gamma = 0.0;
         d.temporal_filter = 0.0;
+        // The split path caps a specular history by its roughness, and a
+        // reference wants every sample it was given.
+        d.lobes = false;
     }
     let mut refs = Vec::with_capacity(n as usize);
     for (k, f) in instants.iter().enumerate() {

@@ -17,19 +17,23 @@ phyz-contact = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine
 phyz-diff    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-diff" }
 phyz-world   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-world" }
 phyz-camera  = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-camera" }
-vcad         = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad", default-features = false }
-vcad-kernel  = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel", features = ["no-builtin-font"] }
-vcad-eval    = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-eval" }
-vcad-ir      = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-ir" }
+# vcad: the `claude/wgpu-30` branch (vcad PR #864), which is where vcad moved onto
+# wgpu 30 and onto kosm-render. Once #864 merges this should track `main` (or a
+# published version). A git dep, not a worktree path, so a clean clone builds.
+vcad         = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", default-features = false }
+vcad-kernel  = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", features = ["no-builtin-font"] }
+vcad-eval    = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-ir      = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
 phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
-vcad-loon    = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-loon" }
-vcad-kernel-export = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-export" }
-vcad-render  = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-render", default-features = false }
-vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-acoustics" }
-vcad-kernel-optics = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-optics" }
-vcad-kernel-raytrace = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-raytrace" }
-vcad-kernel-math = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-math" }
-vcad-kernel-primitives = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-primitives" }
+vcad-loon    = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-export = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-render  = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", default-features = false }
+vcad-kernel-acoustics = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-optics = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-raytrace = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-math = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
 # The `version` is what `cargo package` embeds for a published crate; the path
@@ -52,3 +56,8 @@ tang-ad   = { path = "/Users/cam/Developer/tang/crates/tang-ad" }
 phyz-math      = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
 phyz-model     = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
 phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
+
+# vcad pulls kosm-render from this repo by git rev; without this patch cargo
+# builds two copies and the Geometry impls stop lining up.
+[patch."https://github.com/ecto/kosm"]
+kosm-render = { path = "crates/kosm-render" }

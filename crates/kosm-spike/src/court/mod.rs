@@ -27,6 +27,7 @@ use crate::scene::{AuthoredScene, MM};
 
 pub mod net;
 pub mod aim;
+pub mod bake;
 pub mod parts;
 pub mod render;
 pub mod denoise;
