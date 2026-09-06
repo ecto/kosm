@@ -12,3 +12,5 @@ pub mod pool;
 pub mod room;
 pub mod scene;
 pub mod splash;
+
+pub mod space;
