@@ -22,11 +22,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ipse_map::manifest::{CollisionLayer, MapManifest, Provenance};
+use ipse_map::manifest::{CollisionLayer, Extent, MapManifest, Provenance};
 use ipse_map::{Map, SdfGrid, TriMesh, stl};
 use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, solve_contacts_warm};
 use phyz_math::{GRAVITY, Vec3};
 use phyz_model::{Model, State};
+use rayon::prelude::*;
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
 use crate::garage::marble_model;
@@ -163,26 +164,7 @@ impl SkateparkScene {
 
     /// The park's parts in metres, one per root, in the level's own order.
     pub fn parts(&self) -> anyhow::Result<Vec<Part>> {
-        let opts = vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() };
-        let scene = vcad_eval::evaluate_document(&self.authored.document, &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let names = root_names(self.authored.source());
-        let mut parts = Vec::with_capacity(scene.parts.len());
-        for (i, part) in scene.parts.iter().enumerate() {
-            let p = &part.mesh.positions;
-            let at = |i: u32| {
-                let i = i as usize * 3;
-                Vec3::new(p[i] as f64, p[i + 1] as f64, p[i + 2] as f64) * MM
-            };
-            let tris: Vec<[Vec3; 3]> = part.mesh.indices.chunks_exact(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
-            anyhow::ensure!(!tris.is_empty(), "root {i} evaluated to no triangles");
-            parts.push(Part {
-                name: names.get(i).cloned().unwrap_or_else(|| format!("root{i}")),
-                material: part.material.clone(),
-                tris,
-            });
-        }
-        anyhow::ensure!(!parts.is_empty(), "the park evaluated to no triangles");
-        Ok(parts)
+        parts_of(&self.authored, &|m| materials::split(m).0)
     }
 
     /// The collision set's triangles: every root the bake is allowed to see.
@@ -193,17 +175,48 @@ impl SkateparkScene {
     }
 }
 
+/// Every root of an authored scene, evaluated to triangles in metres, in the
+/// level's own order. `collides` says, from a root's material, whether the
+/// bake may see it: the park reads a `no-collide` prefix, the court has a
+/// list of appearance-only names, and the bake itself does not care which.
+pub fn parts_of(authored: &AuthoredScene, collides: &dyn Fn(&str) -> bool) -> anyhow::Result<Vec<Part>> {
+    let opts = vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() };
+    let scene = vcad_eval::evaluate_document(&authored.document, &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let names = root_names(authored.source());
+    let mut parts = Vec::with_capacity(scene.parts.len());
+    for (i, part) in scene.parts.iter().enumerate() {
+        let p = &part.mesh.positions;
+        let at = |i: u32| {
+            let i = i as usize * 3;
+            Vec3::new(p[i] as f64, p[i + 1] as f64, p[i + 2] as f64) * MM
+        };
+        let tris: Vec<[Vec3; 3]> = part.mesh.indices.chunks_exact(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
+        anyhow::ensure!(!tris.is_empty(), "root {i} evaluated to no triangles");
+        parts.push(Part {
+            name: names.get(i).cloned().unwrap_or_else(|| format!("root{i}")),
+            collide: collides(&part.material),
+            material: part.material.clone(),
+            tris,
+        });
+    }
+    anyhow::ensure!(!parts.is_empty(), "the level evaluated to no triangles");
+    Ok(parts)
+}
+
 /// One evaluated root: what it is called, what it is made of, its triangles.
 pub struct Part {
     pub name: String,
     pub material: String,
+    /// Whether the bake sees it: decided by the level's own rule when the
+    /// part was evaluated, see [`parts_of`].
+    pub collide: bool,
     pub tris: Vec<[Vec3; 3]>,
 }
 
 impl Part {
-    /// Everything but `no-collide` is baked into `mesh.stl` and the SDF.
+    /// Colliding parts are baked into `mesh.stl` and the SDF.
     pub fn collides(&self) -> bool {
-        materials::split(&self.material).0
+        self.collide
     }
 
     /// The colour the window draws it in.
@@ -233,50 +246,104 @@ pub struct Baked {
     pub sdf: SdfGrid,
 }
 
+/// How a level is baked: the field's cell and the padding around the
+/// geometry, and — for a level whose drawn shell is far bigger than the
+/// ground a robot can reach — the volume the field is sampled over.
+#[derive(Clone, Copy, Debug)]
+pub struct BakeOpts {
+    pub cell: f64,
+    pub pad: f64,
+    /// Sample the field only inside this box (metres, `lo`/`hi`) instead of
+    /// the collision mesh's padded bounds. The whole mesh still decides the
+    /// sign and the distance; only the sampled volume shrinks, so a gym whose
+    /// walls are six metres past the court bakes as the court.
+    pub volume: Option<(Vec3, Vec3)>,
+    /// The playable footprint written to `map.toml` as `[extent]`, for a
+    /// consumer that needs to know where the level ends without reading
+    /// the field's bounds.
+    pub extent: Option<(Vec3, Vec3)>,
+}
+
 /// Bake the park into `dir`: `mesh.stl`, `sdf.bin`, `map.toml`, `park.svg`,
 /// and `parts/<root>.stl` + `parts.json` for everything the level draws.
-///
-/// Only roots outside `no-collide` reach `mesh.stl` and the field. The drawn
-/// set is larger — a roof the K1 cannot touch is still a roof — so the two
-/// are written separately rather than one being filtered out of the other.
 pub fn bake(scene: &SkateparkScene, dir: &Path) -> anyhow::Result<Baked> {
+    let opts = BakeOpts { cell: scene.cell, pad: scene.pad, volume: None, extent: None };
+    bake_parts(&scene.authored, &scene.parts()?, opts, dir)
+}
+
+/// Bake evaluated parts into `dir`: `mesh.stl`, `sdf.bin`, `map.toml`,
+/// `park.svg`, and `parts/<root>.stl` + `parts.json` for everything drawn.
+///
+/// Only colliding roots reach `mesh.stl` and the field. The drawn set is
+/// larger — a roof the K1 cannot touch is still a roof — so the two are
+/// written separately rather than one being filtered out of the other.
+pub fn bake_parts(authored: &AuthoredScene, parts: &[Part], opts: BakeOpts, dir: &Path) -> anyhow::Result<Baked> {
     fs::create_dir_all(dir)?;
-    let parts = scene.parts()?;
-    write_parts(&parts, dir)?;
-    let tris: Vec<[Vec3; 3]> = parts.iter().filter(|p| p.collides()).flat_map(|p| p.tris.clone()).collect();
-    anyhow::ensure!(!tris.is_empty(), "the park has no collision geometry");
-    let mesh = {
-        let mut vertices = Vec::with_capacity(tris.len() * 3);
-        let mut triangles = Vec::with_capacity(tris.len());
-        for t in &tris {
-            let i = vertices.len() as u32;
-            vertices.extend_from_slice(t);
-            triangles.push([i, i + 1, i + 2]);
-        }
-        TriMesh::new(vertices, triangles)
+    write_parts(parts, dir)?;
+    let (tris, mesh) = collision_mesh(parts)?;
+    let sdf = match opts.volume {
+        None => SdfGrid::bake(&mesh, opts.cell, opts.pad),
+        Some((lo, hi)) => bake_sdf_within(&mesh, opts.cell, lo, hi),
     };
-    let sdf = SdfGrid::bake(&mesh, scene.cell, scene.pad);
     let err = |e: ipse_map::MapError| anyhow::anyhow!("{e:?}");
     stl::write_binary_stl(&dir.join("mesh.stl"), &tris).map_err(err)?;
     sdf.save(&dir.join("sdf.bin")).map_err(err)?;
-    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "skatepark".into());
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "level".into());
     MapManifest {
         name,
         splat: None,
-        collision: Some(CollisionLayer { mesh: "mesh.stl".into(), sdf: "sdf.bin".into(), cell: Some(scene.cell), colour: None }),
+        collision: Some(CollisionLayer { mesh: "mesh.stl".into(), sdf: "sdf.bin".into(), cell: Some(opts.cell), colour: None }),
         align: None,
         provenance: Some(Provenance {
             captured: None,
             device: Some("kosm".into()),
-            notes: Some(format!("baked from {}", scene.authored.path().display())),
+            notes: Some(format!("baked from {}", authored.path().display())),
         }),
-        extent: None,
+        extent: opts.extent.map(|(lo, hi)| Extent { lo: [lo.x, lo.y, lo.z], hi: [hi.x, hi.y, hi.z] }),
     }
     .save(dir)
     .map_err(err)?;
-    let svg = vcad_render::render_svg_str(&scene.authored.document.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
+    let svg = vcad_render::render_svg_str(&authored.document.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
     fs::write(dir.join("park.svg"), svg)?;
     Ok(Baked { dir: dir.to_owned(), tris: tris.len(), parts: parts.len(), sdf })
+}
+
+/// The colliding parts' triangles, and the mesh the field is baked against.
+pub fn collision_mesh(parts: &[Part]) -> anyhow::Result<(Vec<[Vec3; 3]>, TriMesh)> {
+    let tris: Vec<[Vec3; 3]> = parts.iter().filter(|p| p.collides()).flat_map(|p| p.tris.clone()).collect();
+    anyhow::ensure!(!tris.is_empty(), "the level has no collision geometry");
+    let mut vertices = Vec::with_capacity(tris.len() * 3);
+    let mut triangles = Vec::with_capacity(tris.len());
+    for t in &tris {
+        let i = vertices.len() as u32;
+        vertices.extend_from_slice(t);
+        triangles.push([i, i + 1, i + 2]);
+    }
+    let mesh = TriMesh::new(vertices, triangles);
+    Ok((tris, mesh))
+}
+
+/// `SdfGrid::bake` over a chosen box instead of the mesh's padded bounds:
+/// the same layout (`data[x + nx·(y + ny·z)]`), the same exact signed
+/// distance at every node, against the whole mesh.
+pub fn bake_sdf_within(mesh: &TriMesh, cell: f64, lo: Vec3, hi: Vec3) -> SdfGrid {
+    assert!(cell > 0.0 && cell.is_finite(), "cell must be positive");
+    assert!(hi.x > lo.x && hi.y > lo.y && hi.z > lo.z, "the bake volume is empty");
+    let extent = hi - lo;
+    let nx = (extent.x / cell).ceil() as usize + 1;
+    let ny = (extent.y / cell).ceil() as usize + 1;
+    let nz = (extent.z / cell).ceil() as usize + 1;
+    let mut data = vec![0.0f32; nx * ny * nz];
+    data.par_chunks_mut(nx * ny).enumerate().for_each(|(k, slab)| {
+        let z = lo.z + k as f64 * cell;
+        for j in 0..ny {
+            let y = lo.y + j as f64 * cell;
+            for (i, out) in slab[j * nx..(j + 1) * nx].iter_mut().enumerate() {
+                *out = mesh.signed_distance(Vec3::new(lo.x + i as f64 * cell, y, z)) as f32;
+            }
+        }
+    });
+    SdfGrid { origin: lo, cell, nx, ny, nz, data }
 }
 
 /// `parts/<root>.stl` in metres, one per drawn root, and the `parts.json`

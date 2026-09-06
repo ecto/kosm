@@ -8,6 +8,7 @@ use std::path::PathBuf;
 const DEFAULT_LEVEL: &str = "levels/marble.loon";
 const DEFAULT_FRAMES: usize = 150;
 const DEFAULT_SKATEPARK: &str = "levels/skatepark.loon";
+const DEFAULT_COURT_LEVEL: &str = "levels/court.loon";
 
 pub use crate::pool::PoolRenderer;
 
@@ -19,6 +20,7 @@ pub enum Command {
     Splash { frames: usize },
     Splat { ply: PathBuf },
     Skatepark { level: PathBuf },
+    CourtBake { level: PathBuf },
 }
 
 impl Command {
@@ -63,6 +65,9 @@ impl Command {
             }),
             "--skatepark" => Ok(Self::Skatepark {
                 level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_SKATEPARK.into()),
+            }),
+            "--court-bake" => Ok(Self::CourtBake {
+                level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_COURT_LEVEL.into()),
             }),
             "--splat" => {
                 let ply = args
@@ -137,6 +142,12 @@ mod tests {
         );
         assert!(parse(&["--pool", "--pool-render", "opengl"]).is_err());
         assert!(parse(&["--pool", "--pool-render"]).is_err());
+    }
+
+    #[test]
+    fn court_bake_defaults_to_the_bundled_level() {
+        assert_eq!(parse(&["--court-bake"]).unwrap(), Command::CourtBake { level: DEFAULT_COURT_LEVEL.into() });
+        assert_eq!(parse(&["--court-bake", "levels/x.loon"]).unwrap(), Command::CourtBake { level: "levels/x.loon".into() });
     }
 
     #[test]
