@@ -57,9 +57,7 @@ phyz-math      = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engi
 phyz-model     = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
 phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
 
-# vcad pulls kosm-render from this repo by git rev. Without this patch cargo
-# would compile two kosm-render crates -- the git one inside vcad and the path
-# one here -- and vcad's `kosm_render::Geometry` impls would not be the same
-# trait as the one kosm-view calls. One kosm-render: this checkout's.
+# vcad pulls kosm-render from this repo by git rev; without this patch cargo
+# builds two copies and the Geometry impls stop lining up.
 [patch."https://github.com/ecto/kosm"]
 kosm-render = { path = "crates/kosm-render" }
