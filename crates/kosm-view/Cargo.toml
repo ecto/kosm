@@ -30,7 +30,7 @@ serde_json = { version = "1", optional = true }
 # The GPU tracer runs on the viewport's own device: vcad is on wgpu 30 now,
 # so the surface and the path tracer are one set of wgpu types.
 vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
-vcad-kernel-gpu = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-gpu" }
+vcad-kernel-gpu.workspace = true
 vcad-kernel-math.workspace = true
 vcad-kernel.workspace = true
 vcad-eval.workspace = true
