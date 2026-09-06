@@ -497,6 +497,7 @@ fn step(net: &mut Kpn, g: &Grads, opt: &mut ModuleAdam) {
     set(&mut net.l2.bias, &g.b2);
     set(&mut net.l3.weight, &g.w3);
     set(&mut net.l3.bias, &g.b3);
+    set(&mut net.veto, &g.veto);
     // The order is fixed for the life of the run; `ModuleAdam` sizes its
     // moment vectors on the first step and indexes them positionally.
     let mut params: Vec<&mut Parameter<f32>> = vec![
@@ -506,6 +507,7 @@ fn step(net: &mut Kpn, g: &Grads, opt: &mut ModuleAdam) {
         &mut net.l2.bias,
         &mut net.l3.weight,
         &mut net.l3.bias,
+        &mut net.veto,
     ];
     opt.step(&mut params);
 }
