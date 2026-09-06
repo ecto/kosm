@@ -5,7 +5,7 @@ members = ["crates/kosm-render", "crates/kosm-spike", "crates/kosm-view", "crate
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # phyz: the clean worktree at main HEAD (the main checkout is on a feature branch).
