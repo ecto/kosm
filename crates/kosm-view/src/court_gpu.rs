@@ -105,6 +105,7 @@ use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter, Sun};
 // of `gpu` and has no reason to know about this one.
 use kosm_render::gpu::{Guides, History, NeuralDenoiser, NeuralPipeline};
 use kosm_render::neural::Weights;
+use kosm_render::sampler::SamplePattern;
 
 use crate::court::Camera;
 
@@ -253,6 +254,19 @@ fn restir_from_args() -> Option<(u32, u32, f32)> {
     Some((m, spatial, radius))
 }
 
+/// The sample pattern off the command line: `--sampler white` for the hash
+/// the shader always drew from, `--sampler blue` for the blue-noise sampler,
+/// which is the default. See `kosm_render::sampler`.
+fn sampler_from_args() -> SamplePattern {
+    match flag("sampler") {
+        None => SamplePattern::default(),
+        Some(v) => SamplePattern::parse(&v).unwrap_or_else(|| {
+            eprintln!("court  gpu: unknown --sampler {v:?}; white or blue. Using the default.");
+            SamplePattern::default()
+        }),
+    }
+}
+
 /// The court's own trained denoiser, shipped inside the binary.
 ///
 /// Under a megabyte, so it is embedded rather than looked up beside the
@@ -371,6 +385,8 @@ pub struct Stage {
     /// ReSTIR DI's `(candidates, spatial passes, radius)`, or `None` for the
     /// next-event path. `--restir` turns it on; see `restir_from_args`.
     restir: Option<(u32, u32, f32)>,
+    /// Where the shader's random numbers come from; see `sampler_from_args`.
+    pattern: SamplePattern,
     /// The level's environment and sun, taken off the CPU tier's own
     /// `render::Scene` rather than rebuilt from the level's knobs. They reach
     /// the shader through `set_gradient_env` and `set_sun`, so the two tiers
@@ -510,6 +526,10 @@ impl Stage {
         if let Some((m, sp, r)) = restir {
             eprintln!("court  gpu: ReSTIR DI on — {m} candidates, {sp} spatial pass(es) at {r} px");
         }
+        let pattern = sampler_from_args();
+        if pattern != SamplePattern::default() {
+            eprintln!("court  gpu: sample pattern {pattern:?}");
+        }
 
         // The statics are instances: sixty of the court's bars are one cube,
         // and packing that cube once and placing it sixty times is the whole
@@ -596,6 +616,7 @@ impl Stage {
             max_depth,
             filter,
             restir,
+            pattern,
             env: stage.environment().clone(),
             sun: stage.sun(),
             caustics,
@@ -924,6 +945,7 @@ impl Stage {
             if let Some((m, sp, r)) = self.restir {
                 state.set_restir(m, sp, r);
             }
+            state.set_sample_pattern(self.pattern);
             match budget.as_ref() {
                 Some(b) => self
                     .pipeline
