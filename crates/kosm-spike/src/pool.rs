@@ -30,13 +30,17 @@ use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{Geometry, Model, ModelBuilder, State};
 use tang::Vec3 as V;
 
-use crate::glass::{fresnel, refract, reflect};
+// Snell and Fresnel at the water surface are the same laws the marble's glass
+// obeys, and they live in one place now.
+use kosm_render::optics::{fresnel, reflect, refract};
 
 mod config;
+pub mod render;
 mod scene;
 mod snapshot;
 pub use config::WaterConfig;
 pub use scene::{DEFAULT_POOL_SCENE, PoolGeometry, PoolScene};
+pub use render::PoolRenderer;
 pub use snapshot::PoolSnapshot;
 
 // ---- the pool ---------------------------------------------------------------
@@ -72,10 +76,10 @@ pub const BLEND: f64 = 0.4;
 pub fn fps() -> f64 {
     std::env::var("KOSM_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0)
 }
-const COPING: f64 = 0.06; // deck height above the water line
-const N_WATER: f64 = 1.333;
+pub(crate) const COPING: f64 = 0.06; // deck height above the water line
+pub(crate) const N_WATER: f64 = 1.333;
 /// Absorption per metre, RGB: red goes first, which is why deep water is blue.
-const ABSORB: [f64; 3] = [0.45, 0.10, 0.04];
+pub(crate) const ABSORB: [f64; 3] = [0.45, 0.10, 0.04];
 
 // ---- the melon --------------------------------------------------------------
 
@@ -87,10 +91,10 @@ const WATER_DENSITY: f64 = 1000.0;
 
 // ---- the sun ----------------------------------------------------------------
 
-fn sun_dir() -> V<f64> {
+pub(crate) fn sun_dir() -> V<f64> {
     V::new(-0.35, -0.45, 0.82).normalize()
 }
-const SUN_IRRADIANCE: f64 = 1.05;
+pub(crate) const SUN_IRRADIANCE: f64 = 1.05;
 const SUN_DISC_COS: f64 = 0.99995; // an angular radius of about 0.6°
 
 // ---- the grandstand ---------------------------------------------------------
@@ -1616,14 +1620,28 @@ fn render_frame(
 }
 
 /// The whole thing: drop the melon, render `frames` at 30 fps, encode.
-pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> anyhow::Result<()> {
+pub fn run(
+    out: &Path,
+    frames: usize,
+    width: u32,
+    height: u32,
+    splash: bool,
+    renderer: render::PoolRenderer,
+) -> anyhow::Result<()> {
+    let kosm = renderer == render::PoolRenderer::Kosm;
     let scene = PoolScene::reference()?.with_env_overrides();
     for warning in &scene.authored.warnings {
         println!("scene  {warning}");
     }
     let water_config = scene.water;
     let recording_fps = scene.fps;
-    let tag = if splash { format!("splash_{}mm", (water_config.cell_size * 1000.0).round() as u32) } else { "pool".to_string() };
+    let tag = if splash {
+        format!("splash_{}mm", (water_config.cell_size * 1000.0).round() as u32)
+    } else if kosm {
+        "pool_kosm".to_string()
+    } else {
+        "pool".to_string()
+    };
     let dir = out.join(&tag);
     // stale frames from another run would be swept into the encode
     let _ = std::fs::remove_dir_all(&dir);
@@ -1639,7 +1657,12 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
     let view = View { eye: V::new(-3.2, -2.6, 0.9), target: V::new(0.0, 0.1, -0.1), width, height, vfov: 0.9 };
     let steps_per_frame = (1.0 / recording_fps / drop.model.dt).round() as usize;
     // KOSM_GPU_RENDER=0 keeps the caustic on the CPU, for comparison
-    let mut cgpu = if std::env::var("KOSM_GPU_RENDER").map(|v| v != "0").unwrap_or(true) {
+    let mut cgpu = if kosm {
+        // The kosm-render path has no caustic grid: the tiles are lit by
+        // whatever the path tracer finds through the water. That is the
+        // whole experiment.
+        None
+    } else if std::env::var("KOSM_GPU_RENDER").map(|v| v != "0").unwrap_or(true) {
         match kosm_mpm::GpuCaustic::new() {
             Ok(g) => {
                 println!("pool   caustic on the GPU");
@@ -1650,6 +1673,20 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
                 None
             }
         }
+    } else {
+        None
+    };
+    let mut kosm_scene = if kosm {
+        drop.read_water();
+        let t = std::time::Instant::now();
+        let scene = render::PoolRenderScene::build(drop.geometry(), &drop.surface);
+        println!(
+            "pool   kosm-render scene built in {} ms ({} spp, depth {})",
+            t.elapsed().as_millis(),
+            render::options(0).spp,
+            render::options(0).max_depth
+        );
+        Some(scene)
     } else {
         None
     };
@@ -1669,14 +1706,37 @@ pub fn run(out: &Path, frames: usize, width: u32, height: u32, splash: bool) -> 
         lowest = lowest.min(drop.centre().z);
         drop.read_water();
         tick(1, &mut lap);
-        let c = cgpu
-            .as_mut()
-            .and_then(|gpu| caustic_gpu_for_geometry(gpu, &drop.surface, drop.geometry(), 0.02))
-            .unwrap_or_else(|| caustic_for_geometry(&drop.surface, drop.geometry(), 0.02));
+        let c = if kosm {
+            Caustic { origin: [0.0, 0.0], cell: 1.0, nx: 0, ny: 0, e: Vec::new() }
+        } else {
+            cgpu.as_mut()
+                .and_then(|gpu| caustic_gpu_for_geometry(gpu, &drop.surface, drop.geometry(), 0.02))
+                .unwrap_or_else(|| caustic_for_geometry(&drop.surface, drop.geometry(), 0.02))
+        };
         tick(2, &mut lap);
         let peak_force = drop.fluid_force;
         drop.fluid_force = V::zero();
-        let img = render(&view, &drop, &c);
+        // KOSM_FROM skips the *rendering* of the early frames while still
+        // stepping the simulation: the caustic question is about one late
+        // frame, and at a few hundred samples a frame the other forty are
+        // half an hour of nothing.
+        let from: usize = std::env::var("KOSM_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if k < from {
+            tick(3, &mut lap);
+            continue;
+        }
+        let img = if let Some(scene) = kosm_scene.as_mut() {
+            // The per-frame cost the height field was built for: re-sample
+            // the surface onto the lattices, then refit the trees. Refit is
+            // the number worth watching — it is what a rebuild would have
+            // cost, and it is not it.
+            let snapshot = drop.snapshot();
+            let (sample_ms, refit_ms) = scene.update(&drop.surface);
+            println!("kosm   frame {k:3}  water sample {sample_ms:.1} ms  refit {refit_ms:.1} ms");
+            render::render_snapshot(scene, &snapshot, &view, 0x5eed_0000 + k as u64)
+        } else {
+            render(&view, &drop, &c)
+        };
         tick(3, &mut lap);
         img.save(dir.join(format!("frame_{k:03}.png")))?;
         tick(4, &mut lap);

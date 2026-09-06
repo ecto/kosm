@@ -26,10 +26,18 @@ image.workspace = true
 rayon = "1"
 rustfft = "6"
 kosm-mpm = { path = "../kosm-mpm" }
+kosm-render = { path = "../kosm-render" }
 tang.workspace = true
 tang-3dgs.workspace = true
+# The denoiser's training loop: `Parameter` holds the weights and `ModuleAdam`
+# steps them. The convolutions themselves are ours; see `court::denoise::kpn`.
+tang-tensor = { path = "/Users/cam/Developer/tang/crates/tang-tensor" }
+tang-train = { path = "/Users/cam/Developer/tang/crates/tang-train" }
 ipse-map.workspace = true
 vcad-kernel-acoustics.workspace = true
 vcad-kernel-optics.workspace = true
+vcad-kernel-raytrace.workspace = true
+vcad-kernel-math.workspace = true
+vcad-kernel-primitives.workspace = true
 hound.workspace = true
 anyhow = "1"

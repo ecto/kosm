@@ -1,0 +1,378 @@
+; the court — a Kosm scene.
+;
+; A hardwood slab, a regulation hoop at the +x end, basketballs. This file is
+; the level: the slab, backboard, rim, bracket and pole are vcad geometry
+; (Z-up, mm, cube corner at origin, cylinder base at z = 0), and the balls,
+; the drop, the shot and the recording are `defparam`s. court.rs reads this
+; and nothing else.
+;
+; A size-7 ball is 749–780 mm around (r ≈ 120 mm) and 567–650 g. The NBA's
+; inflation rule is a bounce test: dropped from 6 ft (1.83 m, bottom of the
+; ball), the *top* of the ball must come back to 49–54 in (1.245–1.37 m), so
+; the bottom reaches 1.005–1.13 m: a coefficient of restitution of 0.75–0.79
+; on hardwood. The first apex printed by `--court` is that test, in the sim.
+
+; ---- the balls --------------------------------------------------------------
+[defparam n_balls 3.0]          ; dropped balls, in a line along y at the drop_x
+[defparam ball_r_mm 120.0]
+[defparam ball_g 620.0]
+[defparam restitution 0.77]
+[defparam friction 0.6]
+[defparam drop_mm 1830.0]       ; bottom of the ball above the floor: the rulebook's 6 ft
+[defparam drop_x_mm -1500.0]
+[defparam spacing_mm 500.0]     ; balls in a line along y
+[defparam stagger_mm 120.0]     ; each ball starts this much higher than the last
+
+; ---- the shot ---------------------------------------------------------------
+; a free throw: released 4.57 m (15 ft) from the backboard face, from a hand
+; 2.1 m up, at the elevation and speed below. speed 0 means no shot.
+[defparam shot_x_mm -2830.0]    ; board_x − 4572
+[defparam shot_y_mm 0.0]
+[defparam shot_z_mm 2100.0]
+[defparam shot_speed 7.4]       ; m/s
+[defparam shot_elev_deg 52.0]
+[defparam shot_azimuth_deg 0.0] ; about z, from +x
+[defparam shot_backspin_rps 2.0]
+
+; ---- the aim ----------------------------------------------------------------
+; `aim.rs`: the adjoint of "distance to the rim centre" at the moment the
+; ball's centre falls back through the rim plane, and a two-knob solve on
+; shot_speed and shot_elev_deg. 0 turns it off (the render-only path).
+[defparam aim 1.0]
+[defparam aim_t -1.0]           ; the horizon, s; <= 0 means the ballistic time
+
+; ---- the recording ----------------------------------------------------------
+[defparam t_end 4.0]
+[defparam fps 60.0]
+[defparam dt_ms 1.0]
+
+; ---- the court --------------------------------------------------------------
+[defparam court_x_mm 14000.0]
+[defparam court_y_mm 5000.0]
+[defparam court_t_mm 40.0]      ; a slab: its top is z = 0
+
+; ---- the hoop (regulation) --------------------------------------------------
+[defparam board_x_mm 1742.0]    ; the backboard's front face
+[defparam board_w_mm 1829.0]    ; 72 in
+[defparam board_h_mm 1067.0]    ; 42 in
+[defparam board_t_mm 12.0]
+[defparam board_bottom_mm 2896.0] ; 9.5 ft
+[defparam rim_z_mm 3048.0]      ; 10 ft to the top of the rim
+[defparam rim_r_mm 228.6]       ; 18 in inside diameter
+[defparam rim_rod_mm 16.0]      ; 5/8 in steel
+[defparam rim_offset_mm 381.0]  ; rim centre from the board face, 15 in
+[defparam rim_n 24.0]           ; segments the ring is built from (seg-len below assumes 24)
+[defparam pole_r_mm 60.0]
+[defparam pole_x_mm 2900.0]
+
+; centred box: vcad's cube has a corner at the origin.
+[let box-c [fn [x y z] [translate [/ x -2.0] [/ y -2.0] [/ z -2.0] [cube x y z]]]]
+
+[let slab
+  [translate 0.0 0.0 [/ court_t_mm -2.0] [box-c court_x_mm court_y_mm court_t_mm]]]
+
+; the backboard: its front face at board_x, glass, bottom edge at board_bottom
+[let board
+  [translate [+ board_x_mm [/ board_t_mm 2.0]] 0.0 [+ board_bottom_mm [/ board_h_mm 2.0]]
+    [box-c board_t_mm board_w_mm board_h_mm]]]
+
+; the rim: a ring of rim_n box segments of rod cross-section, centred on the
+; rod's centreline (radius rim_r + rod/2), top at rim_z.
+[let rim-cx [- board_x_mm rim_offset_mm]]
+[let rod-mid [+ rim_r_mm [/ rim_rod_mm 2.0]]]
+[let seg-len [* 1.02 [* 2.0 [* rod-mid 0.130526]]]]   ; 2 R sin(7.5°)
+[let seg0 [translate rod-mid 0.0 0.0 [box-c rim_rod_mm seg-len rim_rod_mm]]]
+[let ring [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 rim_n 360.0 seg0]]
+[let rim [translate rim-cx 0.0 [- rim_z_mm [/ rim_rod_mm 2.0]] ring]]
+
+; the bracket: a flat bar from the back of the ring to the board face
+[let bracket
+  [translate [- board_x_mm [/ [- rim_offset_mm rim_r_mm] 2.0]] 0.0 [- rim_z_mm [+ rim_rod_mm 10.0]]
+    [box-c [- rim_offset_mm rim_r_mm] 120.0 20.0]]]
+
+; the pole and the arm that carries the board
+[let pole [translate pole_x_mm 0.0 0.0 [cylinder pole_r_mm [+ board_bottom_mm board_h_mm]]]]
+[let arm
+  [translate [/ [+ pole_x_mm board_x_mm] 2.0] 0.0 [+ board_bottom_mm [/ board_h_mm 2.0]]
+    [box-c [- pole_x_mm board_x_mm] 100.0 100.0]]]
+
+[root slab "maple"]
+[root board "glass"]
+[root rim "rim"]
+[root bracket "steel"]
+[root pole "steel"]
+[root arm "steel"]
+
+; ---- the net ----------------------------------------------------------------
+; A mass-spring net hung from the rim's rod: net_rows rings of net_strands
+; nodes below the rim, each node tied to the two nodes half a strand round on
+; the ring below — the classic diamond mesh. A regulation net is 15–18 in long
+; and narrows towards the bottom.
+[defparam net_strands 12.0]     ; 0 turns the net off
+[defparam net_rows 7.0]         ; rings below the rim
+[defparam net_length_mm 400.0]  ; rim to the bottom ring
+[defparam net_bottom_r_mm 150.0]; the bottom ring's radius: the net narrows
+[defparam net_cord_mm 5.0]      ; cord diameter
+[defparam net_stiffness 2000.0] ; N/m per cord: nylon, not elastic
+[defparam net_damping 0.9]      ; N·s/m along the cord
+[defparam net_mass_g 110.0]     ; the whole net
+[defparam net_drag 2.0]         ; air on the cords, 1/s: what lets a swing die
+
+; ---- the gym ----------------------------------------------------------------
+; The room is geometry, not a background: four walls, a ceiling, and the floor
+; the slab is let into. There are no textures in the picture, so anything you
+; can see is a root with a material.
+;
+; The camera lives at cam_y_mm = −5.6 m, so the margin has to keep the south
+; wall behind it: gym_margin_mm ≥ 6 m puts the wall at y = −8.5 m.
+[defparam gym_h_mm 9000.0]
+[defparam gym_margin_mm 6000.0]
+[defparam wall_t_mm 200.0]
+[defparam light_rows 2.0]        ; along y
+[defparam light_cols 5.0]        ; along x
+[defparam light_w_mm 1200.0]
+[defparam light_l_mm 600.0]
+[defparam light_radiance 18.0]   ; what a panel looks like straight on
+[defparam env_radiance 0.05]     ; constant grey from infinity, when sky is 0
+
+; ---- daylight ---------------------------------------------------------------
+; `sky 0` is the old still exactly: a constant grey of env_radiance from
+; infinity and no sun. `sky 1` puts a sky gradient and a sun disc outside the
+; room, and the only way either reaches the floor is the clerestory band — the
+; walls are closed solids, so what you get is a row of sun patches thrown from
+; the window openings onto the floor and the bleachers.
+;
+; The band is glazed. It was a bare opening for a while, and that was a
+; renderer's decision showing through the level: next-event estimation used an
+; any-hit shadow ray, so anything the ray touched occluded, a thin dielectric
+; included. With glass in the band the sun could only be found by a BSDF path
+; that happened to refract through a pane and then wander into a 0.27° cone —
+; one ray in tens of thousands, which over 32 passes is salt-and-pepper, not
+; daylight. kosm-render now carries a shadow ray *through* a thin dielectric,
+; attenuated by `1 - F(cos)`, so NEE sees the sun through the glass and the
+; band converges in the same handful of passes an opening did, about four
+; percent dimmer.
+[defparam sky 1.0]               ; 0: the old constant grey. 1: sky gradient + sun
+[defparam sky_zenith 1.1]        ; radiance straight up (a blue-tinted hue)
+[defparam sky_horizon 1.6]       ; radiance at the horizon (near-white)
+[defparam sun_elevation_deg 35.0]  ; above the horizon
+[defparam sun_azimuth_deg 250.0]   ; towards the sun, about z, from +x
+; Irradiance, not radiance, so widening the disc softens the shadow without
+; changing the exposure. 6 is about six times what the ceiling panels put on
+; the floor: the patches are the brightest thing in the room and still hold
+; their colour rather than clipping to white (80 clips; 6 does not).
+[defparam sun_irradiance 6.0]
+[defparam sun_angular_radius_deg 0.27]
+[defparam exposure 1.0]
+[defparam max_depth 6.0]         ; longest light path
+[defparam denoise 1.0]           ; the à-trous pass over the film, 0 for a reference render
+
+[let court-hx [/ court_x_mm 2.0]]
+[let court-hy [/ court_y_mm 2.0]]
+[let gym-hx [+ court-hx gym_margin_mm]]   ; inner face of the ±x walls
+[let gym-hy [+ court-hy gym_margin_mm]]   ; inner face of the ±y walls
+[let wall-hz [/ gym_h_mm 2.0]]
+[let wall-off-x [+ gym-hx [/ wall_t_mm 2.0]]]
+[let wall-off-y [+ gym-hy [/ wall_t_mm 2.0]]]
+[let room-x [+ [* 2.0 gym-hx] [* 2.0 wall_t_mm]]]
+[let room-y [+ [* 2.0 gym-hy] [* 2.0 wall_t_mm]]]
+
+; a window band high on the two long walls, above everything a ball can reach.
+; The wall itself is a gap — a course below the sill, a course above the head,
+; and a pier between each pair of openings — and the openings are filled with
+; glass. See `sky`, above.
+[defparam window_n 8.0]
+[defparam window_w_mm 1800.0]
+[defparam window_h_mm 1400.0]
+[defparam window_sill_mm 6200.0]
+[let window-pitch [/ [* 2.0 gym-hx] window_n]]
+[let window-x0 [+ [* -1.0 gym-hx] [/ window-pitch 2.0]]]
+[let window-head [+ window_sill_mm window_h_mm]]
+[let pier-w [- window-pitch window_w_mm]]
+
+; the four walls — a ball can hit them, so they are colliders like the slab
+[let wall-side [box-c wall_t_mm room-y gym_h_mm]]
+[let wall-under [box-c [* 2.0 gym-hx] wall_t_mm window_sill_mm]]
+[let wall-over [box-c [* 2.0 gym-hx] wall_t_mm [- gym_h_mm window-head]]]
+[let pier [box-c pier-w wall_t_mm window_h_mm]]
+; one pier before each opening and one after the last: the end piers run a
+; little past the corner, into the ±x walls, which is where a jamb belongs.
+[let long-wall [fn [y]
+  [union [translate 0.0 y [/ window_sill_mm 2.0] wall-under]
+  [union [translate 0.0 y [/ [+ gym_h_mm window-head] 2.0] wall-over]
+         [linear-pattern 1.0 0.0 0.0 [+ window_n 1.0] window-pitch
+           [translate [- window-x0 [/ window-pitch 2.0]] y
+                      [+ window_sill_mm [/ window_h_mm 2.0]] pier]]]]]]
+[let walls
+  [union [translate wall-off-x 0.0 wall-hz wall-side]
+  [union [translate [* -1.0 wall-off-x] 0.0 wall-hz wall-side]
+  [union [long-wall wall-off-y]
+         [long-wall [* -1.0 wall-off-y]]]]]]
+
+[let ceiling
+  [translate 0.0 0.0 [+ gym_h_mm [/ wall_t_mm 2.0]] [box-c room-x room-y wall_t_mm]]]
+
+; the floor outside the slab: four strips of the slab's own thickness, so the
+; top is exactly z = 0 and a ball rolling off the maple does not step.
+[let floor-z [/ court_t_mm -2.0]]
+[let floor-margin-x [+ court-hx [/ gym_margin_mm 2.0]]]
+[let floor-margin-y [+ court-hy [/ gym_margin_mm 2.0]]]
+[let floor-strip-x [box-c gym_margin_mm [* 2.0 gym-hy] court_t_mm]]
+[let floor-strip-y [box-c [* 2.0 court-hx] gym_margin_mm court_t_mm]]
+[let floor
+  [union [translate floor-margin-x 0.0 floor-z floor-strip-x]
+  [union [translate [* -1.0 floor-margin-x] 0.0 floor-z floor-strip-x]
+  [union [translate 0.0 floor-margin-y floor-z floor-strip-y]
+         [translate 0.0 [* -1.0 floor-margin-y] floor-z floor-strip-y]]]]]
+
+; the baseline wall, padded: a row of thick pads on the inside of the +x wall,
+; behind the hoop, where a driving player arrives.
+[defparam pad_n 8.0]
+[defparam pad_w_mm 1800.0]
+[defparam pad_h_mm 1800.0]
+[defparam pad_t_mm 100.0]
+[defparam pad_gap_mm 40.0]
+[let pad-pitch [+ pad_w_mm pad_gap_mm]]
+[let pad0
+  [translate [- gym-hx [/ pad_t_mm 2.0]] [* -0.5 [* pad-pitch [- pad_n 1.0]]] [/ pad_h_mm 2.0]
+    [box-c pad_t_mm pad_w_mm pad_h_mm]]]
+[let pads [linear-pattern 0.0 1.0 0.0 pad_n pad-pitch pad0]]
+
+; a small bleacher along the +y side: rows stepping up towards the wall. Real
+; benches — they collide, you can stand on them.
+[defparam bleacher_rows 5.0]
+[defparam bleacher_rise_mm 400.0]
+[defparam bleacher_run_mm 800.0]
+[defparam bleacher_len_mm 14000.0]
+[let bleacher-pitch
+  [sqrt [+ [* bleacher_run_mm bleacher_run_mm] [* bleacher_rise_mm bleacher_rise_mm]]]]
+[let bleacher-y0
+  [+ [- gym-hy [* bleacher_rows bleacher_run_mm]] [/ bleacher_run_mm 2.0]]]
+[let bleachers
+  [linear-pattern 0.0 bleacher_run_mm bleacher_rise_mm bleacher_rows bleacher-pitch
+    [translate 0.0 bleacher-y0 [/ bleacher_rise_mm 2.0]
+      [box-c bleacher_len_mm bleacher_run_mm bleacher_rise_mm]]]]
+
+; the glazing: one pane per opening, on the wall's centreline. 20 mm boxes,
+; which is thicker than the glass they stand for — the `window` material is
+; `thin_walled`, so the daylight arrives undisplaced rather than refracted
+; twice through a slab it is not really twenty millimetres of.
+[defparam pane_t_mm 20.0]
+[let pane [box-c window_w_mm pane_t_mm window_h_mm]]
+[let glazing-wall [fn [y]
+  [linear-pattern 1.0 0.0 0.0 window_n window-pitch
+    [translate window-x0 y [+ window_sill_mm [/ window_h_mm 2.0]] pane]]]]
+[let panes
+  [union [glazing-wall wall-off-y]
+         [glazing-wall [* -1.0 wall-off-y]]]]
+
+[root walls "wall"]
+[root panes "window"]
+[root ceiling "ceiling"]
+[root floor "floor"]
+[root pads "pad"]
+[root bleachers "oak"]
+
+; ---- the markings -----------------------------------------------------------
+; Painted lines are thin solids standing on the slab (z = 0 to paint_t_mm), not
+; a texture. Everything is measured off the hoop knobs, so moving the board
+; moves the whole court with it and it stays regulation.
+;
+; Arcs are patterns of short bars, the way the rim is a pattern of rod
+; segments. A bar is cut to the *arc* length of its step rather than the
+; chord — loon has no sin — which is long by step²/24 (0.16% at 11°) and is
+; taken up by the 3% overlap the bars already carry.
+[defparam line_w_mm 50.0]
+[defparam paint_t_mm 1.0]        ; a line stands this proud of the slab
+[defparam key_t_mm 0.5]          ; the lane's colour, under the lines
+[defparam baseline_off_mm 1219.0] ; 4 ft: the baseline behind the board face
+[defparam lane_w_mm 4877.0]      ; 16 ft
+[defparam lane_len_mm 5791.0]    ; 19 ft, baseline to the free-throw line
+[defparam ft_circle_r_mm 1829.0] ; 6 ft
+[defparam ft_circle_n 32.0]
+[defparam three_r_mm 7239.0]     ; 23 ft 9 in about the rim centre
+[defparam three_n 24.0]
+; The corner straights begin at |y| = 6706 mm (22 ft) from the basket, which is
+; off this 5 m slab entirely, so the arc is swept only as far as the slab is
+; wide: the 24 bars span 36.4°, ending at y = ±2.26 m, inside the maple. Widen
+; court_y_mm and this opens with it.
+[defparam three_sweep_deg 38.0]
+
+[let baseline-x [+ board_x_mm baseline_off_mm]]
+[let ft-x [- baseline-x lane_len_mm]]
+[let lane-mid-x [/ [+ ft-x baseline-x] 2.0]]
+[let paint-z [/ paint_t_mm 2.0]]
+[let bar [fn [x y lx ly] [translate x y paint-z [box-c lx ly paint_t_mm]]]]
+[let arc-chord [fn [r step-deg] [* 1.03 [* r [* step-deg 0.0174532925]]]]]
+
+[let ft-step [/ 360.0 ft_circle_n]]
+[let ft-circle
+  [translate ft-x 0.0 0.0
+    [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 ft_circle_n 360.0
+      [bar ft_circle_r_mm 0.0 line_w_mm [arc-chord ft_circle_r_mm ft-step]]]]]
+
+[let three-step [/ three_sweep_deg three_n]]
+[let three-arc
+  [translate rim-cx 0.0 0.0
+    [circular-pattern 0.0 0.0 0.0 0.0 0.0 1.0 three_n three_sweep_deg
+      [rotate 0.0 0.0 [* -0.5 [* three-step [- three_n 1.0]]]
+        [bar [* -1.0 three_r_mm] 0.0 line_w_mm [arc-chord three_r_mm three-step]]]]]]
+
+[let markings
+  [union [bar baseline-x 0.0 line_w_mm court_y_mm]
+  [union [bar lane-mid-x [/ lane_w_mm 2.0] lane_len_mm line_w_mm]
+  [union [bar lane-mid-x [/ lane_w_mm -2.0] lane_len_mm line_w_mm]
+  [union [bar ft-x 0.0 line_w_mm lane_w_mm]
+  [union ft-circle three-arc]]]]]]
+
+[let key-fill
+  [translate lane-mid-x 0.0 [/ key_t_mm 2.0] [box-c lane_len_mm lane_w_mm key_t_mm]]]
+
+[root markings "paint"]
+[root key-fill "key"]
+
+; ---- the ball ---------------------------------------------------------------
+; The ball's appearance, at the origin: the renderer places one copy at each
+; ball's pose. Two roots, because a root carries one material — the rubber
+; sphere, and the seams as four thin rings straddling its surface. Rings
+; rather than cut channels: a `difference` on a sphere is a convex
+; decomposition every time the colliders are derived, and four unioned tori
+; cost nothing.
+;
+; The classic eight-panel pattern: one ring round the equator, one round a
+; meridian, and two parallel to that meridian at ±0.62 r — whose radius on the
+; sphere is r·√(1 − 0.62²).
+[defparam ball_seam_mm 6.0]
+[defparam ball_seam_off 0.62]    ; as a fraction of the radius
+[let seam-off-mm [* ball_r_mm ball_seam_off]]
+[let seam-r [* ball_r_mm [sqrt [- 1.0 [* ball_seam_off ball_seam_off]]]]]
+[let meridian [rotate 90.0 0.0 0.0 [torus ball_r_mm ball_seam_mm]]]
+[let seam-ring [rotate 90.0 0.0 0.0 [torus seam-r ball_seam_mm]]]
+[let seams
+  [union [torus ball_r_mm ball_seam_mm]
+  [union meridian
+  [union [translate 0.0 seam-off-mm 0.0 seam-ring]
+         [translate 0.0 [* -1.0 seam-off-mm] 0.0 seam-ring]]]]]
+
+[root [sphere ball_r_mm] "ball"]
+[root seams "ball-seams"]
+
+; ---- the recording's picture ------------------------------------------------
+[defparam render_w 960.0]
+[defparam render_h 540.0]
+[defparam render_spp 64.0]
+[defparam still_w 1920.0]
+[defparam still_h 1080.0]
+[defparam still_spp 512.0]
+[defparam still_t 0.95]          ; the still is taken at this time
+[defparam cam_x_mm -800.0]
+[defparam cam_y_mm -5600.0]
+[defparam cam_z_mm 1900.0]
+[defparam cam_at_x_mm 900.0]
+[defparam cam_at_y_mm 300.0]
+[defparam cam_at_z_mm 1900.0]
+[defparam cam_vfov_deg 40.0]
+[defparam cam_aperture_mm 0.0]   ; iris radius; 0 is a pinhole
+[defparam cam_focus_mm 0.0]      ; the sharp plane; 0 focuses on cam_at
+[defparam shutter 0.0]           ; exposure as a fraction of a frame; 0 is an instant
+[defparam shutter_steps 4.0]     ; sub-frames the exposure is sampled at

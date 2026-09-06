@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kosm-spike", "crates/kosm-view", "crates/kosm-mpm"]
+members = ["crates/kosm-render", "crates/kosm-spike", "crates/kosm-view", "crates/kosm-mpm"]
 
 [workspace.package]
 version = "0.0.1"
@@ -17,19 +17,24 @@ phyz-contact = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine
 phyz-diff    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-diff" }
 phyz-world   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-world" }
 phyz-camera  = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-camera" }
-vcad         = { path = "/Users/cam/Developer/vcad/crates/vcad", default-features = false }
-vcad-kernel  = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel", features = ["no-builtin-font"] }
-vcad-eval    = { path = "/Users/cam/Developer/vcad/crates/vcad-eval" }
-vcad-ir      = { path = "/Users/cam/Developer/vcad/crates/vcad-ir" }
+vcad         = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad", default-features = false }
+vcad-kernel  = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel", features = ["no-builtin-font"] }
+vcad-eval    = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-eval" }
+vcad-ir      = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-ir" }
 phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
-vcad-loon    = { path = "/Users/cam/Developer/vcad/crates/vcad-loon" }
-vcad-kernel-export = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-export" }
-vcad-render  = { path = "/Users/cam/Developer/vcad/crates/vcad-render", default-features = false }
-vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-acoustics" }
-vcad-kernel-optics = { path = "/Users/cam/Developer/vcad/crates/vcad-kernel-optics" }
+vcad-loon    = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-loon" }
+vcad-kernel-export = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-export" }
+vcad-render  = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-render", default-features = false }
+vcad-kernel-acoustics = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-acoustics" }
+vcad-kernel-optics = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-optics" }
+vcad-kernel-raytrace = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-raytrace" }
+vcad-kernel-math = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-math" }
+vcad-kernel-primitives = { path = "/Users/cam/Developer/vcad/.claude/worktrees/wgpu-30/crates/vcad-kernel-primitives" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
-tang         = { path = "/Users/cam/Developer/tang/crates/tang" }
+# The `version` is what `cargo package` embeds for a published crate; the path
+# is this machine's checkout and is what every local build actually uses.
+tang         = { path = "/Users/cam/Developer/tang/crates/tang", version = "0.2" }
 tang-3dgs    = { path = "/Users/cam/Developer/tang/crates/tang-3dgs" }
 ipse-map     = { path = "/Users/cam/Developer/ipse/crates/ipse-map" }
 

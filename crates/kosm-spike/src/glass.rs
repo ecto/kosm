@@ -136,29 +136,10 @@ impl<S: Scalar> Shape<S> {
     }
 }
 
-/// Unpolarized Fresnel reflectance.
-pub fn fresnel<S: Scalar>(n1: S, n2: S, cos_i: S, cos_t: S) -> S {
-    let rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t);
-    let rp = (n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i);
-    S::HALF * (rs * rs + rp * rp)
-}
-
-/// Snell refraction of unit `d` at unit normal `n` facing against `d`.
-/// `None` on total internal reflection.
-pub fn refract<S: Scalar>(d: Vec3<S>, n: Vec3<S>, n1: S, n2: S) -> Option<(Vec3<S>, S, S)> {
-    let eta = n1 / n2;
-    let cos_i = -d.dot(&n);
-    let k = S::ONE - eta * eta * (S::ONE - cos_i * cos_i);
-    if k < S::ZERO {
-        return None;
-    }
-    let cos_t = k.sqrt();
-    Some((d * eta + n * (eta * cos_i - cos_t), cos_i, cos_t))
-}
-
-pub fn reflect<S: Scalar>(d: Vec3<S>, n: Vec3<S>) -> Vec3<S> {
-    d - n * (S::TWO * d.dot(&n))
-}
+// Snell, Fresnel and the mirror are `kosm-render`'s now: they are laws at an
+// interface, not facts about this level's glass, and the pool's water surface
+// reads the same three. Re-exported so `glass::refract` still names them.
+pub use kosm_render::optics::{fresnel, reflect, refract};
 
 /// A ray that has just entered the glass at `p` heading `d`: follow it until
 /// it leaves (up to `max_bounces` internal reflections). Returns the exit
