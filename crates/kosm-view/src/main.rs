@@ -14,6 +14,7 @@
 //! kosm-view --orbit-test        what a camera move costs the GPU history
 //! kosm-view --dump-frames 6     six live frames, with the history, to out/view_seq
 //! kosm-view --denoise neural    the court's own trained filter, not the à-trous one
+//! kosm-view --sampler white     the white-noise hash, not the blue-noise pattern
 //! ```
 //!
 //! `--denoise` chooses the filter the device runs over the history.
