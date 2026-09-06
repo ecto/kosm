@@ -1,122 +1,175 @@
-//! The training set: the court, rendered noisy and rendered right.
+//! The training set: the court's *own device history*, and the court rendered
+//! right.
+//!
+//! # The lesson this format exists to encode
+//!
+//! The first dataset was fifty CPU renders at 320x180, and each of its noisy
+//! tiers was the mean of *k* independent one-sample passes with the variance
+//! of that mean. That is a perfectly good description of a Monte Carlo
+//! estimator and it is not what the viewer hands the denoiser. The viewer's
+//! history is an exponential moving average with a cap, carried across camera
+//! and object motion by a reprojection, and shortened wherever a
+//! neighbourhood clamp decides a pixel has gone stale. Its `count` and its
+//! `variance` are different quantities with the same names, and two of the
+//! network's input planes are exactly those two. The v1 weights won on
+//! held-out CPU tiles and rendered the backboard 1.7x too bright in the
+//! window, and that gap is the whole of the reason.
+//!
+//! So: **train on the distribution you run on.** Every plane here is read
+//! back off the device, out of the same buffers `neural.wgsl` binds, after
+//! the same passes the window runs — trace, reproject, accumulate, clamp.
+//! The dataset builder lives in `kosm-view` because that is where the GPU
+//! stage is; this module is the format the two ends agree on and the tiles
+//! the trainer cuts.
 //!
 //! # What one sample is
 //!
-//! A sample is one (camera, time) state of the court, rendered at one size.
-//! It carries three things:
+//! A sample is one *sequence*: a (camera, time) state of the court, driven
+//! frame by frame exactly as `--dump-frames` drives it, with the simulation
+//! stepping and — for some sequences — the camera moving mid-flight. Along
+//! the way it records:
 //!
-//! * **The noisy tiers.** Five running means over 1, 2, 4, 8 and 16
-//!   independent one-sample-per-pixel passes, each with the Monte Carlo
-//!   estimator's own variance. These are exactly what
-//!   `kosm_render::gpu::history`'s `mean` and `stats` buffers hold after that
-//!   many accumulated passes — a running mean of unweighted samples and the
-//!   variance of that mean — so a network fitted here sees at training time
-//!   what it will be handed at inference time. The prefix structure is not an
-//!   economy: the 16 passes *are* the 8, plus 8 more, which is what the
-//!   device's history is.
-//! * **The guides.** Normal, distance and denoise albedo at each pixel's
-//!   first hit, the same three planes the à-trous filter is steered by.
-//!   Taken off the 16-pass film, where they are least noisy; they are
-//!   primary-hit quantities and barely move between tiers.
-//! * **The reference.** A 1024-spp render with the filter off. This is the
-//!   whole point: no denoiser trained on a general corpus has ever seen this
-//!   gym, and we can make as much of its exact answer as we are willing to
-//!   wait for.
+//! * **The history, at the sequence's own length.** Mean radiance, per-pixel
+//!   sample count and per-pixel variance of the mean, straight out of the
+//!   device's `History` after that many passes. The
+//!   counts are what the reprojection and the clamp left behind, so a frame
+//!   here has short-history pixels sitting beside long-history ones, which is
+//!   what a frame in the window looks like and what a frame in v1 never did.
+//! * **The guides.** Normal, depth, albedo and the biased hit id, read out of
+//!   the resident scene's guide planes — bindings 1 and 2 of the neural pass.
+//!   The id is new: it is what tells the network that the backboard's glass
+//!   and the wall behind it are different surfaces when their normals and
+//!   depths agree.
+//! * **The reference.** A [`Config::reference_spp`]-pass render of the *same*
+//!   instant from the *same* camera, with the history at rest, the denoiser
+//!   off and no clamp. Exact ground truth for the frame, not for a frame near
+//!   it.
+//!
+//! # One sequence, one instant, one reference
+//!
+//! A sample stores **one** history length, named by [`Sample::tier`], and the
+//! reference is of *that frame's* instant. It cannot be otherwise: the balls
+//! are in flight and the net is swinging, so the converged answer for the
+//! frame where a pixel has one sample is a different picture from the
+//! converged answer thirty frames later. Covering [`TIERS`] therefore means
+//! several sequences, each run for as many frames as its tier and stopped
+//! there — not one sequence snapshotted along the way.
+//!
+//! The one thing stored twice is the *successor* frame, [`Sample::next`]: one
+//! more pass of the same sequence, whose reference nothing needs because the
+//! temporal consistency term in [`super::train`] compares the network's two
+//! answers to each other and not to the truth.
 //!
 //! # The file
 //!
-//! One header, then one block per sample, every plane f16 and every plane
-//! whole-frame. Crops are taken at load time rather than baked in, so the
-//! same file trains a 64x64 tile network and evaluates a full frame, and a
-//! change of tile size is not a regeneration.
-//!
-//! f16 is not a compromise here. Radiance in this gym runs from about 1e-3 to
-//! a few hundred, well inside f16's range, and its 11-bit significand is
-//! finer than the noise on a 1024-spp estimate of any of it.
+//! One header, then one block per sample, every plane f16 and whole-frame.
+//! Crops are taken at load time, so tile size is not baked in. f16 is not a
+//! compromise: radiance in this gym runs from about 1e-3 to a few hundred,
+//! well inside its range, and counts never exceed the history cap.
 
 use std::io::{Read, Write};
 use std::path::Path;
 
-use kosm_render::pathtrace::{Camera, Film, PathTraceOptions};
-use vcad_kernel_raytrace::pathtrace::Scene as PtScene;
-use vcad_kernel_math::{Point3, Vec3};
+/// The history lengths the network is trained and scored at.
+pub const TIERS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 
-use crate::court::render::{self, Snapshot};
-use crate::court::{Court, CourtScene};
-
-/// The accumulated pass counts each sample is rendered at.
-///
-/// Powers of two up to 16 because that is the interesting part of the curve:
-/// a pixel's history is short exactly when the filter is doing work, and
-/// `GpuDenoiseParams::count_cutoff` fades the filter out by 32 anyway.
-pub const TIERS: [u32; 5] = [1, 2, 4, 8, 16];
-
-/// Planes per tier: mean radiance (3) and the variance of that mean (1).
-const TIER_PLANES: usize = 4;
-/// Guide planes: normal (3), depth (1), albedo (3).
-const GUIDE_PLANES: usize = 7;
+/// Planes per recorded frame: mean radiance (3), sample count (1), variance
+/// of the mean (1). Two frames are stored: the tier, and its successor.
+const FRAME_PLANES: usize = 5;
+/// Guide planes: normal (3), depth (1), albedo (3), id (1).
+const GUIDE_PLANES: usize = 8;
 /// Reference planes: converged radiance (3).
 const REF_PLANES: usize = 3;
 
 /// Every f16 plane one sample carries.
-pub const SAMPLE_PLANES: usize = TIERS.len() * TIER_PLANES + GUIDE_PLANES + REF_PLANES;
+pub const SAMPLE_PLANES: usize = 2 * FRAME_PLANES + GUIDE_PLANES + REF_PLANES;
 
-const MAGIC: &[u8; 8] = b"KOSMDN01";
+const MAGIC: &[u8; 8] = b"KOSMDN02";
 
-/// One sampled state of the court, all planes f16 and row-major.
+/// One frame of a sequence, as the device history held it.
+#[derive(Clone, Default)]
+pub struct FrameState {
+    /// Running mean radiance, 3 f16 per pixel.
+    pub mean: Vec<u16>,
+    /// How many samples each pixel's mean is over, 1 f16 per pixel.
+    pub count: Vec<u16>,
+    /// Variance of that mean, 1 f16 per pixel.
+    pub variance: Vec<u16>,
+}
+
+/// One sampled sequence of the court, all planes f16 and row-major.
 #[derive(Clone)]
 pub struct Sample {
     pub width: u32,
     pub height: u32,
-    /// `TIERS.len()` running means, 3 f16 per pixel each.
-    pub mean: Vec<Vec<u16>>,
-    /// The variance of each of those means, 1 f16 per pixel.
-    pub variance: Vec<Vec<u16>>,
+    /// The nominal history length this sequence was stopped at — the frame
+    /// index, and therefore the count a pixel that kept its history holds.
+    /// One of [`TIERS`]; carried so an evaluation can group by it.
+    pub tier: u32,
+    /// The history at frame `tier`. What the reference is the answer to.
+    pub cur: FrameState,
+    /// The history one pass later, for the temporal term. Same guides: on the
+    /// pixels that term is masked to, nothing under them moved.
+    pub next: FrameState,
     /// World normal at the first hit, 3 f16 per pixel.
     pub normal: Vec<u16>,
     /// Distance to the first hit; zero is the background sentinel.
     pub depth: Vec<u16>,
     /// Denoise albedo, 3 f16 per pixel.
     pub albedo: Vec<u16>,
-    /// The 1024-spp answer, 3 f16 per pixel.
+    /// Biased hit id, 1 f16 per pixel; zero on background.
+    pub id: Vec<u16>,
+    /// The converged answer, 3 f16 per pixel.
     pub reference: Vec<u16>,
 }
 
-impl Sample {
-    fn pixels(&self) -> usize {
-        (self.width as usize) * (self.height as usize)
-    }
-}
-
 /// A whole dataset, in memory.
+///
+/// Unlike v1, samples may be **different sizes**: the viewer runs at whatever
+/// the window and its scale divisor make, and the point of this dataset is
+/// that the network sees the sizes it will be run at. `width`/`height` are
+/// the largest, kept only so a caller can size a scratch buffer.
 pub struct Dataset {
     pub width: u32,
     pub height: u32,
     pub samples: Vec<Sample>,
 }
 
+impl Sample {
+    fn pixels(&self) -> usize {
+        (self.width as usize) * (self.height as usize)
+    }
+
+    fn bytes(&self) -> usize {
+        self.pixels() * SAMPLE_PLANES * 2
+    }
+}
+
 impl Dataset {
     /// Bytes on disk, as [`Dataset::save`] writes them.
     pub fn bytes(&self) -> usize {
-        32 + self.samples.len() * (self.width as usize) * (self.height as usize) * SAMPLE_PLANES * 2
+        16 + self.samples.iter().map(|s| 16 + s.bytes()).sum::<usize>()
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         f.write_all(MAGIC)?;
-        f.write_all(&(self.width).to_le_bytes())?;
-        f.write_all(&(self.height).to_le_bytes())?;
         f.write_all(&(self.samples.len() as u32).to_le_bytes())?;
         f.write_all(&(TIERS.len() as u32).to_le_bytes())?;
-        f.write_all(&[0u8; 8])?;
         for s in &self.samples {
-            for k in 0..TIERS.len() {
-                write_u16(&mut f, &s.mean[k])?;
-                write_u16(&mut f, &s.variance[k])?;
+            f.write_all(&s.width.to_le_bytes())?;
+            f.write_all(&s.height.to_le_bytes())?;
+            f.write_all(&s.tier.to_le_bytes())?;
+            f.write_all(&0u32.to_le_bytes())?;
+            for fr in [&s.cur, &s.next] {
+                write_u16(&mut f, &fr.mean)?;
+                write_u16(&mut f, &fr.count)?;
+                write_u16(&mut f, &fr.variance)?;
             }
             write_u16(&mut f, &s.normal)?;
             write_u16(&mut f, &s.depth)?;
             write_u16(&mut f, &s.albedo)?;
+            write_u16(&mut f, &s.id)?;
             write_u16(&mut f, &s.reference)?;
         }
         f.flush()
@@ -124,47 +177,58 @@ impl Dataset {
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
-        let mut head = [0u8; 32];
+        let mut head = [0u8; 16];
         f.read_exact(&mut head)?;
         if &head[0..8] != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "not a kosm denoise dataset",
+                "not a kosm denoise dataset (v2)",
             ));
         }
-        let width = u32::from_le_bytes(head[8..12].try_into().unwrap());
-        let height = u32::from_le_bytes(head[12..16].try_into().unwrap());
-        let n = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
-        let tiers = u32::from_le_bytes(head[20..24].try_into().unwrap()) as usize;
-        if tiers != TIERS.len() {
+        let n = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
+        let nt = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+        if nt != TIERS.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "tier count does not match this build",
             ));
         }
-        let px = (width as usize) * (height as usize);
         let mut samples = Vec::with_capacity(n);
+        let (mut mw, mut mh) = (0u32, 0u32);
         for _ in 0..n {
-            let mut mean = Vec::with_capacity(tiers);
-            let mut variance = Vec::with_capacity(tiers);
-            for _ in 0..tiers {
-                mean.push(read_u16(&mut f, px * 3)?);
-                variance.push(read_u16(&mut f, px)?);
-            }
+            let mut wh = [0u8; 16];
+            f.read_exact(&mut wh)?;
+            let width = u32::from_le_bytes(wh[0..4].try_into().unwrap());
+            let height = u32::from_le_bytes(wh[4..8].try_into().unwrap());
+            let tier = u32::from_le_bytes(wh[8..12].try_into().unwrap());
+            mw = mw.max(width);
+            mh = mh.max(height);
+            let px = (width as usize) * (height as usize);
+            let mut read_frame = |f: &mut std::io::BufReader<std::fs::File>| {
+                Ok::<_, std::io::Error>(FrameState {
+                    mean: read_u16(f, px * 3)?,
+                    count: read_u16(f, px)?,
+                    variance: read_u16(f, px)?,
+                })
+            };
+            let cur = read_frame(&mut f)?;
+            let next = read_frame(&mut f)?;
             samples.push(Sample {
                 width,
                 height,
-                mean,
-                variance,
+                tier,
+                cur,
+                next,
                 normal: read_u16(&mut f, px * 3)?,
                 depth: read_u16(&mut f, px)?,
                 albedo: read_u16(&mut f, px * 3)?,
+                id: read_u16(&mut f, px)?,
                 reference: read_u16(&mut f, px * 3)?,
             });
         }
         Ok(Self {
-            width,
-            height,
+            width: mw,
+            height: mh,
             samples,
         })
     }
@@ -246,299 +310,91 @@ pub fn f32_from_f16(h: u16) -> f32 {
     f32::from_bits(sign | ((exp + 127 - 15) << 23) | man)
 }
 
-fn to_f16(v: &[f32]) -> Vec<u16> {
+
+/// Pack an f32 plane for storage.
+pub fn to_f16(v: &[f32]) -> Vec<u16> {
     v.iter().copied().map(f16_from_f32).collect()
 }
 
-// ─── generation ───────────────────────────────────────────────────────────
-
-/// What [`generate`] is asked for.
-pub struct Config {
-    pub width: u32,
-    pub height: u32,
-    /// How many (camera, time) states to sample.
-    pub samples: usize,
-    /// Samples per pixel in the reference render.
-    pub reference_spp: u32,
-    /// The latest simulated instant a sample may be taken at, seconds.
-    pub t_end: f64,
-    /// Seed for the camera orbit and the render seeds.
-    pub seed: u64,
+/// Unpack an f16 plane.
+pub fn from_f16(v: &[u16]) -> Vec<f32> {
+    v.iter().copied().map(f32_from_f16).collect()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            width: 320,
-            height: 180,
-            samples: 50,
-            reference_spp: 1024,
-            t_end: 4.0,
-            seed: 0x5EED_C0FF_EE12_3456,
-        }
-    }
-}
+// --- tiles ---------------------------------------------------------------
 
-/// A small deterministic PRNG, so a dataset is reproducible from its seed
-/// without a dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        // splitmix64
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-    fn range(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.unit()
-    }
-}
-
-/// Orbit `cam` around `target` by `d_az` radians of azimuth and `d_el`
-/// radians of elevation, at `scale` times its distance.
+/// One crop of one sample at one tier, unpacked to f32 and laid out as the
+/// network's planes.
 ///
-/// The court's authored camera is the shot the level wants; every sample is a
-/// perturbation of it rather than a camera drawn from nowhere. A denoiser for
-/// *this gym* should see this gym's framings — the floor at this grazing
-/// angle, the panels at this distance — and not waste its capacity on views
-/// the game will never take.
-pub fn orbit(cam: &Camera, target: Point3, d_az: f64, d_el: f64, scale: f64) -> Camera {
-    let v = cam.eye - target;
-    let r = v.norm() * scale;
-    let az = v.y.atan2(v.x) + d_az;
-    let el = (v.z / v.norm()).asin() + d_el;
-    let el = el.clamp(-1.35, 1.35);
-    let eye = target
-        + Vec3::new(
-            r * el.cos() * az.cos(),
-            r * el.cos() * az.sin(),
-            r * el.sin(),
-        );
-    let mut out = Camera::look_at(eye, target, Vec3::z(), cam.fov_deg);
-    out.aperture = cam.aperture;
-    out.focus_dist = if cam.aperture > 0.0 { r } else { cam.focus_dist };
-    out
-}
-
-/// Render the court at every tier and at the reference, for one state.
-///
-/// The tiers are prefix means of the *same* pass sequence: pass `j` is
-/// rendered once, folded into the running sum, and the sum snapshotted
-/// whenever `j + 1` is a tier. Sixteen one-spp renders, not thirty-one.
-fn render_state(
-    picture: &PtScene,
-    cam: &Camera,
-    cfg: &Config,
-    base_seed: u64,
-) -> (Vec<Film>, Film) {
-    let scene_opts = |spp: u32, seed: u64| PathTraceOptions {
-        spp,
-        max_depth: 6,
-        show_background: true,
-        seed,
-        denoise: false,
-        ..Default::default()
-    };
-
-    let n = (cfg.width as usize) * (cfg.height as usize);
-    let mut sum_rgb = vec![0.0f32; n * 3];
-    let mut sum_a = vec![0.0f32; n];
-    // Welford is not needed: the estimator's variance we want is the variance
-    // *of the mean*, and each pass contributes one independent sample, so the
-    // running sum of squares over passes is enough.
-    let mut sum_l = vec![0.0f32; n];
-    let mut sum_l2 = vec![0.0f32; n];
-    let mut tiers: Vec<Film> = Vec::with_capacity(TIERS.len());
-    let mut last: Option<Film> = None;
-
-    let top = *TIERS.last().unwrap();
-    for j in 0..top {
-        let f = render::render(
-            picture,
-            cam,
-            cfg.width,
-            cfg.height,
-            &scene_opts(1, base_seed.wrapping_add(j as u64 * 0x9E37_79B9)),
-        );
-        for i in 0..n {
-            let l = 0.2126 * f.rgb[i * 3] + 0.7152 * f.rgb[i * 3 + 1] + 0.0722 * f.rgb[i * 3 + 2];
-            sum_l[i] += l;
-            sum_l2[i] += l * l;
-            sum_a[i] += f.alpha[i];
-            for c in 0..3 {
-                sum_rgb[i * 3 + c] += f.rgb[i * 3 + c];
-            }
-        }
-        let k = j + 1;
-        if TIERS.contains(&k) {
-            let kf = k as f32;
-            let mut snap = Film {
-                width: f.width,
-                height: f.height,
-                rgb: f.rgb.clone(),
-                alpha: f.alpha.clone(),
-                normal: f.normal.clone(),
-                depth: f.depth.clone(),
-                albedo: f.albedo.clone(),
-                variance: f.variance.clone(),
-            };
-            for i in 0..n {
-                for c in 0..3 {
-                    snap.rgb[i * 3 + c] = sum_rgb[i * 3 + c] / kf;
-                }
-                snap.alpha[i] = sum_a[i] / kf;
-                // The variance of the mean of `k` independent passes: the
-                // sample variance over passes, divided by k. One pass has no
-                // sample variance, so it falls back on the integrator's own
-                // per-pass estimate, which is what the device's history does
-                // on a pixel's first sample.
-                snap.variance[i] = if k >= 2 {
-                    let mu = sum_l[i] / kf;
-                    let s2 = (sum_l2[i] / kf - mu * mu).max(0.0) * kf / (kf - 1.0);
-                    s2 / kf
-                } else {
-                    f.variance[i]
-                };
-            }
-            tiers.push(snap);
-        }
-        last = Some(f);
-    }
-    // The guides come off the last pass, which is the least noisy set of
-    // primary-hit quantities we rendered.
-    let guides = last.expect("at least one tier");
-    for t in tiers.iter_mut() {
-        t.normal.clone_from(&guides.normal);
-        t.depth.clone_from(&guides.depth);
-        t.albedo.clone_from(&guides.albedo);
-    }
-
-    let reference = render::render(
-        picture,
-        cam,
-        cfg.width,
-        cfg.height,
-        &scene_opts(cfg.reference_spp, base_seed ^ 0xD1CE_D1CE_D1CE_D1CE),
-    );
-    (tiers, reference)
-}
-
-/// Sample the court and render every sample noisy and converged.
-///
-/// `progress` is called with `(index, total)` before each sample; a reference
-/// render is minutes of CPU and a caller wants to know it is alive.
-pub fn generate(
-    scene: &CourtScene,
-    cfg: &Config,
-    mut progress: impl FnMut(usize, usize),
-) -> anyhow::Result<Dataset> {
-    let mut court = Court::from_scene(scene)?;
-    let mut picture = render::Scene::new(scene)?;
-    let base_cam = render::camera(scene)?;
-    // The level states its aim point directly, so every orbit turns about the
-    // point the authored shot is about rather than about something recovered
-    // from the forward ray.
-    let a = &scene.authored;
-    let target = Point3::new(
-        a.parameter("cam_at_x_mm")?,
-        a.parameter("cam_at_y_mm")?,
-        a.parameter("cam_at_z_mm")?,
-    );
-
-    // Roll the simulation once and keep a snapshot per step, so a random time
-    // is a lookup rather than a re-run.
-    let mut snaps: Vec<Snapshot> = vec![Snapshot::of(&court)];
-    while court.time() < cfg.t_end {
-        court.step();
-        snaps.push(Snapshot::of(&court));
-    }
-
-    let mut rng = Rng(cfg.seed);
-    let mut samples = Vec::with_capacity(cfg.samples);
-    for s in 0..cfg.samples {
-        progress(s, cfg.samples);
-        let snap = &snaps[(rng.unit() * (snaps.len() - 1) as f64) as usize];
-        let cam = orbit(
-            &base_cam,
-            target,
-            rng.range(-std::f64::consts::PI, std::f64::consts::PI),
-            rng.range(-0.25, 0.45),
-            rng.range(0.7, 1.35),
-        );
-        let pt = picture.at_snapshot(snap);
-        let (tiers, reference) = render_state(&pt, &cam, cfg, rng.next_u64());
-        samples.push(Sample {
-            width: cfg.width,
-            height: cfg.height,
-            mean: tiers.iter().map(|f| to_f16(&f.rgb)).collect(),
-            variance: tiers.iter().map(|f| to_f16(&f.variance)).collect(),
-            normal: to_f16(&tiers[0].normal),
-            depth: to_f16(&tiers[0].depth),
-            albedo: to_f16(&tiers[0].albedo),
-            reference: to_f16(&reference.rgb),
-        });
-    }
-    progress(cfg.samples, cfg.samples);
-    Ok(Dataset {
-        width: cfg.width,
-        height: cfg.height,
-        samples,
-    })
-}
-
-/// One 64x64 (or whatever) crop of one sample at one tier, unpacked to f32
-/// and laid out as the network's planes.
+/// `count` is a plane and not a scalar, which is the other half of the v1
+/// lesson: on the device it always was one, and a reprojected frame has
+/// pixels at one sample beside pixels at the cap.
 pub struct Tile {
     pub size: usize,
-    /// Accumulated passes behind `mean`.
-    pub count: u32,
-    /// Running mean radiance, 3 planes.
+    /// The nominal history length this tier is, for reporting.
+    pub tier: u32,
+    /// Running mean radiance, interleaved.
     pub mean: Vec<f32>,
-    /// Variance of the mean, 1 plane.
+    /// Variance of the mean.
     pub variance: Vec<f32>,
+    /// Per-pixel sample count.
+    pub count: Vec<f32>,
     pub normal: Vec<f32>,
     pub depth: Vec<f32>,
     pub albedo: Vec<f32>,
+    pub id: Vec<f32>,
     pub reference: Vec<f32>,
+    /// The *next* frame of the same sequence, when the file has one: its
+    /// mean, count and variance over the same guides. The temporal term
+    /// compares the network's answer here with its answer there.
+    pub next: Option<Box<TileNext>>,
 }
 
-/// Cut every non-overlapping `size`-square crop out of `sample` at tier
-/// index `tier`.
-pub fn tiles(sample: &Sample, tier: usize, size: usize) -> Vec<Tile> {
-    let w = sample.width as usize;
-    let h = sample.height as usize;
-    let _ = sample.pixels();
-    let mut out = Vec::new();
-    let plane = |src: &[u16], ox: usize, oy: usize, c: usize| -> Vec<f32> {
-        let mut v = vec![0.0f32; size * size * c];
-        for y in 0..size {
-            for x in 0..size {
-                let s = ((oy + y) * w + ox + x) * c;
-                let d = (y * size + x) * c;
-                for k in 0..c {
-                    v[d + k] = f32_from_f16(src[s + k]);
-                }
+/// The successor frame's varying planes; the guides are shared with [`Tile`].
+pub struct TileNext {
+    pub mean: Vec<f32>,
+    pub variance: Vec<f32>,
+    pub count: Vec<f32>,
+}
+
+fn crop(src: &[u16], w: usize, ox: usize, oy: usize, size: usize, c: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; size * size * c];
+    for y in 0..size {
+        for x in 0..size {
+            let s = ((oy + y) * w + ox + x) * c;
+            let d = (y * size + x) * c;
+            for k in 0..c {
+                v[d + k] = f32_from_f16(src[s + k]);
             }
         }
-        v
-    };
+    }
+    v
+}
+
+/// Cut every non-overlapping `size`-square crop out of `sample`.
+pub fn tiles(sample: &Sample, size: usize) -> Vec<Tile> {
+    let w = sample.width as usize;
+    let h = sample.height as usize;
+    let (cur, nxt) = (&sample.cur, &sample.next);
+    let mut out = Vec::new();
     for oy in (0..h.saturating_sub(size - 1)).step_by(size) {
         for ox in (0..w.saturating_sub(size - 1)).step_by(size) {
             out.push(Tile {
                 size,
-                count: TIERS[tier],
-                mean: plane(&sample.mean[tier], ox, oy, 3),
-                variance: plane(&sample.variance[tier], ox, oy, 1),
-                normal: plane(&sample.normal, ox, oy, 3),
-                depth: plane(&sample.depth, ox, oy, 1),
-                albedo: plane(&sample.albedo, ox, oy, 3),
-                reference: plane(&sample.reference, ox, oy, 3),
+                tier: sample.tier,
+                mean: crop(&cur.mean, w, ox, oy, size, 3),
+                variance: crop(&cur.variance, w, ox, oy, size, 1),
+                count: crop(&cur.count, w, ox, oy, size, 1),
+                normal: crop(&sample.normal, w, ox, oy, size, 3),
+                depth: crop(&sample.depth, w, ox, oy, size, 1),
+                albedo: crop(&sample.albedo, w, ox, oy, size, 3),
+                id: crop(&sample.id, w, ox, oy, size, 1),
+                reference: crop(&sample.reference, w, ox, oy, size, 3),
+                next: Some(Box::new(TileNext {
+                    mean: crop(&nxt.mean, w, ox, oy, size, 3),
+                    variance: crop(&nxt.variance, w, ox, oy, size, 1),
+                    count: crop(&nxt.count, w, ox, oy, size, 1),
+                })),
             });
         }
     }
@@ -560,5 +416,48 @@ mod tests {
         }
         assert_eq!(f32_from_f16(f16_from_f32(0.0)), 0.0);
         assert!(f32_from_f16(f16_from_f32(1e30)).is_infinite());
+    }
+
+    #[test]
+    fn a_dataset_round_trips_through_a_file() {
+        let px = 6 * 4;
+        let mk = |v: f32, n: usize| to_f16(&vec![v; n]);
+        let s = Sample {
+            width: 6,
+            height: 4,
+            tier: 4,
+            cur: FrameState {
+                mean: mk(0.1, px * 3),
+                count: mk(4.0, px),
+                variance: mk(0.02, px),
+            },
+            next: FrameState {
+                mean: mk(0.2, px * 3),
+                count: mk(5.0, px),
+                variance: mk(0.01, px),
+            },
+            normal: mk(0.5, px * 3),
+            depth: mk(1200.0, px),
+            albedo: mk(0.3, px * 3),
+            id: mk(7.0, px),
+            reference: mk(0.25, px * 3),
+        };
+        let d = Dataset {
+            width: 6,
+            height: 4,
+            samples: vec![s],
+        };
+        let path = std::env::temp_dir().join("kosm-denoise-v2-roundtrip.bin");
+        d.save(&path).unwrap();
+        let back = Dataset::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.samples.len(), 1);
+        assert_eq!(back.samples[0].width, 6);
+        assert_eq!(back.samples[0].tier, 4);
+        assert_eq!(f32_from_f16(back.samples[0].id[0]), 7.0);
+        let t = &tiles(&back.samples[0], 4)[0];
+        assert_eq!(t.tier, 4);
+        assert_eq!(t.count[0], 4.0);
+        assert_eq!(t.next.as_ref().unwrap().count[0], 5.0);
     }
 }

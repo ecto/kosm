@@ -19,6 +19,22 @@
 //! network settling on a smooth wash that is on average correct — the
 //! standard KPN failure, and the one worth spending a term on.
 //!
+//! *Plus temporal consistency*, which is new in v2 and is the term a
+//! still-image loss cannot express. Every tile is stored with the *next*
+//! frame of its own sequence ([`super::dataset::FRAMES`]), so the network can
+//! be run on both and asked to give the same answer on the pixels that did
+//! not change. "Did not change" is read off the data rather than guessed: a
+//! pixel whose history count went up by exactly one kept its history through
+//! the reprojection and was not clamped, which is precisely the definition of
+//! a pixel that should not flicker. Pixels the reprojection dropped, the
+//! clamp shortened or an object moved across are excluded, because there the
+//! picture *should* change and penalising that would be asking the filter to
+//! smear.
+//!
+//! The term is deliberately small ([`TEMPORAL_WEIGHT`]). Its job is to break
+//! ties between kernels that score the same on one frame, not to out-vote the
+//! reference.
+//!
 //! # What it is measured against
 //!
 //! [`atrous_baseline`] is [`kosm_render::pathtrace::denoise`] on the same
@@ -30,11 +46,27 @@ use kosm_render::pathtrace::{Film, PathTraceOptions};
 use rayon::prelude::*;
 use tang_train::{ModuleAdam, Optimizer, Parameter};
 
-use super::dataset::{Dataset, Sample, TIERS, Tile, f32_from_f16, tiles};
+use super::dataset::{Dataset, Sample, TIERS, Tile, from_f16, tiles};
 use super::kpn::{DEMOD_FLOOR, Grads, Kpn, features, illumination};
 
 /// Weight on the gradient-domain term, relative to the L1.
 pub const GRAD_WEIGHT: f32 = 0.1;
+
+/// Weight on the temporal consistency term, relative to the L1.
+///
+/// A twentieth. The reference is the thing being fitted; this only says that
+/// among kernels which fit it equally well, the steady one wins.
+pub const TEMPORAL_WEIGHT: f32 = 0.05;
+
+/// How close two frames' counts have to be to `+1` for the pixel to count as
+/// having kept its history.
+///
+/// Exactly one, up to f16 rounding on a count near the cap. A pixel that came
+/// back at 1, or came back lower than it went in, was disoccluded or clamped,
+/// and the picture there is *allowed* to move.
+fn kept_history(before: f32, after: f32) -> bool {
+    before >= 1.0 && (after - before - 1.0).abs() < 0.51
+}
 
 /// The tone curve the loss is measured through.
 #[inline]
@@ -118,6 +150,46 @@ pub fn loss_and_grad(
     loss
 }
 
+/// The temporal consistency term and its gradient with respect to both
+/// frames' demodulated filtered illumination.
+///
+/// `cur` and `next` are planar `[3][n]` network outputs for the same tile at
+/// consecutive frames; `valid` is one flag per pixel from [`kept_history`].
+/// Both gradients are *added* to, so a caller can fold this on top of
+/// [`loss_and_grad`]'s.
+pub fn temporal_loss_and_grad(
+    cur: &[f32],
+    next: &[f32],
+    albedo: &[f32],
+    valid: &[bool],
+    s: usize,
+    g_cur: &mut [f32],
+    g_next: &mut [f32],
+) -> f32 {
+    let n = s * s;
+    let live = valid.iter().filter(|v| **v).count();
+    if live == 0 {
+        return 0.0;
+    }
+    let k = TEMPORAL_WEIGHT / (3 * live) as f32;
+    let mut loss = 0.0;
+    for c in 0..3 {
+        for p in 0..n {
+            if !valid[p] {
+                continue;
+            }
+            let a = albedo[p * 3 + c].max(DEMOD_FLOOR);
+            let (pc, pn) = (cur[c * n + p] * a, next[c * n + p] * a);
+            let d = tone(pn) - tone(pc);
+            loss += k * d.abs();
+            let sg = d.signum() * k;
+            g_next[c * n + p] += sg * tone_d(pn) * a;
+            g_cur[c * n + p] -= sg * tone_d(pc) * a;
+        }
+    }
+    loss
+}
+
 /// RMSE between two interleaved RGB images, measured through [`tone`].
 pub fn rmse_tone(pred: &[f32], reference: &[f32]) -> f32 {
     let mut s = 0.0f64;
@@ -144,18 +216,18 @@ pub fn rmse_linear(pred: &[f32], reference: &[f32]) -> f32 {
 /// Whole-frame rather than per-tile because the filter reaches 32 pixels and
 /// a 64-pixel tile filtered alone is mostly border. The tiles are cut out of
 /// the result afterwards, so the baseline is never handicapped by the crop.
-pub fn atrous_baseline(sample: &Sample, tier: usize, opts: &PathTraceOptions) -> Vec<f32> {
+pub fn atrous_baseline(sample: &Sample, opts: &PathTraceOptions) -> Vec<f32> {
     let n = (sample.width as usize) * (sample.height as usize);
-    let un = |v: &[u16]| -> Vec<f32> { v.iter().map(|&x| f32_from_f16(x)).collect() };
+    let f = &sample.cur;
     let mut film = Film {
         width: sample.width,
         height: sample.height,
-        rgb: un(&sample.mean[tier]),
+        rgb: from_f16(&f.mean),
         alpha: vec![1.0; n],
-        normal: un(&sample.normal),
-        depth: un(&sample.depth),
-        albedo: un(&sample.albedo),
-        variance: un(&sample.variance[tier]),
+        normal: from_f16(&sample.normal),
+        depth: from_f16(&sample.depth),
+        albedo: from_f16(&sample.albedo),
+        variance: from_f16(&f.variance),
     };
     kosm_render::pathtrace::denoise(&mut film, opts);
     film.rgb
@@ -184,28 +256,61 @@ pub fn crop_frames(img: &[f32], w: usize, h: usize, size: usize) -> Vec<Vec<f32>
 /// One tile, with its features precomputed once rather than per epoch.
 pub struct Prepared {
     pub size: usize,
-    pub count: u32,
+    /// The nominal history length, for reporting only; the network reads the
+    /// per-pixel `count` plane inside `feat`.
+    pub tier: u32,
     pub feat: Vec<f32>,
     pub illum: Vec<f32>,
     pub albedo: Vec<f32>,
     pub reference: Vec<f32>,
     /// The mean the tile started from, kept so an evaluation can report what
-    /// doing nothing at all would have scored — and because the renderer's
-    /// neighbourhood clamp is measured against it.
+    /// doing nothing at all would have scored.
     pub mean: Vec<f32>,
-    /// The guides, kept for the same reason: [`Prepared::predict`] goes
-    /// through [`Kpn::filter`], which is the renderer's whole path.
+    /// The guides, kept because [`Prepared::predict`] goes through
+    /// [`Kpn::filter`], which is the renderer's whole path.
     pub variance: Vec<f32>,
+    pub count: Vec<f32>,
     pub normal: Vec<f32>,
     pub depth: Vec<f32>,
+    pub id: Vec<f32>,
+    /// The successor frame, when the tile has one: only the two planes a
+    /// forward pass needs, plus the per-pixel validity the temporal term is
+    /// masked by. The guides are shared, so this is a fraction of a whole
+    /// tile rather than a second one.
+    pub next: Option<Box<PreparedNext>>,
+}
+
+/// The successor frame's inputs and the mask that says where its answer is
+/// allowed to differ.
+pub struct PreparedNext {
+    pub feat: Vec<f32>,
+    pub illum: Vec<f32>,
+    /// True where the pixel kept its history from one frame to the next.
+    pub valid: Vec<bool>,
 }
 
 impl Prepared {
     pub fn of(t: &Tile) -> Self {
         let n = t.size * t.size;
+        let next = t.next.as_ref().map(|nx| {
+            Box::new(PreparedNext {
+                feat: features(
+                    n,
+                    &nx.mean,
+                    &nx.variance,
+                    &t.normal,
+                    &t.depth,
+                    &t.albedo,
+                    &t.id,
+                    &nx.count,
+                ),
+                illum: illumination(n, &nx.mean, &t.albedo),
+                valid: (0..n).map(|p| kept_history(t.count[p], nx.count[p])).collect(),
+            })
+        });
         Self {
             size: t.size,
-            count: t.count,
+            tier: t.tier,
             feat: features(
                 n,
                 &t.mean,
@@ -213,21 +318,25 @@ impl Prepared {
                 &t.normal,
                 &t.depth,
                 &t.albedo,
-                t.count,
+                &t.id,
+                &t.count,
             ),
             illum: illumination(n, &t.mean, &t.albedo),
             albedo: t.albedo.clone(),
             reference: t.reference.clone(),
             mean: t.mean.clone(),
             variance: t.variance.clone(),
+            count: t.count.clone(),
             normal: t.normal.clone(),
             depth: t.depth.clone(),
+            id: t.id.clone(),
+            next,
         }
     }
 
-    /// The network's answer for this tile, interleaved radiance — through the
-    /// same neighbourhood clamp the renderer applies, so a number reported
-    /// here is a number about the thing that ships.
+    /// The network's answer for this tile, interleaved radiance — down the
+    /// renderer's own path, so a number reported here is a number about the
+    /// thing that ships.
     pub fn predict(&self, net: &Kpn) -> Vec<f32> {
         let s = self.size;
         net.filter(
@@ -238,20 +347,38 @@ impl Prepared {
             &self.normal,
             &self.depth,
             &self.albedo,
-            self.count,
+            &self.id,
+            &self.count,
         )
     }
 }
 
 /// Cut every sample of `dataset` into tiles at every tier and prepare them.
-pub fn prepare(dataset: &Dataset, size: usize, which: &[usize]) -> Vec<Prepared> {
+///
+/// `limit` caps how many tiles come back, taken by a deterministic stride
+/// rather than a prefix: a v2 sample is a whole 640x360 frame at six tiers and
+/// the full cut is tens of thousands of tiles, which is more memory than it is
+/// signal. Zero means no cap.
+pub fn prepare(dataset: &Dataset, size: usize, which: &[usize], limit: usize) -> Vec<Prepared> {
+    let per_frame =
+        |s: &Sample| (s.width as usize / size.max(1)) * (s.height as usize / size.max(1));
+    let total: usize = which.iter().map(|&si| per_frame(&dataset.samples[si])).sum();
+    // A stride rather than a head: consecutive tiles are neighbouring pixels
+    // of one frame, and the first `limit` of them would be the top of every
+    // picture and nothing else.
+    let stride = if limit == 0 || total <= limit {
+        1
+    } else {
+        total.div_ceil(limit)
+    };
     let mut out = Vec::new();
+    let mut flat = 0usize;
     for &si in which {
-        let s = &dataset.samples[si];
-        for tier in 0..TIERS.len() {
-            for t in tiles(s, tier, size) {
+        for t in tiles(&dataset.samples[si], size) {
+            if flat % stride == 0 {
                 out.push(Prepared::of(&t));
             }
+            flat += 1;
         }
     }
     out
@@ -314,9 +441,27 @@ pub fn fit(
                     let n = t.size * t.size;
                     let act = net.forward(&t.feat, &t.illum, t.size);
                     let mut g = vec![0.0f32; 3 * n];
-                    let l =
+                    let mut l =
                         loss_and_grad(&act.out, &t.albedo, &t.reference, t.size, &mut g);
                     let mut gr = Grads::zeros(net);
+                    // The temporal term needs the successor frame's forward
+                    // too, and contributes a gradient to both. Its backward
+                    // accumulates into the same `Grads`, which is what makes
+                    // the two frames one training example rather than two.
+                    if let Some(nx) = t.next.as_ref() {
+                        let act_n = net.forward(&nx.feat, &nx.illum, t.size);
+                        let mut gn = vec![0.0f32; 3 * n];
+                        l += temporal_loss_and_grad(
+                            &act.out,
+                            &act_n.out,
+                            &t.albedo,
+                            &nx.valid,
+                            t.size,
+                            &mut g,
+                            &mut gn,
+                        );
+                        net.backward(&nx.feat, &nx.illum, &act_n, &gn, &mut gr);
+                    }
                     net.backward(&t.feat, &t.illum, &act, &g, &mut gr);
                     (gr, l as f64)
                 })
@@ -386,16 +531,19 @@ pub fn evaluate(
     size: usize,
     opts: &PathTraceOptions,
 ) -> Vec<TierScore> {
-    let (w, h) = (dataset.width as usize, dataset.height as usize);
     let mut out = Vec::new();
-    for (tier, &count) in TIERS.iter().enumerate() {
+    for &count in TIERS.iter() {
         let mut acc = [0.0f64; 6];
         let mut n_tiles = 0usize;
         for &si in which {
             let s = &dataset.samples[si];
-            let base = atrous_baseline(s, tier, opts);
+            if s.tier != count {
+                continue;
+            }
+            let (w, h) = (s.width as usize, s.height as usize);
+            let base = atrous_baseline(s, opts);
             let base_tiles = crop_frames(&base, w, h, size);
-            for (t, bt) in tiles(s, tier, size).into_iter().zip(base_tiles) {
+            for (t, bt) in tiles(s, size).into_iter().zip(base_tiles) {
                 let p = Prepared::of(&t);
                 let pred = p.predict(net);
                 acc[0] += rmse_tone(&p.mean, &p.reference) as f64;
@@ -425,6 +573,68 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The temporal term is a new gradient path and it flows into *two*
+    /// forwards, which is exactly the kind of term that is easy to get
+    /// backwards. Both halves are differenced.
+    #[test]
+    fn the_temporal_gradient_agrees_with_a_finite_difference() {
+        let s = 4;
+        let n = s * s;
+        let mut cur = vec![0.0f32; 3 * n];
+        let mut next = vec![0.0f32; 3 * n];
+        let mut albedo = vec![0.0f32; 3 * n];
+        for i in 0..3 * n {
+            cur[i] = 0.2 + (i % 7) as f32 * 0.09;
+            next[i] = 0.2 + (i % 5) as f32 * 0.13;
+            albedo[i] = 0.3 + (i % 5) as f32 * 0.07;
+        }
+        // Some pixels held their history and some did not; a mask of all-true
+        // would not test that the mask is read at all.
+        let valid: Vec<bool> = (0..n).map(|p| p % 3 != 0).collect();
+        let mut gc = vec![0.0f32; 3 * n];
+        let mut gn = vec![0.0f32; 3 * n];
+        temporal_loss_and_grad(&cur, &next, &albedo, &valid, s, &mut gc, &mut gn);
+
+        let eps = 1e-3;
+        let mut d0 = vec![0.0f32; 3 * n];
+        let mut d1 = vec![0.0f32; 3 * n];
+        let mut probe = |v: &mut Vec<f32>, i: usize, other: &[f32], first: bool| -> f32 {
+            let o = v[i];
+            v[i] = o + eps;
+            let lp = if first {
+                temporal_loss_and_grad(v, other, &albedo, &valid, s, &mut d0, &mut d1)
+            } else {
+                temporal_loss_and_grad(other, v, &albedo, &valid, s, &mut d0, &mut d1)
+            };
+            v[i] = o - eps;
+            let lm = if first {
+                temporal_loss_and_grad(v, other, &albedo, &valid, s, &mut d0, &mut d1)
+            } else {
+                temporal_loss_and_grad(other, v, &albedo, &valid, s, &mut d0, &mut d1)
+            };
+            v[i] = o;
+            (lp - lm) / (2.0 * eps)
+        };
+        for i in (0..3 * n).step_by(5) {
+            let snapshot = next.clone();
+            let num = probe(&mut cur, i, &snapshot, true);
+            let scale = num.abs().max(gc[i].abs()).max(1e-6);
+            assert!(
+                (num - gc[i]).abs() / scale < 5e-2,
+                "cur {i}: analytic {}, numeric {num}",
+                gc[i]
+            );
+            let snapshot = cur.clone();
+            let num = probe(&mut next, i, &snapshot, false);
+            let scale = num.abs().max(gn[i].abs()).max(1e-6);
+            assert!(
+                (num - gn[i]).abs() / scale < 5e-2,
+                "next {i}: analytic {}, numeric {num}",
+                gn[i]
+            );
+        }
+    }
 
     #[test]
     fn the_loss_gradient_agrees_with_a_finite_difference() {

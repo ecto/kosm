@@ -150,6 +150,33 @@ fn main() -> anyhow::Result<()> {
         let dir = arg("out").unwrap_or_else(|| "out/view_seq".into());
         return court::dump_frames(std::path::Path::new(&dir), t, size, n);
     }
+    // `--dump-dataset <path>` builds the denoiser's v2 training set off the
+    // device's own history. Hours of GPU, and nothing else in the binary
+    // touches it.
+    if let Some(path) = arg("dump-dataset") {
+        return court::dump_dataset(
+            std::path::Path::new(&path),
+            parse("sequences").unwrap_or(60),
+            parse("ref-spp").unwrap_or(1024),
+            parse("seed").unwrap_or(0x5EED_C0FF_EE12_3456),
+        );
+    }
+    // `--denoise-eval` is the pass/fail for the learned filter: the same
+    // sequence under both denoisers against a converged reference, scored per
+    // region. See `court::denoise_eval`.
+    if std::env::args().any(|a| a == "--denoise-eval") {
+        let width: u32 = parse("width").unwrap_or(640);
+        let size = (width, (width * 9 / 16).max(1));
+        let t: f64 = parse("at").unwrap_or(-1.0);
+        return court::denoise_eval(
+            arg("out").as_deref().map(std::path::Path::new),
+            arg("weights").as_deref().map(std::path::Path::new),
+            t,
+            size,
+            parse("frames").unwrap_or(12),
+            parse("ref-spp").unwrap_or(256),
+        );
+    }
     // `--orbit-test` is the reprojection, scripted: converge headlessly, swing
     // the camera a few degrees, take one more pass, and say how much of the
     // frame kept its history across the move.
