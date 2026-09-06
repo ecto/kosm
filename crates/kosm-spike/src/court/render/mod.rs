@@ -31,6 +31,7 @@ use vcad_kernel_math::{Point3, Transform, Vec3};
 use vcad_kernel_raytrace::pathtrace::{
     self, AreaLight, Environment, GradientEnv, Ground, Object, PathTraceOptions, Pbr, Sun,
 };
+use kosm_render::caustics::{CausticMap, CausticOptions};
 use vcad_kernel_raytrace::tlas::placement;
 use vcad_kernel_raytrace::{BrepBvh, Bvh};
 
@@ -316,6 +317,25 @@ impl Scene {
             ground: self.ground,
             splats: None,
         }
+    }
+
+    /// The caustic map for the level's glass, or an empty one.
+    ///
+    /// Traced off the statics alone: a ball is not glass and the sun is a
+    /// level knob, so the map is a property of the level and is built once.
+    /// A level whose only glass is thin-walled — the court's clerestory
+    /// panes, which next-event estimation already sees the sun through —
+    /// yields an empty map, and costs nothing past the check.
+    pub fn caustic_map(&self) -> CausticMap {
+        let scene = pathtrace::Scene {
+            objects: self.statics.iter().map(Placed::object).collect(),
+            lights: self.lights.clone(),
+            env: self.env.clone(),
+            sun: self.sun,
+            ground: self.ground,
+            splats: None,
+        };
+        kosm_render::caustics::trace(&scene, &CausticOptions::default())
     }
 
     // ---- the same picture, for a renderer that packs BReps -----------------
