@@ -47,7 +47,7 @@ use tang_tensor::{Shape, Tensor};
 use tang_train::Parameter;
 
 /// Input feature planes per pixel; see [`features`].
-pub const C_IN: usize = 10;
+pub const C_IN: usize = 11;
 /// The filter footprint: 5x5, so 25 predicted weights per pixel.
 pub const TAPS: usize = 5;
 /// Predicted weights per pixel.
@@ -77,12 +77,25 @@ const MAGIC: &[u8; 8] = b"KOSMKPN1";
 /// | 5..8  | the world normal |
 /// | 8     | `depth / (depth + DEPTH_SCALE)`, zero on background |
 /// | 9     | the albedo's luminance |
+/// | 10    | a hash of the biased hit id |
 ///
 /// The log compression on the two radiance-like planes is what keeps a light
 /// panel at a few hundred from dominating a floor at a tenth. The count plane
 /// is what lets one network serve every history length: a pixel on its first
 /// sample and one on its sixteenth want different kernels and the network has
 /// to be told which it is looking at.
+///
+/// `count` is **per pixel**, not per tile. On the device it always was —
+/// `stats[i].x` — and a frame carried across a camera move has pixels at one
+/// sample sitting beside pixels at thirty. The v1 trainer passed one scalar
+/// for a whole tile because its dataset was built from *k* independent CPU
+/// passes, where that was true; on the reprojected, clamped history the
+/// viewer actually runs it is not, and the network was reading a plane that
+/// lied to it about exactly the pixels the filter matters most for.
+///
+/// The id plane is a hash and not the id, for the reason
+/// `kosm_render::neural::id_feature` gives: it is a label, and the only thing
+/// a convolution should be able to ask of it is whether two pixels match.
 pub fn features(
     n: usize,
     mean: &[f32],
@@ -90,10 +103,10 @@ pub fn features(
     normal: &[f32],
     depth: &[f32],
     albedo: &[f32],
-    count: u32,
+    id: &[f32],
+    count: &[f32],
 ) -> Vec<f32> {
     let mut f = vec![0.0f32; C_IN * n];
-    let inv_sqrt_n = 1.0 / (count.max(1) as f32).sqrt();
     for p in 0..n {
         let a = [
             albedo[p * 3].max(DEMOD_FLOOR),
@@ -104,7 +117,7 @@ pub fn features(
         for c in 0..3 {
             f[c * n + p] = (1.0 + mean[p * 3 + c] / a[c]).max(1e-8).ln();
         }
-        f[3 * n + p] = inv_sqrt_n;
+        f[3 * n + p] = 1.0 / count[p].max(1.0).sqrt();
         f[4 * n + p] = (1.0 + (variance[p].max(0.0) / (la * la)).sqrt()).ln();
         for c in 0..3 {
             f[(5 + c) * n + p] = normal[p * 3 + c];
@@ -112,6 +125,7 @@ pub fn features(
         let d = depth[p];
         f[8 * n + p] = if d > 0.0 { d / (d + DEPTH_SCALE) } else { 0.0 };
         f[9 * n + p] = la;
+        f[10 * n + p] = kosm_render::neural::id_feature(id[p]);
     }
     f
 }
@@ -470,11 +484,12 @@ impl Kpn {
         normal: &[f32],
         depth: &[f32],
         albedo: &[f32],
-        count: u32,
+        id: &[f32],
+        count: &[f32],
     ) -> Vec<f32> {
         let n = w * h;
         assert_eq!(w, h, "the reference forward is square-tiled; see filter_rect");
-        let feat = features(n, mean, variance, normal, depth, albedo, count);
+        let feat = features(n, mean, variance, normal, depth, albedo, id, count);
         let illum = illumination(n, mean, albedo);
         let act = self.forward(&feat, &illum, w);
         let mut out = vec![0.0f32; n * 3];
@@ -816,17 +831,16 @@ mod tests {
             }
         }
 
-        let count = 4u32;
-        let mine = net.filter(s, s, &mean, &variance, &normal, &depth, &albedo, count);
+        // A count plane that varies and an id plane with a seam in it, so the
+        // two new per-pixel inputs are exercised rather than being constants
+        // both implementations happen to agree about.
+        let count: Vec<f32> = (0..n).map(|p| 1.0 + (p % 31) as f32).collect();
+        let id: Vec<f32> = (0..n)
+            .map(|p| if depth[p] > 0.0 { (1 + p % 5) as f32 } else { 0.0 })
+            .collect();
+        let mine = net.filter(s, s, &mean, &variance, &normal, &depth, &albedo, &id, &count);
         let ours = theirs.forward(
-            s,
-            s,
-            &mean,
-            &variance,
-            &normal,
-            &depth,
-            &albedo,
-            count as f32,
+            s, s, &mean, &variance, &normal, &depth, &albedo, &id, &count,
         );
         for i in 0..n * 3 {
             let scale = mine[i].abs().max(ours[i].abs()).max(1e-4);

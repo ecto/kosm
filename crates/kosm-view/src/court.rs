@@ -928,6 +928,539 @@ pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> a
     Ok(())
 }
 
+/// Build the denoiser's v2 training set: the device's own history, sequence by
+/// sequence, at the sizes the viewer runs at.
+///
+/// # Why this lives in the viewer
+///
+/// The v1 dataset was CPU films — the mean of *k* independent one-sample
+/// passes and the variance of that mean — and the network that was fitted to
+/// it ran on something else entirely: an exponential moving average, carried
+/// across motion by a reprojection and shortened by a neighbourhood clamp. It
+/// won by 16–23% on held-out CPU tiles and rendered the backboard 1.7× too
+/// bright in the window. So v2 records what the neural pass is *handed*, out
+/// of the same buffers it binds, after the same passes the window runs — and
+/// the only thing that can drive those is the thing that owns the device.
+///
+/// # What a sequence is
+///
+/// One (camera, time) state and one *history length*. The court is driven
+/// frame by frame exactly as [`dump_frames`] drives it — the simulation
+/// stepping at the level's own rate, one pass a frame, the history
+/// reprojecting and clamping as it goes — for as many frames as the
+/// sequence's tier, and stopped there. Two thirds of the sequences also
+/// **move the camera** partway through, because a viewport is not a tripod
+/// and the pixels the filter matters most for are the short-history ones a
+/// move leaves behind.
+///
+/// One length per sequence, and not a snapshot at every length along the way,
+/// because the reference has to be the answer to *this* frame. The balls are
+/// in flight and the net is swinging: the converged picture of the frame
+/// where a pixel has one sample is a different picture from the converged
+/// picture thirty frames later, and pairing the first with the second would
+/// train the network to predict the future. Covering the tiers is therefore a
+/// rotation across sequences.
+///
+/// One extra pass is taken after the tier and recorded as the successor
+/// frame. Nothing references it, because the temporal consistency term
+/// compares the network's two answers to each other.
+///
+/// The reference is taken from the same camera and the same simulated
+/// instant with the history cleared, the filter off, the clamp off and the
+/// cap lifted: `reference_spp` passes of the bare path tracer.
+///
+/// Sizes rotate through [`DATASET_SIZES`] — the viewport's own scale
+/// divisors — because a 5x5 kernel covers different amounts of world at each,
+/// and the net's cords are about one pixel wide at one and two at another.
+pub fn dump_dataset(
+    out: &std::path::Path,
+    sequences: usize,
+    reference_spp: u32,
+    seed: u64,
+) -> anyhow::Result<()> {
+    use kosm_spike::court::denoise::dataset as ds;
+
+    let scene = CourtScene::bundled()?;
+    let stage = render::Scene::new(&scene)?;
+    let base_cam = authored_camera(&scene);
+    let a = &scene.authored;
+    let target = KVec3::new(
+        a.parameter_or("cam_at_x_mm", 900.0),
+        a.parameter_or("cam_at_y_mm", 300.0),
+        a.parameter_or("cam_at_z_mm", 1900.0),
+    );
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+    )?;
+
+    // The simulation, rolled once and snapshotted, so picking an instant is a
+    // lookup rather than a re-run. The window of instants is the one the
+    // filter has to be good at: balls in flight and the net moving.
+    let mut court = Court::from_scene(&scene)?;
+    let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
+    let mut snaps: Vec<Frame> = vec![Frame::of(&court)];
+    while court.time() < T_DATASET_END {
+        court.step();
+        snaps.push(Frame::of(&court));
+    }
+    let first = ((T_DATASET_START / scene.dt) as usize).min(snaps.len() - 1);
+
+    let mut rng = Rng(seed);
+    let mut samples = Vec::with_capacity(sequences);
+    let t0 = Instant::now();
+    for si in 0..sequences {
+        let size = DATASET_SIZES[si % DATASET_SIZES.len()];
+        let tier = ds::TIERS[si % ds::TIERS.len()];
+        let cam0 = orbit(
+            &base_cam,
+            target,
+            rng.range(-std::f64::consts::PI, std::f64::consts::PI),
+            rng.range(-0.25, 0.45),
+            rng.range(0.7, 1.35),
+        );
+        // Two sequences in three swing the eye a few degrees partway through,
+        // which is what puts reprojected, clamped and freshly disoccluded
+        // pixels in the training set at all. A one-frame sequence has no
+        // "partway", so it moves on its own last frame or not at all.
+        let moves = si % 3 != 0 && tier > 1;
+        let swing = rng.range(-4.0, 4.0);
+        let move_at = if tier > 1 {
+            2 + (rng.next_u64() as usize % (tier as usize - 1)) as u32
+        } else {
+            u32::MAX
+        };
+
+        // The instant the *reference* is of is drawn from the window, and the
+        // sequence is then walked backwards from it. Not forwards: a tier-32
+        // sequence is about a second of simulation, and starting every one of
+        // them inside the window would run them all off the end and give the
+        // longest histories one instant between them.
+        let last = first + (rng.unit() * (snaps.len() - 1 - first) as f64) as usize;
+        let start = last.saturating_sub((tier as usize) * steps_per_frame);
+
+        gpu.reset_sequence()?;
+        let mut cur = ds::FrameState::default();
+        let mut guides = None;
+        let mut cam_at_tier = cam0;
+        // Frame k is the k-th pass, so a pixel that kept its history through
+        // all of them is at count k — which is what `tier` names.
+        for k in 1..=tier + 1 {
+            let idx = (start + (k as usize - 1) * steps_per_frame).min(snaps.len() - 1);
+            let cam = if moves && k >= move_at {
+                orbit(&cam0, target, swing.to_radians(), 0.0, 1.0)
+            } else {
+                cam0
+            };
+            gpu.accumulate(&stage, &snaps[idx], idx as u64 + 1, &cam, size, 1)?;
+            if k == tier {
+                let (hist, g) = gpu.read_denoise_inputs()?;
+                cur = frame_state(&hist);
+                guides = Some(g);
+                cam_at_tier = cam;
+            }
+        }
+        let (hist, _) = gpu.read_denoise_inputs()?;
+        let next = frame_state(&hist);
+        let guides = guides.ok_or_else(|| anyhow::anyhow!("no frame was recorded"))?;
+        let ref_idx = (start + (tier as usize - 1) * steps_per_frame).min(snaps.len() - 1);
+
+        // The reference: the same instant, the same camera, from a cleared
+        // history with the filter and the clamp off. The history's running
+        // mean over that many passes *is* the converged render, so there is
+        // nothing to read but the buffer we are already reading.
+        let saved = *gpu.denoise_params_mut();
+        {
+            let d = gpu.denoise_params_mut();
+            d.iters = 0;
+            d.clamp_k = 0.0;
+            d.history_cap = u32::MAX;
+            d.count_cutoff = u32::MAX;
+        }
+        gpu.reset_sequence()?;
+        // A still camera over a still frame, so every pass is an independent
+        // sample of one picture and the mean converges.
+        for _ in 0..reference_spp {
+            gpu.accumulate(
+                &stage,
+                &snaps[ref_idx],
+                ref_idx as u64 + 1,
+                &cam_at_tier,
+                size,
+                1,
+            )?;
+        }
+        let (refh, _) = gpu.read_denoise_inputs()?;
+        *gpu.denoise_params_mut() = saved;
+
+        samples.push(ds::Sample {
+            width: size.0,
+            height: size.1,
+            tier,
+            cur,
+            next,
+            normal: ds::to_f16(&guides.normal),
+            depth: ds::to_f16(&guides.depth),
+            albedo: ds::to_f16(&guides.albedo),
+            id: ds::to_f16(&guides.id),
+            reference: ds::to_f16(&refh.rgb),
+        });
+        // Written out every so often, not just at the end. An hour of GPU is
+        // long enough that something will interrupt it, and a run that has to
+        // start over from nothing because it was killed eight sequences from
+        // the finish is an hour nobody gets back.
+        if (si + 1) % 12 == 0 && si + 1 < sequences {
+            let part = ds::Dataset {
+                width: DATASET_SIZES.iter().map(|s| s.0).max().unwrap_or(0),
+                height: DATASET_SIZES.iter().map(|s| s.1).max().unwrap_or(0),
+                samples: samples.clone(),
+            };
+            part.save(out)?;
+        }
+        let per = t0.elapsed().as_secs_f64() / (si + 1) as f64;
+        println!(
+            "court  dataset {:3}/{sequences}  {}\u{d7}{}  history {tier:2}  t = {:.2} s  {}  \
+             {:.0} s each, {:.0} s left",
+            si + 1,
+            size.0,
+            size.1,
+            (ref_idx as f64) * scene.dt,
+            if moves { "camera moves" } else { "still camera" },
+            per,
+            per * (sequences - si - 1) as f64
+        );
+    }
+
+    let data = ds::Dataset {
+        width: DATASET_SIZES.iter().map(|s| s.0).max().unwrap_or(0),
+        height: DATASET_SIZES.iter().map(|s| s.1).max().unwrap_or(0),
+        samples,
+    };
+    data.save(out)?;
+    println!(
+        "court  {} sequences over histories {:?}, {}-pass references \u{2192} {} ({:.0} MB) in {:.0} s",
+        data.samples.len(),
+        ds::TIERS,
+        reference_spp,
+        out.display(),
+        data.bytes() as f64 / 1e6,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// The device history, packed for the dataset.
+fn frame_state(h: &kosm_render::gpu::History) -> kosm_spike::court::denoise::dataset::FrameState {
+    use kosm_spike::court::denoise::dataset as ds;
+    ds::FrameState {
+        mean: ds::to_f16(&h.rgb),
+        count: ds::to_f16(&h.count.iter().map(|&c| c as f32).collect::<Vec<_>>()),
+        variance: ds::to_f16(&h.variance),
+    }
+}
+
+/// The frame sizes a dataset rotates through: the viewport's own, at the scale
+/// divisors it actually settles on.
+pub const DATASET_SIZES: [(u32, u32); 3] = [(384, 216), (512, 288), (640, 360)];
+
+/// The simulated window a dataset samples from, seconds. Balls in flight and
+/// the net still moving — the interesting part, and the part a still `--shot`
+/// never sees.
+const T_DATASET_START: f64 = 0.4;
+const T_DATASET_END: f64 = 1.5;
+
+/// Orbit `cam` about `target`: `d_az` radians of azimuth, `d_el` of
+/// elevation, `scale` times the distance.
+///
+/// The court's authored camera is the shot the level wants, and every sample
+/// is a perturbation of it rather than a camera drawn from nowhere. A denoiser
+/// for *this gym* should be shown this gym's framings.
+fn orbit(cam: &Camera, target: KVec3, d_az: f64, d_el: f64, scale: f64) -> Camera {
+    let v = cam.eye - target;
+    let r = v.norm() * scale;
+    let az = v.y.atan2(v.x) + d_az;
+    let el = (v.z / v.norm()).asin() + d_el;
+    let el = el.clamp(-1.35, 1.35);
+    Camera {
+        eye: target
+            + KVec3::new(
+                r * el.cos() * az.cos(),
+                r * el.cos() * az.sin(),
+                r * el.sin(),
+            ),
+        ..*cam
+    }
+}
+
+/// splitmix64, so a dataset is reproducible from its seed with no dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
+/// The regions the viewport check is scored over, as fractions of the frame.
+///
+/// Fractions and not pixels, because the check runs at whatever `--width` it
+/// is given and the authored camera frames the same shot at every size. They
+/// are `(name, x0, y0, x1, y1)` in [0, 1], picked off the authored shot: the
+/// hoop and the net are the two the v1 network failed on and they get boxes
+/// of their own, tight enough that a win there is a win on the thing that was
+/// broken rather than on the wall behind it.
+pub const EVAL_REGIONS: [(&str, f32, f32, f32, f32); 5] = [
+    ("back wall", 0.03, 0.20, 0.30, 0.45),
+    ("bleachers", 0.03, 0.50, 0.68, 0.73),
+    ("floor", 0.03, 0.82, 0.65, 0.99),
+    ("hoop and backboard", 0.53, 0.02, 0.68, 0.26),
+    ("net", 0.53, 0.25, 0.61, 0.37),
+];
+
+/// Root-mean-square difference between two RGBA frames over one box, in 8-bit
+/// codes, alpha ignored.
+fn rmse_codes(a: &[u8], b: &[u8], w: u32, h: u32, box_: (f32, f32, f32, f32)) -> f64 {
+    let x0 = (box_.0 * w as f32) as usize;
+    let y0 = (box_.1 * h as f32) as usize;
+    let x1 = ((box_.2 * w as f32) as usize).min(w as usize);
+    let y1 = ((box_.3 * h as f32) as usize).min(h as usize);
+    let mut acc = 0.0f64;
+    let mut n = 0usize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * w as usize + x) * 4;
+            for c in 0..3 {
+                let d = a[i + c] as f64 - b[i + c] as f64;
+                acc += d * d;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { 0.0 } else { (acc / n as f64).sqrt() }
+}
+
+/// The mean absolute frame-to-frame movement of a patch, in 8-bit codes.
+///
+/// The flicker number. Taken on a patch of back wall, which is static
+/// geometry under static light: anything that moves there is the filter
+/// changing its mind, not the picture changing.
+fn stability_codes(frames: &[Vec<u8>], w: u32, h: u32) -> f64 {
+    // The first region is the back wall, and it is the first region for this
+    // reason: static geometry under static light.
+    let bx = EVAL_REGIONS[0];
+    let x0 = (bx.1 * w as f32) as usize;
+    let y0 = (bx.2 * h as f32) as usize;
+    let x1 = (bx.3 * w as f32) as usize;
+    let y1 = (bx.4 * h as f32) as usize;
+    let mut acc = 0.0f64;
+    let mut n = 0usize;
+    for pair in frames.windows(2) {
+        for y in y0..y1.min(h as usize) {
+            for x in x0..x1.min(w as usize) {
+                let i = (y * w as usize + x) * 4;
+                for c in 0..3 {
+                    acc += (pair[1][i + c] as f64 - pair[0][i + c] as f64).abs();
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 { 0.0 } else { acc / n as f64 }
+}
+
+/// The pass/fail: run the sequence twice, once under each filter, against a
+/// converged render of the same instants, and say what each costs per region.
+///
+/// This is the check the v1 weights failed. The held-out table said the
+/// network beat the à-trous filter by a fifth at every history length; the
+/// window said the backboard came out 1.7x too bright and the net smudged.
+/// Both were true, because the tiles the network was scored on and the frames
+/// it was run on were different distributions. So the number that decides
+/// whether `--denoise neural` is the default is measured *here*, on the
+/// viewport, region by region — and the two regions that broke get boxes of
+/// their own.
+///
+/// The reference for a frame is `ref_spp` passes of the bare path tracer from
+/// a cleared history with the filter and the clamp off, tonemapped through the
+/// same resolve, so every number is a difference between two 8-bit pictures of
+/// one instant.
+pub fn denoise_eval(
+    dir: Option<&std::path::Path>,
+    weights: Option<&std::path::Path>,
+    t: f64,
+    size: (u32, u32),
+    n: u32,
+    ref_spp: u32,
+) -> anyhow::Result<()> {
+    let scene = CourtScene::bundled()?;
+    let stage = render::Scene::new(&scene)?;
+    let camera = authored_camera(&scene);
+    let a = &scene.authored;
+    let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("no GPU adapter: {e}"))?;
+    let mut gpu = court_gpu::Stage::new(
+        &stage,
+        &ctx.device,
+        &ctx.queue,
+        a.parameter_or("max_depth", 6.0).max(1.0) as u32,
+    )?;
+    // A candidate fit is looked at *before* it is bundled — that is the whole
+    // point of the check — so `--weights` runs a file and the default runs
+    // what ships.
+    let weights = match weights {
+        Some(p) => kosm_render::neural::Weights::load(p)
+            .map_err(|e| anyhow::anyhow!("the weights at {}: {e}", p.display()))?,
+        None => court_gpu::Stage::bundled_weights()?,
+    };
+    let t = if t < 0.0 {
+        a.parameter_or("still_t", 0.95)
+    } else {
+        t
+    };
+    let n = n.max(1);
+    let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
+
+    // The instants, rolled once so all three runs see the same simulation.
+    let mut court = Court::from_scene(&scene)?;
+    while court.time() < t {
+        court.step();
+    }
+    let mut instants = Vec::with_capacity(n as usize);
+    instants.push(Frame::of(&court));
+    for _ in 1..n {
+        for _ in 0..steps_per_frame {
+            court.step();
+        }
+        instants.push(Frame::of(&court));
+    }
+
+    // The sequence, under one filter, driven exactly as `dump_frames` drives
+    // it: eight passes to warm the history and then one pass a frame.
+    let mut run = |gpu: &mut court_gpu::Stage| -> anyhow::Result<Vec<Vec<u8>>> {
+        gpu.reset_sequence()?;
+        for _ in 0..8 {
+            gpu.accumulate(&stage, &instants[0], 0, &camera, size, 1)?;
+        }
+        let mut out = Vec::with_capacity(n as usize);
+        for (k, f) in instants.iter().enumerate() {
+            gpu.accumulate(&stage, f, k as u64 + 1, &camera, size, 1)?;
+            out.push(gpu.read_target()?);
+        }
+        Ok(out)
+    };
+
+    gpu.set_neural(None)?;
+    let t0 = Instant::now();
+    let atrous = run(&mut gpu)?;
+    let atrous_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+    gpu.set_neural(Some(&weights))?;
+    let t1 = Instant::now();
+    let neural = run(&mut gpu)?;
+    let neural_ms = t1.elapsed().as_secs_f64() * 1e3 / n as f64;
+    gpu.set_neural(None)?;
+
+    // The references: one per instant, from a cleared history, filter off,
+    // clamp off, cap lifted.
+    let saved = *gpu.denoise_params_mut();
+    {
+        let d = gpu.denoise_params_mut();
+        d.iters = 0;
+        d.clamp_k = 0.0;
+        d.history_cap = u32::MAX;
+        d.count_cutoff = u32::MAX;
+    }
+    let mut refs = Vec::with_capacity(n as usize);
+    for (k, f) in instants.iter().enumerate() {
+        gpu.reset_sequence()?;
+        for _ in 0..ref_spp {
+            gpu.accumulate(&stage, f, k as u64 + 1, &camera, size, 1)?;
+        }
+        refs.push(gpu.read_target()?);
+    }
+    *gpu.denoise_params_mut() = saved;
+
+    if let Some(dir) = dir {
+        std::fs::create_dir_all(dir)?;
+        let save = |img: &[u8], name: String| -> anyhow::Result<()> {
+            image::RgbaImage::from_raw(size.0, size.1, img.to_vec())
+                .ok_or_else(|| anyhow::anyhow!("the target texture is the wrong size"))?
+                .save(dir.join(name))?;
+            Ok(())
+        };
+        for k in 0..n as usize {
+            save(&atrous[k], format!("atrous_{k:02}.png"))?;
+            save(&neural[k], format!("neural_{k:02}.png"))?;
+            save(&refs[k], format!("reference_{k:02}.png"))?;
+        }
+        println!("court  frames in {}", dir.display());
+    }
+
+    let mean = |frames: &[Vec<u8>], bx: (f32, f32, f32, f32)| -> f64 {
+        frames
+            .iter()
+            .zip(&refs)
+            .map(|(f, r)| rmse_codes(f, r, size.0, size.1, bx))
+            .sum::<f64>()
+            / n as f64
+    };
+
+    println!(
+        "\ncourt  denoise: {}\u{d7}{}, {n} frames from t = {t:.2} s, \
+         against a {ref_spp}-pass reference. RMSE in 8-bit codes:\n",
+        size.0, size.1
+    );
+    println!("  {:<20} {:>9} {:>9}", "region", "à-trous", "neural");
+    let whole = (0.0, 0.0, 1.0, 1.0);
+    let (wa, wn) = (mean(&atrous, whole), mean(&neural, whole));
+    println!("  {:<20} {wa:>9.2} {wn:>9.2}", "whole frame");
+    let mut worse = Vec::new();
+    for (name, x0, y0, x1, y1) in EVAL_REGIONS {
+        let bx = (x0, y0, x1, y1);
+        let (ra, rn) = (mean(&atrous, bx), mean(&neural, bx));
+        println!("  {name:<20} {ra:>9.2} {rn:>9.2}");
+        if rn > ra {
+            worse.push((name, ra, rn));
+        }
+    }
+    if wn > wa {
+        worse.push(("whole frame", wa, wn));
+    }
+
+    println!(
+        "\n  frame-to-frame movement on a static patch: \
+         à-trous {:.2}, neural {:.2} codes",
+        stability_codes(&atrous, size.0, size.1),
+        stability_codes(&neural, size.0, size.1),
+    );
+    println!(
+        "  a pass costs: à-trous {atrous_ms:.1} ms, neural {neural_ms:.1} ms"
+    );
+    if worse.is_empty() {
+        println!("\n  the neural filter wins everywhere.");
+    } else {
+        println!("\n  the neural filter loses on:");
+        for (name, ra, rn) in worse {
+            println!("    {name}: {rn:.2} against {ra:.2}");
+        }
+    }
+    Ok(())
+}
+
 // ---- the window -------------------------------------------------------------
 
 /// What a pass may cost: one frame at thirty a second. The window buys that

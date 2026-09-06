@@ -11,15 +11,19 @@
 //!
 //! Three pieces, in the order they run:
 //!
-//! * [`dataset`] — sample (camera, time) states off the court, render each at
-//!   1/2/4/8/16 accumulated samples per pixel plus a 1024-spp reference, and
-//!   write the planes to one file.
+//! * [`dataset`] — the file format, and the tiles cut out of it. The
+//!   *generation* is `kosm-view`'s `--dump-dataset`, not this crate's: a v2
+//!   sample is the device history read back after the same passes the window
+//!   runs, and only the thing that drives the device can make one. That move
+//!   is the whole lesson of v1 — see [`dataset`]'s module docs.
 //! * [`kpn`] — the network: three 3x3 convolutions predicting a normalised
 //!   5x5 filter kernel per pixel, applied to the *demodulated* illumination
 //!   exactly where the à-trous filter would have run.
 //! * [`train`] — the fit, with `tang_train`'s `Parameter` and `ModuleAdam`
 //!   over hand-written convolution kernels; see [`kpn`] for why the layers
-//!   are ours rather than `tang_train::Conv2d`'s.
+//!   are ours rather than `tang_train::Conv2d`'s. The loss is L1 through a
+//!   tone curve, plus gradients, plus a temporal consistency term that only
+//!   a paired dataset can express.
 //!
 //! The weights come out as the `.bin` `kosm_render::gpu::neural::Weights`
 //! loads, so the thing trained here is the thing the viewport runs.

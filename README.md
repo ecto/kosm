@@ -1729,10 +1729,139 @@ was run on, and both are ours:
   different amounts of world in the two, and the net's cords are about a pixel
   wide in one and two in the other.
 
-So: the method works, the plumbing is right end to end, and the weights that
-ship are not yet good enough to make `--denoise neural` the default. That is
-the honest state of it, and the next move is a dataset built from the device's
-own history at the viewport's own resolution rather than a bigger network.
+So: the method works, the plumbing is right end to end, and the weights are
+not good enough to make `--denoise neural` the default. The next move is a
+dataset built from the device's own history rather than a bigger network.
+
+### v2: train on the distribution you run on
+
+The v1 dataset was CPU films, and each of its noisy tiers was the mean of *k*
+independent one-sample passes with the variance of that mean. That is a fine
+description of a Monte Carlo estimator and it is not what the viewer hands the
+denoiser. v2 changes the dataset and leaves the network nearly alone.
+
+**The dataset is the device's own history** (`kosm-view --dump-dataset`, read
+by `court::denoise::dataset`). Generation moved out of `kosm-spike` entirely,
+because only the thing that drives the GPU can produce what the GPU pass is
+handed. A sequence is one (camera, time) state and one *history length*: the
+court is driven frame by frame exactly as `--dump-frames` drives it — the
+simulation stepping at the level's own rate, one pass a frame, the
+reprojection carrying pixels across motion and the clamp shortening the ones
+that went stale — and stopped at that length. Then the mean, the **per-pixel
+count**, the per-pixel variance and the guide planes are read straight out of
+the buffers `neural.wgsl` binds (`RayTracePipeline::read_guides` is the one
+thing added to the renderer, and nothing in the render path calls it).
+
+Two thirds of the sequences swing the camera a few degrees partway through, so
+reprojected, clamped and freshly-disoccluded pixels are in the training set
+rather than being what the network meets for the first time in the window.
+Sizes rotate through 384x216, 512x288 and 640x360 — the viewport's own scale
+divisors — so a 5x5 kernel is not fitted to one pixel scale.
+
+**One length per sequence, not a snapshot at every length along the way.**
+This is the part that is easy to get wrong, and the first v2 generator got it
+wrong: the balls are in flight and the net is swinging, so the converged
+answer for the frame where a pixel has one sample is a different picture from
+the converged answer thirty frames later. A sample's reference has to be the
+answer to *its own* frame. Covering 1, 2, 4, 8, 16 and 32 is therefore a
+rotation across sequences.
+
+**108 sequences, 1024-pass references, 697 MB, 59 minutes** — all of it GPU,
+against v1's 8.2 hours of CPU for 172.8 MB.
+
+**Two features and a term.** The network keeps its shape — three 3x3
+convolutions, 32 hidden channels, a softmax over 25 taps applied to the
+frame's own demodulated illumination:
+
+* `count` became **per pixel**. On the device it always was (`stats[i].x`).
+  The v1 trainer passed one scalar for a whole tile because on a mean of *k*
+  independent passes that was true; on a reprojected history it is not, and
+  the plane that tells the network how much noise a pixel still has was lying
+  to it about exactly the pixels the filter matters most for.
+* A **hit-id plane**, hashed. The id is already in guide plane 2 beside the
+  albedo, and the reprojection already validates on it. It is a *label*, so it
+  is hashed rather than fed: the only question a convolution should be able to
+  ask of it is "is my neighbour the same surface as me", and a hash makes that
+  a difference it can see. Eleven input planes, **19,673 parameters** against
+  v1's 19,385.
+* A **temporal consistency term**. Each sample stores one extra pass as a
+  successor frame; the network runs on both and the two answers are asked to
+  agree — on the pixels that kept their history, which is read off the counts
+  rather than guessed. Where the reprojection dropped a pixel or the clamp
+  shortened it the picture *should* move, and penalising that would be asking
+  the filter to smear. Weight a twentieth: it breaks ties between kernels that
+  fit the reference equally well.
+
+Thirty epochs, batch 16, 1450 tiles: **25 minutes**, loss 0.0116 → 0.0072.
+Held-out RMSE on the 21 sequences it never saw — device-history tiles this
+time, not CPU films:
+
+| history | raw | à-trous | neural |
+|---|---|---|---|
+| 1 | 0.0683 | 0.0142 | **0.0123** |
+| 2 | 0.0592 | 0.0145 | **0.0128** |
+| 4 | 0.0403 | 0.0106 | **0.0103** |
+| 8 | 0.0386 | 0.0145 | **0.0128** |
+| 16 | 0.0341 | 0.0162 | **0.0131** |
+| 32 | 0.0312 | 0.0125 | **0.0101** |
+
+3–19% better, at every history length. Smaller than v1's claimed 16–23%, and
+this time it is a number about the frames the filter actually runs on.
+
+**And then we looked at it again.** `--denoise-eval` is the check the v1
+weights failed, made into a command: the same sixty-frame sequence under both
+filters, against a 256-pass reference of each instant, scored per region.
+640x360, from t = 0.4 s, RMSE in 8-bit codes:
+
+| region | à-trous | neural |
+|---|---|---|
+| whole frame | **13.35** | 17.62 |
+| back wall | 11.86 | **11.31** |
+| bleachers | 9.55 | **8.86** |
+| floor | 13.67 | **12.82** |
+| hoop and backboard | **20.70** | 63.60 |
+| net | **25.52** | 33.49 |
+
+The flat majority of the frame is fixed. Where v1 lost on the wall and the
+bleachers, v2 wins on the wall, the bleachers and the floor — and on the
+bleachers you can see it: the steps keep their edges and the grain between
+them is gone. That is what the dataset change bought.
+
+**The hoop did not get fixed, and it got worse.** The backboard is a bright
+speckled mess where the reference has flat dark glass, and the net's cords
+still blur where the à-trous filter keeps the lattice. The id plane was aimed
+squarely at this and did not land, which says the failure is not that the
+network cannot tell the glass from the wall.
+
+The likelier cause is the demodulation. The filter averages `mean / albedo`
+and multiplies back, and on the backboard's glass the denoise albedo is at or
+near `DEMOD_FLOOR` — so the illumination the kernel averages is the radiance
+divided by a hundredth, every firefly in the neighbourhood is amplified a
+hundredfold, and a convex combination cannot put back what the division blew
+up. The à-trous filter survives the same demodulation because it *rejects* on
+luminance: a tap a hundred error-bars away gets weight zero. A softmax over 25
+taps has no such veto — it must spend its whole unit of weight somewhere, and
+on a specular pixel there is nowhere good to spend it.
+
+So: **`--denoise neural` stays off by default**, and the flag is where it was.
+It loses on the hoop and backboard (63.60 against 20.70) and on the net (33.49
+against 25.52), and therefore on the whole frame. It wins everywhere else, it
+is no less steady frame to frame (1.90 codes against 1.79 on a static patch of
+wall), and it costs 65.8 ms a pass against 43.4 ms — still not a cheaper
+filter.
+
+The v2 weights ship anyway, as the bundled asset, because they are strictly
+better than what was there: v1's file cannot even load now (`Weights::
+from_bytes` refuses a ten-plane blob against an eleven-plane build, which is
+the shape check doing its job).
+
+**The lesson, and it is the one worth keeping.** Train on the distribution you
+run on. v1's held-out table was not wrong, it was about a distribution nothing
+ever produced, and no amount of network would have found that out. v2's table
+is smaller and it is true. The remaining gap is not a dataset problem and not
+a capacity problem — it is that a normalised 5x5 average of demodulated
+radiance is the wrong estimator for a specular surface, and the next move is
+to give the network a veto rather than more weights.
 
 ### the pixel filter
 

@@ -102,7 +102,7 @@ use vcad_kernel_raytrace::gpu::{
 use vcad_kernel_raytrace::pathtrace::{Environment, Pbr, PixelFilter, Sun};
 // The learned denoiser is kosm-render's own; vcad re-exports the a-trous half
 // of `gpu` and has no reason to know about this one.
-use kosm_render::gpu::{NeuralDenoiser, NeuralPipeline};
+use kosm_render::gpu::{Guides, History, NeuralDenoiser, NeuralPipeline};
 use kosm_render::neural::Weights;
 
 use crate::court::Camera;
@@ -937,6 +937,83 @@ impl Stage {
             .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("no history yet"))?;
         Ok(hist.count)
+    }
+
+    /// Swap the learned filter in or out at run time.
+    ///
+    /// `--denoise` decides this once when the stage is built, which is right
+    /// for the window: a viewport runs one filter. The side-by-side check
+    /// runs *both* over the same sequence and has to hold the scene, the
+    /// camera and the simulation fixed while it does, so it swaps the filter
+    /// rather than building a second stage around a second copy of the court.
+    pub fn set_neural(&mut self, weights: Option<&Weights>) -> anyhow::Result<()> {
+        self.neural = match weights {
+            Some(w) => Some((
+                NeuralPipeline::new(&self.ctx)
+                    .map_err(|e| anyhow::anyhow!("the neural denoiser's pipelines: {e}"))?,
+                NeuralDenoiser::new(&self.ctx, w, 0, 0),
+            )),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// The weights bundled into the binary, for a caller that wants to run the
+    /// learned filter without a `--denoise` flag.
+    pub fn bundled_weights() -> anyhow::Result<Weights> {
+        Weights::from_bytes(BUNDLED_WEIGHTS)
+            .map_err(|e| anyhow::anyhow!("the bundled denoiser weights: {e}"))
+    }
+
+    /// The denoise knobs this stage runs with, to change.
+    ///
+    /// For the dataset builder, which needs two settings the window never
+    /// wants: the filter off and the clamp off, so a reference render is the
+    /// bare converged mean of the path tracer and not a filtered picture of
+    /// it. Nothing in the window calls this.
+    pub fn denoise_params_mut(&mut self) -> &mut GpuDenoiseParams {
+        &mut self.denoise
+    }
+
+    /// Forget every pixel's history and every trace of the pass before.
+    ///
+    /// A dataset sequence has to start where the window starts on a cut: no
+    /// mean, no counts, and no previous view to reproject from. Clearing the
+    /// device buffers is only half of that — the *host* also remembers the
+    /// last camera and the last placements, and a stale `prev_view` would
+    /// reproject the new sequence's first pass out of the old one's frame.
+    pub fn reset_sequence(&mut self) -> anyhow::Result<()> {
+        if let Some(res) = self.resident.as_ref() {
+            if let Some(h) = res.history() {
+                h.clear(&self.ctx);
+            }
+        }
+        self.last_view = None;
+        self.last_camera = None;
+        self.prev_placements = None;
+        self.prev_ball_places = 0;
+        self.reprojected = false;
+        Ok(())
+    }
+
+    /// Everything the neural pass is handed, brought back to the host: the
+    /// history's mean, per-pixel count and variance, and the guide planes.
+    ///
+    /// This is the dataset builder's whole readback, and it is deliberately
+    /// the *same* buffers `neural.wgsl` binds rather than a CPU film of the
+    /// same instant. Training on the second and running on the first is what
+    /// went wrong the first time.
+    pub fn read_denoise_inputs(&mut self) -> anyhow::Result<(History, Guides)> {
+        let res = self
+            .resident
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no pass yet"))?;
+        let hist = pollster::block_on(self.pipeline.read_history(&self.ctx, res))
+            .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("no history yet"))?;
+        let guides = pollster::block_on(self.pipeline.read_guides(&self.ctx, res))
+            .map_err(|e| anyhow::anyhow!("the tracer: {e}"))?;
+        Ok((hist, guides))
     }
 
     pub fn read_target(&self) -> anyhow::Result<Vec<u8>> {
