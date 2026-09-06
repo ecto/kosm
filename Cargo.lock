@@ -1590,6 +1590,8 @@ dependencies = [
  "rustfft",
  "tang",
  "tang-3dgs",
+ "tang-tensor",
+ "tang-train",
  "vcad",
  "vcad-eval",
  "vcad-ir",
@@ -1765,6 +1767,7 @@ dependencies = [
 [[package]]
 name = "loon-lang"
 version = "0.7.0"
+source = "git+https://github.com/ecto/loon?rev=c12ef566613995f913012c79773bab825950566f#c12ef566613995f913012c79773bab825950566f"
 dependencies = [
  "codespan-reporting 0.11.1",
  "dirs-next",
@@ -3239,6 +3242,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stepperoni"
 version = "0.1.0"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -3331,6 +3335,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-ad"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "tang-la",
+]
+
+[[package]]
 name = "tang-expr"
 version = "0.1.0"
 dependencies = [
@@ -3357,11 +3369,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-optim"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "tang-ad",
+ "tang-la",
+]
+
+[[package]]
 name = "tang-tensor"
 version = "0.1.0"
 dependencies = [
  "tang",
  "tang-la",
+]
+
+[[package]]
+name = "tang-train"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "tang-ad",
+ "tang-la",
+ "tang-optim",
+ "tang-tensor",
 ]
 
 [[package]]
@@ -3616,6 +3648,7 @@ checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 [[package]]
 name = "vcad"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "anyhow",
  "serde",
@@ -3630,6 +3663,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-package"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "vcad-ir",
 ]
@@ -3637,6 +3671,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-pcb"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "log",
  "rayon",
@@ -3657,6 +3692,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-schematic"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3667,6 +3703,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-sim"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "tang",
@@ -3681,6 +3718,7 @@ dependencies = [
 [[package]]
 name = "vcad-eval"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3703,6 +3741,7 @@ dependencies = [
 [[package]]
 name = "vcad-gdsii"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "geo",
  "thiserror 2.0.20",
@@ -3712,6 +3751,7 @@ dependencies = [
 [[package]]
 name = "vcad-ir"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3721,6 +3761,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-kernel-acoustics",
@@ -3761,6 +3802,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-acoustics"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3769,6 +3811,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-adjoint"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3777,6 +3820,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-antenna"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3785,6 +3829,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-booleans"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "rayon",
  "vcad-kernel-geom",
@@ -3797,6 +3842,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-calibration"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "ryu",
  "serde",
@@ -3806,6 +3852,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cam"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "geo",
  "geo-clipper",
@@ -3818,6 +3865,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-constraints"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "slotmap",
  "tang",
@@ -3831,6 +3879,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cost"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3839,6 +3888,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-dfm"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3856,6 +3906,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-diff"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "tang",
  "vcad-kernel-geom",
@@ -3869,6 +3920,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-em"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3877,6 +3929,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-enclosure"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3885,6 +3938,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-export"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -3893,6 +3947,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-fea"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-kernel-tessellate",
@@ -3902,6 +3957,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-fillet"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -3913,6 +3969,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-flow"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-kernel-adjoint",
@@ -3923,6 +3980,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-geom"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "tang",
  "vcad-kernel-math",
@@ -3931,6 +3989,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-gpu"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "bytemuck",
  "kosm-render",
@@ -3946,6 +4005,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-math"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "tang",
 ]
@@ -3953,6 +4013,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-naming"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -3963,6 +4024,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-neutronics"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3971,6 +4033,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-nurbs"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "tang",
  "vcad-kernel-geom",
@@ -3980,6 +4043,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-optics"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3988,6 +4052,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-particle"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3996,6 +4061,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-photonics"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-gdsii",
@@ -4005,6 +4071,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-primitives"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -4014,6 +4081,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-qcd"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
 ]
@@ -4021,6 +4089,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-raytrace"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "bytemuck",
  "js-sys",
@@ -4044,6 +4113,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sheet"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -4054,6 +4124,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-shell"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -4065,6 +4136,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sketch"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "thiserror 2.0.20",
  "vcad-kernel-geom",
@@ -4076,6 +4148,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-step"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "stepperoni",
  "thiserror 2.0.20",
@@ -4089,6 +4162,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-stocksim"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -4100,6 +4174,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sweep"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "rustc-hash 1.1.0",
  "thiserror 2.0.20",
@@ -4113,6 +4188,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-tessellate"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "earcutr",
  "tang",
@@ -4125,6 +4201,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-text"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "thiserror 2.0.20",
  "ttf-parser",
@@ -4135,6 +4212,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-thermal"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -4143,6 +4221,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-tolerance"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-kernel-adjoint",
@@ -4152,6 +4231,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-topo"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "slotmap",
  "vcad-kernel-math",
@@ -4160,6 +4240,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-topopt"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "vcad-kernel-tessellate",
@@ -4168,6 +4249,7 @@ dependencies = [
 [[package]]
 name = "vcad-loon"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "loon-lang",
  "serde_json",
@@ -4178,6 +4260,7 @@ dependencies = [
 [[package]]
 name = "vcad-parts"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -4187,6 +4270,7 @@ dependencies = [
 [[package]]
 name = "vcad-receipt"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde",
  "serde_json",
@@ -4195,6 +4279,7 @@ dependencies = [
 [[package]]
 name = "vcad-render"
 version = "0.9.3"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "serde_json",
  "vcad-ecad-pcb",
@@ -4206,6 +4291,7 @@ dependencies = [
 [[package]]
 name = "vcad-tool-derive"
 version = "0.9.4"
+source = "git+https://github.com/ecto/vcad?branch=claude%2Fwgpu-30#504047fb0920a27365b4212b0bd7d376e183e687"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5427,7 +5513,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "tang-ad"
-version = "0.1.0"
