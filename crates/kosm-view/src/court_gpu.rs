@@ -146,8 +146,10 @@ fn flag(key: &str) -> Option<String> {
 /// how many standard errors of disagreement between the history and this
 /// pass's neighbourhood it takes to shorten a pixel's history, and
 /// `--no-spatial-variance` turns off SVGF's spatial estimate for the pixels
-/// too young to have an error bar of their own. Defaults are
-/// [`GpuDenoiseParams::default`]'s — 64, 4.0 and on.
+/// too young to have an error bar of their own. `--firefly-k K`,
+/// `--variance-gamma G`, `--temporal-filter W`, `--fresh-iters N` and
+/// `--fresh-lum-relax R` are the four stabilizers, zero (or 1 for the relax)
+/// turning each off. Defaults are [`GpuDenoiseParams::default`]'s.
 fn denoise_from_args() -> GpuDenoiseParams {
     let mut d = GpuDenoiseParams::default();
     if let Some(v) = flag("history-cap").and_then(|v| v.parse::<u32>().ok()) {
@@ -161,6 +163,22 @@ fn denoise_from_args() -> GpuDenoiseParams {
     }
     if std::env::args().any(|a| a == "--no-spatial-variance") {
         d.spatial_variance = false;
+    }
+    // The four stabilizers, each with a value that turns it off.
+    if let Some(v) = flag("firefly-k").and_then(|v| v.parse::<f32>().ok()) {
+        d.firefly_k = v.max(0.0);
+    }
+    if let Some(v) = flag("variance-gamma").and_then(|v| v.parse::<f32>().ok()) {
+        d.variance_gamma = v.max(0.0);
+    }
+    if let Some(v) = flag("temporal-filter").and_then(|v| v.parse::<f32>().ok()) {
+        d.temporal_filter = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = flag("fresh-iters").and_then(|v| v.parse::<u32>().ok()) {
+        d.fresh_extra_iters = v;
+    }
+    if let Some(v) = flag("fresh-lum-relax").and_then(|v| v.parse::<f32>().ok()) {
+        d.fresh_lum_relax = v.max(1.0);
     }
     d
 }

@@ -1383,6 +1383,11 @@ pub fn denoise_eval(
         d.clamp_k = 0.0;
         d.history_cap = u32::MAX;
         d.count_cutoff = u32::MAX;
+        // The bare path tracer: no firefly cap, no variance box, and the
+        // presented frame is the mean itself.
+        d.firefly_k = 0.0;
+        d.variance_gamma = 0.0;
+        d.temporal_filter = 0.0;
     }
     let mut refs = Vec::with_capacity(n as usize);
     for (k, f) in instants.iter().enumerate() {
