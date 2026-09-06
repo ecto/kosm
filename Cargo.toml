@@ -52,3 +52,8 @@ tang-ad   = { path = "/Users/cam/Developer/tang/crates/tang-ad" }
 phyz-math      = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
 phyz-model     = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
 phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
+
+# vcad pulls kosm-render from this repo by git rev; without this patch cargo
+# builds two copies and the Geometry impls stop lining up.
+[patch."https://github.com/ecto/kosm"]
+kosm-render = { path = "crates/kosm-render" }

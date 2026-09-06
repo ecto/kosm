@@ -90,6 +90,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kosm_render::caustics::CausticMap;
 use kosm_render::gpu::{InstanceMotion, SampleBudget};
 use kosm_spike::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
@@ -382,6 +383,12 @@ pub struct Stage {
     /// are lit by the same sky and the same daylight.
     env: Environment,
     sun: Option<Sun>,
+    /// The level's photon map: the sun through any refracting solid the
+    /// level has, traced once on the CPU off the statics and uploaded with
+    /// the resident scene. Empty for a level with no such glass — the
+    /// court's panes are thin-walled, and next-event estimation already sees
+    /// the sun through those — and then the shader's caustic path stays off.
+    caustics: CausticMap,
     /// The merged scene for the frame on screen, and which frame that was.
     /// Assembling it is a clone of the statics and a placement per instance,
     /// which costs the same whatever the resolution — so it is done once per
@@ -557,6 +564,23 @@ impl Stage {
             .map(GpuAreaLight::from_area_light)
             .collect();
 
+        // `--no-caustics` leaves the map out: the picture without the sun
+        // through the backboard, for a side-by-side or a timing.
+        let built = Instant::now();
+        let caustics = if std::env::args().any(|a| a == "--no-caustics") {
+            CausticMap::empty()
+        } else {
+            stage.caustic_map()
+        };
+        if !caustics.is_empty() {
+            eprintln!(
+                "court  gpu: caustic map — {} photons at a {:.1} mm radius in {} ms",
+                caustics.len(),
+                caustics.radius(),
+                built.elapsed().as_millis()
+            );
+        }
+
         eprintln!(
             "court  gpu: {kept} solids packed ({dropped} skipped, no BRep), \
              {} surfaces, {} faces, {} bvh nodes, {} panels",
@@ -585,6 +609,7 @@ impl Stage {
             pattern,
             env: stage.environment().clone(),
             sun: stage.sun(),
+            caustics,
             resident: None,
             uploaded: None,
             history,
@@ -753,10 +778,14 @@ impl Stage {
                 }
             }
             None => {
-                self.resident = Some(
-                    self.pipeline
-                        .resident_scene(&self.ctx, scene, size.0, size.1),
-                );
+                let mut res = self
+                    .pipeline
+                    .resident_scene(&self.ctx, scene, size.0, size.1);
+                // Once, with the scene: the map is the level's, not the frame's.
+                if !self.caustics.is_empty() {
+                    res.set_caustics(&self.ctx, Some(&self.caustics));
+                }
+                self.resident = Some(res);
             }
         }
         self.uploaded = Some(frame_id);
