@@ -148,8 +148,18 @@ fn flag(key: &str) -> Option<String> {
 /// `--no-spatial-variance` turns off SVGF's spatial estimate for the pixels
 /// too young to have an error bar of their own. Defaults are
 /// [`GpuDenoiseParams::default`]'s — 64, 4.0 and on.
+///
+/// `--no-lobes` filters the summed sample as one buffer, the way the tier
+/// did before the first bounce was split into a diffuse and a specular
+/// half; the window's default is the split.
 fn denoise_from_args() -> GpuDenoiseParams {
-    let mut d = GpuDenoiseParams::default();
+    let mut d = GpuDenoiseParams {
+        lobes: true,
+        ..GpuDenoiseParams::default()
+    };
+    if std::env::args().any(|a| a == "--no-lobes") {
+        d.lobes = false;
+    }
     if let Some(v) = flag("history-cap").and_then(|v| v.parse::<u32>().ok()) {
         d.history_cap = v.max(1);
     }
