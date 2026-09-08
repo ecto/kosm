@@ -1,0 +1,6 @@
+# The marble's frozen gate. Four draws from seed 11, scored by the same miss
+# distance the hint descends. These three numbers must not move: they are the
+# only reason a score from today is comparable with a score from last month.
+seed = 11
+count = 4
+tolerance = 0.005

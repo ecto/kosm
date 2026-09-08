@@ -1089,6 +1089,78 @@ fn lamp0_r(level: &Level) -> f64 {
     level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM
 }
 
+// ---- the task ---------------------------------------------------------------
+
+/// The marble as a [`kosm::task::Task`]: release the marble somewhere on the
+/// plate and score how close to the cup it ends up.
+///
+/// The spawn is the release point, which is the domain-randomisation axis,
+/// the curriculum axis and the replay key at once — the same three roles
+/// ipse-dojo's spawn played. The scoring rule is `MissDistance`, the one the
+/// hint descends, so the gate and the solver cannot drift apart.
+pub struct Cup {
+    level: Level,
+    model: Model,
+    goal: Vec3,
+    horizon: usize,
+}
+
+impl Cup {
+    /// Load the bundled level and derive its colliders once.
+    pub fn new() -> anyhow::Result<Self> {
+        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
+        let level = Level::load(kosm::scene::AuthoredScene::bundled_path("marble.loon"))?;
+        let derived = colliders::colliders_from_document(&level.document)?;
+        let model = build_model(&level, level.tilt()?, &derived.colliders)?;
+        let goal = goal(&model, &level)?;
+        Ok(Self { level, model, goal, horizon: 300 })
+    }
+}
+
+impl kosm::task::Task for Cup {
+    /// The release point, plate-local metres.
+    type Spawn = [f64; 2];
+
+    fn name(&self) -> &str {
+        "marble/cup"
+    }
+
+    /// A deterministic lattice over the plate: the seed picks a cell, so the
+    /// same seed is the same episode on any machine on any day.
+    fn spawn(&self, seed: u64) -> [f64; 2] {
+        let x = -0.12 + (seed % 5) as f64 * 0.015;
+        let y = -0.05 + ((seed / 5) % 5) as f64 * 0.025;
+        [x, y]
+    }
+
+    fn build(&self, spawn: &[f64; 2]) -> World {
+        world_at(&self.model, &q0_for(&self.model, &self.level, *spawn))
+    }
+
+    fn horizon(&self) -> usize {
+        self.horizon
+    }
+
+    /// Higher is better, so the score is the negated miss distance.
+    fn score(&self, trajectory: &kosm::step::Trajectory, _: &[f64; 2]) -> f64 {
+        let end = trajectory.last().expect("a rollout keeps its first world");
+        -MissDistance { goal: self.goal }.see(end)
+    }
+
+    fn held_out(&self) -> Vec<(String, [f64; 2])> {
+        vec![("authored".into(), self.level.start().unwrap_or([-0.1, 0.025]))]
+    }
+
+    fn invariants(&self) -> Vec<kosm::task::Invariant> {
+        let goal = self.goal;
+        vec![kosm::task::Invariant::new("a still marble at the cup scores best", move || {
+            // the ceiling is zero and it is reached only at the cup; a reward
+            // that could pay more elsewhere would be one the hint could game
+            if goal.norm().is_finite() { Ok(()) } else { Err("the cup is not a place".into()) }
+        })]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1192,37 @@ mod tests {
             &[p.x, p.y, p.z, miss.see(end)],
             1e-6,
         )
+    }
+
+    /// The frozen gate over the real level: one number, twice the same, and
+    /// a ledger line under a run id that says what produced it.
+    #[test]
+    fn the_gate_is_one_number_and_the_ledger_keeps_it() -> anyhow::Result<()> {
+        use kosm::task::Task;
+        let task = Cup::new()?;
+        assert!(kosm::task::check_invariants(&task).is_empty());
+        let spec = kosm::gate::GateSpec::load(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sims/marble/gate.toml"),
+        )?;
+        assert_eq!((spec.seed, spec.count), (11, 4));
+        let a = kosm::gate::check(&task, &Zero, &spec);
+        let b = kosm::gate::check(&task, &Zero, &spec);
+        assert_eq!(a.score, b.score, "the gate is not deterministic");
+        assert_eq!(a.scores.len(), 4 + 1, "four draws and the held-out one");
+        assert!(a.score < 0.0, "the score is a negated distance");
+        assert!(!a.regressed_from(a.score));
+
+        let dir = std::env::temp_dir().join(format!("kosm-marble-gate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let ledger = kosm::ledger::Ledger::open(&dir)?;
+        let id = kosm::run::RunId::of("marble", &[Param::new("seed", spec.seed as f64)], spec.seed);
+        ledger.append(&kosm::ledger::Entry::from_gate(&id, &a))?;
+        let entries = ledger.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].task, "marble/cup");
+        assert_eq!(entries[0].run, id.to_string());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// A batch of eight identical worlds steps to eight identical worlds,

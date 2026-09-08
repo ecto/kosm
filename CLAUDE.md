@@ -171,7 +171,8 @@ four stages (build → run → observe → optimise-optional). Copy it.
 - A `Task` is spawn / build / horizon / score / held_out / invariants.
   `gate::check(&task, &policy, &spec)` runs a `gate.toml`'s frozen draws and
   returns one number; `Ledger::open(dir).append(&Entry::from_gate(..))`
-  writes it to an append-only `ledger.jsonl`.
+  writes it to an append-only `ledger.jsonl`. `sims/marble` has both:
+  `Cup` implements `Task` and `sims/marble/gate.toml` is its frozen gate.
 - `check_invariants(&task)` runs before compute is spent. A task that
   declares none is a task whose author has not yet been surprised.
 
