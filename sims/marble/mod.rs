@@ -23,6 +23,7 @@
 
 mod level;
 
+use kosm::prelude::{Lens, Param, PhyzStep, Recorder, Step, World, Zero};
 use kosm::{audio, colliders, frame, garage, glass, lamp, light, room};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -162,18 +163,51 @@ fn objective(g: Vec3) -> FinalStateObjective<'static> {
     FinalStateObjective { value, gradient }
 }
 
-/// Forward rollout with the production simulator.
-fn simulate(model: &Model, q0: &DVec, steps: usize) -> (Vec<Vec3>, State) {
-    let sim = Simulator::new();
+// ---- the three nouns -------------------------------------------------------
+//
+// The level's physics is phyz's, unchanged; what follows is the kosm view of
+// it. `World::from_phyz` is lossless both ways, `PhyzStep` is the same
+// `step_with_contacts` the loop below used to call by hand, and the miss
+// distance is a `Lens` rather than a number computed at three call sites.
+
+/// The marble's world: the level's model, the marble released at `q0`.
+fn world_at(model: &Model, q0: &DVec) -> World {
     let mut state = model.default_state();
     state.q = q0.clone();
-    let mat = material();
-    let mut traj = Vec::with_capacity(steps);
-    for _ in 0..steps {
-        sim.step_with_contacts(model, &mut state, -10.0, &mat);
-        traj.push(Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]));
+    World::from_phyz(model.clone(), state)
+}
+
+/// The level's plant: phyz at the level's `DT`, the level's friction, and a
+/// ground plane far below (in kosm a level is geometry, not a half-space).
+fn plant() -> PhyzStep {
+    PhyzStep::new(DT).with_ground(-10.0).with_material(material())
+}
+
+/// The marble's world-space position, off a world's `q` column.
+fn marble_at(world: &World) -> Vec3 {
+    Vec3::new(world.q()[POS], world.q()[POS + 1], world.q()[POS + 2])
+}
+
+/// How far the marble is from the cup. The level's whole objective, as a
+/// lens: the hint, the tilt search and the gate all read this one rule.
+struct MissDistance {
+    goal: Vec3,
+}
+
+impl Lens for MissDistance {
+    type Out = f64;
+
+    fn see(&self, world: &World) -> f64 {
+        (marble_at(world) - self.goal).norm()
     }
-    (traj, state)
+}
+
+/// Forward rollout with the production simulator, through `kosm::step`.
+fn simulate(model: &Model, q0: &DVec, steps: usize) -> (Vec<Vec3>, State) {
+    let traj = kosm::step::rollout(&world_at(model, q0), &plant(), &Zero, steps);
+    let path = traj.iter().skip(1).map(marble_at).collect();
+    let (_, state) = traj.last().expect("a rollout keeps its first world").clone().into_phyz();
+    (path, state)
 }
 
 fn in_cup(model: &Model, level: &Level, p: Vec3) -> anyhow::Result<bool> {
@@ -381,11 +415,23 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     run_marble(&level, args.out())
 }
 
-fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
+fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     let ctrl = |_: usize| DVec::zeros(6);
 
     // 1. the level: one loon file → document → STL, SVG, colliders
     let level = Level::load(level_path)?;
+
+    // The run: `hash(sim path, params, seed, kosm rev)`. Everything below
+    // writes under `<out>/<run id>/`, under the names it always used, so the
+    // outputs are immutable and two runs with the same hash are the same run.
+    let run_params: Vec<Param> = ["pitch_deg", "roll_deg", "start_x", "start_y", "t_end"]
+        .iter()
+        .filter_map(|name| level.parameters.get(*name).map(|v| Param::new(*name, *v)))
+        .collect();
+    let mut recorder = Recorder::new(out_root, "marble", &run_params, 0)?;
+    println!("run    {}", recorder.id());
+    let run_dir = recorder.dir().to_path_buf();
+    let out: &Path = &run_dir;
     for warning in &level.warnings {
         println!("level  {warning}");
     }
@@ -435,13 +481,19 @@ fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
     let g = goal(&model, &level)?;
     let obj = objective(g);
     let q0 = q0_for(&model, &level, start);
+    // the rollout, as a trajectory, and the objective as a lens over it
+    let miss = MissDistance { goal: g };
+    let released = kosm::step::rollout(&world_at(&model, &q0), &plant(), &Zero, steps);
+    let miss_before = miss.see(released.last().expect("a rollout keeps its first world"));
     let (traj, final_state) = simulate(&model, &q0, steps);
     let end = traj[traj.len() - 1];
+    recorder.metric("miss_before_m", miss_before)?;
+    recorder.metric("steps", steps)?;
     println!(
         "sim    {} steps at {} ms; marble ends {:.3} m from the cup centre, {}",
         steps,
         DT * 1e3,
-        (end - g).norm(),
+        miss_before,
         verdict(&model, &level, &traj)?
     );
     render(&model, &final_state, &out.join("frame_before.png"))?;
@@ -512,6 +564,11 @@ fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
         }
     }
     let (traj, hinted, heard) = simulate_listening(&model, &level, &q0_for(&model, &level, xy), steps)?;
+    let in_the_cup = in_cup(&model, &level, traj[traj.len() - 1])?;
+    recorder.metric("miss_after_m", j.sqrt())?;
+    recorder.metric("release_x_m", xy[0])?;
+    recorder.metric("release_y_m", xy[1])?;
+    recorder.metric("in_the_cup", in_the_cup)?;
     println!("hint   final: release ({:+.3}, {:+.3}), {}", xy[0], xy[1], verdict(&model, &level, &traj)?);
     render(&model, &hinted, &out.join("frame_hint.png"))?;
     fs::create_dir_all(out.join("hinted"))?;
@@ -645,6 +702,9 @@ fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
     let solved = build_model(&level, t, &derived.colliders)?;
     let (traj, solved_state) = simulate(&solved, &q0_for(&solved, &level, start), steps);
     println!("tilt   final: {}", verdict(&solved, &level, &traj)?);
+    recorder.metric("tilt_pitch_deg", t.pitch.to_degrees())?;
+    recorder.metric("tilt_roll_deg", t.roll.to_degrees())?;
+    recorder.metric("tilt_miss_m", j.sqrt())?;
     render(&solved, &solved_state, &out.join("frame_tilted.png"))?;
     export_track(&level.document, t, &out.join("solved"))?;
     fs::write(
@@ -765,6 +825,8 @@ fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
 
     // 7. a captured place: the marble on the real garage floor, and the
     //    splat as the frame's backdrop. rung 4 in miniature.
+    recorder.finish()?;
+
     let map_dir = std::env::var("KOSM_MAP").unwrap_or_else(|_| "/Users/cam/Developer/ipse/maps/garage-perim".into());
     if Path::new(&map_dir).join("map.toml").exists() {
         garage_stage(&level, Path::new(&map_dir), out)?;
@@ -1026,4 +1088,52 @@ fn light_stage(
 
 fn lamp0_r(level: &Level) -> f64 {
     level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The level, as a `World`, released where the level says.
+    fn released() -> anyhow::Result<(Model, Level, World)> {
+        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
+        let level = Level::load(kosm::scene::AuthoredScene::bundled_path("marble.loon"))?;
+        let derived = colliders::colliders_from_document(&level.document)?;
+        let model = build_model(&level, level.tilt()?, &derived.colliders)?;
+        let q0 = q0_for(&model, &level, level.start()?);
+        let world = world_at(&model, &q0);
+        Ok((model, level, world))
+    }
+
+    /// The three nouns over the real level, and the answer against the
+    /// stored one. A changed number here means changed code; re-record with
+    /// `KOSM_UPDATE_SNAPSHOTS=1` when the change is wanted.
+    #[test]
+    fn the_released_marble_rolls_where_it_rolled_last_time() -> anyhow::Result<()> {
+        let (model, level, world) = released()?;
+        let miss = MissDistance { goal: goal(&model, &level)? };
+        let traj = kosm::step::rollout(&world, &plant(), &Zero, 300);
+        assert_eq!(traj.len(), 301);
+        let end = traj.last().unwrap();
+        let p = marble_at(end);
+        kosm::snapshot::assert_close(
+            "marble/released_300",
+            &[p.x, p.y, p.z, miss.see(end)],
+            1e-6,
+        )
+    }
+
+    /// A batch of eight identical worlds steps to eight identical worlds,
+    /// and every one of them equals the single step. Rayon does not change
+    /// the answer.
+    #[test]
+    fn a_batch_is_the_singles_it_is_made_of() -> anyhow::Result<()> {
+        let (_, _, world) = released()?;
+        let plant = plant();
+        let one = plant.step(&world, &kosm::step::Action::none());
+        for w in kosm::step::step_batch(&plant, &world.repeat(8), &[]) {
+            assert!(kosm::diff::diff(&one, &w).is_within(0.0));
+        }
+        Ok(())
+    }
 }

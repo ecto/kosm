@@ -52,7 +52,7 @@ fn collect(dir: &Path, path: &str, module: &str, table: &mut Vec<(String, String
     }
 }
 
-/// The sim directories directly inside `dir`, sorted, skipping `.` and `_`.
+/// The sim directories directly inside `dir`, sorted, skipping dotfiles.
 fn dirs(dir: &Path) -> Vec<(PathBuf, String)> {
     let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
     let mut out: Vec<(PathBuf, String)> = entries
@@ -61,7 +61,7 @@ fn dirs(dir: &Path) -> Vec<(PathBuf, String)> {
         .filter(|p| p.is_dir())
         .filter_map(|p| {
             let name = p.file_name()?.to_str()?.to_owned();
-            (!name.starts_with('.') && !name.starts_with('_') && entry_file(&p).is_some())
+            (!name.starts_with('.') && entry_file(&p).is_some())
                 .then_some((p, name))
         })
         .collect();
