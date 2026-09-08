@@ -1,6 +1,6 @@
 //! The GPU solver against the CPU solver from the same state.
-use kosm_spike::pool::MELON_AXES;
-use kosm_spike::splash::{Body, Water};
+use kosm::pool::MELON_AXES;
+use kosm::splash::{Body, Water};
 use phyz_math::Vec3;
 
 fn rms(a: &[Vec3], b: &[Vec3]) -> (f64, f64) {
@@ -48,7 +48,7 @@ fn one_and_many_substeps() {
         let p = cpu.x[wi];
         let (mut far_cnt, mut far_sum) = (0usize, 0.0);
         for (a, b, x) in cpu.v.iter().zip(&gpu.v).zip(&cpu.x).map(|((a, b), x)| (a, b, x)) {
-            if x.x.hypot(x.y) > kosm_spike::pool::box_half() - 0.15 { far_cnt += 1; far_sum += (*a - *b).norm_squared(); }
+            if x.x.hypot(x.y) > kosm::pool::box_half() - 0.15 { far_cnt += 1; far_sum += (*a - *b).norm_squared(); }
         }
         println!("      worst particle at r={:.3} z={:.3}; rms dv within 15 cm of the edge {:.2e} ({far_cnt} particles)", p.x.hypot(p.y), p.z, (far_sum / far_cnt.max(1) as f64).sqrt());
         let gm: f64 = gpu.g_mass.iter().sum();
@@ -179,7 +179,7 @@ fn settled_density_gpu() {
     // and the same for the particles, by |x|/POOL_X
     let mut px = vec![0usize; 10];
     for p in &w.x {
-        let f = (p.x.abs() / kosm_spike::pool::POOL_X).min(0.999);
+        let f = (p.x.abs() / kosm::pool::POOL_X).min(0.999);
         px[(f * 10.0) as usize] += 1;
     }
     println!("particles by |x|/POOL_X decile: {:?}", px.iter().map(|c| c * 100 / w.x.len()).collect::<Vec<_>>());

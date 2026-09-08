@@ -20,7 +20,7 @@
 //! deterministic: the frame the renderer aims at is the frame the simulation
 //! would have reached anyway, computed early. Paused, the head start is zero.
 //! `KOSM_NO_LOOKAHEAD=1` puts the old pace back for comparison. The picture is the court's own,
-//! `kosm_spike::court::render`: the level's roots evaluated by vcad into BRep
+//! `kosm::court::render`: the level's roots evaluated by vcad into BRep
 //! solids with one BVH each, materials by root name, the balls and the net
 //! placed where phyz has them, the panels as area lights. This file owns the
 //! window's camera and the pace; nothing here describes a shape or a material.
@@ -71,8 +71,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kosm_spike::court::render::{self, Snapshot};
-use kosm_spike::court::{Court, CourtScene};
+use kosm::court::render::{self, Snapshot};
+use kosm::court::{Court, CourtScene};
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
@@ -978,7 +978,7 @@ pub fn dump_dataset(
     reference_spp: u32,
     seed: u64,
 ) -> anyhow::Result<()> {
-    use kosm_spike::court::denoise::dataset as ds;
+    use kosm::court::denoise::dataset as ds;
 
     let scene = CourtScene::bundled()?;
     let stage = render::Scene::new(&scene)?;
@@ -1156,8 +1156,8 @@ pub fn dump_dataset(
 }
 
 /// The device history, packed for the dataset.
-fn frame_state(h: &kosm_render::gpu::History) -> kosm_spike::court::denoise::dataset::FrameState {
-    use kosm_spike::court::denoise::dataset as ds;
+fn frame_state(h: &kosm_render::gpu::History) -> kosm::court::denoise::dataset::FrameState {
+    use kosm::court::denoise::dataset as ds;
     ds::FrameState {
         mean: ds::to_f16(&h.rgb),
         count: ds::to_f16(&h.count.iter().map(|&c| c as f32).collect::<Vec<_>>()),

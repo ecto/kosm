@@ -1,8 +1,8 @@
 //! What each of the court's roots costs to turn into geometry, both ways:
 //! evaluated to one solid with vcad's booleans, and walked to the placed
 //! primitives it is a union of.
-use kosm_spike::court::render::instances::{instances, Prims};
-use kosm_spike::court::CourtScene;
+use kosm::court::render::instances::{instances, Prims};
+use kosm::court::CourtScene;
 
 fn main() {
     let scene = CourtScene::bundled().unwrap();

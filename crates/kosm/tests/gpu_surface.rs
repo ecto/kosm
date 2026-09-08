@@ -1,7 +1,7 @@
 //! The surface and the caustic, on the GPU against the CPU reference.
 
-use kosm_spike::pool::{self, Surface};
-use kosm_spike::splash::{HeightGrid, Water};
+use kosm::pool::{self, Surface};
+use kosm::splash::{HeightGrid, Water};
 
 #[test]
 fn surface_matches_the_cpu() {

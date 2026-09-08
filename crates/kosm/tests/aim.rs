@@ -6,7 +6,7 @@
 //! agree with central differences on both channels, `dJ/d(release point)` and
 //! `dJ/d(release velocity)`. Second, that the solve does its job: a short free
 //! throw, a miss in the production simulator, comes back a make.
-use kosm_spike::court::{Court, CourtScene, Shot, aim};
+use kosm::court::{Court, CourtScene, Shot, aim};
 
 #[test]
 fn the_adjoint_is_the_derivative_in_free_flight() {

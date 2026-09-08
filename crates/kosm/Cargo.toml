@@ -1,5 +1,5 @@
 [package]
-name = "kosm-spike"
+name = "kosm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

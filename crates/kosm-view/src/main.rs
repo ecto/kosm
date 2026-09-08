@@ -22,7 +22,7 @@
 //! `atrous` is the default and is the hand-tuned wavelet in `history.wgsl`;
 //! `neural` is a small kernel-predicting network fitted to 1024-spp reference
 //! renders of this court, embedded in the binary. `neural=weights.bin` runs a
-//! different fit, which is how `kosm-spike`'s `denoise_dataset` example's
+//! different fit, which is how `kosm`'s `denoise_dataset` example's
 //! output gets looked at without a rebuild.
 //!
 //! It opens live: the simulation runs in wall-clock time and the window shows

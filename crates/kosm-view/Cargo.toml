@@ -6,7 +6,7 @@ license.workspace = true
 description = "The window: a wgpu surface, a blitted image, and nothing else on it"
 
 [dependencies]
-kosm-spike = { path = "../kosm-spike" }
+kosm = { path = "../kosm" }
 kosm-render = { path = "../kosm-render", features = ["gpu"] }
 # the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
 wgpu = "30"

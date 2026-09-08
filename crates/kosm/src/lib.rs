@@ -1,4 +1,4 @@
-//! kosm-spike as a library: the marble, the lamp, the frame, the glass, the
+//! kosm as a library: the marble, the lamp, the frame, the glass, the
 //! pool and the splash, so the viewer and the CLI share one implementation.
 pub mod analytic;
 pub mod audio;

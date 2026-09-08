@@ -11,8 +11,8 @@
 //!    reached by running the deterministic sim on, is the same state as
 //!    stepping straight to that time.
 
-use kosm_spike::court::render::Snapshot;
-use kosm_spike::court::{Court, CourtScene};
+use kosm::court::render::Snapshot;
+use kosm::court::{Court, CourtScene};
 
 fn scene() -> CourtScene {
     CourtScene::bundled().expect("the bundled court scene")

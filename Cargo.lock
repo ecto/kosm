@@ -1545,30 +1545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
-name = "kosm-mpm"
-version = "0.0.1"
-dependencies = [
- "bytemuck",
- "pollster 0.4.0",
- "wgpu 30.0.1",
-]
-
-[[package]]
-name = "kosm-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "js-sys",
- "pollster 0.4.0",
- "rayon",
- "tang",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wgpu 30.0.1",
-]
-
-[[package]]
-name = "kosm-spike"
+name = "kosm"
 version = "0.0.1"
 dependencies = [
  "anyhow",
@@ -1607,6 +1584,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosm-mpm"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "pollster 0.4.0",
+ "wgpu 30.0.1",
+]
+
+[[package]]
+name = "kosm-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "pollster 0.4.0",
+ "rayon",
+ "tang",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu 30.0.1",
+]
+
+[[package]]
 name = "kosm-view"
 version = "0.0.1"
 dependencies = [
@@ -1616,8 +1616,8 @@ dependencies = [
  "egui",
  "image",
  "ipse-map",
+ "kosm",
  "kosm-render",
- "kosm-spike",
  "log",
  "phyz-math",
  "pollster 0.4.0",

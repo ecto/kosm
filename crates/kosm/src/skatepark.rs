@@ -501,7 +501,7 @@ pub fn roll_from(scene: &SkateparkScene, sdf: &SdfGrid, c0: Vec3, v0: Vec3, t_en
 /// shoved toward the +x transition.
 pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
     format!(
-        "# written by kosm-spike --skatepark; run from the ipse checkout.\n\
+        "# written by kosm --skatepark; run from the ipse checkout.\n\
          # `objects/skateboard` is the board rigbake writes.\n\
          name = \"skatepark — mini ramp\"\n\
          notes = \"Stand on the board on the flat, take a push toward the +x transition, ride it.\"\n\
@@ -535,7 +535,7 @@ pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
     )
 }
 
-/// `kosm-spike --skatepark [level]`: bake, check, report.
+/// `kosm --skatepark [level]`: bake, check, report.
 pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     let scene = SkateparkScene::load(level)?;
     for w in &scene.authored.warnings {

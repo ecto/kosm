@@ -2,13 +2,13 @@
 //! slab and the stanchion, and a rim's radius from the rod under the hoop.
 //!
 //! The full map is 1.2 GB and ten minutes of exact distances, which is the
-//! CLI's job (`kosm-spike --court-bake`). The test bakes the same level at the
+//! CLI's job (`kosm --court-bake`). The test bakes the same level at the
 //! same cell against the same collision mesh, over a small box around each
 //! probe — `bake_sdf_within` is the function the bake calls — and writes one
 //! small map through `bake_parts` to check the files and the manifest.
 
-use kosm_spike::court::bake::{self, CourtBake};
-use kosm_spike::skatepark::{self, BakeOpts};
+use kosm::court::bake::{self, CourtBake};
+use kosm::skatepark::{self, BakeOpts};
 use phyz_math::Vec3;
 
 /// A half-metre box of field around `p`, at the level's own cell.

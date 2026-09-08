@@ -1,7 +1,7 @@
 //! The court on the GPU: the same picture, traced by `vcad-kernel-raytrace`'s
 //! compute shader instead of its CPU integrator.
 //!
-//! Nothing about the *scene* is decided here either. `kosm_spike::court::render`
+//! Nothing about the *scene* is decided here either. `kosm::court::render`
 //! still owns what the court is made of — which roots, which materials, where
 //! the balls are, which panels are lights — and this module only packs that
 //! into the buffers the shader reads. Every solid is packed once, with
@@ -92,7 +92,7 @@ use std::time::{Duration, Instant};
 
 use kosm_render::caustics::CausticMap;
 use kosm_render::gpu::{InstanceMotion, SampleBudget};
-use kosm_spike::court::render::{self, Snapshot};
+use kosm::court::render::{self, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_math::{Point3, Transform};
@@ -297,7 +297,7 @@ const BUNDLED_WEIGHTS: &[u8] = include_bytes!("../assets/denoise-court.bin");
 /// `--denoise atrous` (the default) is the a-trous wavelet chain in
 /// `history.wgsl`. `--denoise neural` is the network in
 /// `kosm_render::gpu::neural`, trained on this court's own reference renders
-/// by kosm-spike's `denoise_dataset` example; `--denoise neural=PATH` runs a
+/// by kosm's `denoise_dataset` example; `--denoise neural=PATH` runs a
 /// different set of weights, which is how a new fit is looked at without a
 /// rebuild.
 fn neural_weights_from_args() -> anyhow::Result<Option<Weights>> {

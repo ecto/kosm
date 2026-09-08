@@ -113,7 +113,7 @@ pub fn bake(court: &CourtBake, dir: &Path) -> anyhow::Result<Baked> {
 /// A scenario ipse's runner can take as is: the K1 at centre court, standing.
 pub fn scenario_toml(court: &CourtBake, map_dir: &Path) -> String {
     format!(
-        "# written by kosm-spike --court-bake; run from the ipse checkout.\n\
+        "# written by kosm --court-bake; run from the ipse checkout.\n\
          name = \"court — centre court\"\n\
          notes = \"Stand at centre court on the baked hardwood for six seconds. No board, no shove: the floor is the test.\"\n\
          \n\
@@ -129,7 +129,7 @@ pub fn scenario_toml(court: &CourtBake, map_dir: &Path) -> String {
     )
 }
 
-/// `kosm-spike --court-bake [level]`: bake, sample, report.
+/// `kosm --court-bake [level]`: bake, sample, report.
 pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     let court = CourtBake::load(level)?;
     for w in &court.authored.warnings {

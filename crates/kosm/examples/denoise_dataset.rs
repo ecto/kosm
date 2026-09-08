@@ -4,7 +4,7 @@
 //! # the expensive half, and it needs a GPU, so it lives in the viewer:
 //! cargo run --release -p kosm-view -- --dump-dataset target/denoise-v2.bin
 //!
-//! cargo run --release -p kosm-spike --example denoise_dataset -- \
+//! cargo run --release -p kosm --example denoise_dataset -- \
 //!     train --data target/denoise-v2.bin --out target/denoise-court.bin
 //! ```
 //!
@@ -17,7 +17,7 @@
 
 use std::time::Instant;
 
-use kosm_spike::court::denoise::{dataset, kpn::Kpn, train};
+use kosm::court::denoise::{dataset, kpn::Kpn, train};
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()

@@ -1,4 +1,4 @@
-use kosm_spike::pool::{self, Drop};
+use kosm::pool::{self, Drop};
 #[test]
 fn surface_across_the_box_edge() {
     let mut d = Drop::new(1.3).with_water(0.05);
@@ -16,8 +16,8 @@ fn surface_across_the_box_edge() {
 
 #[test]
 fn caustic_of_flat_water_is_one() {
-    use kosm_spike::pool::{caustic, Surface};
-    use kosm_spike::splash::HeightGrid;
+    use kosm::pool::{caustic, Surface};
+    use kosm::splash::HeightGrid;
     let flat = |cell: f64, half: f64| HeightGrid { origin: [-half, -half], cell, nx: (2.0 * half / cell) as usize, ny: (2.0 * half / cell) as usize, z: vec![0.0; ((2.0 * half / cell) as usize).pow(2)] };
     for (name, s) in [
         ("flat grid + flat far, t=0", Surface { rings: Vec::new(), t: 0.0, grid: Some(flat(0.02, 1.0)), far: Some(flat(0.1, 25.0)) }),
@@ -58,7 +58,7 @@ fn seam_profile_at_impact() {
     println!("box half {half}  sponge {}  blend {}", pool::SPONGE, pool::BLEND);
     {
         let w = d.water.as_ref().unwrap();
-        let mean = |g: &kosm_spike::splash::HeightGrid| g.z.iter().sum::<f64>() / g.z.len() as f64;
+        let mean = |g: &kosm::splash::HeightGrid| g.z.iter().sum::<f64>() / g.z.len() as f64;
         println!("level_offset {:.4}  rest map: {}  fine grid mean {:.4}  fine at centre {:.4}  cpu-extracted (synced) at centre {:.4}",
             w.level_offset,
             w.rest.as_ref().map(|r| format!("{}x{} mean {:.4}", r.nx, r.ny, mean(r))).unwrap_or("none".into()),
@@ -86,7 +86,7 @@ fn seam_profile_at_impact() {
 
 #[test]
 fn far_field_conserves_energy() {
-    use kosm_spike::far::Far;
+    use kosm::far::Far;
     let mut far = Far::new(0.1);
     // a Gaussian bump, 2 cm high, 30 cm wide, released from rest
     let (nx, cell) = (far.grid.nx, far.grid.cell);
@@ -126,7 +126,7 @@ fn far_field_conserves_energy() {
 
 #[test]
 fn far_fft_speed() {
-    use kosm_spike::far::Far;
+    use kosm::far::Far;
     let mut far = Far::new(0.1);
     far.grid.z[1000] = 0.01;
     let t = std::time::Instant::now();
@@ -143,8 +143,8 @@ fn far_fft_speed() {
 
 #[test]
 fn settled_water_energy_is_steady() {
-    use kosm_spike::pool::MELON_AXES;
-    use kosm_spike::splash::{Body, Water};
+    use kosm::pool::MELON_AXES;
+    use kosm::splash::{Body, Water};
     use phyz_math::Vec3;
     let h = 0.05;
     let bulk = 2.0e6;
@@ -162,7 +162,7 @@ fn settled_water_energy_is_steady() {
     let (k0, p0, i0) = w.energy();
     let zmean = w.x.iter().map(|p| p.z).sum::<f64>() / w.x.len() as f64;
     let jmean = w.j.iter().sum::<f64>() / w.j.len() as f64;
-    println!("settled (flip {} relax {}): kinetic {k0:.2} J  potential {p0:.1} J  internal {i0:.2} J  z mean {zmean:.3} (rest -1.0)  J mean {jmean:.4}", w.flip, kosm_spike::splash::j_relax());
+    println!("settled (flip {} relax {}): kinetic {k0:.2} J  potential {p0:.1} J  internal {i0:.2} J  z mean {zmean:.3} (rest -1.0)  J mean {jmean:.4}", w.flip, kosm::splash::j_relax());
     let mut worst: f64 = 0.0;
     for n in 1..=10 {
         w.step_block(&far, 256);

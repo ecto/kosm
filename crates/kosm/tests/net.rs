@@ -1,5 +1,5 @@
 //! The net: it hangs, and a made shot goes through it.
-use kosm_spike::court::{Court, CourtScene};
+use kosm::court::{Court, CourtScene};
 
 /// Left alone, the net hangs from the rim at the length it was cut to: the
 /// lowest node within a few centimetres of rim − net_length, no cord stretched

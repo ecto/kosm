@@ -1,4 +1,4 @@
-//! Command selection for the `kosm-spike` binary.
+//! Command selection for the `kosm` binary.
 //!
 //! Keep process arguments at the composition root. Simulation code receives a
 //! typed command instead of repeatedly querying `std::env::args`.

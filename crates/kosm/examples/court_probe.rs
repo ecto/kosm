@@ -1,5 +1,5 @@
 //! What the court's picture is made of, and how long a small one takes.
-use kosm_spike::court::{render, Court, CourtScene};
+use kosm::court::{render, Court, CourtScene};
 fn main() {
     let scene = CourtScene::bundled().unwrap();
     let court = Court::from_scene(&scene).unwrap();

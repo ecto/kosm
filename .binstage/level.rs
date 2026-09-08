@@ -1,11 +1,11 @@
 //! Marble-specific interpretation of an authored scene.
 
-use kosm_spike::scene::AuthoredScene;
+use kosm::scene::AuthoredScene;
 use phyz_math::{Mat3, SpatialTransform, Vec3};
 use vcad_ir::{CsgOp, Document, Node};
 
 pub(crate) const DT: f64 = 1e-3;
-pub(crate) use kosm_spike::scene::MM;
+pub(crate) use kosm::scene::MM;
 pub(crate) type Level = AuthoredScene;
 
 pub(crate) trait MarbleLevel {
