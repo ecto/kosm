@@ -11,9 +11,24 @@ resolves its parameters, converts authored millimetres at the computation edge,
 and can write solved parameters back. Marble and pool then attach different
 computations to that source; they do not share an artificial simulation loop.
 
-## the marble (`crates/kosm-spike`)
+The tree: `crates/kosm` is the engine (worlds, colliders, materials, audio,
+light, `brep`, `denoise`, `fluid`), `crates/kosm-render` the camera lens,
+`crates/kosm-mpm` the GPU fluid, `crates/kosm-view` the window as a library,
+and `crates/kosm-cli` the `kosm` binary. `sims/` is the content: a directory
+under it is a sim, its path is its name, and `crates/kosm-cli/build.rs` walks
+the tree so nothing is listed by hand.
 
-The first spike. The level is [`levels/marble.loon`](levels/marble.loon):
+```
+kosm list                    # the tree
+kosm run court               # frames into out/
+kosm run court --out frames  # somewhere else
+kosm run skatepark/warehouse # a nested sim
+kosm run court --view        # a window (needs --features view)
+```
+
+## the marble (`sims/marble`)
+
+The first spike. The level is [`sims/marble/marble.loon`](sims/marble/marble.loon):
 geometry in vcad's loon vocabulary, knobs as `defparam`s (tilt, release point,
 marble, horizon). Everything else is derived from that one file:
 
@@ -26,10 +41,10 @@ marble, horizon). Everything else is derived from that one file:
 - `out/marble.wav`: the hinted run, heard — modal synthesis in a room, no samples
 
 ```bash
-cargo run --release -p kosm-spike            # or: kosm-spike levels/other.loon
+cargo run --release -p kosm-cli -- run marble   # or: kosm run marble other.loon
 open out/track.svg out/frame_before.png out/frame_hint.png out/frame_tilted.png
 afplay out/marble.wav
-diff levels/marble.loon out/solved/marble.loon   # the solved knobs, written back
+diff sims/marble/marble.loon out/solved/marble.loon   # the solved knobs, written back
 ```
 
 The document is the only description of the geometry. `colliders.rs` walks
@@ -39,7 +54,7 @@ fixed track body, and checks every collider's support function against the
 tessellation before the first step. Plate, walls and cup are all real colliders;
 the cup is a ring of box segments with a mouth facing uphill so it catches.
 
-### a cup that is actually hollow ([`levels/marble-cup.loon`](levels/marble-cup.loon))
+### a cup that is actually hollow ([`sims/marble/marble-cup.loon`](sims/marble/marble-cup.loon))
 
 A ring of box segments is a union of convex primitives, which is what a phyz
 collider is. Modelled the way a person would actually model it — a cylinder with
@@ -64,7 +79,7 @@ support test. The support test only ever sees the outside of the level, where a
 cup and a puck are the same shape — it is exactly blind to this bug.
 
 ```bash
-cargo run --release -p kosm-spike levels/marble-cup.loon
+cargo run --release -p kosm-cli -- run marble sims/marble/marble-cup.loon
 ```
 
 The cup comes out as 24 wedges reaching 0.376 mm into the bore, and the marble
@@ -115,8 +130,8 @@ for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 
 ### the pool
 
-`kosm-spike --pool [frames]` drops a watermelon into the authored scene
-[`levels/pool.loon`](levels/pool.loon) (`pool.rs`). Drop height, melon geometry
+`kosm run pool --frames N` drops a watermelon into the authored scene
+[`sims/pool/pool.loon`](sims/pool/pool.loon) (`sims/pool/`). Drop height, melon geometry
 and density, water parameters, and recording cadence come from that scene.
 Typed pool geometry is carried through rigid dynamics, snapshots, and both the
 reference and live renderers. The fine-water/far-field solver still requires the
@@ -200,7 +215,7 @@ placed spheres of the same water.
 
 ### the splash
 
-`kosm-spike --splash [frames]` runs the same drop with the water simulated
+`kosm run pool --splash --frames N` runs the same drop with the water simulated
 (`splash.rs`): a dense-grid MLS-MPM for weakly compressible water over the
 whole pool, APIC transfer with a FLIP blend, and the thing phyz-particle's
 reference solver lacks, a rigid collider that pushes back. Grid nodes inside
@@ -274,8 +289,8 @@ contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.
 
 ### the court
 
-`kosm-spike --court [frames]` is a gym: the authored scene
-[`levels/court.loon`](levels/court.loon) (`court/`) has a maple slab, a
+`kosm run court --frames N` is a gym: the authored scene
+[`sims/court/court.loon`](sims/court/court.loon) (`sims/court/`) has a maple slab, a
 regulation hoop at one end — backboard, a rim of 24 rod segments, bracket, arm
 and pole, all vcad geometry derived into colliders the same way the marble
 track is — and basketballs that are phyz free bodies. Three are dropped from
@@ -415,10 +430,10 @@ hoop, the gym, the lights, the camera, the sample counts, the denoiser — is a
 simulator.
 
 ```bash
-cargo run --release -p kosm-spike -- --court          # out/court.mp4, out/court_still.png
-KOSM_SPP=4 cargo run --release -p kosm-spike -- --court 30   # a quick look
-cargo run --release -p kosm-spike --example court_trace      # one ball, height and speed through each impact
-diff levels/court.loon out/hinted/court.loon                 # the aimed shot, written back
+cargo run --release -p kosm-cli -- run court          # out/court.mp4, out/court_still.png
+KOSM_SPP=4 cargo run --release -p kosm-cli -- run court --frames 30  # a quick look
+cargo run --release -p kosm-cli --example court_trace      # one ball, height and speed through each impact
+diff sims/court/court.loon out/hinted/court.loon                 # the aimed shot, written back
 ```
 
 The balls did not bounce until phyz did. Its soft contact is a resting-contact
@@ -439,12 +454,12 @@ rather than a guard on the measured shortfall.
 
 ### the skatepark
 
-`kosm-spike --skatepark [level]` is a training level for the Booster K1 in
+`kosm run skatepark` is a training level for the Booster K1 in
 `../ipse`, which already has the skateboard rig and a K1 that rides it on a
 flat floor. Its terrain is an `ipse-map` directory — a collision mesh and a
 signed-distance grid baked from it — that a scenario file points at, so the
 park is authored here as vcad geometry
-([`levels/skatepark.loon`](levels/skatepark.loon): a mini ramp, one solid, the
+([`sims/skatepark/skatepark.loon`](sims/skatepark/skatepark.loon): a mini ramp, one solid, the
 transition radius, lip, width, flat, deck and coping as `defparam`s) and
 baked with ipse-map's own baker into `out/maps/skatepark/` (`mesh.stl`,
 `sdf.bin`, `map.toml`, `park.svg`, and a `scenario.toml` that stands the K1
@@ -473,7 +488,7 @@ the start-of-step frame, and turns the solved velocity into the end-of-step
 frame exactly afterwards; the adjoint carries the turn's tangent. Tests:
 `phyz/tests/spinning_free_body.rs`, `ipse-map` `sdf::tests::outside_is_none`.
 
-`levels/warehouse.loon` is the same machinery at level scale: THPS1's first
+`sims/skatepark/warehouse/warehouse.loon` (`kosm run skatepark/warehouse`) is the same machinery at level scale: THPS1's first
 level scaled to the K1 inside a 16 × 9 m shed — half pipe, mezzanine, two
 quarter pipes either side of an open door, a platform, a bent rail, kickers,
 box piles, a ledge, and the building itself. One root per piece, each with a
@@ -489,8 +504,8 @@ the ride recorder draws the level from those rather than from one grey mesh.
 and the rail against the radius the field puts around its axis.
 
 ```bash
-cargo run --release -p kosm-spike -- --skatepark
-cargo run --release -p kosm-spike -- --skatepark levels/warehouse.loon
+cargo run --release -p kosm-cli -- run skatepark
+cargo run --release -p kosm-cli -- run skatepark/warehouse
 open out/maps/skatepark/park.svg
 cd ../ipse && cargo run -p ipse-sim --bin train -- ../kosm/out/maps/skatepark/scenario.toml
 ```
@@ -534,7 +549,7 @@ rung through a 100 µs contact.
 
 ## the window
 
-`cargo run --release -p kosm-view` opens the court in a bare 3D viewport: a
+`cargo run --release -p kosm-cli --features view -- run court --view` opens the court in a bare 3D viewport: a
 winit window, a wgpu surface, and one RGBA8 image blitted across it by a
 twenty-line shader. There is no UI — no panels, no text, no timeline widget,
 no inspector. Anything on screen is the scene's own picture. Controls are the
@@ -1150,7 +1165,7 @@ The geometry stayed with the geometry too. `intersect/` (plane, cylinder,
 sphere, cone, torus, bilinear, B-spline) and `trim.rs` are still vcad's,
 because knowing that a ray-sphere hit at *(u, v)* falls outside a trimmed
 face's boundary loop is a B-rep fact, not a lighting one.
-Kosm's own tracers are clients too. `kosm-spike/src/analytic.rs` implements the
+Kosm's own tracers are clients too. `kosm/src/analytic.rs` implements the
 trait over the marble level's phyz colliders — box, sphere, cylinder — so the
 marble's beauty pass is the same integrator the court's is. And Snell, Fresnel
 and Sellmeier moved *into* the renderer as `kosm_render::optics`, generic over
@@ -1428,7 +1443,7 @@ estimation found a blocker, returned black, and the only way light got into a
 glazed room was a BSDF path that happened to refract through the pane and then
 wander into the sun's 0.27° cone. That is one ray in tens of thousands, which
 over the passes a frame gets is salt-and-pepper, not daylight — and it is why
-`levels/court.loon` had its clerestory band cut open as a *hole* for a while,
+`sims/court/court.loon` had its clerestory band cut open as a *hole* for a while,
 with a comment saying so.
 
 A thin sheet is not a blocker, it is a filter. `occluded` is now
@@ -1813,7 +1828,7 @@ tracer is ours, and a 1024-spp render of the court is exact ground truth we can
 make as much of as we are willing to wait for. So: sample the level, render
 each sample noisy *and* converged, and fit a filter to the difference.
 
-**The dataset** (`kosm-spike`, `examples/denoise_dataset.rs`). Fifty (camera,
+**The dataset** (`kosm`, `examples/denoise_dataset.rs`). Fifty (camera,
 time) states — the authored camera orbited through a full circle of azimuth,
 ±0.25/0.45 rad of elevation and 0.7–1.35× its distance, at a random instant of
 the first four seconds of the shot. Each rendered at 320×180 sixteen times at
@@ -1870,7 +1885,7 @@ The pass reads the history's running mean, its per-pixel statistics and the
 scene's guide planes, and writes into the same `(illumination, variance)`
 scratch buffer the wavelet iterations write, so `resolve` remodulates and
 tonemaps without knowing which filter ran. `tests/gpu_neural.rs` pins the WGSL
-against the Rust reference forward to 2e-3 relative, and a test in `kosm-spike`
+against the Rust reference forward to 2e-3 relative, and a test in `kosm`
 pins the *trainer's* forward against that same reference — three
 implementations of one network, and the weight file means the same thing to all
 three.
@@ -1930,7 +1945,7 @@ description of a Monte Carlo estimator and it is not what the viewer hands the
 denoiser. v2 changes the dataset and leaves the network nearly alone.
 
 **The dataset is the device's own history** (`kosm-view --dump-dataset`, read
-by `court::denoise::dataset`). Generation moved out of `kosm-spike` entirely,
+by `kosm::denoise::dataset`). Generation moved out of `kosm` entirely,
 because only the thing that drives the GPU can produce what the GPU pass is
 handed. A sequence is one (camera, time) state and one *history length*: the
 court is driven frame by frame exactly as `--dump-frames` drives it — the
@@ -2097,7 +2112,7 @@ is a bilinear patch rather than two triangles. The patch is the right call
 twice over: the ray–patch equation is a plain quadratic in `t` (surface and
 ray are both linear in `x` and `y`, so their difference is degree two), so a
 hit point lands on the interpolated surface to machine precision instead of to
-a triangulation's chord error; and `kosm-spike`'s pool already marches
+a triangulation's chord error; and the pool sim already marches
 `p.z - surface.height(p.x, p.y)` against a *bilinear* sample of that same
 grid, so triangles would have had the renderer and the simulator looking at
 two different sheets of water.
