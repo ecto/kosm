@@ -1584,6 +1584,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosm-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hound",
+ "image",
+ "ipse-map",
+ "kosm",
+ "kosm-mpm",
+ "kosm-render",
+ "kosm-view",
+ "phyz",
+ "phyz-camera",
+ "phyz-collision",
+ "phyz-contact",
+ "phyz-diff",
+ "phyz-math",
+ "phyz-model",
+ "phyz-rigid",
+ "phyz-world",
+ "rayon",
+ "rustfft",
+ "tang",
+ "tang-3dgs",
+ "vcad",
+ "vcad-eval",
+ "vcad-ir",
+ "vcad-kernel",
+ "vcad-kernel-acoustics",
+ "vcad-kernel-export",
+ "vcad-kernel-math",
+ "vcad-kernel-optics",
+ "vcad-kernel-primitives",
+ "vcad-kernel-raytrace",
+ "vcad-loon",
+ "vcad-render",
+]
+
+[[package]]
 name = "kosm-mpm"
 version = "0.0.1"
 dependencies = [

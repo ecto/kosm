@@ -1,7 +1,7 @@
 //! The skatepark, baked and rolled on: the field is the arc, and a rolling
 //! sphere on that field obeys 10/7 · g · Δ.
 
-use kosm::skatepark::{self, SkateparkScene};
+use crate::skatepark::{self, SkateparkScene};
 
 #[test]
 fn the_field_is_the_arc_and_the_wheel_rolls_as_predicted() {

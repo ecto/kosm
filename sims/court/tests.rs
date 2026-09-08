@@ -1,6 +1,6 @@
 //! The rulebook's inflation test, in the simulator: a ball dropped from 1.8 m
 //! with restitution e comes back to e² of that, and keeps doing so.
-use kosm::court::{Court, CourtScene};
+use crate::court::{Court, CourtScene};
 
 #[test]
 fn a_dropped_ball_bounces_to_e_squared() {

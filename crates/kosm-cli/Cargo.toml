@@ -1,0 +1,49 @@
+[package]
+name = "kosm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kosm's front door: the filesystem under sims/ is the registry"
+
+[lib]
+name = "kosm_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kosm"
+path = "src/main.rs"
+
+[dependencies]
+kosm = { path = "../kosm" }
+kosm-mpm = { path = "../kosm-mpm" }
+kosm-render = { path = "../kosm-render" }
+kosm-view = { path = "../kosm-view" }
+phyz.workspace = true
+phyz-math.workspace = true
+phyz-model.workspace = true
+phyz-rigid.workspace = true
+phyz-contact.workspace = true
+phyz-diff.workspace = true
+phyz-world.workspace = true
+phyz-camera.workspace = true
+phyz-collision.workspace = true
+vcad.workspace = true
+vcad-kernel.workspace = true
+vcad-eval.workspace = true
+vcad-ir.workspace = true
+vcad-loon.workspace = true
+vcad-kernel-export.workspace = true
+vcad-render.workspace = true
+vcad-kernel-acoustics.workspace = true
+vcad-kernel-optics.workspace = true
+vcad-kernel-raytrace.workspace = true
+vcad-kernel-math.workspace = true
+vcad-kernel-primitives.workspace = true
+ipse-map.workspace = true
+image.workspace = true
+hound.workspace = true
+tang.workspace = true
+tang-3dgs.workspace = true
+rayon = "1"
+rustfft = "6"
+anyhow = "1"

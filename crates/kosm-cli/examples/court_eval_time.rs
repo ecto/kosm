@@ -2,7 +2,7 @@
 //! evaluated to one solid with vcad's booleans, and walked to the placed
 //! primitives it is a union of.
 use kosm::brep::instances::{instances, Prims};
-use kosm::court::CourtScene;
+use kosm_cli::court::CourtScene;
 
 fn main() {
     let scene = CourtScene::bundled().unwrap();

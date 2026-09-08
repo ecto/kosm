@@ -30,9 +30,9 @@ use phyz_model::{Model, State};
 use rayon::prelude::*;
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
-use crate::garage::marble_model;
-use crate::materials;
-use crate::scene::{AuthoredScene, MM};
+use kosm::garage::marble_model;
+use kosm::materials;
+use kosm::scene::{AuthoredScene, MM};
 
 pub const DEFAULT_SKATEPARK_SCENE: &str = "skatepark.loon";
 
@@ -536,7 +536,7 @@ pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
 }
 
 /// `kosm --skatepark [level]`: bake, check, report.
-pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
+pub fn run_level(level: &Path, out: &Path) -> anyhow::Result<()> {
     let scene = SkateparkScene::load(level)?;
     for w in &scene.authored.warnings {
         eprintln!("skatepark warning: {w}");
@@ -592,4 +592,19 @@ pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     fs::write(&scenario, scenario_toml(&scene, &fs::canonicalize(&dir)?))?;
     println!("skatepark scenario: {}  (cd ../ipse && cargo run -p ipse-sim --bin train -- {})", scenario.display(), scenario.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests;
+
+/// The warehouse is the same park code over a different level.
+pub mod warehouse;
+
+/// `kosm run skatepark` — bake the park and ride it.
+pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    let level = args
+        .value("level")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path("skatepark.loon"));
+    run_level(&level, args.out())
 }

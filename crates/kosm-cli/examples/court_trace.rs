@@ -1,4 +1,4 @@
-use kosm::court::{Court, CourtScene};
+use kosm_cli::court::{Court, CourtScene};
 fn main() {
     let mut scene = CourtScene::bundled().unwrap();
     scene.n_balls = 1;

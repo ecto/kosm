@@ -6,7 +6,7 @@
 //! a wheel rolled at it leaves the ground above its lip. A rail is Ø 50 mm if
 //! the field a wheel would feel reads its radius on its axis.
 
-use kosm::skatepark::{self, SkateparkScene};
+use crate::skatepark::{self, SkateparkScene};
 use phyz_math::Vec3;
 
 #[test]

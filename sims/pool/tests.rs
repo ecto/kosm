@@ -1,4 +1,4 @@
-use kosm::pool::{self, Drop};
+use crate::pool::{self, Drop};
 #[test]
 fn surface_across_the_box_edge() {
     let mut d = Drop::new(1.3).with_water(0.05);
@@ -16,7 +16,7 @@ fn surface_across_the_box_edge() {
 
 #[test]
 fn caustic_of_flat_water_is_one() {
-    use kosm::pool::{caustic, Surface};
+    use crate::pool::{caustic, Surface};
     use kosm::splash::HeightGrid;
     let flat = |cell: f64, half: f64| HeightGrid { origin: [-half, -half], cell, nx: (2.0 * half / cell) as usize, ny: (2.0 * half / cell) as usize, z: vec![0.0; ((2.0 * half / cell) as usize).pow(2)] };
     for (name, s) in [
@@ -143,7 +143,7 @@ fn far_fft_speed() {
 
 #[test]
 fn settled_water_energy_is_steady() {
-    use kosm::pool::MELON_AXES;
+    use crate::pool::MELON_AXES;
     use kosm::splash::{Body, Water};
     use phyz_math::Vec3;
     let h = 0.05;

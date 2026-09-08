@@ -1,6 +1,6 @@
 //! Which of the court's root materials the physics owns.
 
-pub use crate::brep::PlacedSolid;
+pub use kosm::brep::PlacedSolid;
 
 /// Root materials that are appearance only: the physics leaves them out of
 /// the court body, the picture draws them. `ball` is the ball's own solid and

@@ -7,8 +7,8 @@
 //! probe — `bake_sdf_within` is the function the bake calls — and writes one
 //! small map through `bake_parts` to check the files and the manifest.
 
-use kosm::court::bake::{self, CourtBake};
-use kosm::skatepark::{self, BakeOpts};
+use crate::court::bake::{self, CourtBake};
+use crate::skatepark::{self, BakeOpts};
 use phyz_math::Vec3;
 
 /// A half-metre box of field around `p`, at the level's own cell.

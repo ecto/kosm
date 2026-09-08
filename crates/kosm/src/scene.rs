@@ -23,12 +23,16 @@ pub struct AuthoredScene {
 }
 
 impl AuthoredScene {
-    /// Resolve a scene shipped in the workspace's `levels` directory without
-    /// depending on the caller's working directory.
+    /// Resolve a `.loon` that ships beside its sim, without depending on the
+    /// caller's working directory. The sims tree is the search path: a file
+    /// named here is looked for anywhere under `sims/`, so `court.loon` is
+    /// found at `sims/court/court.loon` and `warehouse.loon` at
+    /// `sims/skatepark/warehouse/warehouse.loon`.
     pub fn bundled_path(name: impl AsRef<Path>) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../levels")
-            .join(name)
+        let name = name.as_ref();
+        let sims = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sims");
+        let leaf = name.file_name().unwrap_or(name.as_os_str());
+        find(&sims, leaf).unwrap_or_else(|| sims.join(name))
     }
 
     pub fn load_bundled(name: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -133,4 +137,19 @@ mod tests {
 
         assert_eq!(scene.millimetres("radius").unwrap(), 0.125);
     }
+}
+
+/// The first file named `leaf` anywhere under `dir`, breadth-first-ish.
+fn find(dir: &Path, leaf: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        } else if path.file_name() == Some(leaf) {
+            return Some(path);
+        }
+    }
+    dirs.sort();
+    dirs.iter().find_map(|d| find(d, leaf))
 }

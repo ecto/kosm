@@ -1028,7 +1028,7 @@ mod tests {
     /// bore and a slot, and the marble has to be able to get inside it.
     #[test]
     fn the_cup_level_leaves_its_cup_hollow() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../levels/marble-cup.loon");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sims/marble/marble-cup.loon");
         let src = std::fs::read_to_string(path).expect("level file");
         let d = derive(&src);
         assert!(d.warnings.is_empty(), "the cup should not have fallen back: {:?}", d.warnings);

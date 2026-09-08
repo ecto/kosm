@@ -21,12 +21,11 @@
 //!   - **tilt**: hold the release point, rotate the plate. Two scalars, central
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
-mod cli;
 mod level;
 
-use kosm_spike::{audio, colliders, court, frame, garage, glass, lamp, light, pool, room};
+use kosm::{audio, colliders, frame, garage, glass, lamp, light, room};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use level::{DT, Level, MM, MarbleLevel, Tilt, tilted};
 
@@ -367,27 +366,22 @@ fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::L
 
 // ---- main -------------------------------------------------------------------
 
-fn main() -> anyhow::Result<()> {
+/// `kosm run marble` — the level, the rollout, the gradients, the frame.
+pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     // Scene adapters resolve roles explicitly; provenance recovery would
     // re-evaluate large scenes once per parameter. This is before any threads.
     unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
-    match cli::Command::from_env()? {
-        cli::Command::Court { frames } => return court::run(Path::new("out"), frames, 0, 0),
-        cli::Command::Pool { frames, renderer } => {
-            return pool::run(Path::new("out"), frames, 1280, 720, false, renderer);
-        }
-        cli::Command::Splash { frames } => {
-            return pool::run(Path::new("out"), frames, 1280, 720, true, cli::PoolRenderer::Legacy);
-        }
-        cli::Command::Skatepark { level } => return kosm_spike::skatepark::run(&level, Path::new("out")),
-        cli::Command::CourtBake { level } => return court::bake::run(&level, Path::new("out")),
-        cli::Command::Splat { ply } => return garage::survey_splat(&ply, Path::new("out/splat"), 960, 720),
-        cli::Command::Marble { level } => run_marble(&level),
+    if let Some(ply) = args.value("splat") {
+        return garage::survey_splat(Path::new(ply), &args.out().join("splat"), 960, 720);
     }
+    let level = args
+        .positional()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path("marble.loon"));
+    run_marble(&level, args.out())
 }
 
-fn run_marble(level_path: &Path) -> anyhow::Result<()> {
-    let out = Path::new("out");
+fn run_marble(level_path: &Path, out: &Path) -> anyhow::Result<()> {
     let ctrl = |_: usize| DVec::zeros(6);
 
     // 1. the level: one loon file → document → STL, SVG, colliders

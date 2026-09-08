@@ -22,7 +22,7 @@ use std::path::Path;
 use phyz_math::Vec3;
 
 use super::{Hoop, parts};
-use crate::scene::{AuthoredScene, MM};
+use kosm::scene::{AuthoredScene, MM};
 use crate::skatepark::{self, BakeOpts, Baked, Part};
 
 pub const DEFAULT_COURT_LEVEL: &str = "levels/court.loon";

@@ -30,7 +30,7 @@ use phyz_math::{GRAVITY, Vec3};
 use vcad_kernel::Solid;
 use vcad_kernel_math::{Dir3, Transform};
 
-use crate::scene::MM;
+use kosm::scene::MM;
 
 use super::parts::PlacedSolid;
 use super::CourtScene;

@@ -4,7 +4,7 @@
 //! Renderers and viewers can retain it without retaining the mutable world.
 
 use super::{Foam, Melon, PoolGeometry, PoolSimulation, Surface};
-use crate::splash::Droplet;
+use kosm::splash::Droplet;
 use tang::Vec3 as V;
 
 #[derive(Clone)]

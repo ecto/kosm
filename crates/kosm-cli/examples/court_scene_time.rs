@@ -1,6 +1,6 @@
 //! What the court's whole picture costs to assemble: every root walked to its
 //! placed primitives, a BVH per distinct solid, the gym and the lights.
-use kosm::court::{render, CourtScene};
+use kosm_cli::court::{render, CourtScene};
 
 fn main() {
     let scene = CourtScene::bundled().unwrap();

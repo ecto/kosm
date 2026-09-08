@@ -2,14 +2,14 @@
 
 use std::path::Path;
 
-use crate::scene::AuthoredScene;
+use kosm::scene::AuthoredScene;
 
 use super::WaterConfig;
 
 pub const DEFAULT_POOL_SCENE: &str = "levels/pool.loon";
 const DEFAULT_POOL_FILE: &str = "pool.loon";
 
-pub use crate::fluid::PoolGeometry;
+pub use kosm::fluid::PoolGeometry;
 
 pub struct PoolScene {
     pub authored: AuthoredScene,
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn authored_dimensions_are_not_reference_only() {
-        let source = include_str!("../../../../levels/pool.loon")
+        let source = include_str!("pool.loon")
             .replace("[defparam pool_length_mm 50000.0]", "[defparam pool_length_mm 8000.0]")
             .replace("[defparam pool_width_mm 25000.0]", "[defparam pool_width_mm 4000.0]")
             .replace("[defparam pool_depth_mm 2000.0]", "[defparam pool_depth_mm 1250.0]");

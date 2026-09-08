@@ -22,18 +22,27 @@ use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
-use crate::colliders;
-use crate::scene::{AuthoredScene, MM};
+use kosm::colliders;
+use kosm::scene::{AuthoredScene, MM};
 
 pub mod net;
 pub mod aim;
 pub mod bake;
 pub mod parts;
 
-/// The picture is [`kosm::brep`](crate::brep) now; this keeps the old path.
-pub use crate::brep as render;
-/// The denoiser is [`kosm::denoise`](crate::denoise) now.
-pub use crate::denoise;
+#[cfg(test)]
+mod aim_tests;
+#[cfg(test)]
+mod bake_tests;
+#[cfg(test)]
+mod net_tests;
+#[cfg(test)]
+mod tests;
+
+/// The picture is [`kosm::brep`](kosm::brep) now; this keeps the old path.
+pub use kosm::brep as render;
+/// The denoiser is [`kosm::denoise`](kosm::denoise) now.
+pub use kosm::denoise;
 
 pub const DEFAULT_COURT_SCENE: &str = "court.loon";
 
@@ -412,7 +421,7 @@ impl Court {
 }
 
 /// Drop the balls, record, report the bounces against `e²`, encode.
-pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow::Result<()> {
+pub fn render_frames(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow::Result<()> {
     let evaluated = std::time::Instant::now();
     let scene = CourtScene::bundled()?;
     let evaluated = evaluated.elapsed();
@@ -619,4 +628,17 @@ pub fn snapshot(court: &Court) -> render::Snapshot {
         extras: court.extras.clone(),
         extra_vel: court.extra_vel.clone(),
     }
+}
+
+/// `kosm run court` — the frames, or `--bake` for the collider bake.
+pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    if args.flag("bake") {
+        let level = args
+            .value("level")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path(DEFAULT_COURT_SCENE));
+        return bake::run(&level, args.out());
+    }
+    let frames = args.value("frames").and_then(|v| v.parse().ok());
+    render_frames(args.out(), frames, 0, 0)
 }

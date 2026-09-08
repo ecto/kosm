@@ -1,5 +1,5 @@
 //! What the court's picture is made of, and how long a small one takes.
-use kosm::court::{render, Court, CourtScene};
+use kosm_cli::court::{render, Court, CourtScene};
 fn main() {
     let scene = CourtScene::bundled().unwrap();
     let court = Court::from_scene(&scene).unwrap();
@@ -14,7 +14,7 @@ fn main() {
         cam.aperture,
         cam.focus_dist
     );
-    let at = picture.at_snapshot(&kosm::court::snapshot(&court));
+    let at = picture.at_snapshot(&kosm_cli::court::snapshot(&court));
     println!("objects {} (statics + {} balls + {} extras)", at.objects.len(), court.bodies(), court.extras.len());
     let t = std::time::Instant::now();
     let film = render::render(&at, &cam, 96, 54, &render::options(&scene.authored, 4, 0));

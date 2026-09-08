@@ -34,6 +34,11 @@ use tang::Vec3 as V;
 // obeys, and they live in one place now.
 use kosm_render::optics::{fresnel, reflect, refract};
 
+#[cfg(test)]
+mod hydrostatic_tests;
+#[cfg(test)]
+mod tests;
+
 mod config;
 pub mod render;
 mod scene;
@@ -46,7 +51,7 @@ pub use snapshot::PoolSnapshot;
 // ---- the pool ---------------------------------------------------------------
 
 // the pool's reference dimensions and the fine region are `kosm::fluid`
-pub use crate::fluid::{
+pub use kosm::fluid::{
     ABSORB, BLEND, BOX_DEPTH, COPING, DEPTH, N_WATER, POOL_X, POOL_Y, SPONGE, box_half, fps,
     region_inset,
 };
@@ -61,12 +66,12 @@ const WATER_DENSITY: f64 = 1000.0;
 
 // ---- the sun ----------------------------------------------------------------
 
-pub use crate::fluid::{SUN_IRRADIANCE, sun_dir};
+pub use kosm::fluid::{SUN_IRRADIANCE, sun_dir};
 const SUN_DISC_COS: f64 = 0.99995; // an angular radius of about 0.6°
 
 // ---- the grandstand ---------------------------------------------------------
 
-pub use crate::fluid::{STAND_RISE, STAND_ROWS, STAND_TREAD};
+pub use kosm::fluid::{STAND_RISE, STAND_ROWS, STAND_TREAD};
 const SEAT_PITCH: f64 = 0.6;
 
 fn hash2(i: i64, j: i64) -> f64 {
@@ -315,7 +320,7 @@ impl FoamField {
 }
 
 // the waves and the surface are `kosm::fluid`
-pub use crate::fluid::{Ring, Surface};
+pub use kosm::fluid::{Ring, Surface};
 
 // ---- the melon as geometry --------------------------------------------------
 
@@ -393,16 +398,16 @@ pub struct PoolSimulation {
     pub last_splash: f64,
     pub entered: bool,
     /// The simulated water, when the splash is on.
-    pub water: Option<crate::splash::Water>,
-    pub droplets: Vec<crate::splash::Droplet>,
+    pub water: Option<kosm::splash::Water>,
+    pub droplets: Vec<kosm::splash::Droplet>,
     /// Foam on the surface.
     pub foam: Vec<Foam>,
     /// Last frame's fine surface, for its rate of rise.
-    surface_prev: Option<crate::splash::HeightGrid>,
+    surface_prev: Option<kosm::splash::HeightGrid>,
     /// Last frame's fluid force on the melon, for the log.
     pub fluid_force: V<f64>,
     /// The pool beyond the box.
-    pub far: Option<crate::far::Far>,
+    pub far: Option<kosm::far::Far>,
     geometry: PoolGeometry,
     melon_axes: [f64; 3],
     recording_fps: f64,
@@ -493,7 +498,7 @@ impl PoolSimulation {
         let bulk = config.bulk_modulus;
         let cs = (bulk / 1000.0f64).sqrt();
         let dt = 0.35 * h / cs;
-        let mut water = crate::splash::Water::fill(h, dt, config.air_above, bulk);
+        let mut water = kosm::splash::Water::fill(h, dt, config.air_above, bulk);
         if config.use_gpu {
             let subs = (self.model.dt / dt).ceil() as u32;
             match water.enable_gpu(subs.max(256)) {
@@ -504,7 +509,7 @@ impl PoolSimulation {
         // pack the fill down before anything arrives, and take the rest level
         water.settle(config.settle_seconds);
         self.water = Some(water);
-        self.far = Some(crate::far::Far::new(0.1));
+        self.far = Some(kosm::far::Far::new(0.1));
         Ok(self)
     }
 
@@ -556,7 +561,7 @@ impl PoolSimulation {
         if let (Some((g, cand)), Some(w)) = (picked, &self.water) {
             let off = w.level_offset;
             // the drops: the highest 250 of the candidates over the surface
-            let mut up: Vec<(f64, crate::splash::Droplet)> = cand
+            let mut up: Vec<(f64, kosm::splash::Droplet)> = cand
                 .iter()
                 .filter_map(|d| {
                     let s = g.at(d.pos.x, d.pos.y) + off;
@@ -565,7 +570,7 @@ impl PoolSimulation {
                 .collect();
             up.sort_by(|a, b| b.0.total_cmp(&a.0));
             up.truncate(250);
-            let now: Vec<crate::splash::Droplet> = up.into_iter().map(|(_, d)| d).collect();
+            let now: Vec<kosm::splash::Droplet> = up.into_iter().map(|(_, d)| d).collect();
             let t = self.state.time;
             let mut landed = 0;
             for d in &self.droplets {
@@ -774,9 +779,9 @@ impl PoolSimulation {
     }
 
     /// The scene-authored actor as seen by the fine-water computation.
-    fn fluid_body(&self, velocity: V<f64>) -> crate::splash::Body {
+    fn fluid_body(&self, velocity: V<f64>) -> kosm::splash::Body {
         let melon = self.melon();
-        crate::splash::Body {
+        kosm::splash::Body {
             centre: Vec3::new(melon.centre.x, melon.centre.y, melon.centre.z),
             axis: Vec3::new(melon.axis.x, melon.axis.y, melon.axis.z),
             vel: Vec3::new(velocity.x, velocity.y, velocity.z),
@@ -858,7 +863,7 @@ impl PoolSimulation {
 }
 
 // the caustic is `kosm::fluid`
-pub use crate::fluid::{Caustic, caustic, caustic_for_geometry, caustic_gpu, caustic_gpu_for_geometry};
+pub use kosm::fluid::{Caustic, caustic, caustic_for_geometry, caustic_gpu, caustic_gpu_for_geometry};
 pub struct View {
     pub eye: V<f64>,
     pub target: V<f64>,
@@ -1222,7 +1227,7 @@ fn shade_melon(p: V<f64>, n: V<f64>, d: V<f64>, melon: &Melon, drop: &Scene, cau
 pub struct Scene<'a> {
     pub geometry: PoolGeometry,
     pub surface: &'a Surface,
-    pub droplets: &'a [crate::splash::Droplet],
+    pub droplets: &'a [kosm::splash::Droplet],
     /// The surface's maximum this frame (computed once: it is a grid scan)...
     pub top: f64,
     /// ...and the far field's, for rays that never cross the region.
@@ -1246,7 +1251,7 @@ fn render_frame(
     geometry: PoolGeometry,
     melon: &Melon,
     surface: &Surface,
-    droplets: &[crate::splash::Droplet],
+    droplets: &[kosm::splash::Droplet],
     foam: &[Foam],
     caustic: &Caustic,
 ) -> image::RgbaImage {
@@ -1288,7 +1293,7 @@ fn render_frame(
 }
 
 /// The whole thing: drop the melon, render `frames` at 30 fps, encode.
-pub fn run(
+pub fn render_frames(
     out: &Path,
     frames: usize,
     width: u32,
@@ -1409,7 +1414,7 @@ pub fn run(
         img.save(dir.join(format!("frame_{k:03}.png")))?;
         tick(4, &mut lap);
         if std::env::var_os("KOSM_PROF").is_some() {
-            let w = crate::splash::take_prof().map(|ns| ns / 1_000_000);
+            let w = kosm::splash::take_prof().map(|ns| ns / 1_000_000);
             println!("prof   frame {k:3}  step {:5} ms (zero {} bin {} p2g {} grid {} g2p {})  read_water {:5} ms  caustic {:5} ms  render {:5} ms  save {:4} ms", ms[0], w[0], w[1], w[2], w[3], w[4], ms[1], ms[2], ms[3], ms[4]);
         }
         if k == 0 || k % 5 == 0 || k + 1 == frames || std::env::var_os("KOSM_PROF").is_some() {
@@ -1486,4 +1491,14 @@ pub fn run(
         println!("pool   {} frames → {}", frames, mp4.display());
     }
     Ok(())
+}
+
+/// `kosm run pool` — the drop, or `--splash` for the splash alone.
+pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    let frames = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(150);
+    let renderer = match args.value("pool-render") {
+        Some(name) => render::PoolRenderer::parse(name)?,
+        None => render::PoolRenderer::default(),
+    };
+    render_frames(args.out(), frames, 1280, 720, args.flag("splash"), renderer)
 }

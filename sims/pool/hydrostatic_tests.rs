@@ -5,7 +5,7 @@
 //! of 6.93 litres — and the coupling either reproduces it or it does not.
 //! Everything about the way the melon floats follows from this number, since
 //! the net buoyancy at 950 kg/m^3 is only 5% of it.
-use kosm::pool::MELON_AXES;
+use crate::pool::MELON_AXES;
 use kosm::splash::{Body, Water};
 use phyz_math::{GRAVITY, Vec3};
 

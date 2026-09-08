@@ -26,7 +26,7 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
-use crate::pool::{DEPTH, POOL_X, POOL_Y};
+use crate::fluid::{DEPTH, POOL_X, POOL_Y};
 use crate::splash::HeightGrid;
 use phyz_math::GRAVITY;
 
