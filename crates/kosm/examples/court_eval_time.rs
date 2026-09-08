@@ -1,7 +1,7 @@
 //! What each of the court's roots costs to turn into geometry, both ways:
 //! evaluated to one solid with vcad's booleans, and walked to the placed
 //! primitives it is a union of.
-use kosm::court::render::instances::{instances, Prims};
+use kosm::brep::instances::{instances, Prims};
 use kosm::court::CourtScene;
 
 fn main() {

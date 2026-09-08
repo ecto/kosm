@@ -20,7 +20,7 @@
 //! deterministic: the frame the renderer aims at is the frame the simulation
 //! would have reached anyway, computed early. Paused, the head start is zero.
 //! `KOSM_NO_LOOKAHEAD=1` puts the old pace back for comparison. The picture is the court's own,
-//! `kosm::court::render`: the level's roots evaluated by vcad into BRep
+//! `kosm::brep`: the level's roots evaluated by vcad into BRep
 //! solids with one BVH each, materials by root name, the balls and the net
 //! placed where phyz has them, the panels as area lights. This file owns the
 //! window's camera and the pace; nothing here describes a shape or a material.
@@ -71,7 +71,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kosm::court::render::{self, Snapshot};
+use kosm::brep::{self as render, Snapshot};
 use kosm::court::{Court, CourtScene};
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
@@ -156,7 +156,7 @@ fn simulate(tx: Sender<Timed>, frames: usize, lookahead: Lookahead) {
     // At most four frames of solving for one frame of wall clock.
     let cap = 4 * steps_per_frame;
     let mut start = Instant::now();
-    let _ = tx.send(Timed { frame: Frame::of(&court), due: start });
+    let _ = tx.send(Timed { frame: kosm::court::snapshot(&court), due: start });
     let mut said = false;
     let mut solved = Duration::ZERO;
     let mut snapped = Duration::ZERO;
@@ -192,7 +192,7 @@ fn simulate(tx: Sender<Timed>, frames: usize, lookahead: Lookahead) {
         }
         solved += lap.elapsed();
         let snap = Instant::now();
-        if tx.send(Timed { frame: Frame::of(&court), due }).is_err() {
+        if tx.send(Timed { frame: kosm::court::snapshot(&court), due }).is_err() {
             return;
         }
         snapped += snap.elapsed();
@@ -414,7 +414,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
     // window is black until it is done. Say so, or it looks broken.
     eprintln!("court  evaluating the level…");
     let t0 = Instant::now();
-    let mut stage = match CourtScene::bundled().and_then(|s| render::Scene::new(&s)) {
+    let mut stage = match CourtScene::bundled().and_then(|s| render::Scene::new(&s.authored, s.ball_r)) {
         Ok(stage) => stage,
         Err(error) => return eprintln!("court: could not build the picture: {error}"),
     };
@@ -679,7 +679,7 @@ fn passes_seed(history: &History) -> u64 {
 /// picture testable.
 pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let mut stage = render::Scene::new(&scene)?;
+    let mut stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let camera = authored_camera(&scene);
     let t = if t < 0.0 {
         scene.authored.parameter_or("still_t", 0.95)
@@ -690,7 +690,7 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
     while court.time() < t {
         court.step();
     }
-    let frame = Frame::of(&court);
+    let frame = kosm::court::snapshot(&court);
     let t0 = Instant::now();
     let picture = stage.at_snapshot(&frame);
     let film = pathtrace::render(
@@ -732,7 +732,7 @@ pub fn still_gpu(
     passes: u32,
 ) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
     let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
@@ -753,7 +753,7 @@ pub fn still_gpu(
     while court.time() < t {
         court.step();
     }
-    let frame = Frame::of(&court);
+    let frame = kosm::court::snapshot(&court);
 
     let t0 = Instant::now();
     let passes = passes.max(1);
@@ -797,7 +797,7 @@ pub fn still_gpu(
 /// comes back at one. Before this, every pixel came back at one.
 pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
     let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
@@ -817,7 +817,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
     while court.time() < t {
         court.step();
     }
-    let frame = Frame::of(&court);
+    let frame = kosm::court::snapshot(&court);
 
     let passes = passes.max(1);
     for _ in 0..passes {
@@ -866,7 +866,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
 /// absence is checked by eye.
 pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
     let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
@@ -892,7 +892,7 @@ pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> a
     // converging on the frames before this one — so the sequence starts the
     // way the window would: a few passes on the first frame, and then one a
     // frame like a live tier.
-    let warm = Frame::of(&court);
+    let warm = kosm::court::snapshot(&court);
     for _ in 0..8 {
         gpu.accumulate(&stage, &warm, 0, &camera, size, 1)?;
     }
@@ -903,7 +903,7 @@ pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> a
                 court.step();
             }
         }
-        let frame = Frame::of(&court);
+        let frame = kosm::court::snapshot(&court);
         let lap = Instant::now();
         gpu.accumulate(&stage, &frame, k as u64 + 1, &camera, size, 1)?;
         let rgba = gpu.read_target()?;
@@ -978,10 +978,10 @@ pub fn dump_dataset(
     reference_spp: u32,
     seed: u64,
 ) -> anyhow::Result<()> {
-    use kosm::court::denoise::dataset as ds;
+    use kosm::denoise::dataset as ds;
 
     let scene = CourtScene::bundled()?;
-    let stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let base_cam = authored_camera(&scene);
     let a = &scene.authored;
     let target = KVec3::new(
@@ -1003,10 +1003,10 @@ pub fn dump_dataset(
     // filter has to be good at: balls in flight and the net moving.
     let mut court = Court::from_scene(&scene)?;
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
-    let mut snaps: Vec<Frame> = vec![Frame::of(&court)];
+    let mut snaps: Vec<Frame> = vec![kosm::court::snapshot(&court)];
     while court.time() < T_DATASET_END {
         court.step();
-        snaps.push(Frame::of(&court));
+        snaps.push(kosm::court::snapshot(&court));
     }
     let first = ((T_DATASET_START / scene.dt) as usize).min(snaps.len() - 1);
 
@@ -1156,8 +1156,8 @@ pub fn dump_dataset(
 }
 
 /// The device history, packed for the dataset.
-fn frame_state(h: &kosm_render::gpu::History) -> kosm::court::denoise::dataset::FrameState {
-    use kosm::court::denoise::dataset as ds;
+fn frame_state(h: &kosm_render::gpu::History) -> kosm::denoise::dataset::FrameState {
+    use kosm::denoise::dataset as ds;
     ds::FrameState {
         mean: ds::to_f16(&h.rgb),
         count: ds::to_f16(&h.count.iter().map(|&c| c as f32).collect::<Vec<_>>()),
@@ -1309,7 +1309,7 @@ pub fn denoise_eval(
     ref_spp: u32,
 ) -> anyhow::Result<()> {
     let scene = CourtScene::bundled()?;
-    let stage = render::Scene::new(&scene)?;
+    let stage = render::Scene::new(&scene.authored, scene.ball_r)?;
     let camera = authored_camera(&scene);
     let a = &scene.authored;
     let ctx = vcad_kernel_gpu::GpuContext::init_blocking()
@@ -1342,12 +1342,12 @@ pub fn denoise_eval(
         court.step();
     }
     let mut instants = Vec::with_capacity(n as usize);
-    instants.push(Frame::of(&court));
+    instants.push(kosm::court::snapshot(&court));
     for _ in 1..n {
         for _ in 0..steps_per_frame {
             court.step();
         }
-        instants.push(Frame::of(&court));
+        instants.push(kosm::court::snapshot(&court));
     }
 
     // The sequence, under one filter, driven exactly as `dump_frames` drives

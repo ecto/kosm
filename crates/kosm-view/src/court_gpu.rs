@@ -1,7 +1,7 @@
 //! The court on the GPU: the same picture, traced by `vcad-kernel-raytrace`'s
 //! compute shader instead of its CPU integrator.
 //!
-//! Nothing about the *scene* is decided here either. `kosm::court::render`
+//! Nothing about the *scene* is decided here either. `kosm::brep`
 //! still owns what the court is made of — which roots, which materials, where
 //! the balls are, which panels are lights — and this module only packs that
 //! into the buffers the shader reads. Every solid is packed once, with
@@ -92,7 +92,7 @@ use std::time::{Duration, Instant};
 
 use kosm_render::caustics::CausticMap;
 use kosm_render::gpu::{InstanceMotion, SampleBudget};
-use kosm::court::render::{self, Snapshot};
+use kosm::brep::{self as render, Snapshot};
 use vcad_kernel::Solid;
 use vcad_kernel_gpu::GpuContext;
 use vcad_kernel_math::{Point3, Transform};

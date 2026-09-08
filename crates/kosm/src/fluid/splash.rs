@@ -40,7 +40,7 @@ pub fn take_prof() -> [u64; 5] {
     std::array::from_fn(|i| PROF[i].swap(0, Ordering::Relaxed))
 }
 
-use crate::pool::{BOX_DEPTH, POOL_X, POOL_Y, SPONGE, box_half};
+use super::{BOX_DEPTH, POOL_X, POOL_Y, SPONGE, box_half};
 
 pub struct Water {
     pub h: f64,
@@ -428,7 +428,7 @@ impl Water {
                         if xi.z > hi.z && vel.z > 0.0 { vel.z = 0.0; }
                         // the sponge: the box's outer band damps the motion so
                         // waves leave for the far field instead of reflecting
-                        let inset = crate::pool::region_inset(xi.x, xi.y);
+                        let inset = super::region_inset(xi.x, xi.y);
                         // the region's edge: no outflow across it (see the GPU kernel)
                         let dist = xi.x.hypot(xi.y);
                         if outside(i, jj) && dist > 1e-6 {

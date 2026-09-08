@@ -29,8 +29,11 @@ pub mod net;
 pub mod aim;
 pub mod bake;
 pub mod parts;
-pub mod render;
-pub mod denoise;
+
+/// The picture is [`kosm::brep`](crate::brep) now; this keeps the old path.
+pub use crate::brep as render;
+/// The denoiser is [`kosm::denoise`](crate::denoise) now.
+pub use crate::denoise;
 
 pub const DEFAULT_COURT_SCENE: &str = "court.loon";
 
@@ -458,7 +461,7 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
     let a = &scene.authored;
     let (w, h) = if width > 0 { (width, height) } else { (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32) };
     let spp = std::env::var("KOSM_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(a.parameter_or("render_spp", 8.0) as usize);
-    let cam = render::camera(&scene)?;
+    let cam = render::camera(a)?;
     let exposure = a.parameter_or("exposure", 1.0);
     // the shutter: what fraction of a frame the film is exposed for, and how
     // many sub-frames that exposure is sampled at. 0 is an instant.
@@ -470,7 +473,7 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
     let sub_spp = spp.div_ceil(subs);
     let still_t = a.parameter_or("still_t", -1.0);
     let mut still_done = still_t < 0.0;
-    let mut picture = render::Scene::new(&scene)?;
+    let mut picture = render::Scene::new(a, scene.ball_r)?;
     println!(
         "render {w}×{h} at {spp} spp per frame ({subs} × {sub_spp}, shutter {:.2} frame); {} static objects, {} panels; still {}×{} at {} spp at t = {still_t:.2} s",
         shutter,
@@ -498,8 +501,8 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
             }
             sim_time += lap.elapsed();
             let lap = std::time::Instant::now();
-            let at = picture.at(&court);
-            let opts = render::options(&scene, sub_spp, (k as u64) << 8 | j as u64);
+            let at = picture.at_snapshot(&snapshot(&court));
+            let opts = render::options(a, sub_spp, (k as u64) << 8 | j as u64);
             let f = render::render(&at, &cam, w, h, &opts);
             match &mut film {
                 Some(acc) => render::accumulate(acc, &f),
@@ -517,8 +520,8 @@ pub fn run(out: &Path, frames: Option<usize>, width: u32, height: u32) -> anyhow
             let sspp = a.parameter_or("still_spp", 128.0) as usize;
             let lap = std::time::Instant::now();
             let still = out.join("court_still.png");
-            let at = picture.at(&court);
-            let opts = render::options(&scene, sspp, 1 << 32);
+            let at = picture.at_snapshot(&snapshot(&court));
+            let opts = render::options(a, sspp, 1 << 32);
             render::to_image(&render::render(&at, &cam, sw, sh, &opts), exposure, 1).save(&still)?;
             println!("render {} at t = {:.2} s, {sw}×{sh} × {sspp} spp in {:.1} s", still.display(), court.time(), lap.elapsed().as_secs_f64());
         }
@@ -601,5 +604,19 @@ pub fn report(scene: &CourtScene, court: &Court) {
             line.push_str(&format!(" … {} bounces", apexes.len()));
         }
         println!("{line}");
+    }
+}
+
+/// The court's moving half, as the picture wants it.
+pub fn snapshot(court: &Court) -> render::Snapshot {
+    render::Snapshot {
+        t: court.time(),
+        dt: court.dt(),
+        balls: (0..court.bodies()).map(|k| (court.centre(k), court.rotation(k))).collect(),
+        vel: (0..court.bodies())
+            .map(|k| (court.world_velocity(k), court.world_angular_velocity(k)))
+            .collect(),
+        extras: court.extras.clone(),
+        extra_vel: court.extra_vel.clone(),
     }
 }

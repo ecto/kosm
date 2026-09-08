@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
-use kosm::pool::{self, box_half, Caustic, PoolGeometry, Surface, STAND_RISE, STAND_ROWS, STAND_TREAD};
-use kosm::splash::Droplet;
+use kosm::fluid::{box_half, Caustic, PoolGeometry, Surface, STAND_RISE, STAND_ROWS, STAND_TREAD};
+use kosm::pool;
+use kosm::fluid::Droplet;
 use tang::Vec3 as V;
 
 const COPING: f32 = 0.06;

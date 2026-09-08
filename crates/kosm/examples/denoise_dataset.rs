@@ -17,7 +17,7 @@
 
 use std::time::Instant;
 
-use kosm::court::denoise::{dataset, kpn::Kpn, train};
+use kosm::denoise::{dataset, kpn::Kpn, train};
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()

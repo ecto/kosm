@@ -4,36 +4,12 @@ use std::path::Path;
 
 use crate::scene::AuthoredScene;
 
-use super::{DEPTH, POOL_X, POOL_Y, WaterConfig};
+use super::WaterConfig;
 
 pub const DEFAULT_POOL_SCENE: &str = "levels/pool.loon";
 const DEFAULT_POOL_FILE: &str = "pool.loon";
 
-/// Authored pool knobs consumed by the pool's scene-specific computations.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PoolGeometry {
-    pub half_extents: [f64; 2],
-    pub depth: f64,
-}
-
-impl PoolGeometry {
-    pub const fn reference() -> Self {
-        Self {
-            half_extents: [POOL_X, POOL_Y],
-            depth: DEPTH,
-        }
-    }
-
-    pub fn stand_y0(self) -> f64 {
-        self.half_extents[1] + 3.0
-    }
-}
-
-impl Default for PoolGeometry {
-    fn default() -> Self {
-        Self::reference()
-    }
-}
+pub use crate::fluid::PoolGeometry;
 
 pub struct PoolScene {
     pub authored: AuthoredScene,

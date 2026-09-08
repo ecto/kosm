@@ -45,41 +45,11 @@ pub use snapshot::PoolSnapshot;
 
 // ---- the pool ---------------------------------------------------------------
 
-// Reference dimensions for the fine-water solver. Coarse pool computations and
-// renderers carry `PoolGeometry` from the authored scene instead.
-pub const POOL_X: f64 = 25.0; // half-lengths of the water
-pub const POOL_Y: f64 = 12.5;
-pub const DEPTH: f64 = 2.0;
-/// The fine MPM region: a disc of this radius (KOSM_BOX overrides) around
-/// the region's centre, which is the pool's centre for now. Beyond it the
-/// water is the far field (see `far`). The GPU grid spans the whole pool;
-/// only the blocks the particles touch are allocated, so the region is a set
-/// of particles, not a box — the first step toward water that appears where
-/// something happens and leaves when it is over.
-pub fn box_half() -> f64 {
-    static HALF: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *HALF.get_or_init(|| std::env::var("KOSM_BOX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.25))
-}
-/// Distance from the region's edge, positive inside: the same measure the
-/// sponge, the render blend and the far field's nudge all use.
-pub fn region_inset(x: f64, y: f64) -> f64 {
-    box_half() - x.hypot(y)
-}
-pub const BOX_DEPTH: f64 = DEPTH; // the full depth: a floor the melon could fall through is no floor
-/// The box's outer band where the fluid's velocity is damped so waves leave
-/// instead of reflecting off a wall two metres from the splash.
-pub const SPONGE: f64 = 0.25;
-/// Width of the band, inside the sponge, over which the rendered surface
-/// fades from the fine grid to the far field.
-pub const BLEND: f64 = 0.4;
-/// Frames per second of a recording (KOSM_FPS overrides).
-pub fn fps() -> f64 {
-    std::env::var("KOSM_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0)
-}
-pub(crate) const COPING: f64 = 0.06; // deck height above the water line
-pub(crate) const N_WATER: f64 = 1.333;
-/// Absorption per metre, RGB: red goes first, which is why deep water is blue.
-pub(crate) const ABSORB: [f64; 3] = [0.45, 0.10, 0.04];
+// the pool's reference dimensions and the fine region are `kosm::fluid`
+pub use crate::fluid::{
+    ABSORB, BLEND, BOX_DEPTH, COPING, DEPTH, N_WATER, POOL_X, POOL_Y, SPONGE, box_half, fps,
+    region_inset,
+};
 
 // ---- the melon --------------------------------------------------------------
 
@@ -91,19 +61,12 @@ const WATER_DENSITY: f64 = 1000.0;
 
 // ---- the sun ----------------------------------------------------------------
 
-pub(crate) fn sun_dir() -> V<f64> {
-    V::new(-0.35, -0.45, 0.82).normalize()
-}
-pub(crate) const SUN_IRRADIANCE: f64 = 1.05;
+pub use crate::fluid::{SUN_IRRADIANCE, sun_dir};
 const SUN_DISC_COS: f64 = 0.99995; // an angular radius of about 0.6°
 
 // ---- the grandstand ---------------------------------------------------------
 
-/// A stand along the far long side: stepped rows from the deck, a seat every
-/// 0.6 m, most of them taken.
-pub const STAND_ROWS: usize = 14;
-pub const STAND_RISE: f64 = 0.45;
-pub const STAND_TREAD: f64 = 0.85;
+pub use crate::fluid::{STAND_RISE, STAND_ROWS, STAND_TREAD};
 const SEAT_PITCH: f64 = 0.6;
 
 fn hash2(i: i64, j: i64) -> f64 {
@@ -351,154 +314,8 @@ impl FoamField {
     }
 }
 
-// ---- the waves --------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-pub struct Ring {
-    pub x: f64,
-    pub y: f64,
-    pub t0: f64,
-    pub amp: f64,
-    pub wavelength: f64,
-}
-
-impl Ring {
-    fn speed(&self) -> f64 {
-        // deep-water gravity waves: c = sqrt(g λ / 2π)
-        (GRAVITY * self.wavelength / std::f64::consts::TAU).sqrt()
-    }
-    fn height(&self, x: f64, y: f64, t: f64) -> f64 {
-        let dt = t - self.t0;
-        if dt <= 0.0 {
-            return 0.0;
-        }
-        let r = (x - self.x).hypot(y - self.y);
-        let front = self.speed() * dt;
-        let k = std::f64::consts::TAU / self.wavelength;
-        // a packet three wavelengths wide riding the front, spreading as 1/√r,
-        // dying over a couple of seconds
-        let packet = (-((r - front) / (1.5 * self.wavelength)).powi(2)).exp();
-        let spread = (0.05 / r.max(0.05)).sqrt();
-        let decay = (-dt / 2.5).exp();
-        self.amp * packet * spread * decay * (k * (r - front)).cos()
-    }
-}
-
-#[derive(Clone)]
-pub struct Surface {
-    pub rings: Vec<Ring>,
-    pub t: f64,
-    /// When the water is simulated, its free surface replaces the rings
-    /// inside the box...
-    pub grid: Option<crate::splash::HeightGrid>,
-    /// ...and the far field's height carries on beyond it.
-    pub far: Option<crate::splash::HeightGrid>,
-}
-
-impl Surface {
-    pub fn height(&self, x: f64, y: f64) -> f64 {
-        // ambient ripple, 1 mm, so still water is not a mirror
-        let ambient = 0.0008 * ((7.0 * x + 3.0 * self.t).sin() * (5.0 * y - 2.0 * self.t).cos()) + 0.0005 * ((11.0 * x - 4.0 * y + 1.7 * self.t).sin());
-        if let Some(g) = &self.grid {
-            // the fluid's surface inside the box (the sub-grid rings from
-            // landing drops are baked in once per frame), blending into the
-            // far field over the box's last decimetre
-            // the fine surface counts inside the sponge band only: at the
-            // box wall it dips (the wall layer, the extraction's edge) and a
-            // blend across that dip is a lens
-            // ...and the blend must be wide and C1: a 10 cm linear blend
-            // between two surfaces a millimetre apart is a ring of curvature,
-            // and a ring of curvature is a lens (the caustic showed a frame)
-            let inset = region_inset(x, y);
-            let far = self.far.as_ref().map(|f| f.at(x, y)).unwrap_or(0.0) + ambient;
-            if inset > SPONGE + BLEND {
-                return g.at(x, y) + ambient;
-            }
-            if inset <= SPONGE {
-                return far;
-            }
-            let u = (inset - SPONGE) / BLEND;
-            let w = u * u * (3.0 - 2.0 * u);
-            return w * (g.at(x, y) + ambient) + (1.0 - w) * far;
-        }
-        let mut h = 0.0;
-        for r in &self.rings {
-            h += r.height(x, y, self.t);
-        }
-        h + ambient
-    }
-    /// Mean height of the fluid surface over the pool's interior (0 = rest).
-    pub fn mean_level(&self) -> f64 {
-        let Some(g) = &self.grid else { return 0.0 };
-        let mut s = 0.0;
-        let mut n = 0.0f64;
-        for jy in 3..g.ny.saturating_sub(3) {
-            for ix in 3..g.nx.saturating_sub(3) {
-                let z = g.z[jy * g.nx + ix];
-                if z > -1.0 {
-                    // wet cells only; the dry corners beyond the disc report the floor
-                    s += z;
-                    n += 1.0;
-                }
-            }
-        }
-        s / n.max(1.0)
-    }
-    /// The highest the surface gets this frame, plus a margin for the rings.
-    pub fn top(&self) -> f64 {
-        let grid = self.grid.as_ref().map(|g| g.z.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0);
-        grid + 0.02
-    }
-    pub fn normal(&self, x: f64, y: f64) -> V<f64> {
-        let e = 1e-3;
-        let dx = (self.height(x + e, y) - self.height(x - e, y)) / (2.0 * e);
-        let dy = (self.height(x, y + e) - self.height(x, y - e)) / (2.0 * e);
-        V::new(-dx, -dy, 1.0).normalize()
-    }
-    /// Where a ray meets the surface, by marching then bisection.
-    fn hit(&self, o: V<f64>, d: V<f64>, t_max: f64, top_fine: f64, top_far: f64) -> Option<f64> {
-        let f = |t: f64| {
-            let p = o + d * t;
-            p.z - self.height(p.x, p.y)
-        };
-        let mut t = 0.0;
-        let mut prev = f(0.0);
-        while t < t_max {
-            // 4 mm steps up close, where the splash is; coarser with distance,
-            // where the far field is smooth and the pool is fifty metres long
-            let mut step = 0.004 + 0.012 * t;
-            // and, above the highest water this ray could meet, stride down
-            // to it: the crown's tip sets the fine bound only inside the
-            // region, the far field is millimetres everywhere else
-            let p = o + d * t;
-            let bound = if region_inset(p.x, p.y) > -0.5 { top_fine } else { top_far };
-            let clearance = p.z - bound;
-            if clearance > 0.02 {
-                if d.z >= 0.0 {
-                    return None; // climbing away from any water
-                }
-                step = step.max(0.5 * clearance / -d.z);
-            }
-            let tn = (t + step).min(t_max);
-            let cur = f(tn);
-            if (prev > 0.0) != (cur > 0.0) {
-                let (mut a, mut b) = (t, tn);
-                for _ in 0..12 {
-                    let m = 0.5 * (a + b);
-                    if (f(a) > 0.0) != (f(m) > 0.0) {
-                        b = m;
-                    } else {
-                        a = m;
-                    }
-                }
-                return Some(0.5 * (a + b));
-            }
-            prev = cur;
-            t = tn;
-        }
-        None
-    }
-}
+// the waves and the surface are `kosm::fluid`
+pub use crate::fluid::{Ring, Surface};
 
 // ---- the melon as geometry --------------------------------------------------
 
@@ -1040,157 +857,8 @@ impl PoolSimulation {
     }
 }
 
-// ---- rendering --------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct Caustic {
-    pub origin: [f64; 2],
-    pub cell: f64,
-    pub nx: usize,
-    pub ny: usize,
-    pub e: Vec<f64>,
-}
-
-impl Caustic {
-    fn at(&self, x: f64, y: f64) -> f64 {
-        let gx = (x - self.origin[0]) / self.cell - 0.5;
-        let gy = (y - self.origin[1]) / self.cell - 0.5;
-        if gx < 0.0 || gy < 0.0 || gx >= (self.nx - 1) as f64 || gy >= (self.ny - 1) as f64 {
-            return 1.0;
-        }
-        let (ix, iy) = (gx.floor() as usize, gy.floor() as usize);
-        let (wx, wy) = (gx - ix as f64, gy - iy as f64);
-        let e = &self.e;
-        e[iy * self.nx + ix] * (1.0 - wx) * (1.0 - wy)
-            + e[iy * self.nx + ix + 1] * wx * (1.0 - wy)
-            + e[(iy + 1) * self.nx + ix] * (1.0 - wx) * wy
-            + e[(iy + 1) * self.nx + ix + 1] * wx * wy
-    }
-}
-
-/// Sunlight through the surface onto the floor: irradiance relative to what a
-/// flat surface would pass, so still water reads as 1 and ripples focus it.
-pub fn caustic(surface: &Surface, cell: f64) -> Caustic {
-    caustic_for_geometry(surface, PoolGeometry::reference(), cell)
-}
-
-pub fn caustic_for_geometry(
-    surface: &Surface,
-    geometry: PoolGeometry,
-    cell: f64,
-) -> Caustic {
-    // over the box and a margin: the sun's refracted rays land a metre
-    // sideways over two metres of depth, and beyond the map the floor reads 1
-    let half = box_half() + 3.0;
-    let nx = ((2.0 * half) / cell) as usize;
-    let ny = ((2.0 * half) / cell) as usize;
-    let origin = [-half, -half];
-    // launch from beyond the map too: a cell near the map's edge is lit by
-    // rays from both sides, or the edge shows as a frame
-    let margin = 1.5;
-    let (lx, ly) = (((2.0 * half + 2.0 * margin) / cell) as usize, ((2.0 * half + 2.0 * margin) / cell) as usize);
-    let l_origin = [-half - margin, -half - margin];
-    let mut e = vec![0.0; nx * ny];
-    let s = sun_dir();
-    let d = -s;
-    // reference: a flat surface refracts the sun to a fixed direction with a
-    // fixed transmission; each ray deposits relative to that
-    let n_flat = V::new(0.0, 0.0, 1.0);
-    let (d_flat, ci, ct) = refract(d, n_flat, 1.0, N_WATER).expect("sun above the horizon");
-    let t_flat = 1.0 - fresnel(1.0, N_WATER, ci, ct);
-    let flat_cos = -d_flat.z;
-    let sub = 3; // rays per cell per axis
-    let per_ray = 1.0 / (sub * sub) as f64;
-    // one row of launch points per task, each with its own accumulator
-    let e = (0..ly * sub)
-        .into_par_iter()
-        .fold(
-            || vec![0.0; nx * ny],
-            |mut e, iy| {
-                for ix in 0..lx * sub {
-                    // launch from the surface point that the flat refraction would
-                    // send to this floor cell, so the reference is uniform
-                    let fx = l_origin[0] + (ix as f64 + 0.5) * cell / sub as f64;
-                    let fy = l_origin[1] + (iy as f64 + 0.5) * cell / sub as f64;
-                    let back = geometry.depth / flat_cos;
-                    let sx = fx - d_flat.x * back;
-                    let sy = fy - d_flat.y * back;
-                    let n = surface.normal(sx, sy);
-                    let Some((dr, ci, ct)) = refract(d, n, 1.0, N_WATER) else { continue };
-                    let tr = 1.0 - fresnel(1.0, N_WATER, ci, ct);
-                    let z0 = surface.height(sx, sy);
-                    let tt = (z0 + geometry.depth) / -dr.z;
-                    let hx = sx + dr.x * tt;
-                    let hy = sy + dr.y * tt;
-                    let w = per_ray * (tr / t_flat) * (-dr.z / flat_cos);
-                    let gx = (hx - origin[0]) / cell - 0.5;
-                    let gy = (hy - origin[1]) / cell - 0.5;
-                    let (bx, by) = (gx.floor(), gy.floor());
-                    let (wx, wy) = (gx - bx, gy - by);
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let (jx, jy) = (bx as i64 + dx, by as i64 + dy);
-                        if jx < 0 || jy < 0 || jx >= nx as i64 || jy >= ny as i64 {
-                            continue;
-                        }
-                        let ww = (if dx == 0 { 1.0 - wx } else { wx }) * (if dy == 0 { 1.0 - wy } else { wy });
-                        e[jy as usize * nx + jx as usize] += w * ww;
-                    }
-                }
-                e
-            },
-        )
-        .reduce(
-            || vec![0.0; nx * ny],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(&b) {
-                    *x += y;
-                }
-                a
-            },
-        );
-    Caustic { origin, cell, nx, ny, e }
-}
-
-/// The same caustic, traced on the GPU: three million rays, the composed
-/// surface evaluated in WGSL, deposited through fixed-point atomics. The CPU
-/// version above stays the reference; `KOSM_GPU_RENDER=0` selects it.
-pub fn caustic_gpu(gpu: &mut kosm_mpm::GpuCaustic, surface: &Surface, cell: f64) -> Option<Caustic> {
-    caustic_gpu_for_geometry(gpu, surface, PoolGeometry::reference(), cell)
-}
-
-pub fn caustic_gpu_for_geometry(
-    gpu: &mut kosm_mpm::GpuCaustic,
-    surface: &Surface,
-    geometry: PoolGeometry,
-    cell: f64,
-) -> Option<Caustic> {
-    let g = surface.grid.as_ref()?;
-    let half = box_half() + 3.0;
-    let fz: Vec<f32> = g.z.iter().map(|z| *z as f32).collect();
-    // no far field yet (the first frames, or the ring model): a flat pool
-    let zero = crate::splash::HeightGrid { origin: [-POOL_X, -POOL_Y], cell: POOL_X, nx: 2, ny: 2, z: vec![0.0; 4] };
-    let f = surface.far.as_ref().unwrap_or(&zero);
-    let rz: Vec<f32> = f.z.iter().map(|z| *z as f32).collect();
-    let d = -sun_dir();
-    let cfg = kosm_mpm::CausticCfg {
-        cell: cell as f32,
-        half: half as f32,
-        margin: 1.5,
-        sub: 3,
-        depth: geometry.depth as f32,
-        n_water: N_WATER as f32,
-        dir: [d.x as f32, d.y as f32, d.z as f32],
-        t: surface.t as f32,
-        box_half: box_half() as f32,
-        sponge: SPONGE as f32,
-        blend: BLEND as f32,
-    };
-    let fine = kosm_mpm::Grid { origin: [g.origin[0] as f32, g.origin[1] as f32], cell: g.cell as f32, nx: g.nx as u32, ny: g.ny as u32, z: &fz };
-    let far = kosm_mpm::Grid { origin: [f.origin[0] as f32, f.origin[1] as f32], cell: f.cell as f32, nx: f.nx as u32, ny: f.ny as u32, z: &rz };
-    let (nx, ny, e) = gpu.trace(&cfg, &fine, &far);
-    Some(Caustic { origin: [-half, -half], cell, nx, ny, e: e.into_iter().map(|v| v as f64).collect() })
-}
-
+// the caustic is `kosm::fluid`
+pub use crate::fluid::{Caustic, caustic, caustic_for_geometry, caustic_gpu, caustic_gpu_for_geometry};
 pub struct View {
     pub eye: V<f64>,
     pub target: V<f64>,
