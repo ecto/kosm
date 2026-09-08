@@ -30,12 +30,20 @@ pub mod aim;
 pub mod bake;
 pub mod parts;
 
+/// The court in a window, and the GPU tier behind it. `--view`.
+#[cfg(feature = "view")]
+pub mod game;
+#[cfg(feature = "view")]
+mod game_gpu;
+
 #[cfg(test)]
 mod aim_tests;
 #[cfg(test)]
 mod bake_tests;
 #[cfg(test)]
 mod net_tests;
+#[cfg(test)]
+mod motion_tests;
 #[cfg(test)]
 mod tests;
 
@@ -632,6 +640,15 @@ pub fn snapshot(court: &Court) -> render::Snapshot {
 
 /// `kosm run court` — the frames, or `--bake` for the collider bake.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    #[cfg(feature = "view")]
+    if args.view {
+        kosm_view::init();
+        return game::run(
+            args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0),
+            args.value("spp").and_then(|v| v.parse().ok()).unwrap_or(4),
+            args.flag("cpu"),
+        );
+    }
     if args.flag("bake") {
         let level = args
             .value("level")

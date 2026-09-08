@@ -34,6 +34,10 @@ use tang::Vec3 as V;
 // obeys, and they live in one place now.
 use kosm_render::optics::{fresnel, reflect, refract};
 
+/// The pool, live in a window. `--view`.
+#[cfg(feature = "view")]
+pub mod game;
+
 #[cfg(test)]
 mod hydrostatic_tests;
 #[cfg(test)]

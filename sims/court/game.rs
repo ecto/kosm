@@ -44,7 +44,7 @@
 //! will not pack, and it is the reference the GPU picture is checked against.
 //!
 //! Whichever traced it, a pass is **one raw sample** and neither tracer
-//! accumulates. [`crate::history`] does: a running mean and a sample count per
+//! accumulates. [`kosm_view::history`] does: a running mean and a sample count per
 //! pixel, a reprojection through a moved camera, and a geometric mask that
 //! throws away only the pixels a moved ball, its shadow, or a moved extra
 //! actually landed on. Both tiers bring the guide buffers the reprojection
@@ -57,7 +57,7 @@
 //!
 //! ## the pass is the mask
 //!
-//! [`crate::history`] answers, before a pass runs, which rectangles the world
+//! [`kosm_view::history`] answers, before a pass runs, which rectangles the world
 //! moved under. The CPU tier re-traces exactly those with
 //! `pathtrace::render_into`, into a `Film` it keeps between passes so the
 //! pixels it did not touch are last pass's rather than black; the GPU tier
@@ -72,13 +72,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kosm::brep::{self as render, Snapshot};
-use kosm::court::{Court, CourtScene};
+use super::{Court, CourtScene};
+
 use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
-use crate::court_gpu;
-use crate::history::{History, Plan, Pose, View};
-use crate::viewport;
+use super::game_gpu as court_gpu;
+use kosm_view::history::{History, Plan, Pose, View};
+use kosm_view::viewport;
 
 // ---- the recording ----------------------------------------------------------
 
@@ -156,7 +157,7 @@ fn simulate(tx: Sender<Timed>, frames: usize, lookahead: Lookahead) {
     // At most four frames of solving for one frame of wall clock.
     let cap = 4 * steps_per_frame;
     let mut start = Instant::now();
-    let _ = tx.send(Timed { frame: kosm::court::snapshot(&court), due: start });
+    let _ = tx.send(Timed { frame: super::snapshot(&court), due: start });
     let mut said = false;
     let mut solved = Duration::ZERO;
     let mut snapped = Duration::ZERO;
@@ -192,7 +193,7 @@ fn simulate(tx: Sender<Timed>, frames: usize, lookahead: Lookahead) {
         }
         solved += lap.elapsed();
         let snap = Instant::now();
-        if tx.send(Timed { frame: kosm::court::snapshot(&court), due }).is_err() {
+        if tx.send(Timed { frame: super::snapshot(&court), due }).is_err() {
             return;
         }
         snapped += snap.elapsed();
@@ -690,7 +691,7 @@ pub fn still(path: &std::path::Path, t: f64, size: (u32, u32), spp: u32) -> anyh
     while court.time() < t {
         court.step();
     }
-    let frame = kosm::court::snapshot(&court);
+    let frame = super::snapshot(&court);
     let t0 = Instant::now();
     let picture = stage.at_snapshot(&frame);
     let film = pathtrace::render(
@@ -753,7 +754,7 @@ pub fn still_gpu(
     while court.time() < t {
         court.step();
     }
-    let frame = kosm::court::snapshot(&court);
+    let frame = super::snapshot(&court);
 
     let t0 = Instant::now();
     let passes = passes.max(1);
@@ -817,7 +818,7 @@ pub fn orbit_test(t: f64, size: (u32, u32), passes: u32, deg: f64) -> anyhow::Re
     while court.time() < t {
         court.step();
     }
-    let frame = kosm::court::snapshot(&court);
+    let frame = super::snapshot(&court);
 
     let passes = passes.max(1);
     for _ in 0..passes {
@@ -892,7 +893,7 @@ pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> a
     // converging on the frames before this one — so the sequence starts the
     // way the window would: a few passes on the first frame, and then one a
     // frame like a live tier.
-    let warm = kosm::court::snapshot(&court);
+    let warm = super::snapshot(&court);
     for _ in 0..8 {
         gpu.accumulate(&stage, &warm, 0, &camera, size, 1)?;
     }
@@ -903,7 +904,7 @@ pub fn dump_frames(dir: &std::path::Path, t: f64, size: (u32, u32), n: u32) -> a
                 court.step();
             }
         }
-        let frame = kosm::court::snapshot(&court);
+        let frame = super::snapshot(&court);
         let lap = Instant::now();
         gpu.accumulate(&stage, &frame, k as u64 + 1, &camera, size, 1)?;
         let rgba = gpu.read_target()?;
@@ -1003,10 +1004,10 @@ pub fn dump_dataset(
     // filter has to be good at: balls in flight and the net moving.
     let mut court = Court::from_scene(&scene)?;
     let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
-    let mut snaps: Vec<Frame> = vec![kosm::court::snapshot(&court)];
+    let mut snaps: Vec<Frame> = vec![super::snapshot(&court)];
     while court.time() < T_DATASET_END {
         court.step();
-        snaps.push(kosm::court::snapshot(&court));
+        snaps.push(super::snapshot(&court));
     }
     let first = ((T_DATASET_START / scene.dt) as usize).min(snaps.len() - 1);
 
@@ -1342,12 +1343,12 @@ pub fn denoise_eval(
         court.step();
     }
     let mut instants = Vec::with_capacity(n as usize);
-    instants.push(kosm::court::snapshot(&court));
+    instants.push(super::snapshot(&court));
     for _ in 1..n {
         for _ in 0..steps_per_frame {
             court.step();
         }
-        instants.push(kosm::court::snapshot(&court));
+        instants.push(super::snapshot(&court));
     }
 
     // The sequence, under one filter, driven exactly as `dump_frames` drives

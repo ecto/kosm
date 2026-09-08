@@ -107,7 +107,7 @@ use kosm_render::gpu::{Guides, History, NeuralDenoiser, NeuralPipeline};
 use kosm_render::neural::Weights;
 use kosm_render::sampler::SamplePattern;
 
-use crate::court::Camera;
+use super::game::Camera;
 
 /// `--filter box|gaussian|blackman`, read once when the tracer is built.
 ///
@@ -290,7 +290,7 @@ fn sampler_from_args() -> SamplePattern {
 /// Under a megabyte, so it is embedded rather than looked up beside the
 /// executable: a viewer that has to find a file next to itself is a viewer
 /// that breaks when someone moves it.
-const BUNDLED_WEIGHTS: &[u8] = include_bytes!("../assets/denoise-court.bin");
+const BUNDLED_WEIGHTS: &[u8] = include_bytes!("assets/denoise-court.bin");
 
 /// Which filter `--denoise` asks for.
 ///

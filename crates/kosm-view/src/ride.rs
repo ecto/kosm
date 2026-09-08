@@ -19,7 +19,7 @@ use serde::Deserialize;
 use tang::Vec3 as V;
 use wgpu::util::DeviceExt as _;
 
-use crate::live::{read_back, Camera};
+use crate::frame::{Camera, read_back};
 
 // ---- the file ---------------------------------------------------------------
 

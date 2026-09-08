@@ -1588,6 +1588,9 @@ name = "kosm-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytemuck",
+ "eframe",
+ "egui",
  "hound",
  "image",
  "ipse-map",
@@ -1604,6 +1607,7 @@ dependencies = [
  "phyz-model",
  "phyz-rigid",
  "phyz-world",
+ "pollster 0.4.0",
  "rayon",
  "rustfft",
  "tang",
@@ -1614,12 +1618,14 @@ dependencies = [
  "vcad-kernel",
  "vcad-kernel-acoustics",
  "vcad-kernel-export",
+ "vcad-kernel-gpu",
  "vcad-kernel-math",
  "vcad-kernel-optics",
  "vcad-kernel-primitives",
  "vcad-kernel-raytrace",
  "vcad-loon",
  "vcad-render",
+ "wgpu 30.0.1",
 ]
 
 [[package]]
@@ -1655,7 +1661,6 @@ dependencies = [
  "egui",
  "image",
  "ipse-map",
- "kosm",
  "kosm-render",
  "log",
  "phyz-math",

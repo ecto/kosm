@@ -11,8 +11,8 @@
 //!    reached by running the deterministic sim on, is the same state as
 //!    stepping straight to that time.
 
-use kosm::court::render::Snapshot;
-use kosm::court::{Court, CourtScene};
+use kosm::brep::Snapshot;
+use super::{Court, CourtScene};
 
 fn scene() -> CourtScene {
     CourtScene::bundled().expect("the bundled court scene")
@@ -35,11 +35,11 @@ fn velocity_is_the_motion_vector() {
     // Early: the balls are released above the slab and have touched nothing,
     // so the whole frame is one constant acceleration.
     let mut court = stepped_to(&scene, 0.05);
-    let prev = kosm::court::snapshot(&court);
+    let prev = super::snapshot(&court);
     for _ in 0..steps_per_frame {
         court.step();
     }
-    let now = kosm::court::snapshot(&court);
+    let now = super::snapshot(&court);
     assert!(now.t > prev.t);
     for k in 0..now.balls.len() {
         let posed = now.balls[k].0 - prev.balls[k].0;
@@ -64,12 +64,12 @@ fn a_frame_ahead_is_the_frames_own_state() {
     for _ in 0..ahead {
         running.step();
     }
-    let run_on = kosm::court::snapshot(&running);
+    let run_on = super::snapshot(&running);
 
     // The same time, reached from the beginning instead of from a frame the
     // renderer happened to be holding.
     let direct = stepped_to(&scene, target - 0.5 * scene.dt);
-    let straight = kosm::court::snapshot(&direct);
+    let straight = super::snapshot(&direct);
 
     assert!((run_on.t - straight.t).abs() < 1e-9, "{} vs {}", run_on.t, straight.t);
     for k in 0..run_on.balls.len() {

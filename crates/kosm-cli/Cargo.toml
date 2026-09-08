@@ -17,7 +17,12 @@ path = "src/main.rs"
 kosm = { path = "../kosm" }
 kosm-mpm = { path = "../kosm-mpm" }
 kosm-render = { path = "../kosm-render" }
-kosm-view = { path = "../kosm-view" }
+kosm-view = { path = "../kosm-view", optional = true }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"], optional = true }
+egui = { version = "0.36", optional = true }
+bytemuck = { version = "1", optional = true }
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
 phyz.workspace = true
 phyz-math.workspace = true
 phyz-model.workspace = true
@@ -36,7 +41,8 @@ vcad-kernel-export.workspace = true
 vcad-render.workspace = true
 vcad-kernel-acoustics.workspace = true
 vcad-kernel-optics.workspace = true
-vcad-kernel-raytrace.workspace = true
+vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
+vcad-kernel-gpu = { workspace = true, optional = true }
 vcad-kernel-math.workspace = true
 vcad-kernel-primitives.workspace = true
 ipse-map.workspace = true
@@ -47,3 +53,9 @@ tang-3dgs.workspace = true
 rayon = "1"
 rustfft = "6"
 anyhow = "1"
+
+[features]
+default = []
+# A sim's own viewer mode (`kosm run court --view`). Off by default: egui and
+# eframe are the heaviest thing in the graph and the agent loop is headless.
+view = ["dep:kosm-view", "dep:eframe", "dep:egui", "dep:bytemuck", "dep:wgpu", "dep:pollster", "dep:vcad-kernel-gpu", "kosm-render/gpu"]
