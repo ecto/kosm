@@ -74,10 +74,10 @@ Four rules, each with a paper behind it and a consequence for the tree.
 ```
 crates/
   kosm/            core: World, Step, Lens, Trajectory, build, Param,
-                   diff, run hash, colliders, materials, audio, brep→bvh,
-                   denoise, urdf import
-  kosm-dojo/       training: Task, gate, CEM, MAP-Elites, artifact ledger
-                   (from ipse-dojo, minus Ladder)
+                   diff, run hash, Task, gate, ledger, colliders,
+                   materials, audio, brep→bvh, denoise, urdf import
+  kosm-train/      loops that produce policies: PPO, BC, CEM, MAP-Elites
+                   (from ipse-dojo and ipse-sim)
   kosm-scan/       room scans, hulls, object bake → World (from ipse-map)
   kosm-render/     lens: camera, depth. cpu and gpu tiers. depends on tang only.
   kosm-mpm/        step: material point fluids on wgpu. depends on wgpu only.
@@ -89,10 +89,10 @@ docs/
 Dependency edges, and only these:
 
 ```
-kosm-view, kosm-dojo, kosm-scan  ──▶ kosm ──▶ kosm-render
+kosm-view, kosm-train, kosm-scan ──▶ kosm ──▶ kosm-render
                                        │  ──▶ kosm-mpm
                                        │  ──▶ phyz, vcad, tang   (git revs)
-sims/*                           ──▶ kosm (+ kosm-dojo, kosm-view as needed)
+sims/*                           ──▶ kosm (+ kosm-train, kosm-view as needed)
 ```
 
 `kosm-render` and `kosm-mpm` never see `kosm`, phyz, or vcad. `kosm-view`
@@ -245,11 +245,15 @@ ledger, the deploy bus, and the ethics. Everything in ipse that is not about
 the K1 specifically is training infrastructure that grew there because
 nowhere else existed. Two crates cross the seam:
 
-- **ipse-dojo → kosm-dojo**, minus `Ladder`. `Task` (spawn, score, held out,
-  invariants), the frozen gate, CEM, MAP-Elites, the artifact ledger are
-  generic. `Ladder` stays in ipse: escrow and the reluctance rule are the
-  project's ethical commitments, and kosm must not be able to violate them by
-  default.
+- **ipse-dojo splits two ways.** `Task` (spawn, score, held out,
+  invariants), the frozen gate, and the artifact ledger are contracts and
+  assertions over the three nouns with no loop of their own; they go into
+  core `kosm` beside `diff` and the run hash. CEM and MAP-Elites are loops
+  that produce policies; they go into `kosm-train`, and so do PPO (`rl.rs`)
+  and behaviour cloning (`bc.rs`) from ipse-sim, which are generic over a
+  `Task` once the observation layout is the task's. `Ladder` stays in ipse:
+  escrow and the reluctance rule are the project's ethical commitments, and
+  kosm must not be able to violate them by default.
 - **ipse-map → kosm-scan.** Scans, hulls, object bake, fusion into a world.
   Already what kosm's skatepark and court consume, through hardcoded
   worktree paths today.
@@ -279,7 +283,9 @@ not the world. That is the "recognizably itself" test written as a type.
 2. **The sims tree.** `sims/k1/` in ipse: `scene.rs` wrapping the URDF load,
    `skate/` and `ollie/` composing on top, `gate.toml` beside each task.
    Trainers call the batched Step; `rl_gpu.rs` and the six `gpu_*_parity`
-   examples are deleted. ipse-dojo moves across; ipse implements `Task`.
+   examples are deleted. `Task`, gate, and ledger move into core; the
+   trainers move into `kosm-train`; ipse implements `Task` and keeps its
+   policies, observation layout, and `Ladder`.
 3. **Reality as a Step.** deploy implements `Step` and the sensor lenses,
    `capture` records a `Trajectory`, the body schema becomes a gradient of a
    diff.
