@@ -29,6 +29,14 @@
 //! let batch = world.repeat(8);
 //! let stepped = step_batch(&step, &batch, &[]);
 //! assert_eq!(stepped.len(), 8);
+//!
+//! // and a gradient of a rollout, zeroth order: two more rollouts
+//! let score = |w: &World| -rollout(w, &step, &Zero, 100).last().unwrap().q()[5];
+//! let h = 1e-4;
+//! let mut lo = world.clone(); lo.state_mut().q[5] -= h;
+//! let mut hi = world.clone(); hi.state_mut().q[5] += h;
+//! let d_score_d_height = (score(&hi) - score(&lo)) / (2.0 * h);
+//! assert!(d_score_d_height.is_finite());
 //! # Ok(()) }
 //! ```
 

@@ -256,6 +256,14 @@ pub fn demo_marble() -> (Model, State) {
         .add_fixed_body("plate", -1, SpatialTransform::identity(), fixed)
         .build();
     model.bodies[0].geometry = Some(Geometry::Sphere { radius: r });
+    // the plate is a slab the bead can actually land on, so a rollout over
+    // this rig has a contact in it and the camera lens has something to see
+    model.bodies[1].collisions = vec![phyz_model::GeomInstance {
+        name: Some("plate".into()),
+        origin: SpatialTransform::identity(),
+        geometry: Geometry::Box { half_extents: Vec3::new(0.1, 0.1, 0.005) },
+    }];
+    model.bodies[1].visuals = model.bodies[1].collisions.clone();
     let mut state = model.default_state();
     // free-joint q is [wx, wy, wz, x, y, z]
     state.q[5] = 0.2;

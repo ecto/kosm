@@ -1,0 +1,193 @@
+# kosm, for an agent
+
+Three nouns and one loop. `docs/architecture.md` is the why; this is the how.
+
+- **World** — columns (phyz's `Model` + `State`, plus materials, lights,
+  params). No method on it runs anything.
+- **Step** — `World → World`, pure. A batch is a `Vec<World>`.
+- **Lens** — `World → observation`. A camera is a lens, a reward is a lens,
+  a probe on a column is a lens.
+
+One import: `use kosm::prelude::*;`. Everything it exports has a doctest —
+`cargo test -p kosm --doc` runs them, and the snippets below are copied from
+those doctests and the crate's own tests, so they compile.
+
+## The headless loop
+
+You cannot see a window. Run the sim, read the files, edit, run again.
+
+```
+cargo run -p kosm-cli -- list                       # the tree under sims/ is the registry
+cargo run -p kosm-cli -- run _template --out out/   # a few seconds, tiny render budget
+# then look at out/<id>/frame.png and out/<id>/metrics.json
+```
+
+`<id>` is `hash(sim path, params, seed, kosm git rev)`; the run prints it.
+Same id, same bytes: a changed frame means changed code. `--view` opens
+kosm-view and is never what you want here.
+
+## Five recipes
+
+### 1. Build a world
+
+```rust
+use kosm::prelude::*;
+let (model, state) = kosm::world::demo_marble();
+let world = World::from_phyz(model, state).with_params(vec![Param::new("tilt", 0.05)]);
+assert_eq!(world.param("tilt"), Some(0.05));
+let tilted = world.with(&[("tilt", 0.09)]);   // a copy; `with` never mutates
+```
+
+`World::from_phyz` is lossless both ways — `world.phyz()` hands the model
+and state back, `world.into_phyz()` hands them back by value. A real sim
+builds its geometry from an `AuthoredScene` and its colliders with
+`colliders_from_document`, then hands phyz's `Model` to `from_phyz`; see
+`sims/marble/mod.rs`.
+
+### 2. Add a body
+
+Bodies are phyz's, because the physics is phyz's. Build the model, then wrap
+it. From `kosm::world::demo_marble`:
+
+```rust
+use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
+use phyz_model::{GeomInstance, Geometry, ModelBuilder};
+let (r, m) = (0.01, 0.005);
+let i = 0.4 * m * r * r;
+let mut model = ModelBuilder::new()
+    .gravity(Vec3::new(0.0, 0.0, -GRAVITY))
+    .dt(1e-3)
+    .add_free_body("marble", -1, SpatialTransform::identity(),
+        SpatialInertia::new(m, Vec3::zeros(), Mat3::from_diagonal(&Vec3::new(i, i, i))))
+    .add_fixed_body("plate", -1, SpatialTransform::identity(),
+        SpatialInertia::new(1.0, Vec3::zeros(), Mat3::identity() * 0.01))
+    .build();
+model.bodies[0].geometry = Some(Geometry::Sphere { radius: r });   // the camera lens draws this as glass
+model.bodies[1].collisions = vec![GeomInstance {
+    name: Some("plate".into()),
+    origin: SpatialTransform::identity(),
+    geometry: Geometry::Box { half_extents: Vec3::new(0.1, 0.1, 0.005) },
+}];
+```
+
+### 3. Batch a step
+
+A batch is a `Vec<World>`; `step_batch` walks it with rayon.
+
+```rust
+use kosm::prelude::*;
+let (model, state) = kosm::world::demo_marble();
+let world = World::from_phyz(model, state);
+let step = PhyzStep::new(1e-3);
+
+let next = step.step(&world, &Action::none());     // one step, pure
+let traj = rollout(&world, &step, &Zero, 50);      // index 0 is the world that went in
+assert_eq!(traj.len(), 51);
+
+let stepped = step_batch(&step, &world.repeat(8), &[]);   // eight at once
+assert_eq!(stepped.len(), 8);
+```
+
+`step_batch` takes either no actions (every world gets `Action::none()`) or
+exactly one per world; anything else panics rather than quietly recycling.
+
+### 4. Take a gradient
+
+Gradients are one estimator, not the estimator (architecture.md rule 4).
+Batched rollouts are the zeroth-order path and cost nothing to reach:
+
+```rust
+use kosm::prelude::*;
+let (model, state) = kosm::world::demo_marble();
+let world = World::from_phyz(model, state);
+let step = PhyzStep::new(1e-3);
+let score = |w: &World| -rollout(w, &step, &Zero, 100).last().unwrap().q()[5];
+
+let h = 1e-4;
+let mut lo = world.clone(); lo.state_mut().q[5] -= h;
+let mut hi = world.clone(); hi.state_mut().q[5] += h;
+let d_score_d_height = (score(&hi) - score(&lo)) / (2.0 * h);
+```
+
+The first-order path is phyz's convex-contact adjoint through
+`phyz_diff::convex_adjoint_gradient`, and tang duals through
+`kosm::frame` / `kosm::light` for the render and the optics.
+`sims/marble/mod.rs` does all three and checks each against central
+differences — read it before writing a fourth.
+
+### 5. Add a lens
+
+```rust
+use kosm::prelude::*;
+use phyz_math::Vec3;
+let (model, state) = kosm::world::demo_marble();
+let world = World::from_phyz(model, state);
+
+let height = Probe::q("bead height", 5);            // one column entry
+assert_eq!(height.see(&world), 0.2);
+
+let low = reward("low is good", |w: &World| -w.q()[5]);   // a closure
+assert_eq!(low.see(&world), -0.2);
+
+let cam = Camera::look_at(Vec3::new(0.25, -0.35, 0.30), Vec3::new(0.0, 0.0, 0.10), 320, 240, 4);
+let frame = cam.see(&world);                        // kosm-render; `.with_depth(true)` for depth
+```
+
+A lens of your own is one `impl`:
+
+```rust
+struct MissDistance { goal: phyz_math::Vec3 }
+impl kosm::lens::Lens for MissDistance {
+    type Out = f64;
+    fn see(&self, w: &kosm::world::World) -> f64 {
+        (phyz_math::Vec3::new(w.q()[3], w.q()[4], w.q()[5]) - self.goal).norm()
+    }
+}
+```
+
+## Writing outputs
+
+```rust
+use kosm::prelude::*;
+// inside a sim's `pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()>`
+let params = vec![Param::new("height", 0.3)];
+let mut rec = Recorder::new(args.out(), "_template", &params, 0)?;   // out/<run id>/
+rec.metric("height_end_m", 0.02)?;
+rec.png("frame.png", &image::RgbaImage::new(4, 4))?;
+rec.finish()?;   // writes metrics.json and run.json, prints the id
+```
+
+`sims/_template/mod.rs` is under 80 lines and does exactly this, through the
+four stages (build → run → observe → optimise-optional). Copy it.
+
+## Snapshots, gates, the ledger
+
+- `kosm::snapshot::assert_close("marble/released_300", &values, 1e-6)` diffs
+  against `sims/marble/snapshots/released_300.json`, writing it when it does
+  not exist. `KOSM_UPDATE_SNAPSHOTS=1` re-records. `assert_image_close` is
+  the same for a frame, with a mean-channel-difference tolerance.
+- `diff(&a, &b)` is per column plus per param, with `.is_within(tol)`. A
+  shape change reads as infinity, not as a small number.
+- A `Task` is spawn / build / horizon / score / held_out / invariants.
+  `gate::check(&task, &policy, &spec)` runs a `gate.toml`'s frozen draws and
+  returns one number; `Ledger::open(dir).append(&Entry::from_gate(..))`
+  writes it to an append-only `ledger.jsonl`.
+- `check_invariants(&task)` runs before compute is spent. A task that
+  declares none is a task whose author has not yet been surprised.
+
+## Caveats
+
+- **Disk.** This machine runs near full. `target/` is tens of gigabytes.
+  Check `df -h /System/Volumes/Data` before a build; do not `cargo clean`
+  (the rebuild costs more than it frees) and do not build `--release` unless
+  a number depends on it.
+- **GPU.** The default build is headless and CPU. The `view` feature pulls
+  in eframe, egui and wgpu and is the heaviest thing in the graph — leave it
+  off. `kosm-render`'s GPU tier and `kosm-mpm` need a real device and are
+  not available in a headless test.
+- **Render budget.** `Camera`'s `spp` is the cost. Four is a thumbnail,
+  ninety-six is the marble's beauty frame and takes seconds per frame.
+  A test or a template stays small.
+- **Externals.** phyz is a worktree path and vcad is a git branch (see the
+  workspace `Cargo.toml`); `tang` is unified by a `[patch]` so `tang::Scalar`
+  is one trait across the graph. A changed path there is a full rebuild.

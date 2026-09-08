@@ -163,7 +163,7 @@ impl Lens for Camera {
         let xforms = forward_kinematics(model, state).0;
         let mut objects = Vec::new();
         let mut bounds = kosm_render::Aabb::empty();
-        let mut take = |geom: kosm_render::Analytic, bounds: &mut kosm_render::Aabb| {
+        let take = |geom: kosm_render::Analytic, bounds: &mut kosm_render::Aabb| {
             for i in 0..kosm_render::Geometry::len(&geom) {
                 bounds.include(&kosm_render::Geometry::bounds(&geom, i));
             }

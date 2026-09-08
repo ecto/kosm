@@ -23,7 +23,7 @@
 
 mod level;
 
-use kosm::prelude::{Lens, Param, PhyzStep, Recorder, Step, World, Zero};
+use kosm::prelude::{Lens, Param, PhyzStep, Recorder, World, Zero};
 use kosm::{audio, colliders, frame, garage, glass, lamp, light, room};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -486,7 +486,6 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     let released = kosm::step::rollout(&world_at(&model, &q0), &plant(), &Zero, steps);
     let miss_before = miss.see(released.last().expect("a rollout keeps its first world"));
     let (traj, final_state) = simulate(&model, &q0, steps);
-    let end = traj[traj.len() - 1];
     recorder.metric("miss_before_m", miss_before)?;
     recorder.metric("steps", steps)?;
     println!(
@@ -1128,6 +1127,7 @@ mod tests {
     /// the answer.
     #[test]
     fn a_batch_is_the_singles_it_is_made_of() -> anyhow::Result<()> {
+        use kosm::prelude::Step;
         let (_, _, world) = released()?;
         let plant = plant();
         let one = plant.step(&world, &kosm::step::Action::none());
