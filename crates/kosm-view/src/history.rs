@@ -242,7 +242,10 @@ pub struct Pose {
 }
 
 impl Pose {
-    #[cfg(test)]
+    /// A pose with no turn to it: a thing the mask only has to follow, not
+    /// watch spin. The court's balls carry a rotation because a seam shows it;
+    /// the cove's being, its shadow and the door's face are all followed by
+    /// where they are and how big they are, and nothing else.
     pub fn still(centre: [f64; 3], radius: f64) -> Self {
         Self {
             centre,

@@ -16,7 +16,17 @@
 //! kosm-view --denoise neural    the court's own trained filter, not the à-trous one
 //! kosm-view --sampler white     the white-noise hash, not the blue-noise pattern
 //! kosm-view --no-caustics       the GPU court without the sun through the backboard
+//! kosm-view --rune              the cove, walkable: WASD and the mouse
+//! kosm-view --rune levels/cove.loon   the same, on a named level
+//! kosm-view --rune --shot out/rune.png  one still of the cove, no window
 //! ```
+//!
+//! `--rune` is the other tier: `rune.rs` owns the cove — the simulation on one
+//! thread, the rune's score and its gate on another, the CPU path tracer on a
+//! third — and the being is walked rather than orbited, so the cursor is
+//! captured and the mouse leans it. It has no GPU tier: the cove's being is a
+//! tessellated capsule and its sea a height field, and vcad's compute tracer
+//! packs analytic B-reps and nothing else. See `rune.rs`.
 //!
 //! `--denoise` chooses the filter the device runs over the history.
 //! `atrous` is the default and is the hand-tuned wavelet in `history.wgsl`;
@@ -34,6 +44,7 @@
 mod court;
 mod court_gpu;
 mod history;
+mod rune;
 mod viewport;
 // The skatepark's ride viewer from main is an egui app; it rides along behind
 // the `ride` feature so the default binary stays the bare viewport.
@@ -117,6 +128,31 @@ fn main() -> anyhow::Result<()> {
         if let Some(source) = source {
             return ride::run(source);
         }
+    }
+
+    // `--rune [level]` is the cove: a different level, a different loop, and a
+    // player. It takes the shot flags for itself before the court sees them,
+    // because `--rune --shot out/rune.png` is a still of the cove and not of
+    // the gym.
+    if std::env::args().any(|a| a == "--rune" || a.starts_with("--rune=")) {
+        let level = rune::level_from(arg("rune").filter(|v| !v.starts_with('-')));
+        let width: u32 = parse("rune-width").unwrap_or(rune::WIDTH);
+        if let Some(path) = arg("shot") {
+            let size = (width, (width * 9 / 16).max(1));
+            return rune::still(
+                &level,
+                std::path::Path::new(&path),
+                size,
+                parse("passes").unwrap_or(64),
+            );
+        }
+        // `--cpu` is the court's flag for "do not hand the render thread a
+        // device", and this tier never does; it is accepted and says so rather
+        // than being rejected.
+        if std::env::args().any(|a| a == "--cpu") {
+            eprintln!("rune   --cpu: this tier is the CPU integrator either way");
+        }
+        return rune::run(level, parse("frames").unwrap_or(0), width);
     }
 
     // `--shot <path>` renders one frame with the same producer the window
