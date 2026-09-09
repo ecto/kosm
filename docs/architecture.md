@@ -78,7 +78,9 @@ crates/
                    materials, audio, brep→bvh, denoise, urdf import
   kosm-train/      loops that produce policies: PPO, BC, CEM, MAP-Elites
                    (from ipse-dojo and ipse-sim)
-  kosm-scan/       room scans, hulls, object bake → World (from ipse-map)
+  kosm-scan/       leaf: room scans, hulls, object bake, SDF grids
+                   (from ipse-map). depends on phyz only; core reads it.
+  kosm-registry/   build-dependency: walks a sims/ tree into a registry
   kosm-render/     lens: camera, depth. cpu and gpu tiers. depends on tang only.
   kosm-mpm/        step: material point fluids on wgpu. depends on wgpu only.
   kosm-view/       plays any Trajectory. generic over World.
@@ -89,13 +91,15 @@ docs/
 Dependency edges, and only these:
 
 ```
-kosm-view, kosm-train, kosm-scan ──▶ kosm ──▶ kosm-render
-                                       │  ──▶ kosm-mpm
-                                       │  ──▶ phyz, vcad, tang   (git revs)
-sims/*                           ──▶ kosm (+ kosm-train, kosm-view as needed)
+kosm-view, kosm-train ──▶ kosm ──▶ kosm-render
+                            │  ──▶ kosm-mpm
+                            │  ──▶ kosm-scan
+                            │  ──▶ phyz, vcad, tang   (git revs)
+sims/*                ──▶ kosm (+ kosm-train, kosm-view as needed)
 ```
 
-`kosm-render` and `kosm-mpm` never see `kosm`, phyz, or vcad. `kosm-view`
+`kosm-render`, `kosm-mpm`, and `kosm-scan` never see `kosm`; render and mpm
+never see phyz or vcad either. `kosm-view`
 never sees a sim by name. vcad's dependency on `kosm-render` is a temporary
 back-edge (the `[patch]` in Cargo.toml); it goes away when kosm-render is
 tagged and vcad tracks the tag.
