@@ -6,3 +6,6 @@ assets
 # live in the tree beside the code that embeds it.
 !crates/kosm-view/assets
 !crates/kosm-view/assets/**
+
+# per-developer cargo override; see .cargo/config.toml.example
+.cargo/config.toml

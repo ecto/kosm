@@ -3,7 +3,11 @@ name = "kosm-mpm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "MLS-MPM water on the GPU: wgpu compute kernels, one submit per block of substeps"
+keywords = ["mpm", "fluid", "wgpu", "gpu", "simulation"]
+categories = ["simulation", "science", "graphics"]
+exclude = ["out/"]
 
 [dependencies]
 wgpu = "30"

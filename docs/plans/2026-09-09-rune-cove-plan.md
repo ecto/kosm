@@ -4,10 +4,34 @@ Date: 2026-09-09. Design: `2026-09-09-rune-cove-design.md`. Status: steps 1–7
 built and committed the same day; test 5 (GPU vs CPU) not written because the
 GPU tracer cannot trace the being's mesh, so the window runs the CPU tier.
 
+**Ported to `sims/rune` on 2026-09-09.** Main's restructure (PR #18) split
+`crates/kosm-spike` into `crates/kosm` and a `sims/` tree and made a level a
+Rust function rather than a `.loon`. The file paths in the steps below are
+the ones the work was done against; where they moved:
+
+| then | now |
+|---|---|
+| `levels/cove.loon` | `sims/rune/scene.rs` (`kosm::build`, `b.param` knobs) |
+| `crates/kosm-spike/src/cove/**` | `sims/rune/{mod,bake,sim,being,rune,hint}.rs`, `render.rs`, `materials.rs` |
+| `crates/kosm-spike/src/cli.rs`, `lib.rs`, `--cove` | `kosm run rune` (`crates/kosm-cli/build.rs` walks `sims/`) |
+| `crates/kosm-spike/src/{glass,light}.rs` | `crates/kosm/src/{glass,light}.rs` |
+| `crates/kosm-view/src/rune.rs`, `--rune` | `sims/rune/game.rs`, `kosm run rune --view` |
+| `crates/kosm-view/src/main.rs` | nothing: `kosm-view` names no sim now |
+| `ipse-map` | `crates/kosm-scan` |
+| `cargo test -p kosm-spike -- cove` | `cargo test -p kosm-cli --release --features view -- rune` |
+
+The one behaviour that could not survive the move is step 4's write-back:
+`rune::solve_and_record` used to rewrite `levels/cove.loon`'s `defparam`s in
+place. A Rust level cannot be rewritten by a solver without a source
+rewriter nobody wants, so it writes `out/solved/rune.params` and prints the
+three `b.param` lines instead, and `scene.rs` carries them as its defaults
+with a comment saying where they came from.
+
 Eight steps. Each names the files it touches, what it builds on, and the
 check that says it is done. Steps 3, 4+5 and 6 are independent once 1 and 2
 are in; 7 needs 3 and 6; 8 is last. Everything runs under
-`cargo test -p kosm-spike --release -- cove` except the window itself.
+`cargo test -p kosm-cli --release --features view -- rune` (was
+`cargo test -p kosm-spike --release -- cove`) except the window itself.
 
 ## 1. The level and its scene
 
@@ -51,7 +75,7 @@ are in; 7 needs 3 and 6; 8 is last. Everything runs under
 
 - `Cove` holds the phyz `Model`, `State`, the `SdfGrid`, the contact
   cache and the door's gate. The being is `add_free_body` with
-  `Geometry::Capsule { radius, length }` (phyz has it; ipse-map's contact
+  `Geometry::Capsule { radius, length }` (phyz has it; kosm-scan's contact
   path handles it for the K1's limbs). Mass from glass density and the
   capsule's volume.
 - **Upright.** Each step, before `aba`, add a torque on the free joint

@@ -4,6 +4,11 @@ Date: 2026-09-09. Status: built the same day (see the plan and the commits
 on `claude/rune-game-brainstorm-9f5c1d`); the "What the cove taught us"
 section at the end records where the physics overruled the design.
 
+**Ported to `sims/rune` on 2026-09-09**, when main's restructure (PR #18)
+turned `crates/kosm-spike` into `crates/kosm` plus a `sims/` tree and made
+the level a Rust function instead of a `.loon`. The paths below are the old
+ones; the new ones are in the "Code" section at the end.
+
 ## The claim
 
 Myst was legendary because its world looked more real than any real-time
@@ -40,7 +45,7 @@ Not in the slice: grass, a second puzzle, the tide as a clock, sound, an
 agent that writes the level, the cel pass. Each is a follow-up with its own
 design.
 
-## The cove: `levels/cove.loon`
+## The cove: `sims/rune/scene.rs` (was `levels/cove.loon`)
 
 Z-up, millimetres, vcad's conventions, one document. Knobs:
 
@@ -78,7 +83,7 @@ No limbs. It is the first spike's marble grown up, and its curvature is the
 lens.
 
 - **Standing.** The capsule's feet are the SDF contact path the K1's feet
-  use (`ipse_map::find_terrain_contacts_model` on the baked cove), with the
+  use (`kosm_scan::find_terrain_contacts_model` on the baked cove), with the
   skatepark's solver settings. An orientation spring on the free joint holds
   it upright with a low centre of mass, so it is a weeble, not a ragdoll.
 - **Walking.** WASD is a horizontal force at the centre of mass, capped at a
@@ -130,7 +135,7 @@ fails that test does not ship.
 
 ## Rendering
 
-`kosm-view` gets a `--rune` tier beside `--court` and `--ride`, and it is
+`kosm-view` gets a rune tier beside the court's and the ride player, and it is
 the court's loop: three threads, the simulation stepping ahead by the
 measured latency, one raw sample a pass, `history.rs` accumulating with
 reprojection and the geometric mask. What the mask throws away here is what
@@ -151,12 +156,22 @@ The CPU integrator stays the reference, as everywhere else.
 
 ## Code
 
-- `levels/cove.loon`: the level.
-- `crates/kosm-spike/src/cove.rs`: `CoveScene` (knobs resolved to metres),
-  the bake to `out/maps/cove/`, the being's model, the door's model, the
-  rune score, the `Dual` hint, and the solvability sweep.
-  `kosm-spike --cove` runs the bake and the sweep and writes one frame.
-- `crates/kosm-view/src/rune.rs`: the tier. Input, camera, the loop.
+After the port to `sims/rune` (2026-09-09), one sim directory:
+
+- `sims/rune/scene.rs`: the level, in Rust over `kosm::build` — the knob
+  table below is its `b.param` list, and it carries the solver's own
+  `solution_*` as its defaults. Was `levels/cove.loon`.
+- `sims/rune/mod.rs`: `CoveScene` (knobs resolved to metres) and
+  `kosm run rune`, which bakes, solves, sweeps and writes one frame.
+  `bake.rs`, `sim.rs`, `being.rs`, `rune.rs` (score, hint gradient, solve),
+  `hint.rs`, `render.rs` and `materials.rs` beside it. Was
+  `crates/kosm-spike/src/cove/**`.
+- `sims/rune/game.rs`: the window tier, `kosm run rune --view`. Input,
+  camera, the loop. Was `crates/kosm-view/src/rune.rs`.
+- `crates/kosm/src/{glass,light}.rs`: the capsule, the receiver frame and
+  `trace_onto`. `crates/kosm-render/src/caustics.rs`: `power_within`.
+  `crates/kosm-view/src/history.rs`: the CPU temporal history, behind
+  `kosm_view::TemporalHistory`.
 
 No new crate. The game is a level, a scene module and a window tier, which
 is what the court and the skatepark are.

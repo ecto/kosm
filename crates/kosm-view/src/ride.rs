@@ -19,7 +19,7 @@ use serde::Deserialize;
 use tang::Vec3 as V;
 use wgpu::util::DeviceExt as _;
 
-use crate::live::{read_back, Camera};
+use crate::frame::{Camera, read_back};
 
 // ---- the file ---------------------------------------------------------------
 
@@ -229,7 +229,7 @@ fn tessellate(def: &MeshDef) -> anyhow::Result<Vec<Vertex>> {
     match def {
         MeshDef::Stl { path, scale } => {
             let s = *scale as f32;
-            let soup = ipse_map::stl::read_binary_stl(path)?;
+            let soup = kosm_scan::stl::read_binary_stl(path)?;
             for t in soup {
                 let p = |i: usize| [t[i][0] * s, t[i][1] * s, t[i][2] * s];
                 tri(&mut v, p(0), p(1), p(2));

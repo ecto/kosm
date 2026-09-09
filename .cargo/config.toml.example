@@ -1,0 +1,38 @@
+# Developer override, not committed. Copy to .cargo/config.toml and point the
+# paths at your own checkouts of phyz and tang; Cargo.toml is the truth and a
+# clean clone builds from its git revs with no sibling checkouts at all.
+#
+# A `[patch]` here overrides a `[patch]` for the same source in Cargo.toml
+# (config wins, silently) and applies workspace-wide, which is what makes
+# "one tang for the whole graph" true: vcad and phyz both pull tang from
+# crates.io, and both are collapsed here. CI runs without this file, since
+# building from the pins is the thing being verified.
+#
+# Cargo rewrites Cargo.lock to these paths on the first build; do not commit
+# that (see CLAUDE.md).
+
+[patch."https://github.com/ecto/phyz"]
+phyz         = { path = "../phyz/crates/phyz" }
+phyz-math    = { path = "../phyz/crates/phyz-math" }
+phyz-model   = { path = "../phyz/crates/phyz-model" }
+phyz-rigid   = { path = "../phyz/crates/phyz-rigid" }
+phyz-contact = { path = "../phyz/crates/phyz-contact" }
+phyz-diff    = { path = "../phyz/crates/phyz-diff" }
+phyz-world   = { path = "../phyz/crates/phyz-world" }
+phyz-camera  = { path = "../phyz/crates/phyz-camera" }
+phyz-collision = { path = "../phyz/crates/phyz-collision" }
+
+[patch."https://github.com/ecto/tang"]
+tang         = { path = "../tang/crates/tang" }
+tang-3dgs    = { path = "../tang/crates/tang-3dgs" }
+tang-tensor  = { path = "../tang/crates/tang-tensor" }
+tang-train   = { path = "../tang/crates/tang-train" }
+
+
+# vcad and phyz reach tang through crates.io; the manifest sends that to the git
+# rev, this sends it the rest of the way to the checkout.
+[patch.crates-io]
+tang      = { path = "../tang/crates/tang" }
+tang-la   = { path = "../tang/crates/tang-la" }
+tang-expr = { path = "../tang/crates/tang-expr" }
+tang-ad   = { path = "../tang/crates/tang-ad" }

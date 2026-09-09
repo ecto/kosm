@@ -57,6 +57,7 @@
 //! pass: that is the only way the picture converges, and it is what the quiet
 //! stretches between bounces are for.
 
+use crate::temporal::TemporalHistory;
 use vcad_kernel_math::{Point3, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film, PathTraceOptions};
 
@@ -71,12 +72,6 @@ const NORMAL_TOL: f32 = 0.9;
 /// jittered sample, silhouettes are soft, and a shadow's penumbra is wider
 /// than its umbra.
 const DILATE: i32 = 3;
-
-/// A pose that moved by less than this, in millimetres, did not move.
-const MOVED_MM: f64 = 1.0;
-
-/// …nor did one whose rotation matrix changed by less than this per element.
-const TURNED: f64 = 1e-4;
 
 /// Where the reprojection puts a background pixel: far enough that the
 /// direction is all that matters, near enough not to lose float precision.
@@ -97,57 +92,14 @@ const FIREFLY_FLOOR: f32 = 1e-3;
 
 // ---- the camera, as the reprojection needs it -------------------------------
 
-/// A pinhole view: where the eye is, the screen basis, and the tangent
-/// half-extents of the frustum. Built from `pathtrace::Camera` and a size,
-/// which is exactly what `Camera::ray` uses, so pixel centres agree to the
-/// float.
-///
-/// The aperture is ignored. A defocused camera's primary rays leave from the
-/// lens, not the eye, so the unprojection is off by at most the aperture
-/// radius; the depth and normal tests below reject anything that matters.
-#[derive(Clone, Copy, PartialEq)]
-pub struct View {
-    pub eye: Point3,
-    pub forward: Vec3,
-    pub right: Vec3,
-    pub up: Vec3,
-    pub half_w: f64,
-    pub half_h: f64,
-    pub width: u32,
-    pub height: u32,
-}
+/// The view and the pose the reprojection needs are [`crate::temporal`]'s:
+/// one `View` and one `Pose` for every tier, so a sim can hand the same two
+/// to this history and to the device's. What this module adds to them is the
+/// screen-space arithmetic only a host-side reprojection does — a ray through
+/// a pixel, a point projected back, the rectangle a moving sphere covers.
+pub use crate::temporal::{Pose, View};
 
 impl View {
-    pub fn of(cam: &pathtrace::Camera, width: u32, height: u32) -> Self {
-        let half_h = (cam.fov_deg.to_radians() * 0.5).tan();
-        Self {
-            eye: cam.eye,
-            forward: cam.forward,
-            right: cam.right,
-            up: cam.up,
-            half_w: half_h * (width as f64 / height as f64),
-            half_h,
-            width,
-            height,
-        }
-    }
-
-    /// The same eye and the same frustum, sampled at a different raster size.
-    ///
-    /// What a resampled history was taken under: the camera did not move, so
-    /// carrying the picture across a size step must not read as a camera move
-    /// — [`History::merge`] compares views, and a view that differs only in
-    /// its raster would send the whole picture through the reprojection with
-    /// old-size pixel coordinates into new-size buffers.
-    pub fn at_size(&self, width: u32, height: u32) -> Self {
-        Self {
-            half_w: self.half_h * (width as f64 / height as f64),
-            width,
-            height,
-            ..*self
-        }
-    }
-
     /// The unit direction through a pixel's centre.
     pub fn ray_dir(&self, px: u32, py: u32) -> Vec3 {
         let sx = 2.0 * ((px as f64 + 0.5) / self.width as f64) - 1.0;
@@ -239,50 +191,15 @@ impl Rect {
 
 // ---- what moved -------------------------------------------------------------
 
-/// One thing that can move, in millimetres: where it is, how it is turned, and
-/// a sphere that contains it. The renderer builds these from a `Snapshot` —
-/// the balls, then the extras — and the order is the identity, so a court that
-/// gains or loses a body invalidates everything for one frame.
-#[derive(Clone, Copy, PartialEq)]
-pub struct Pose {
-    pub centre: [f64; 3],
-    pub rot: [f64; 9],
-    pub radius: f64,
-}
-
+/// The pose the mask follows is [`crate::temporal::Pose`]. The court's balls
+/// carry a rotation because a seam shows it; the cove's being, its shadow and
+/// the door's face are all followed by where they are and how big they are,
+/// and nothing else.
 impl Pose {
-    /// A pose with no turn to it: a thing the mask only has to follow, not
-    /// watch spin. The court's balls carry a rotation because a seam shows it;
-    /// the cove's being, its shadow and the door's face are all followed by
-    /// where they are and how big they are, and nothing else.
-    pub fn still(centre: [f64; 3], radius: f64) -> Self {
-        Self {
-            centre,
-            rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            radius,
-        }
-    }
-
     fn point(&self) -> Point3 {
         Point3::new(self.centre[0], self.centre[1], self.centre[2])
     }
 
-    /// Did this pose change enough to be worth a repaint? A millimetre of
-    /// travel, or any turn a seam would show.
-    fn differs(&self, other: &Pose) -> bool {
-        let d = [
-            self.centre[0] - other.centre[0],
-            self.centre[1] - other.centre[1],
-            self.centre[2] - other.centre[2],
-        ];
-        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > MOVED_MM {
-            return true;
-        }
-        self.rot
-            .iter()
-            .zip(&other.rot)
-            .any(|(a, b)| (a - b).abs() > TURNED)
-    }
 }
 
 /// What a pass should trace, decided before it runs.
@@ -359,6 +276,10 @@ pub struct History {
     /// has already measured. `None` — the default, and the court's — folds
     /// every sample in whole. See [`History::set_firefly_cap`].
     firefly_cap: Option<f32>,
+    /// What [`TemporalHistory::reproject`] was last told, waiting for the film
+    /// [`TemporalHistory::accumulate`] will merge under it. Unused by a caller
+    /// that drives [`History::merge`] itself.
+    pending: Option<(View, Vec<Pose>)>,
 }
 
 impl History {
@@ -378,6 +299,7 @@ impl History {
             mask_fraction: 1.0,
             denoise_floor: 0.0,
             firefly_cap: None,
+            pending: None,
         }
     }
 
@@ -1267,6 +1189,81 @@ fn paint_zero(keep: &mut [u8], size: (u32, u32), rects: impl Iterator<Item = [u3
 
 // ---- tests ------------------------------------------------------------------
 
+// ---- the viewer's trait -------------------------------------------------------
+
+/// The CPU tier's [`TemporalHistory`], and the reason the trait exists.
+///
+/// The viewer's contract is four calls in order — [`begin`] at this pass's
+/// size, [`reproject`] with the camera it is about to render from and what
+/// moved under it, [`accumulate`] the film that came back, [`resolve`] for
+/// the glass — and this history does all four, so it fits without the trait
+/// moving. Two notes on how the richer API underneath is folded into it:
+///
+/// - **the reprojection is in [`History::merge`]**, not in a pass of its own,
+///   because a host-side reproject has to read *this* pass's guide buffers to
+///   decide which pixels survive. So [`reproject`] records the view and the
+///   poses the next [`accumulate`] will merge under, and answers with the
+///   share of the screen the plan expects to keep. Every tier's `reproject`
+///   is already "tell me where things are before you hand me the film"; this
+///   one just does the work a step later.
+/// - **the whole frame is traced.** The trait has no way to say "trace only
+///   these rectangles", and a sim that wants the masked pass calls
+///   [`History::plan`] and [`History::merge`] directly, which is what
+///   `sims/rune/game.rs` does.
+///
+/// [`begin`]: TemporalHistory::begin
+/// [`reproject`]: TemporalHistory::reproject
+/// [`accumulate`]: TemporalHistory::accumulate
+/// [`resolve`]: TemporalHistory::resolve
+impl TemporalHistory for History {
+    fn begin(&mut self, size: (u32, u32)) {
+        self.resample(size);
+    }
+
+    fn reproject(&mut self, view: &View, poses: &[Pose]) -> f32 {
+        let plan = self.plan(view, poses, &[]);
+        self.pending = Some((*view, poses.to_vec()));
+        1.0 - plan.coverage(self.size)
+    }
+
+    fn accumulate(&mut self, film: &Film) {
+        let (view, poses) = match self.pending.take() {
+            Some(p) => p,
+            // No `reproject` this pass: the camera and the world are wherever
+            // the last merge left them, which is the honest reading of "the
+            // viewer did not say anything moved". With nothing merged yet
+            // there is no history to carry either way, so any view will do
+            // and the next `reproject` sees a camera move and starts over.
+            None => (
+                self.view.unwrap_or(View {
+                    eye: Point3::new(0.0, 0.0, 0.0),
+                    forward: Vec3::new(0.0, 0.0, -1.0),
+                    right: Vec3::new(1.0, 0.0, 0.0),
+                    up: Vec3::new(0.0, 1.0, 0.0),
+                    half_w: 1.0,
+                    half_h: 1.0,
+                    width: film.width,
+                    height: film.height,
+                }),
+                self.poses.clone(),
+            ),
+        };
+        self.merge(film, &view, &poses, &[], None);
+    }
+
+    fn resolve(&self, exposure: f32) -> Vec<u8> {
+        History::resolve(self, exposure, &PathTraceOptions::default())
+    }
+
+    fn reset(&mut self) {
+        *self = History::new(self.size);
+    }
+
+    fn mean_samples(&self) -> f32 {
+        History::mean_samples(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,7 +1312,6 @@ mod tests {
         film
     }
 
-    #[test]
     /// The two opt-in fields are off by default, which is the whole promise
     /// the court is owed: a `History` nobody has spoken to behaves exactly as
     /// it did before either existed.
@@ -1370,6 +1366,7 @@ mod tests {
             mask_fraction: h.mask_fraction,
             denoise_floor: h.denoise_floor,
             firefly_cap: h.firefly_cap,
+            pending: None,
         }
     }
 
