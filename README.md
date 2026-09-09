@@ -2250,7 +2250,23 @@ draws and quits.
 
 ## building
 
-`vcad` depends on a sibling `../tang` checkout and `phyz` on crates.io `tang`;
-the workspace `[patch.crates-io]` unifies them on the checkout so `tang::Scalar`
-is one trait across the graph. `vcad-kernel` is built with `no-builtin-font`
-so it does not need vcad's `node_modules`.
+```bash
+git clone https://github.com/ecto/kosm && cd kosm && cargo build
+```
+
+Every external — phyz, vcad, tang, ipse-map — is a git rev in the workspace
+`Cargo.toml`, so that is all a clean clone needs: no sibling checkouts, no paths
+into anyone's home directory. Bumping one is an edit to that file and a commit,
+which is also what makes a run hash mean something.
+
+If you *do* have the sibling repos checked out and want a kosm build to pick up
+your edits to them, that is `.cargo/config.toml`: it `[patch]`es each of those
+git sources back to a local path. The committed copy holds Cam's paths (his is
+the only dev machine today); move it aside to see exactly what a clean clone
+sees, and note that CI must run without it. The manifest is the truth; that
+file is the developer override.
+
+The patches are also what keeps one phyz and one tang in the graph: `vcad`
+depends on crates.io `tang` and `phyz` does too, and `[patch.crates-io]` sends
+both to the same rev, so `tang::Scalar` is one trait. `vcad-kernel` is built
+with `no-builtin-font` so it does not need vcad's `node_modules`.

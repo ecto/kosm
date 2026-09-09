@@ -8,56 +8,73 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# phyz: the clean worktree at main HEAD (the main checkout is on a feature branch).
-phyz         = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz" }
-phyz-math    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
-phyz-model   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
-phyz-rigid   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-rigid" }
-phyz-contact = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-contact" }
-phyz-diff    = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-diff" }
-phyz-world   = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-world" }
-phyz-camera  = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-camera" }
-# vcad: the `claude/wgpu-30` branch (vcad PR #864), which is where vcad moved onto
-# wgpu 30 and onto kosm-render. Once #864 merges this should track `main` (or a
-# published version). A git dep, not a worktree path, so a clean clone builds.
-vcad         = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", default-features = false }
-vcad-kernel  = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", features = ["no-builtin-font"] }
-vcad-eval    = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-ir      = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
-vcad-loon    = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-export = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-render  = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30", default-features = false }
-vcad-kernel-acoustics = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-optics = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-raytrace = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-math = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
-vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", branch = "claude/wgpu-30" }
+# Externals are git revs, not paths: a clean clone of this repo must resolve and
+# build without any of Cam's sibling checkouts existing. Local development still
+# builds the working trees — `.cargo/config.toml` patches every one of these back
+# to a path on this machine. The manifest is the truth; that file is the override.
+#
+# phyz: `claude/rigid-impact-restitution` HEAD (the free-joint Coriolis fix).
+# Pushed, but NOT on `origin/main` yet — bump this to the merge commit when it lands.
+phyz         = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-math    = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-model   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-rigid   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-contact = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-diff    = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-world   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-camera  = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+phyz-collision = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
+# vcad: the rev on `claude/wgpu-30` (vcad PR #864) that this repo has been
+# building and testing against — the one Cargo.lock already held. A rev, not a
+# branch, so the resolve is reproducible and the branch cannot move under us:
+# the current branch tip (29fa77b) changes Difference tessellation and fails
+# `colliders::the_cup_level_leaves_its_cup_hollow`. Bump deliberately, not by
+# drift. Once #864 merges this should track `main` (or a published version).
+vcad         = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", default-features = false }
+vcad-kernel  = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", features = ["no-builtin-font"] }
+vcad-eval    = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-ir      = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-loon    = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-export = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-render  = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", default-features = false }
+vcad-kernel-acoustics = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-optics = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-raytrace = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-math = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
-# The `version` is what `cargo package` embeds for a published crate; the path
-# is this machine's checkout and is what every local build actually uses.
-tang         = { path = "/Users/cam/Developer/tang/crates/tang", version = "0.2" }
-tang-3dgs    = { path = "/Users/cam/Developer/tang/crates/tang-3dgs" }
-ipse-map     = { path = "/Users/cam/Developer/ipse/crates/ipse-map" }
+# tang: `main` HEAD. The `version` is what `cargo package` would embed if kosm
+# is ever published; the git rev is what every build actually resolves.
+tang         = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913", version = "0.2" }
+tang-3dgs    = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+# The denoiser's training loop: `Parameter` holds the weights, `ModuleAdam` steps
+# them. The convolutions themselves are ours; see `court::denoise::kpn`.
+tang-tensor  = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+tang-train   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+# ipse: `main` HEAD.
+ipse-map     = { git = "https://github.com/ecto/ipse", rev = "942523bd269e3110a84fbf3952d7ae5e37a3ceea" }
 
-# One tang. vcad builds against the sibling checkout; phyz against crates.io.
-# Unify on the checkout so tang::Scalar is one trait across the graph.
+# One tang. vcad and phyz both depend on crates.io `tang`; unify them on the same
+# git rev this workspace uses, or `tang::Scalar` is two traits across the graph.
 [patch.crates-io]
-tang      = { path = "/Users/cam/Developer/tang/crates/tang" }
-tang-la   = { path = "/Users/cam/Developer/tang/crates/tang-la" }
-tang-expr = { path = "/Users/cam/Developer/tang/crates/tang-expr" }
-tang-ad   = { path = "/Users/cam/Developer/tang/crates/tang-ad" }
+tang      = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+tang-la   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+tang-ad   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 
-# ipse-map pins phyz by git rev; point it at the same worktree everything else uses,
-# or `Model` splits into two types.
-[patch."https://github.com/ecto/phyz"]
-phyz-math      = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-math" }
-phyz-model     = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-model" }
-phyz-collision = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz-collision" }
+# KNOWN GAP, one phyz is not yet true on a clean clone. ipse pins phyz at
+# b79e35afe1f3286e18de3b51a260e15839340a14 (12 commits behind ours), so an
+# untouched clone resolves two phyz and `Model` splits into two types. It cannot
+# be fixed here: cargo refuses a `[patch]` whose replacement is the same git URL
+# it patches, so we cannot pull ipse's phyz forward onto ours from this manifest.
+# `.cargo/config.toml` collapses them for local builds. The real fix is to bump
+# ipse's phyz pin to this rev and re-pin ipse-map above.
 
 # vcad pulls kosm-render from this repo by git rev; without this patch cargo
-# builds two copies and the Geometry impls stop lining up.
+# builds two copies and the Geometry impls stop lining up. This is the documented
+# temporary back-edge and stays in the manifest (a path inside this repo works on
+# a clean clone). It goes away when kosm-render is tagged and vcad tracks the tag.
 [patch."https://github.com/ecto/kosm"]
 kosm-render = { path = "crates/kosm-render" }

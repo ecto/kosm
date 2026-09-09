@@ -206,6 +206,14 @@ four stages (build → run → observe → optimise-optional). Copy it.
 - **Render budget.** `Camera`'s `spp` is the cost. Four is a thumbnail,
   ninety-six is the marble's beauty frame and takes seconds per frame.
   A test or a template stays small.
-- **Externals.** phyz is a worktree path and vcad is a git branch (see the
-  workspace `Cargo.toml`); `tang` is unified by a `[patch]` so `tang::Scalar`
-  is one trait across the graph. A changed path there is a full rebuild.
+- **Externals.** phyz, vcad, tang and ipse-map are git revs in the workspace
+  `Cargo.toml` — a clean clone builds with no sibling checkouts. `.cargo/config.toml`
+  patches those same sources back to the local checkouts on this machine, so
+  edits next door still land in a kosm build; it is committed, it overrides the
+  manifest's patches, and CI must run without it. `tang` is unified by a
+  `[patch.crates-io]` so `tang::Scalar` is one trait across the graph. Changing
+  any of it is a full rebuild.
+- **ipse still pins an older phyz.** ipse-map reaches phyz at
+  `b79e35a`, twelve commits behind the rev kosm pins, and cargo will not let a
+  manifest `[patch]` pull a git URL onto itself. The config patch collapses them
+  locally; a clean clone gets two `Model` types until ipse bumps its pin.
