@@ -218,7 +218,9 @@ impl Plan {
     /// The pixels the plan asks for, as a share of the screen. Rectangles may
     /// overlap, so this is an upper bound — which is the safe side for a
     /// caller deciding whether a patch is still cheaper than the frame.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// It is also what [`crate::budget::Budget`] is told a pass repainted, so
+    /// it is no longer a test-only convenience.
     pub fn coverage(&self, size: (u32, u32)) -> f32 {
         let n = (size.0 as f32) * (size.1 as f32);
         if self.full || n <= 0.0 {

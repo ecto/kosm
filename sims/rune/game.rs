@@ -76,22 +76,48 @@ use super::render::{self as cove_render, PER_M, Placement};
 use super::{CoveScene, bake, hint, rune};
 use phyz_math::{Mat3, Vec3};
 
+use kosm_view::budget::Budget;
 use kosm_view::history::{History, Plan, Pose, View};
 use kosm_view::viewport;
 
 // ---- the knobs the window owns ---------------------------------------------
 
-/// The render size. Fixed, not tuned.
+/// The nominal render size: what a still picture converges at, and the base
+/// [`Budget`] measures its ladder against. `--rune-width N` moves it.
 ///
-/// The court's tuner buys resolution against a thirty-millisecond budget,
-/// which is a trade worth making when a pass is somewhere near it. A CPU pass
-/// of this cove is not: at 480×270 with the level's twelve bounces it is a few
-/// hundred milliseconds, and every size the tuner could reach is over budget,
-/// so a tuner here would walk the picture down to its floor and leave it
-/// there. A fixed size that the history is allowed to converge on is the
-/// better picture. `--rune-width N` moves it for a measurement.
+/// It used to be the whole story — fixed, not tuned — on the reasoning that
+/// the court's thirty-millisecond tuner would walk this tier down to its floor
+/// and leave it there, and that a fixed size the history is allowed to
+/// converge on is the better picture. Half of that was right. A CPU pass of
+/// this cove is sixty-five to a hundred and fifty milliseconds at 480×270,
+/// so a *walking* player was getting seven to fifteen passes a second of a
+/// picture whose every pixel was two samples old — resolution nobody could
+/// see, bought with a frame rate everybody could feel.
+///
+/// What the old reasoning was missing is that the two states want opposite
+/// things. [`Budget`] is the policy: while walking, the largest size whose
+/// predicted pass fits [`TARGET_MS`], with the history carrying the pixels
+/// through the moved eye so a quarter-size pass reads as motion blur rather
+/// than as blocks; while standing, this size and never less — and [`PRETTY`]
+/// above it when the pass fits [`CEILING_MS`], because a still frame's only
+/// cost is patience.
 pub const WIDTH: u32 = 480;
 pub const HEIGHT: u32 = WIDTH * 9 / 16;
+
+/// What a walking pass may cost. Twenty-five passes a second is not a frame
+/// rate a path tracer will reach here, but it is the number the ladder is
+/// measured against, and against a hundred-and-thirty-millisecond base pass it
+/// buys the floor — a quarter size, a sixteenth of the rays.
+const TARGET_MS: f64 = 40.0;
+
+/// What a *still* pass may cost before the pretty rung is given back. A
+/// quarter of a second a pass is four passes a second into a picture nobody is
+/// moving, which converges perfectly well.
+const CEILING_MS: f64 = 250.0;
+
+/// The size a still picture is allowed to reach, as a multiple of [`WIDTH`].
+/// Twice, which is four times the rays: 960×540 from the default 480×270.
+const PRETTY: u32 = 2;
 
 /// Radians of yaw per unit of raw mouse motion, and of tilt.
 ///
@@ -687,19 +713,22 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
 
 // ---- the picture --------------------------------------------------------------
 
-/// What the window asks for.
+/// What the window asks for: a frame, and the moment it is due on the glass.
+///
+/// No size. The size is [`render_worker`]'s, because it is chosen from what
+/// that thread measured; the window's job is to say *which* frame it wants and
+/// *when*, and to blit whatever size comes back.
 #[derive(Clone, Copy)]
 struct Job {
     frame: Snapshot,
-    size: (u32, u32),
     due: Instant,
 }
 
-/// What comes back.
+/// What comes back: the picture, at whatever size the budget chose for it, and
+/// the moment it was due.
 struct Shot {
     size: (u32, u32),
     rgba: Vec<u8>,
-    ms: u128,
     mask: f32,
     mean_spp: f32,
     due: Instant,
@@ -795,6 +824,10 @@ struct Tracer {
     caustics: CausticMap,
     traced_at: Option<Placement>,
     passes: u64,
+    /// The view the last pass rendered from, so "the camera moved" is a fact
+    /// this side owns rather than one read back out of the history's plan. A
+    /// size step is not a camera move, so the comparison is at the new size.
+    last_view: Option<View>,
 }
 
 impl Tracer {
@@ -861,6 +894,7 @@ impl Tracer {
             caustics: CausticMap::empty(),
             traced_at: None,
             passes: 0,
+            last_view: None,
         })
     }
 
@@ -891,7 +925,12 @@ impl Tracer {
     /// retraces pays for it inside its own milliseconds, and a pass that does
     /// not shows the last map, which is what "keep showing the last map while
     /// walking" is.
-    fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit) -> (Vec<u8>, f32, f32) {
+    fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit) -> Passed {
+        // A size step is a new grid, not a new picture: the history is
+        // resampled onto it, keeping the mean, the counts and the guides. That
+        // is what lets [`Budget`] change the size while the picture is
+        // converging — a climb back to the base after a walk seeds itself from
+        // the low-res picture instead of starting from black.
         self.history.resample(size);
         if (self.film.width, self.film.height) != size {
             self.film = Film::new(size.0, size.1);
@@ -906,6 +945,14 @@ impl Tracer {
         let view = View::of(&cam, size.0, size.1);
         let poses = poses(&self.scene, frame, moved, lit.glint);
         let plan: Plan = self.history.plan(&view, &poses, &[]);
+        // What the budget is told. A size step re-states the stored view at
+        // the new size, so the comparison is made there too and a resize is
+        // not mistaken for a camera move.
+        let camera_moved = self
+            .last_view
+            .map_or(true, |v| v.at_size(size.0, size.1) != view);
+        self.last_view = Some(view);
+        let repainted = plan.coverage(size);
         let frame_px = (size.0 as u64) * (size.1 as u64);
         let patch_px: u64 = plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum();
         let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
@@ -924,23 +971,64 @@ impl Tracer {
         };
         self.history.merge(&self.film, &view, &poses, &[], traced.as_deref());
         let rgba = self.history.resolve(self.exposure, &options(&self.scene, seed, true));
-        (rgba, self.history.mask_fraction(), self.history.mean_samples())
+        Passed {
+            rgba,
+            mask: self.history.mask_fraction(),
+            mean_spp: self.history.mean_samples(),
+            repainted,
+            camera_moved,
+        }
     }
 }
 
+/// What one pass came back with, and what the budget reads off it.
+///
+/// `repainted` and `camera_moved` are the two signals [`Budget::next`] takes:
+/// the share of the frame the plan asked for, and whether the eye is where it
+/// was. A pass with neither is a still one, and a still one is the only kind
+/// allowed to grow the picture.
+struct Passed {
+    rgba: Vec<u8>,
+    mask: f32,
+    mean_spp: f32,
+    repainted: f32,
+    camera_moved: bool,
+}
+
 /// The renderer: build the picture once, then keep adding passes to whatever
-/// the window last asked for. The court's worker, with the GPU branch and the
-/// tuner's cost model taken out, because there is one tier here and it has
-/// nothing to choose.
-fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow) {
+/// the window last asked for, at whatever size [`Budget`] says it can afford.
+///
+/// The court's worker, with the GPU branch taken out — there is one tier here
+/// — and the size restored to something that moves. The job carries the frame
+/// and the deadline; the *size* is this thread's, because the size is chosen
+/// from what this thread measured and nobody else has that number. A job that
+/// asks for a size the budget did not choose is a job whose picture would not
+/// match the history the next pass carries.
+fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow, mut budget: Budget, ready: Arc<AtomicBool>) {
     eprintln!("rune   evaluating the level…");
-    let mut tracer = match Tracer::new((WIDTH, HEIGHT)) {
+    let mut size = budget.size();
+    let mut tracer = match Tracer::new(size) {
         Ok(t) => t,
         Err(e) => return eprintln!("rune: could not build the picture: {e}"),
     };
-    eprintln!("rune   the cpu path tracer");
+    // The level is up. `--walk` waits on this: a scripted walk that started
+    // during the minute the level takes to evaluate would be over before the
+    // first pass, and the measurement it exists for would be of nothing.
+    ready.store(true, Ordering::Release);
+    eprintln!(
+        "rune   the cpu path tracer, {}",
+        if budget.is_on() {
+            format!(
+                "budgeted: {:.0} ms a walking pass, {:.0} ms a still one, {}×{} nominal",
+                TARGET_MS, CEILING_MS, WIDTH, HEIGHT
+            )
+        } else {
+            "--budget off: the size is pinned".to_owned()
+        }
+    );
     let mut current: Option<Job> = None;
     let mut said_at = Instant::now();
+    let mut since_said = 0u32;
     loop {
         let mut latest = None;
         loop {
@@ -960,24 +1048,45 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow) {
             current = Some(job);
         }
         let Some(job) = current else { continue };
-        if job.size.0 == 0 || job.size.1 == 0 {
+        if size.0 == 0 || size.1 == 0 {
             continue;
         }
         let lap = Instant::now();
         let lit = *glow.lock().unwrap_or_else(|e| e.into_inner());
-        let (rgba, mask, mean_spp) = tracer.pass(&job.frame, job.size, lit);
-        let shot = Shot { size: job.size, rgba, ms: lap.elapsed().as_millis(), mask, mean_spp, due: job.due };
-        if said_at.elapsed().as_secs() >= 2 {
+        let done = tracer.pass(&job.frame, size, lit);
+        let ms = lap.elapsed().as_secs_f64() * 1e3;
+        let shot = Shot {
+            size,
+            rgba: done.rgba,
+            mask: done.mask,
+            mean_spp: done.mean_spp,
+            due: job.due,
+        };
+        since_said += 1;
+        // The pace line, once a second: the size and the scale the policy
+        // chose, what the pass it chose them from actually cost, and how many
+        // of them a second that is. A headless run is read off this.
+        let elapsed = said_at.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
             said_at = Instant::now();
             eprintln!(
-                "rune   cpu {}×{} at 1 spp: {} ms a pass, {:.0}% repainted, {:.1} samples a pixel",
-                job.size.0,
-                job.size.1,
-                shot.ms,
+                "rune   cpu {}×{} (×{:.2}{}) at 1 spp: {:.0} ms a pass, {:.1} passes a second, \
+                 {:.0}% repainted, {:.1} samples a pixel — {}",
+                shot.size.0,
+                shot.size.1,
+                budget.scale(),
+                if budget.is_on() { "" } else { ", pinned" },
+                ms,
+                since_said as f64 / elapsed,
                 100.0 * shot.mask,
-                shot.mean_spp
+                shot.mean_spp,
+                if budget.is_still() { "still" } else { "walking" },
             );
+            since_said = 0;
         }
+        // Measured, then chosen: the next size is a fact about the pass that
+        // just ran and about whether anything moved under it.
+        size = budget.next(ms, done.repainted, done.camera_moved);
         if out.send(shot).is_err() {
             return;
         }
@@ -994,7 +1103,15 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow) {
 /// It is not a different renderer: it is [`Tracer::pass`], asked the same
 /// question repeatedly with nothing moving in between, which is exactly the
 /// state the window converges to when the player stops walking.
-pub fn still(path: &Path, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
+///
+/// `walk` is the other half of that: `walk` passes with the being stepped
+/// along the beach first, driven through the same [`Budget`] the window uses,
+/// and then the rest of them standing. What comes out is a picture of the
+/// *climb back* — the policy's transition, in a file, without a window. `walk`
+/// of zero is the old behaviour to the byte: nothing moves, the budget sees a
+/// still frame from its first pass, and the size never leaves the ladder's
+/// still end.
+pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow::Result<()> {
     let scene = CoveScene::bundled()?;
     let solution = rune::Pose::solution(&scene);
     // `KOSM_RUNE_SPAWN=1` stands the being where the player finds it even on a
@@ -1037,19 +1154,62 @@ pub fn still(path: &Path, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
         _ => {}
     }
 
-    let mut tracer = Tracer::new(size)?;
+    // A step a pass, along the beach and back — the same order of movement a
+    // walking player makes between two passes, so the budget sees the same
+    // signal it would see in the window.
+    let stride = 0.04;
+    let walked = |k: u32| -> Snapshot {
+        let d = stride * k as f64;
+        snapshot_of(&Placement::standing(&scene, x + d, y, tilt), &scene)
+    };
+
+    let mut at = budget.size();
+    let mut tracer = Tracer::new(at)?;
     let t0 = Instant::now();
     let mut rgba = Vec::new();
     let mut mean = 0.0;
-    for _ in 0..passes.max(1) {
-        let (px, _, m) = tracer.pass(&frame, size, lit);
-        rgba = px;
-        mean = m;
+    let mut shot = at;
+    let mut smallest = at;
+    for k in 0..passes.max(1) {
+        let moving = k < walk;
+        let held = if moving { walked(k) } else { walked(walk.saturating_sub(1)) };
+        let lap = Instant::now();
+        let done = tracer.pass(&held, at, lit);
+        let ms = lap.elapsed().as_secs_f64() * 1e3;
+        shot = at;
+        if (at.0 as u64) * (at.1 as u64) < (smallest.0 as u64) * (smallest.1 as u64) {
+            smallest = at;
+        }
+        if walk > 0 {
+            eprintln!(
+                "rune   pass {k}: {}×{} (×{:.2}) — {} at {:.0} ms, {:.1} samples a pixel",
+                at.0,
+                at.1,
+                budget.scale(),
+                if moving { "walking" } else { "standing" },
+                ms,
+                done.mean_spp
+            );
+        }
+        rgba = done.rgba;
+        mean = done.mean_spp;
+        // The still runs the policy on its own measured milliseconds, which is
+        // the same number the window feeds it. There is no clock to pace
+        // against here, so the passes come as fast as they come — but the
+        // *sizes* they come at are the window's policy exactly, which is what
+        // makes this picture worth taking.
+        at = budget.next(ms, done.repainted, done.camera_moved);
+    }
+    if walk > 0 {
+        eprintln!(
+            "rune   the walk took the picture down to {}×{} and standing brought it back to {}×{}",
+            smallest.0, smallest.1, shot.0, shot.1
+        );
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    image::RgbaImage::from_raw(size.0, size.1, rgba)
+    image::RgbaImage::from_raw(shot.0, shot.1, rgba)
         .ok_or_else(|| anyhow::anyhow!("the history is the wrong size"))?
         .save(path)?;
     println!(
@@ -1062,8 +1222,8 @@ pub fn still(path: &Path, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
         },
         tilt.to_degrees(),
         scene.open_frac,
-        size.0,
-        size.1,
+        shot.0,
+        shot.1,
         passes.max(1),
         mean,
         t0.elapsed().as_secs_f64(),
@@ -1110,13 +1270,18 @@ struct App {
     /// held force, so the direction is recomputed from this on every press and
     /// release rather than accumulated.
     keys: [bool; 4],
-    size: (u32, u32),
     frames: Vec<Timed>,
     cursor: usize,
-    asked: Option<(f64, (u32, u32))>,
+    /// The simulated time of the frame the render thread was last asked for.
+    asked: Option<f64>,
     pending: Option<(Receiver<Job>, Sender<Shot>)>,
     started: bool,
     glow: Glow,
+    /// The render thread's policy, handed over when that thread is spawned.
+    budget: Budget,
+    /// Set by the render thread once the level has evaluated: what a scripted
+    /// walk waits on.
+    ready: Arc<AtomicBool>,
 
     lookahead: Lookahead,
     latency_ms: f64,
@@ -1168,8 +1333,8 @@ impl App {
         let Some(timed) = self.frames.get(self.cursor) else {
             return;
         };
-        let _ = self.jobs.send(Job { frame: timed.frame, size: self.size, due: timed.due });
-        self.asked = Some((timed.frame.t, self.size));
+        let _ = self.jobs.send(Job { frame: timed.frame, due: timed.due });
+        self.asked = Some(timed.frame.t);
     }
 }
 
@@ -1186,7 +1351,9 @@ impl viewport::Scene for App {
             return;
         };
         let glow = self.glow.clone();
-        std::thread::spawn(move || render_worker(jobs, shots, glow));
+        let budget = self.budget.clone();
+        let ready = self.ready.clone();
+        std::thread::spawn(move || render_worker(jobs, shots, glow, budget, ready));
     }
 
     fn event(&mut self, event: viewport::Event) {
@@ -1267,7 +1434,7 @@ impl viewport::Scene for App {
             self.late = 0;
             self.worst_ms = 0.0;
         }
-        let key = self.frames.get(self.cursor).map(|f| (f.frame.t, self.size));
+        let key = self.frames.get(self.cursor).map(|f| f.frame.t);
         if key.is_some() && self.asked != key {
             self.ask();
         }
@@ -1297,15 +1464,40 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 /// `kosm run rune --view`: the cove, live.
 ///
 /// `--shot PATH` takes one still through this same tier instead, `--passes N`
-/// says how many passes to fold into it, and `--rune-width N` moves the render
-/// size. `--frames N` stops the simulation after N frames, which is how the
-/// window is opened in a test.
+/// says how many passes to fold into it, and `--rune-width N` moves the
+/// nominal render size. `--frames N` stops the simulation after N frames,
+/// which is how the window is opened in a test.
+///
+/// The budget's flags, which are the same for the window and the still:
+///
+/// - `--budget off` pins the size at `--rune-width` — the control the
+///   measurement in the commit message was taken against.
+/// - `--budget-target MS` is what a walking pass may cost, `--budget-ceiling
+///   MS` what a still one may before the pretty rung is given back, and
+///   `--rune-pretty N` is that rung's width.
+/// - `--walk N` scripts the player. In the window it holds W for `N` seconds
+///   from the start, so a headless run walks and then stops without a hand on
+///   the keyboard; in a `--shot` it steps the being for the first `N` passes
+///   and stands for the rest, which is the picture of the climb back.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let num = |name: &str| args.value(name).and_then(|v| v.parse().ok());
+    let ms = |name: &str| args.value(name).and_then(|v| v.parse::<f64>().ok());
     let width: u32 = num("rune-width").unwrap_or(WIDTH);
+    let height = (width * 9 / 16).max(1);
+    let pretty: u32 = num("rune-pretty").unwrap_or(width * PRETTY);
+    let budget = if args.value("budget").as_deref() == Some("off") {
+        Budget::off((width, height))
+    } else {
+        Budget::new(
+            (width, height),
+            (pretty, (pretty * 9 / 16).max(1)),
+            ms("budget-target").unwrap_or(TARGET_MS),
+            ms("budget-ceiling").unwrap_or(CEILING_MS),
+        )
+    };
+    let walk: u32 = num("walk").unwrap_or(0);
     if let Some(path) = args.value("shot") {
-        let size = (width, (width * 9 / 16).max(1));
-        return still(Path::new(path), size, num("passes").unwrap_or(64));
+        return still(Path::new(path), num("passes").unwrap_or(64), walk, budget);
     }
     // `--cpu` is the court's flag for "do not hand the render thread a
     // device", and this tier never does; it is accepted and says so rather
@@ -1314,11 +1506,16 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         eprintln!("rune   --cpu: this tier is the CPU integrator either way");
     }
     let frames: usize = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0);
-    window(frames, width)
+    window(frames, budget, walk)
 }
 
 /// The window itself: four threads and a viewport.
-pub fn window(frames: usize, width: u32) -> anyhow::Result<()> {
+///
+/// `walk` seconds of held W at the start, for a run with nobody at the
+/// keyboard: it is how the pass rate while walking is measured, and it is
+/// exactly the same held direction a key press sets, so the simulation cannot
+/// tell the difference.
+pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
@@ -1330,6 +1527,21 @@ pub fn window(frames: usize, width: u32) -> anyhow::Result<()> {
 
     let photons = live_photons(&CoveScene::bundled()?.authored);
 
+    let ready = Arc::new(AtomicBool::new(false));
+    if walk > 0 {
+        let (held, ready) = (held.clone(), ready.clone());
+        std::thread::spawn(move || {
+            while !ready.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("rune   --walk {walk}: holding W for {walk} s, then standing");
+            held.lock().unwrap_or_else(|e| e.into_inner()).forward = 1.0;
+            std::thread::sleep(Duration::from_secs(walk as u64));
+            held.lock().unwrap_or_else(|e| e.into_inner()).forward = 0.0;
+            eprintln!("rune   --walk: let go of W");
+        });
+    }
+
     {
         let (held, latest, gate, lookahead) = (held.clone(), latest.clone(), gate.clone(), lookahead.clone());
         std::thread::spawn(move || simulate(tx, held, latest, gate, frames, lookahead));
@@ -1339,7 +1551,6 @@ pub fn window(frames: usize, width: u32) -> anyhow::Result<()> {
         std::thread::spawn(move || rune_worker(latest, gate, photons, glow));
     }
 
-    let size = (width.max(64), (width.max(64) * 9 / 16).max(36));
     viewport::run(
         "Kosm — the cove",
         (1280, 720),
@@ -1349,13 +1560,14 @@ pub fn window(frames: usize, width: u32) -> anyhow::Result<()> {
             jobs: job_tx,
             held,
             keys: [false; 4],
-            size,
             frames: Vec::new(),
             cursor: 0,
             asked: None,
             pending: Some((job_rx, shot_tx)),
             started: false,
             glow,
+            budget,
+            ready,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
