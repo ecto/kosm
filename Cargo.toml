@@ -82,5 +82,11 @@ tang-ad   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69
 # builds two copies and the Geometry impls stop lining up. This is the documented
 # temporary back-edge and stays in the manifest (a path inside this repo works on
 # a clean clone). It goes away when kosm-render is tagged and vcad tracks the tag.
+# drop once vcad tracks tag kosm-render-v0.2.0 (vcad branch claude/kosm-render-tag)
+#
+# Verified 2026-09-09: without this, `cargo metadata --offline` still "resolves",
+# but it resolves by ADDING a second kosm-render — `Adding kosm-render v0.1.0
+# (https://github.com/ecto/kosm?rev=5c42c287…)` — pulled in by vcad's pinned rev.
+# Two copies in one graph is exactly the breakage this patch exists to prevent.
 [patch."https://github.com/ecto/kosm"]
 kosm-render = { path = "crates/kosm-render" }

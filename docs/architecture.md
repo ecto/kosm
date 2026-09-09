@@ -101,8 +101,11 @@ sims/*                ──▶ kosm (+ kosm-train, kosm-view as needed)
 `kosm-render`, `kosm-mpm`, and `kosm-scan` never see `kosm`; render and mpm
 never see phyz or vcad either. `kosm-view`
 never sees a sim by name. vcad's dependency on `kosm-render` is a temporary
-back-edge (the `[patch]` in Cargo.toml); it goes away when kosm-render is
-tagged and vcad tracks the tag.
+back-edge (the `[patch]` in Cargo.toml). The tag it waits on now exists:
+`kosm-render-v0.2.0`, local only. The patch stays until vcad's rev in
+`[workspace.dependencies]` is bumped to a vcad commit that tracks that tag —
+until then vcad's pinned rev drags a second kosm-render into the graph and the
+`Geometry` impls stop lining up. See step 6 below for the push order.
 
 ## Sims
 
@@ -315,6 +318,16 @@ stays in ipse, on a generic `kosm::build::urdf`.
 4. Delete `kosm-view/history.rs` behind a history trait.
 5. Split `pathtrace.rs` into `cpu/`.
 6. Tag `kosm-render`, point vcad at the tag, drop the `[patch]` back-edge.
+   Prepared locally, nothing pushed. `kosm-render` is 0.2.0 and the annotated
+   tag `kosm-render-v0.2.0` sits on this branch; vcad's `claude/kosm-render-tag`
+   (worktree `vcad/.claude/worktrees/kosm-render-tag`, branched off
+   `claude/wgpu-30`) swaps its `branch = "claude/adaptive-sampling"` pin for
+   `tag = "kosm-render-v0.2.0"`. The `[patch]` is still in the root manifest,
+   annotated, because vcad's pinned rev still pulls kosm-render from git.
+   Cam pushes, in order:
+   1. the kosm branch and the tag `kosm-render-v0.2.0`;
+   2. vcad `claude/kosm-render-tag`, then merge it into `claude/wgpu-30` (#864);
+   3. bump kosm's `vcad` rev to that merge commit and delete the `[patch]`.
 
 1 and 2 are structure only and go first. 3 is the foundation's proof and goes
 before anything is called done. 4 and 5 wait for the next time those files
