@@ -102,6 +102,11 @@ pub struct Built {
     /// free, colliders derived from the document. A sim whose physics needs
     /// more than that takes `document` and builds its own rig.
     pub world: World,
+    /// Collider warnings from every body, one line each: a `Difference` that
+    /// fell back to a hull says so here.
+    pub warnings: Vec<String>,
+    /// Informational lines about decompositions that succeeded.
+    pub notes: Vec<String>,
     recipe: Recipe,
 }
 
@@ -139,6 +144,21 @@ impl Built {
         self.param(name).map(|v| v * MM)
     }
 
+    /// A knob, or an error naming it. The spelling `AuthoredScene` used.
+    pub fn parameter(&self, name: &str) -> anyhow::Result<f64> {
+        self.param(name).ok_or_else(|| anyhow::anyhow!("the level has no `{name}`"))
+    }
+
+    pub fn parameter_or(&self, name: &str, default: f64) -> f64 {
+        self.param(name).unwrap_or(default)
+    }
+
+    /// A knob's length in metres: the authored units are millimetres, and
+    /// this is the one place they cross.
+    pub fn millimetres(&self, name: &str) -> anyhow::Result<f64> {
+        Ok(self.parameter(name)? * MM)
+    }
+
     /// Re-run the closure with these knobs turned. Everything downstream —
     /// the document, the colliders, the world's params — is rebuilt from it,
     /// so nothing can be left describing the old value.
@@ -150,14 +170,6 @@ impl Built {
         run(self.recipe.closure.clone(), params)
     }
 
-    /// All warnings and notes the collider derivation produced, one line each.
-    pub fn warnings(&self) -> Vec<String> {
-        self.bodies.iter().flat_map(|b| b.colliders.warnings.iter().cloned()).collect()
-    }
-
-    pub fn notes(&self) -> Vec<String> {
-        self.bodies.iter().flat_map(|b| b.colliders.notes.iter().cloned()).collect()
-    }
 }
 
 /// Author a world in Rust.
@@ -214,7 +226,9 @@ fn finish(inner: Inner, recipe: Recipe) -> anyhow::Result<Built> {
     }
 
     let world = world_of(&built_bodies, &params);
-    Ok(Built { document: doc, params, bodies: built_bodies, world, recipe })
+    let warnings = built_bodies.iter().flat_map(|b| b.colliders.warnings.iter().cloned()).collect();
+    let notes = built_bodies.iter().flat_map(|b| b.colliders.notes.iter().cloned()).collect();
+    Ok(Built { document: doc, params, bodies: built_bodies, world, warnings, notes, recipe })
 }
 
 /// A phyz rig over the authored bodies: dynamic bodies free, static bodies

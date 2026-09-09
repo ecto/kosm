@@ -452,7 +452,7 @@ fn run_marble(hollow: bool, out_root: &Path) -> anyhow::Result<()> {
     println!("run    {}", recorder.id());
     let run_dir = recorder.dir().to_path_buf();
     let out: &Path = &run_dir;
-    for warning in &level.warnings() {
+    for warning in &level.warnings {
         println!("level  {warning}");
     }
     let tilt = level.tilt()?;

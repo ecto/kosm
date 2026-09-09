@@ -1,18 +1,54 @@
-//! Pool-specific interpretation of an authored scene.
+//! The pool's level, in Rust.
+//!
+//! This was `pool.loon`. Authorship lives here; `mod.rs` supplies this
+//! scene's fluid, rigid-body and light computations. vcad lengths are
+//! millimetres and simulation lengths cross to metres exactly once, in
+//! `Built::millimetres`.
 
-use std::path::Path;
-
-use kosm::scene::AuthoredScene;
+use kosm::build::{Built, Params, build};
 
 use super::WaterConfig;
 
-pub const DEFAULT_POOL_SCENE: &str = "levels/pool.loon";
-const DEFAULT_POOL_FILE: &str = "pool.loon";
-
 pub use kosm::fluid::PoolGeometry;
 
+/// The authored pool: a basin and the watermelon's bounding volume. vcad's
+/// cube has a corner at the origin, so both are placed by their corner. These
+/// roots make the authored scene inspectable; the coarse simulation and the
+/// renderers consume the authored dimensions, and the fine-water solver still
+/// requires the reference basin.
+pub fn scene(params: &Params) -> anyhow::Result<Built> {
+    build(params, |b| {
+        // environment
+        let length = b.param("pool_length_mm", 50000.0);
+        let width = b.param("pool_width_mm", 25000.0);
+        let depth = b.param("pool_depth_mm", 2000.0);
+
+        // watermelon
+        let drop = b.param("drop_height_mm", 1300.0);
+        let a = b.param("melon_a_mm", 150.0);
+        let melon_b = b.param("melon_b_mm", 105.0);
+        let c = b.param("melon_c_mm", 105.0);
+        b.param("melon_density", 950.0);
+
+        // water computation
+        b.param("water_cell_mm", 25.0);
+        b.param("water_bulk_modulus", 2.0e6);
+        b.param("water_air_above_mm", 1000.0);
+        b.param("water_settle_seconds", 2.0);
+        b.param("water_use_gpu", 1.0);
+        b.param("fps", 60.0);
+
+        b.body("pool-volume")
+            .material("water")
+            .add(b.cube(length, width, depth).at(-0.5 * length, -0.5 * width, -depth));
+        b.body("melon-bounds")
+            .material("watermelon")
+            .add(b.cube(2.0 * a, 2.0 * melon_b, 2.0 * c).at(-a, -melon_b, drop - c));
+    })
+}
+
 pub struct PoolScene {
-    pub authored: AuthoredScene,
+    pub authored: Built,
     pub geometry: PoolGeometry,
     pub drop_height: f64,
     pub melon_axes: [f64; 3],
@@ -22,12 +58,12 @@ pub struct PoolScene {
 }
 
 impl PoolScene {
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let authored = AuthoredScene::load(path)?;
-        Self::interpret(authored)
+    /// The level with these knobs turned.
+    pub fn build(params: &Params) -> anyhow::Result<Self> {
+        Self::interpret(scene(params)?)
     }
 
-    fn interpret(authored: AuthoredScene) -> anyhow::Result<Self> {
+    fn interpret(authored: Built) -> anyhow::Result<Self> {
         let half_x = authored.millimetres("pool_length_mm")? * 0.5;
         let half_y = authored.millimetres("pool_width_mm")? * 0.5;
         let depth = authored.millimetres("pool_depth_mm")?;
@@ -79,9 +115,9 @@ impl PoolScene {
         self
     }
 
+    /// The level at its authored defaults.
     pub fn reference() -> anyhow::Result<Self> {
-        let authored = AuthoredScene::load_bundled(DEFAULT_POOL_FILE)?;
-        Self::interpret(authored)
+        Self::build(&Params::default())
     }
 }
 
@@ -139,19 +175,11 @@ mod tests {
 
     #[test]
     fn authored_dimensions_are_not_reference_only() {
-        let source = include_str!("pool.loon")
-            .replace("[defparam pool_length_mm 50000.0]", "[defparam pool_length_mm 8000.0]")
-            .replace("[defparam pool_width_mm 25000.0]", "[defparam pool_width_mm 4000.0]")
-            .replace("[defparam pool_depth_mm 2000.0]", "[defparam pool_depth_mm 1250.0]");
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("kosm-pool-{unique}.loon"));
-        std::fs::write(&path, source).unwrap();
-
-        let loaded = PoolScene::load(&path);
-        std::fs::remove_file(&path).unwrap();
+        let mut params = Params::new();
+        params.set("pool_length_mm", 8000.0);
+        params.set("pool_width_mm", 4000.0);
+        params.set("pool_depth_mm", 1250.0);
+        let loaded = PoolScene::build(&params);
 
         assert_eq!(
             loaded.unwrap().geometry,

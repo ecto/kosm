@@ -48,7 +48,7 @@ pub mod render;
 mod scene;
 mod snapshot;
 pub use config::WaterConfig;
-pub use scene::{DEFAULT_POOL_SCENE, PoolGeometry, PoolScene};
+pub use scene::{PoolGeometry, PoolScene, scene};
 pub use render::PoolRenderer;
 pub use snapshot::PoolSnapshot;
 
