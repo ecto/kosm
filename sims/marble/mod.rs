@@ -4,12 +4,13 @@
 //! rollout (the same solver the robots use), an adjoint gradient (the hint
 //! button), and a rendered frame.
 //!
-//! The level is `levels/marble.loon`. Everything below reads that file and
-//! nothing else: the geometry is the vcad document it evaluates to, the
-//! colliders and visuals are a derivation of that document (`colliders.rs`,
-//! checked against the tessellation before the first step), and the knobs
-//! (tilt, release point, marble, horizon) are its `defparam`s. A solved level
-//! is the same file with the knobs rewritten.
+//! The level is `scene.rs`, a Rust function over `kosm::build` that emits
+//! CAD. Everything below reads what it built and nothing else: the geometry
+//! is the vcad document, the colliders and visuals are a derivation of that
+//! document (`colliders.rs`, checked against the tessellation before the
+//! first step), and the knobs (tilt, release point, marble, horizon) are its
+//! `Param`s. A solved level is the same function with the knobs turned —
+//! `built.with(&[..])` — and its document written out beside the frame.
 //!
 //! Units: vcad millimetres in the level, phyz metres in the physics.
 //!
@@ -22,12 +23,14 @@
 //!     differences of the same rollout (tilt is not an adjoint channel yet).
 
 mod level;
+pub mod scene;
 
 use kosm::prelude::{Lens, Param, PhyzStep, Recorder, World, Zero};
 use kosm::{audio, colliders, frame, garage, glass, lamp, light, room};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use kosm::build::Params;
 use level::{DT, Level, MM, MarbleLevel, Tilt, tilted};
 
 use phyz::Simulator;
@@ -75,6 +78,27 @@ fn export_track(doc: &Document, t: Tilt, out: &Path) -> anyhow::Result<()> {
         t.pitch.to_degrees(),
         t.roll.to_degrees()
     );
+    Ok(())
+}
+
+/// The level, either cup.
+fn build_level(hollow: bool, params: &Params) -> anyhow::Result<Level> {
+    if hollow { scene::scene_hollow(params) } else { scene::scene(params) }
+}
+
+/// A solved level: the same Rust function with its knobs turned, written out
+/// as the vcad document it builds. This is what rewriting a `defparam` and
+/// re-evaluating the file used to produce, minus the file.
+fn write_level(level: &Level, updates: &[(&str, f64)], dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    write_level_as(level, updates, &dir.join("marble.json"))
+}
+
+fn write_level_as(level: &Level, updates: &[(&str, f64)], path: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, level.with(updates)?.document.to_json()?)?;
     Ok(())
 }
 
@@ -227,7 +251,7 @@ fn verdict(model: &Model, level: &Level, traj: &[Vec3]) -> anyhow::Result<&'stat
 /// level's `defparam`s where it declares them and from `audio`'s documented
 /// defaults where it does not.
 fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
-    let m = |name: &str, fallback: f64| level.parameters.get(name).copied().unwrap_or(fallback);
+    let m = |name: &str, fallback: f64| level.opt(name).unwrap_or(fallback);
     let track_mat = audio::Material {
         rho: m("track_density", audio::PLA.rho),
         e: m("track_e", audio::PLA.e),
@@ -260,8 +284,8 @@ fn track_spec(level: &Level) -> anyhow::Result<audio::TrackSpec> {
 /// Everything but the absorption coefficients is millimetres in the level.
 fn room_spec(level: &Level) -> room::RoomSpec {
     let d = room::RoomSpec::default();
-    let mm = |name: &str, fallback: f64| level.parameters.get(name).copied().map(|v| v * MM).unwrap_or(fallback);
-    let raw = |name: &str, fallback: f64| level.parameters.get(name).copied().unwrap_or(fallback);
+    let mm = |name: &str, fallback: f64| level.opt(name).map(|v| v * MM).unwrap_or(fallback);
+    let raw = |name: &str, fallback: f64| level.opt(name).unwrap_or(fallback);
     room::RoomSpec {
         dims: [mm("room_x", d.dims[0]), mm("room_y", d.dims[1]), mm("room_z", d.dims[2])],
         table: [mm("table_x", d.table[0]), mm("table_y", d.table[1]), mm("table_z", d.table[2])],
@@ -402,37 +426,33 @@ fn render_with(model: &Model, state: &State, path: &Path, lamp: Option<(&lamp::L
 
 /// `kosm run marble` — the level, the rollout, the gradients, the frame.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
-    // Scene adapters resolve roles explicitly; provenance recovery would
-    // re-evaluate large scenes once per parameter. This is before any threads.
-    unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
     if let Some(ply) = args.value("splat") {
         return garage::survey_splat(Path::new(ply), &args.out().join("splat"), 960, 720);
     }
-    let level = args
-        .positional()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path("marble.loon"));
-    run_marble(&level, args.out())
+    // `kosm run marble cup` builds the cup as a real hollow — a bore and a
+    // slot — instead of a ring of box segments. Same level otherwise.
+    let hollow = args.positional() == Some("cup");
+    run_marble(hollow, args.out())
 }
 
-fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
+fn run_marble(hollow: bool, out_root: &Path) -> anyhow::Result<()> {
     let ctrl = |_: usize| DVec::zeros(6);
 
-    // 1. the level: one loon file → document → STL, SVG, colliders
-    let level = Level::load(level_path)?;
+    // 1. the level: a Rust function → document → STL, SVG, colliders
+    let level = build_level(hollow, &Params::default())?;
 
     // The run: `hash(sim path, params, seed, kosm rev)`. Everything below
     // writes under `<out>/<run id>/`, under the names it always used, so the
     // outputs are immutable and two runs with the same hash are the same run.
     let run_params: Vec<Param> = ["pitch_deg", "roll_deg", "start_x", "start_y", "t_end"]
         .iter()
-        .filter_map(|name| level.parameters.get(*name).map(|v| Param::new(*name, *v)))
+        .filter_map(|name| level.opt(name).map(|v| Param::new(*name, v)))
         .collect();
     let mut recorder = Recorder::new(out_root, "marble", &run_params, 0)?;
     println!("run    {}", recorder.id());
     let run_dir = recorder.dir().to_path_buf();
     let out: &Path = &run_dir;
-    for warning in &level.warnings {
+    for warning in &level.warnings() {
         println!("level  {warning}");
     }
     let tilt = level.tilt()?;
@@ -440,9 +460,9 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     let steps = level.steps()?;
     println!(
         "level  {} → {} IR nodes, {} knobs; pitch {:+.2}° roll {:+.2}°, release ({:+.3}, {:+.3}), t_end {:.2} s",
-        level_path.display(),
+        if hollow { "scene::scene_hollow" } else { "scene::scene" },
         level.document.nodes.len(),
-        level.parameters.len(),
+        level.params.len(),
         tilt.pitch.to_degrees(),
         tilt.roll.to_degrees(),
         start[0],
@@ -450,7 +470,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         steps as f64 * DT
     );
     export_track(&level.document, tilt, out)?;
-    let derived = colliders::colliders_from_document(&level.document)?;
+    let derived = &level.bodies[0].colliders;
     for w in &derived.warnings {
         println!("warn   {w}");
     }
@@ -571,10 +591,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     println!("hint   final: release ({:+.3}, {:+.3}), {}", xy[0], xy[1], verdict(&model, &level, &traj)?);
     render(&model, &hinted, &out.join("frame_hint.png"))?;
     fs::create_dir_all(out.join("hinted"))?;
-    fs::write(
-        out.join("hinted/marble.loon"),
-        level.with_params(&[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)]),
-    )?;
+    write_level(&level, &[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)], &out.join("hinted"))?;
 
     // 5. the hinted run, heard: the same contacts, as modal synthesis
     let spec = track_spec(&level)?;
@@ -597,7 +614,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     ];
     let air = room_spec(&level);
     let rt60 = air.rt60();
-    let roughness = level.parameters.get("track_roughness_mm").copied().unwrap_or(0.2) * MM;
+    let roughness = level.opt("track_roughness_mm").unwrap_or(0.2) * MM;
     let dry = audio::render_dry(
         &spec,
         &banks,
@@ -706,9 +723,10 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
     recorder.metric("tilt_miss_m", j.sqrt())?;
     render(&solved, &solved_state, &out.join("frame_tilted.png"))?;
     export_track(&level.document, t, &out.join("solved"))?;
-    fs::write(
-        out.join("solved/marble.loon"),
-        level.with_params(&[("pitch_deg", t.pitch.to_degrees()), ("roll_deg", t.roll.to_degrees())]),
+    write_level(
+        &level,
+        &[("pitch_deg", t.pitch.to_degrees()), ("roll_deg", t.roll.to_degrees())],
+        &out.join("solved"),
     )?;
 
     // Everything the headless loop needs is decided by here, so the metrics
@@ -719,7 +737,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
 
     // 5. the lamp: the objective is the marble's *shadow*. light is analytic,
     //    motion is the adjoint, one chain rule joins them.
-    if level.parameters.contains_key("lamp_x") {
+    if level.opt("lamp_x").is_some() {
         let lamp0 = lamp::Lamp {
             pos: Vec3::new(level.p("lamp_x")? * MM, level.p("lamp_y")? * MM, 0.25 + level.p("lamp_z")? * MM),
             target: [level.p("shadow_x")? * MM, level.p("shadow_y")? * MM],
@@ -759,7 +777,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         let ld = lamp::out_dir(out);
         fs::create_dir_all(&ld)?;
         render_with(&model, &st, &ld.join("frame_release.png"), Some((&lamp0, r)))?;
-        fs::write(ld.join("marble.loon"), level.with_params(&[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)]))?;
+        write_level(&level, &[("start_x", xy[0] / MM), ("start_y", xy[1] / MM)], &ld)?;
         // knob 2: the lamp, in closed form, for the original release
         let c_end = traj_end(&model, &q0_fn(start), steps);
         let moved = lamp::Lamp { pos: lamp::lamp_for(&lamp0, &xf, c_end), ..lamp0 };
@@ -770,9 +788,10 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         );
         let (_, st0) = simulate(&model, &q0_fn(start), steps);
         render_with(&model, &st0, &ld.join("frame_lamp.png"), Some((&moved, r)))?;
-        fs::write(
-            ld.join("marble-lamp.loon"),
-            level.with_params(&[("lamp_x", moved.pos.x / MM), ("lamp_y", moved.pos.y / MM)]),
+        write_level_as(
+            &level,
+            &[("lamp_x", moved.pos.x / MM), ("lamp_y", moved.pos.y / MM)],
+            &ld.join("marble-lamp.json"),
         )?;
 
         // 6. the frame as a solver: a ray caster generic over tang::Scalar.
@@ -781,7 +800,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         let intr = CameraIntrinsics::from_vfov(800, 600, 0.75, 0.05, 5.0);
         let target = Vec3::new(0.0, 0.0, 0.25);
         let pose = CameraPose::look_at(target + Vec3::new(-0.05, -0.42, 0.28), target, Vec3::z());
-        let lamp_r = level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM;
+        let lamp_r = level.opt("lamp_r").unwrap_or(25.0) * MM;
         let colliders = model.bodies[TRACK].collisions.clone();
         let scene_at = |c: Vec3| frame::Scene::<f64>::new(&xf, &colliders, tang::Vec3::new(c.x, c.y, c.z), r, lamp0.pos, lamp_r);
         let fd = frame::out_dir(out);
@@ -820,7 +839,7 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         let c_img = traj_end(&model, &q0_fn(xy_img), steps);
         frame::render(&scene_at(c_img), &pose, &intr).save(fd.join("frame_solved.png"))?;
         println!("frame  release solved on the shadow pass to ({:+.3}, {:+.3}): patch visibility {:.4} (lit: {:.4})", xy_img[0], xy_img[1], jimg * jimg, j_far);
-        fs::write(fd.join("marble.loon"), level.with_params(&[("start_x", xy_img[0] / MM), ("start_y", xy_img[1] / MM)]))?;
+        write_level(&level, &[("start_x", xy_img[0] / MM), ("start_y", xy_img[1] / MM)], &fd)?;
 
         // 8. light as physics: the marble is glass. the lamp's light refracts
         //    through it onto the plate as a spectral caustic, and the index of
@@ -963,17 +982,17 @@ fn light_stage(
     // the generic Sellmeier against vcad-kernel-optics' N-BK7: one glass, two crates
     let bk7 = vcad_kernel_optics::glass::Glass::n_bk7();
     let worst = [0.45, 0.5876, 0.65].iter().map(|&l| (light::sellmeier::<f64>(l) - bk7.index(l)).abs()).fold(0.0, f64::max);
-    let nd_true = level.parameters.get("marble_nd").copied().unwrap_or(1.5168);
+    let nd_true = level.opt("marble_nd").unwrap_or(1.5168);
     println!("light  N-BK7 Sellmeier agrees with vcad-kernel-optics to {worst:.1e}; marble n_d = {nd_true} (n(450 nm) − n(650 nm) = {:+.4})", light::index::<f64>(nd_true, 0.45) - light::index::<f64>(nd_true, 0.65));
 
     // three glass samples on the tray: a marble, a cube, a pyramid. sizes are
     // the level's, so they can be set to the real ones.
     let lamp_local = xf.world_to_body_point(lamp0.pos);
     let lamp_t = tang::Vec3::new(lamp_local.x, lamp_local.y, lamp_local.z);
-    let cube_a = level.parameters.get("cube_mm").copied().unwrap_or(20.0) * MM;
-    let pyr_a = level.parameters.get("pyramid_mm").copied().unwrap_or(25.0) * MM;
-    let pyr_h = level.parameters.get("pyramid_h_mm").copied().unwrap_or(20.0) * MM;
-    let yaw = level.parameters.get("sample_yaw_deg").copied().unwrap_or(25.0).to_radians();
+    let cube_a = level.opt("cube_mm").unwrap_or(20.0) * MM;
+    let pyr_a = level.opt("pyramid_mm").unwrap_or(25.0) * MM;
+    let pyr_h = level.opt("pyramid_h_mm").unwrap_or(20.0) * MM;
+    let yaw = level.opt("sample_yaw_deg").unwrap_or(25.0).to_radians();
     let samples: Vec<(&str, glass::Shape<f64>)> = vec![
         ("marble", glass::Shape::Sphere { centre: tang::Vec3::new(-0.05, 0.0, r), r }),
         ("cube", glass::Shape::cube(0.0, 0.0, cube_a, yaw)),
@@ -1085,12 +1104,12 @@ fn light_stage(
         }
     }
     println!("light  recovered n_d = {nd:.4} (true {nd_true}); N-BK7 is 1.5168, soda-lime is ~1.52, fused silica 1.458");
-    fs::write(ld.join("marble.loon"), level.with_params(&[("marble_nd", nd)]))?;
+    write_level(level, &[("marble_nd", nd)], &ld)?;
     Ok(())
 }
 
 fn lamp0_r(level: &Level) -> f64 {
-    level.parameters.get("lamp_r").copied().unwrap_or(25.0) * MM
+    level.opt("lamp_r").unwrap_or(25.0) * MM
 }
 
 // ---- the task ---------------------------------------------------------------
@@ -1112,10 +1131,8 @@ pub struct Cup {
 impl Cup {
     /// Load the bundled level and derive its colliders once.
     pub fn new() -> anyhow::Result<Self> {
-        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
-        let level = Level::load(kosm::scene::AuthoredScene::bundled_path("marble.loon"))?;
-        let derived = colliders::colliders_from_document(&level.document)?;
-        let model = build_model(&level, level.tilt()?, &derived.colliders)?;
+        let level = build_level(false, &Params::default())?;
+        let model = build_model(&level, level.tilt()?, &level.bodies[0].colliders.colliders)?;
         let goal = goal(&model, &level)?;
         Ok(Self { level, model, goal, horizon: 300 })
     }
@@ -1171,10 +1188,8 @@ mod tests {
 
     /// The level, as a `World`, released where the level says.
     fn released() -> anyhow::Result<(Model, Level, World)> {
-        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
-        let level = Level::load(kosm::scene::AuthoredScene::bundled_path("marble.loon"))?;
-        let derived = colliders::colliders_from_document(&level.document)?;
-        let model = build_model(&level, level.tilt()?, &derived.colliders)?;
+        let level = build_level(false, &Params::default())?;
+        let model = build_model(&level, level.tilt()?, &level.bodies[0].colliders.colliders)?;
         let q0 = q0_for(&model, &level, level.start()?);
         let world = world_at(&model, &q0);
         Ok((model, level, world))

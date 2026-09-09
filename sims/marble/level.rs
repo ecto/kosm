@@ -1,48 +1,52 @@
-//! Marble-specific interpretation of an authored scene.
+//! Marble-specific interpretation of the built scene.
 
-use kosm::scene::AuthoredScene;
+use kosm::build::Built;
 use phyz_math::{Mat3, SpatialTransform, Vec3};
 use vcad_ir::{CsgOp, Document, Node};
 
 pub(crate) const DT: f64 = 1e-3;
 pub(crate) use kosm::scene::MM;
-pub(crate) type Level = AuthoredScene;
+
+/// The level is what `scene.rs` built. It carries the document the printer,
+/// the colliders and the picture read, and the knobs that used to be
+/// `defparam`s.
+pub(crate) type Level = Built;
 
 pub(crate) trait MarbleLevel {
     fn p(&self, name: &str) -> anyhow::Result<f64>;
+    fn opt(&self, name: &str) -> Option<f64>;
     fn tilt(&self) -> anyhow::Result<Tilt>;
     fn start(&self) -> anyhow::Result<[f64; 2]>;
     fn marble_r(&self) -> anyhow::Result<f64>;
     fn steps(&self) -> anyhow::Result<usize>;
-    fn with_params(&self, updates: &[(&str, f64)]) -> String;
 }
 
-impl MarbleLevel for AuthoredScene {
+impl MarbleLevel for Built {
     fn p(&self, name: &str) -> anyhow::Result<f64> {
-        self.parameter(name)
+        self.param(name).ok_or_else(|| anyhow::anyhow!("the level has no `{name}`"))
+    }
+
+    fn opt(&self, name: &str) -> Option<f64> {
+        self.param(name)
     }
 
     fn tilt(&self) -> anyhow::Result<Tilt> {
         Ok(Tilt {
-            pitch: self.parameter("pitch_deg")?.to_radians(),
-            roll: self.parameter("roll_deg")?.to_radians(),
+            pitch: self.p("pitch_deg")?.to_radians(),
+            roll: self.p("roll_deg")?.to_radians(),
         })
     }
 
     fn start(&self) -> anyhow::Result<[f64; 2]> {
-        Ok([self.millimetres("start_x")?, self.millimetres("start_y")?])
+        Ok([self.p("start_x")? * MM, self.p("start_y")? * MM])
     }
 
     fn marble_r(&self) -> anyhow::Result<f64> {
-        self.millimetres("marble_r")
+        Ok(self.p("marble_r")? * MM)
     }
 
     fn steps(&self) -> anyhow::Result<usize> {
-        Ok((self.parameter("t_end")? / DT).round() as usize)
-    }
-
-    fn with_params(&self, updates: &[(&str, f64)]) -> String {
-        self.with_parameters(updates)
+        Ok((self.p("t_end")? / DT).round() as usize)
     }
 }
 
