@@ -1594,6 +1594,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosm-train"
+version = "0.0.1"
+dependencies = [
+ "kosm",
+ "rayon",
+ "tang-tensor",
+ "tang-train",
+]
+
+[[package]]
 name = "kosm-view"
 version = "0.0.1"
 dependencies = [

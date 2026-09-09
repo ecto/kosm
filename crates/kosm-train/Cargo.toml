@@ -1,0 +1,12 @@
+[package]
+name = "kosm-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Loops that produce policies: PPO, behaviour cloning, CEM, MAP-Elites"
+
+[dependencies]
+kosm = { path = "../kosm" }
+tang-tensor.workspace = true
+tang-train.workspace = true
+rayon = "1"

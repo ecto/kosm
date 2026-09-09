@@ -26,7 +26,7 @@ cargo run -p kosm-cli -- run _template --out out/   # a few seconds, tiny render
 Same id, same bytes: a changed frame means changed code. `--view` opens
 kosm-view and is never what you want here.
 
-## Five recipes
+## Six recipes
 
 ### 1. Build a world
 
@@ -162,6 +162,49 @@ impl kosm::lens::Lens for MissDistance {
 }
 ```
 
+### 6. Train a policy
+
+Loops live in `kosm-train`, contracts in `kosm`. A `Task` says what the
+episode is; `TaskEnv` turns it into the flat thing a trainer wants — an
+observation lens, a per-step reward lens, and `control_every` substeps per
+action — and `ppo::train` runs the loop over a batch of them.
+
+```rust,ignore
+use kosm::prelude::*;
+use kosm::world::World;
+use kosm_train::{env::TaskEnv, ppo::{self, PpoConfig}};
+
+// One env per worker; rayon runs them side by side, seeds are drawn on this
+// thread so the batch does not depend on how they were scheduled.
+let envs: Vec<_> = (0..8)
+    .map(|_| TaskEnv::new(
+        Cup,                                        // any `impl Task`
+        PhyzStep::new(1e-3),
+        |w: &World| vec![w.q()[3], w.q()[4], w.q()[5]],   // what the policy sees
+        |w: &World| -w.q()[5],                            // what it is paid, per step
+        3,                                                // action width
+        20,                                               // 20 substeps = 50 Hz control
+    ).with_privileged(|w: &World| vec![w.state().time]))  // critic-only, optional
+    .collect();
+
+let cfg = PpoConfig { episodes_per_iter: 32, ..PpoConfig::default() };
+let (actor, _critic, history) = ppo::train(envs, cfg, 300, |it, iter, _| {
+    println!("{it:4}  return {:8.2}  len {:5.1}  kl {:.4}", iter.mean_return, iter.mean_len, iter.kl);
+});
+ppo::save_actor(&actor, "out/cup.actor", "300 iterations")?;
+```
+
+`load_actor` reads it back; the header is versioned, so a file from a
+different observation schema is refused rather than read into the wrong
+columns. `log_std` is not saved — a warm start must call
+`ppo::set_init_std` before it collects, and `train_from` does.
+
+The other loops are `kosm_train::search` (CEM and MAP-Elites over a
+parameter vector, no gradient) and `kosm_train::bc::fit_actor` (regress an
+actor onto demonstrated actions before PPO ever runs). `kosm_train::artifact`
+is the **policy** ledger — role map, plant, measured score — as opposed to
+`kosm::ledger`, which is the run ledger.
+
 ## Writing outputs
 
 ```rust
@@ -206,14 +249,16 @@ four stages (build → run → observe → optimise-optional). Copy it.
 - **Render budget.** `Camera`'s `spp` is the cost. Four is a thumbnail,
   ninety-six is the marble's beauty frame and takes seconds per frame.
   A test or a template stays small.
-- **Externals.** phyz, vcad, tang and ipse-map are git revs in the workspace
+- **Externals.** phyz, vcad and tang are git revs in the workspace
   `Cargo.toml` — a clean clone builds with no sibling checkouts. `.cargo/config.toml`
   patches those same sources back to the local checkouts on this machine, so
   edits next door still land in a kosm build; it is committed, it overrides the
   manifest's patches, and CI must run without it. `tang` is unified by a
   `[patch.crates-io]` so `tang::Scalar` is one trait across the graph. Changing
   any of it is a full rebuild.
-- **ipse still pins an older phyz.** ipse-map reaches phyz at
-  `b79e35a`, twelve commits behind the rev kosm pins, and cargo will not let a
-  manifest `[patch]` pull a git URL onto itself. The config patch collapses them
-  locally; a clean clone gets two `Model` types until ipse bumps its pin.
+- **One phyz.** There used to be a gap here: ipse-map pinned phyz twelve commits
+  behind the rev kosm pins, cargo will not let a manifest `[patch]` pull a git URL
+  onto itself, and a clean clone got two `Model` types. `crates/kosm-scan` is
+  ipse-map lifted into this workspace, so ipse is no longer a dependency and the
+  problem is gone — every phyz in the graph is the one rev the manifest pins, on a
+  clean clone as much as here.

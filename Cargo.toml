@@ -7,6 +7,7 @@ members = [
     "crates/kosm-view",
     "crates/kosm-mpm",
     "crates/kosm-scan",
+    "crates/kosm-train",
 ]
 
 [workspace.package]
