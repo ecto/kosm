@@ -3,14 +3,17 @@
 //! A winit window, a wgpu surface, and one image blitted across it: that is
 //! [`viewport`], and a sim that wants a window implements [`viewport::Scene`]
 //! and hands it to [`Viewer::run`]. [`temporal`] is the temporal history the
-//! tiers accumulate into, behind one trait; [`frame`] the camera and the
-//! readback both the window and a still share, and [`ride`] the
-//! recorded-rollout player.
+//! tiers accumulate into, behind one trait; [`history`] is the CPU tier's
+//! implementation of it — reprojection, a geometric mask, an à-trous filter,
+//! a firefly cap — for a sim with no GPU tracer to hand a scene to;
+//! [`frame`] the camera and the readback both the window and a still share,
+//! and [`ride`] the recorded-rollout player.
 //!
 //! Nothing here names a sim. `sims/court/game.rs` and `sims/pool/game.rs` are
 //! the per-sim viewer modes and live with their sims.
 
 pub mod frame;
+pub mod history;
 pub mod temporal;
 pub mod viewport;
 

@@ -60,6 +60,33 @@ pub struct Caustic<S: Scalar> {
     pub outside: usize,
 }
 
+/// The plane the light is caught on: its origin, the normal it is lit from,
+/// and the two in-plane axes the caustic's grid is indexed by.
+///
+/// The plate is the identity case. The cove's door is not: its face is a
+/// vertical wall, and the rune is the caustic read in *its* coordinates, so
+/// the receiver has to be a frame and not an assumption about z.
+#[derive(Clone, Copy, Debug)]
+pub struct Receiver {
+    pub origin: Vec3<f64>,
+    pub normal: Vec3<f64>,
+    pub u: Vec3<f64>,
+    pub v: Vec3<f64>,
+}
+
+impl Receiver {
+    /// The marble's plate: the world's own axes, receiving at z = 0.
+    pub fn plate() -> Self {
+        Self { origin: Vec3::zero(), normal: Vec3::z(), u: Vec3::x(), v: Vec3::y() }
+    }
+
+    /// A world point in the receiver's coordinates.
+    fn point(&self, p: Vec3<f64>) -> Vec3<f64> {
+        let q = p - self.origin;
+        Vec3::new(self.u.dot(&q), self.v.dot(&q), self.normal.dot(&q))
+    }
+}
+
 /// Trace `rays_per_band` light rays per band from the lamp through a glass
 /// `shape` to the plate. Everything in the plate frame (plate top is z = 0).
 pub fn trace<S: Scalar>(
@@ -70,6 +97,28 @@ pub fn trace<S: Scalar>(
     cells: usize,
     rays_per_band: usize,
 ) -> Caustic<S> {
+    trace_onto(lamp, shape, nd, Receiver::plate(), window, cells, rays_per_band)
+}
+
+/// The same trace onto any receiving plane. The lamp and the glass are moved
+/// into the receiver's frame — one rigid change of coordinates, which the
+/// duals carry through untouched — and from there this *is* the plate case,
+/// so there is one ray walk and not two to keep in agreement.
+///
+/// The returned `Caustic`'s grid is in the receiver's `(u, v)`.
+pub fn trace_onto<S: Scalar>(
+    lamp: Vec3<f64>,
+    shape: &crate::glass::Shape<S>,
+    nd: S,
+    receiver: Receiver,
+    window: f64,
+    cells: usize,
+    rays_per_band: usize,
+) -> Caustic<S> {
+    let lift = |p: Vec3<f64>| Vec3::new(S::from_f64(p.x), S::from_f64(p.y), S::from_f64(p.z));
+    let shape =
+        &shape.to_frame(lift(receiver.origin), lift(receiver.u), lift(receiver.v), lift(receiver.normal));
+    let lamp = receiver.point(lamp);
     let (centre_s, bound_s) = shape.bounds();
     let centre = Vec3::new(centre_s.x.to_f64(), centre_s.y.to_f64(), centre_s.z.to_f64());
     let bound = bound_s.to_f64();
@@ -222,6 +271,7 @@ fn shape_f64<S: Scalar>(shape: &crate::glass::Shape<S>) -> crate::glass::Shape<f
             centre: v(*centre),
             bound_r: bound_r.to_f64(),
         },
+        Shape::Capsule { a, b, r } => Shape::Capsule { a: v(*a), b: v(*b), r: r.to_f64() },
     }
 }
 
@@ -361,4 +411,69 @@ pub fn composite(
 
 pub fn out_dir(out: &Path) -> std::path::PathBuf {
     out.join("light")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glass::Shape;
+
+    /// Plate coordinates as world coordinates for a receiver that is the
+    /// wall `x = 0` facing `+x`: `(X, Y, Z)` on the plate is `(Z, X, Y)` in
+    /// the world, which is the plate stood on end.
+    fn on_end(p: Vec3<f64>) -> Vec3<f64> {
+        Vec3::new(p.z, p.x, p.y)
+    }
+
+    fn wall() -> Receiver {
+        Receiver { origin: Vec3::zero(), normal: Vec3::x(), u: Vec3::y(), v: Vec3::z() }
+    }
+
+    const ND: f64 = 1.5168;
+    const WINDOW: f64 = 0.04;
+    const CELLS: usize = 48;
+    const RAYS: usize = 4_000;
+
+    #[test]
+    fn the_wall_receives_what_the_plate_receives() {
+        let (lamp, centre, r) = (Vec3::new(0.0, 0.0, 0.4), Vec3::new(0.0, 0.0, 0.05), 0.0125);
+        let flat = trace::<f64>(lamp, &Shape::Sphere { centre, r }, ND, WINDOW, CELLS, RAYS);
+        let stood = trace_onto::<f64>(
+            on_end(lamp),
+            &Shape::Sphere { centre: on_end(centre), r },
+            ND,
+            wall(),
+            WINDOW,
+            CELLS,
+            RAYS,
+        );
+        assert!(flat.traced > 1_000, "the plate case traced {} rays", flat.traced);
+        assert!(flat.total(2) > 0.0, "the plate case caught nothing");
+        assert_eq!((flat.n, flat.traced, flat.tir, flat.outside), (stood.n, stood.traced, stood.tir, stood.outside));
+        assert!((flat.origin[0] - stood.origin[0]).abs() < 1e-12 && (flat.origin[1] - stood.origin[1]).abs() < 1e-12);
+        for b in 0..BANDS_LEN {
+            for (f, s) in flat.e[b].iter().zip(&stood.e[b]) {
+                assert!((f - s).abs() <= 1e-12 * f.abs().max(1.0), "band {b}: {f} vs {s}");
+            }
+        }
+    }
+
+    /// The wall is not a second code path, so the dual it carries is the same
+    /// dual the plate carries: `∂E/∂n_d` against central differences.
+    #[test]
+    fn the_wall_still_differentiates_in_the_index() {
+        let (lamp, centre, r) = (Vec3::new(0.0, 0.0, 0.4), Vec3::new(0.0, 0.0, 0.05), 0.0125);
+        let (lamp, centre) = (on_end(lamp), on_end(centre));
+        let total = |nd: f64| {
+            let c = trace_onto::<f64>(lamp, &Shape::Sphere { centre, r }, nd, wall(), WINDOW, CELLS, RAYS);
+            (0..BANDS_LEN).map(|b| c.total(b)).sum::<f64>()
+        };
+        let shape = crate::glass::to_dual(&Shape::Sphere { centre, r });
+        let c = trace_onto::<Dual<f64>>(lamp, &shape, Dual::new(ND, 1.0), wall(), WINDOW, CELLS, RAYS);
+        let d: Dual<f64> = (0..BANDS_LEN).map(|b| c.total(b)).fold(Dual::constant(0.0), |a, v| a + v);
+        let h = 1e-5;
+        let fd = (total(ND + h) - total(ND - h)) / (2.0 * h);
+        assert!((d.real - total(ND)).abs() < 1e-12, "the dual's real part is the f64 answer");
+        assert!((d.dual - fd).abs() < 1e-4 * fd.abs().max(1.0), "dual {} vs central differences {fd}", d.dual);
+    }
 }

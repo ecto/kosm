@@ -2063,6 +2063,9 @@ impl viewport::Scene for App {
                 self.camera = self.authored;
                 self.orbit = self.orbit_from_camera();
             }
+            // The court orbits with the mouse and has no held keys: raw look,
+            // releases, and the walking keys are for the scenes that walk.
+            _ => {}
         }
     }
 
