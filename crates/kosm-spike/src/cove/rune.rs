@@ -35,6 +35,7 @@
 //!
 //! Metres and radians, z up, as everywhere else in the cove.
 
+use super::being::TILT_MAX;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -394,8 +395,11 @@ fn grid(scene: &CoveScene, photons: usize, margin: f64, log: bool) -> (Pose, Sco
         let mut row = 0.0f64;
         for ix in 0..=nx {
             let x = x0 + ix as f64 * 0.5;
+            // Only leans the player can hold: the grid stops at the sim's
+            // clamp, or the answer is a pose the game itself refuses.
             for it in -5..=5 {
-                let pose = Pose { x, y, tilt: (it as f64 * 2.0f64).to_radians() };
+                let tilt = (it as f64 * 2.0f64).to_radians().clamp(-TILT_MAX, TILT_MAX);
+                let pose = Pose { x, y, tilt };
                 let s = score(scene, &pose, photons);
                 if s.frac > 0.0 {
                     lit += 1;
@@ -520,11 +524,11 @@ pub fn solve_within(scene: &CoveScene, photons: usize, margin: f64) -> (Pose, Sc
     let mut evals = 0usize;
     let mut f = |v: &[f64]| -> f64 {
         evals += 1;
-        let pose = Pose { x: v[0].clamp(x0, x1), y: v[1].clamp(y0, y1), tilt: (v[2] * TILT_UNIT).clamp(-0.35, 0.35) };
+        let pose = Pose { x: v[0].clamp(x0, x1), y: v[1].clamp(y0, y1), tilt: (v[2] * TILT_UNIT).clamp(-TILT_MAX, TILT_MAX) };
         -score(scene, &pose, photons).frac
     };
     let (v, _) = nelder_mead(&mut f, &[seed.x, seed.y, seed.tilt / TILT_UNIT], &[0.25, 0.25, 2.0], 120);
-    let pose = Pose { x: v[0].clamp(x0, x1), y: v[1].clamp(y0, y1), tilt: (v[2] * TILT_UNIT).clamp(-0.35, 0.35) };
+    let pose = Pose { x: v[0].clamp(x0, x1), y: v[1].clamp(y0, y1), tilt: (v[2] * TILT_UNIT).clamp(-TILT_MAX, TILT_MAX) };
     let s = score(scene, &pose, photons);
     println!(
         "rune simplex  {evals} evaluations at {photons} photons: {:.5} at ({:+.3}, {:+.3}) m, {:+.2}°",

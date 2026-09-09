@@ -27,21 +27,24 @@
 [defparam door_w_mm 1800.0]
 [defparam door_h_mm 2600.0]
 [defparam door_t_mm 200.0]
-[defparam door_x_mm 0.0]        ; where along the cliff the door sits
+[defparam door_x_mm 100.0]      ; where along the cliff the door sits (100 centres the solved spot)
 [defparam aperture_r_mm 120.0]  ; the rune's keyhole: a disc on the door face, not geometry
-[defparam aperture_z_mm 1500.0] ; keyhole height above the sand at the door
+[defparam aperture_z_mm 400.0]  ; keyhole height above the sand at the door: sunlight travels
+                                ; downward, so it can never land above the being's head
 [defparam open_frac 0.3]        ; the score that opens the door
 
 ; ---- the sun ----------------------------------------------------------------
 ; A low afternoon sun out over the sea, so what it throws through the being
-; lands on the cliff face.
-[defparam sun_az_deg 200.0]     ; toward the sun, about z, from +x toward +y
+; lands on the cliff face. A glass body focuses 1.47 radii from its axis, so
+; the sun must be within 47° of the door's normal (−y is 270°) or the focus
+; falls inside the being's own shadow.
+[defparam sun_az_deg 250.0]     ; toward the sun, about z, from +x toward +y
 [defparam sun_el_deg 22.0]      ; above the horizon
 
 ; ---- the being --------------------------------------------------------------
 ; A capsule of glass on one free joint: the marble grown up, and the lens.
 [defparam being_r_mm 350.0]
-[defparam being_h_mm 1400.0]
+[defparam being_h_mm 1000.0]    ; nearer a sphere: a long capsule smears its focus into a line
 [defparam n_d 1.5168]           ; the d-line index of N-BK7
 [defparam walk_mps 1.4]         ; the speed the walking force is capped at
 [defparam spawn_x_mm -9000.0]   ; where you start
@@ -51,9 +54,9 @@
 ; Solved, not authored: the pose whose caustic falls in the aperture. The
 ; search writes these back into this file, the way the marble writes its
 ; solved knobs. Zeros mean "not solved yet".
-[defparam solution_x_mm 0.0]
-[defparam solution_y_mm 0.0]
-[defparam solution_tilt_deg 0.0]
+[defparam solution_x_mm -47.2224]
+[defparam solution_y_mm 15600.0000]
+[defparam solution_tilt_deg -10.0000]
 
 ; ---- the bake ---------------------------------------------------------------
 [defparam sdf_cell_mm 100.0]    ; the being's feet are 350 mm across

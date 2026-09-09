@@ -267,6 +267,16 @@ pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     let sun = scene.sun_dir();
     println!("cove sun: toward ({:+.3}, {:+.3}, {:+.3}), {:.0}° azimuth and {:.0}° up", sun.x, sun.y, sun.z, scene.sun_az.to_degrees(), scene.sun_el.to_degrees());
     bake::run(&scene, out)?;
+    // The solve writes the answer back into the document when it opens the
+    // door, so the picture is taken from a scene re-read afterwards: what it
+    // shows is the solved pose the level now carries, not the one it had.
+    rune::solve_and_record(&scene, 100_000, out)?;
+    let scene = CoveScene::load(level)?;
+    if scene.solution_x != 0.0 || scene.solution_y != 0.0 {
+        let climbs = hint::solvable(&scene, 6, 200, &dir.join("solvable.txt"))?;
+        let opened = climbs.iter().filter(|c| c.solved).count();
+        println!("cove solvable: {opened} of {} spawns open the door -> {}", climbs.len(), dir.join("solvable.txt").display());
+    }
     still(&scene, &dir)
 }
 

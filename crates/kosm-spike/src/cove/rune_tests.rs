@@ -171,7 +171,6 @@ fn the_score_is_the_fraction_of_the_sun_the_being_caught() {
 /// fix it and [`the_rune_scores_at_a_keyhole_the_light_can_reach`] is this
 /// same test on that cove.
 #[test]
-#[ignore = "levels/cove.loon has no pose over open_frac; see reachable() for the three knobs"]
 fn the_rune_scores_at_the_authored_solution() {
     let scene = CoveScene::bundled().unwrap();
     let pose = Pose::solution(&scene);
@@ -338,7 +337,7 @@ fn the_glint_points_home_from_the_far_end_of_the_beach() {
 /// with `--ignored` to write the report; the numbers in it are the level's
 /// verdict, not the sweep's.
 #[test]
-#[ignore = "two minutes, and levels/cove.loon has no pose over open_frac"]
+#[ignore = "two minutes of tracing; `--cove` runs the same sweep and reports it"]
 fn the_cove_is_solvable() {
     let scene = CoveScene::bundled().unwrap();
     let climbs = hint::solvable(&scene, 6, 200, &out_dir().join("cove/solvable.txt")).unwrap();
