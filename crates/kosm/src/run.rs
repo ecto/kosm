@@ -182,6 +182,33 @@ mod tests {
         assert_eq!(a.as_str().len(), 16);
     }
 
+    /// The defect `docs/kosm-migration.md` records: ipse's gate runner passed
+    /// only the gate spec, so two ollie runs that differed in `--schedule`
+    /// landed in one directory with two different scores. Nothing in `RunId`
+    /// was wrong — a knob that changes the episode has to be *declared* — so
+    /// this is the test that says so: an extra param, whatever its origin,
+    /// moves the id, and a content hash is how a file becomes one.
+    #[test]
+    fn a_knob_the_caller_adds_moves_the_id() {
+        let base = [Param::new("gate_seed", 0.0), Param::new("gate_count", 32.0)];
+        let a = RunId::of("k1/skate/ollie", &base, 0);
+
+        let with = |h: f64| {
+            let mut p = base.to_vec();
+            p.push(Param::new("schedule", h));
+            RunId::of("k1/skate/ollie", &p, 0)
+        };
+        assert_ne!(a, with(1.0), "declaring a schedule moves the id");
+        assert_ne!(with(1.0), with(2.0), "a different schedule moves it again");
+        assert_eq!(with(3.0), with(3.0), "the same schedule does not");
+
+        // A param whose name differs but whose value does not is still a
+        // different run: the name is hashed too.
+        let mut named = base.to_vec();
+        named.push(Param::new("policy", 1.0));
+        assert_ne!(with(1.0), RunId::of("k1/skate/ollie", &named, 0));
+    }
+
     #[test]
     fn the_seed_and_the_sim_are_part_of_the_identity() {
         let a = RunId::of("marble", &[], 0);
