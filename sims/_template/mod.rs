@@ -26,21 +26,27 @@ fn params(args: &kosm_cli::Args) -> Vec<Param> {
     vec![Param::new("height", height), Param::new("steps", 400.0)]
 }
 
-/// **Stage 1, build.** A world is phyz's model and state plus kosm's own
-/// columns. `demo_marble` is a bead over a fixed plate; a real sim builds its
-/// geometry through `kosm::build` / `AuthoredScene` and its colliders through
-/// `colliders_from_document`.
-fn build(params: &[Param]) -> World {
-    let (model, mut state) = kosm::world::demo_marble();
-    let height = params.iter().find(|p| p.name == "height").map(|p| p.value).unwrap_or(0.3);
-    state.q[5] = height; // free-joint q is [wx wy wz x y z]
-    World::from_phyz(model, state).with_params(params.to_vec())
+/// **Stage 1, build.** The level is a Rust function that emits CAD:
+/// `kosm::build` runs it, walks the vcad document it produced into phyz
+/// colliders, and hands back a `Built` whose `world` is the columns. Authored
+/// units are millimetres and degrees; they cross to metres here and nowhere
+/// else. A bead over a fixed plate, which is what `sims/marble` grows into.
+fn scene(params: &[Param]) -> anyhow::Result<Built> {
+    let height_mm = params.iter().find(|p| p.name == "height").map(|p| p.value).unwrap_or(0.3) * 1e3;
+    let mut knobs = Params::new();
+    knobs.set("height_mm", height_mm);
+    build(&knobs, |b| {
+        let height = b.param("height_mm", 300.0);
+        b.body("plate").material("pla").boxed(200.0, 200.0, 10.0).at(0.0, 0.0, -5.0);
+        b.body("bead").glass().sphere(10.0).dynamic(0.005).at(0.0, 0.0, height);
+    })
 }
 
 /// `kosm run _template --out DIR`.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let params = params(args);
-    let world = build(&params);
+    let built = scene(&params)?;
+    let world = built.world.clone().with_params(params.clone());
 
     // Stage 2, run: a rollout is a trajectory, and a step is pure.
     let steps = params.iter().find(|p| p.name == "steps").map(|p| p.value as usize).unwrap_or(400);
@@ -50,7 +56,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     // Stage 3, observe. A probe is a lens on a column; a reward is a closure
     // as a lens; a camera is a lens through kosm-render. None of them holds
     // the world.
-    let height = Probe::q("bead height", 5);
+    let height = Probe::q("bead height", 5);   // free-joint q is [wx wy wz x y z]
     let dropped = reward("dropped", |w: &World| world.q()[5] - w.q()[5]);
     let camera = Camera::look_at(
         Vec3::new(0.25, -0.35, 0.30),

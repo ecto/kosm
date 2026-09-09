@@ -30,19 +30,36 @@ kosm-view and is never what you want here.
 
 ### 1. Build a world
 
+The level is a Rust function that emits CAD. `build` runs it, walks the
+document it produced into phyz colliders, and hands back a `Built`:
+
 ```rust
 use kosm::prelude::*;
-let (model, state) = kosm::world::demo_marble();
-let world = World::from_phyz(model, state).with_params(vec![Param::new("tilt", 0.05)]);
-assert_eq!(world.param("tilt"), Some(0.05));
-let tilted = world.with(&[("tilt", 0.09)]);   // a copy; `with` never mutates
+let built = build(&Params::default(), |b| {
+    let tilt = b.param("tilt", 5.0);            // a knob: degrees, mm, vcad's units
+    b.body("plate").boxed(400.0, 400.0, 10.0).material("pla").rotate_y(tilt);
+    b.body("marble").sphere(8.0).glass().dynamic(0.012).at(0.0, 0.0, 30.0);
+})?;
+assert_eq!(built.world.param("tilt"), Some(5.0));
+let steeper = built.with(&[("tilt", 9.0)])?;    // re-runs the closure; never mutates
+assert_eq!(steeper.world.param("tilt"), Some(9.0));
+# Ok::<(), anyhow::Error>(())
 ```
 
-`World::from_phyz` is lossless both ways — `world.phyz()` hands the model
-and state back, `world.into_phyz()` hands them back by value. A real sim
-builds its geometry from an `AuthoredScene` and its colliders with
-`colliders_from_document`, then hands phyz's `Model` to `from_phyz`; see
-`sims/marble/mod.rs`.
+Authoring is **millimetres and degrees** (vcad's), simulation is metres and
+radians (phyz's); `kosm::scene::MM` is the one place they cross. Origins are
+vcad's too: `cube` has a corner at the origin, `cylinder`'s base is at
+`z = 0`, `sphere` and `boxed` are centred. `Shape` carries `translate` /
+`at`, `rotate_x/y/z`, `scale`, `union`, `difference`, `intersection`,
+`linear_pattern` and `circular_pattern`; a `difference` goes through
+`colliders.rs`'s convex decomposition, so a cup stays hollow.
+
+`Built` gives you `document` (for the STL, the SVG, `brep::Scene`), `params`,
+`bodies[i].colliders`, and `world`. `World::from_phyz` is lossless both ways
+— `world.phyz()` hands the model and state back, `world.into_phyz()` by
+value — so a sim whose physics needs more than `build`'s default rig takes
+`built.document`, derives what it wants and builds its own `Model`; see
+`sims/marble/scene.rs` and `sims/marble/mod.rs`.
 
 ### 2. Add a body
 

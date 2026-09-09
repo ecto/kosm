@@ -40,7 +40,6 @@ vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
 vcad-kernel-gpu.workspace = true
 vcad-kernel-math.workspace = true
 vcad-kernel.workspace = true
-vcad-eval.workspace = true
 [features]
 default = []
 ride = ["dep:ipse-map", "dep:serde", "dep:serde_json"]

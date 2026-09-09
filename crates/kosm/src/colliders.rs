@@ -910,18 +910,16 @@ fn to_collision_geometry(g: &Geometry) -> phyz_collision::Geometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::{Builder, Params, Shape, build};
 
-    fn doc_of(src: &str) -> Document {
-        // Provenance recovery re-evaluates the program many times over and
-        // nothing here reads it back.
-        // SAFETY: the test process has not spawned anything that reads the env.
-        unsafe { std::env::set_var("VCAD_LOON_NO_PARAM_RECOVERY", "1") };
-        let (doc, _) = vcad_loon::eval_vcad_parametric(src, None, None).expect("level evaluates");
-        doc
-    }
-
-    fn derive(src: &str) -> Derived {
-        colliders_from_document(&doc_of(src)).expect("colliders derive")
+    /// The colliders of a one-body level, built in Rust.
+    fn derive(shape: impl Fn(&Builder) -> Shape + Send + Sync + 'static) -> Derived {
+        let built = build(&Params::default(), move |b| {
+            b.body("part").add(shape(b));
+        })
+        .expect("builds");
+        let mut bodies = built.bodies;
+        bodies.remove(0).colliders
     }
 
     fn hulls(d: &Derived) -> Vec<(&Vec<Vec3>, &Vec<[usize; 3]>)> {
@@ -934,15 +932,34 @@ mod tests {
             .collect()
     }
 
-    /// Booleans are subject-last: `[difference tool subject]`.
     /// A tube: outer radius 25, bore 20, 30 mm tall, bored right through.
-    const HOLLOW_CYLINDER: &str = "[difference [cylinder 20.0 40.0] [cylinder 25.0 30.0]]";
+    fn hollow_cylinder(b: &Builder) -> Shape {
+        b.cylinder(25.0, 30.0).difference(b.cylinder(20.0, 40.0))
+    }
+
     /// A 100×80×10 plate with a 12 mm bore straight through it at (50, 40).
-    const HOLED_PLATE: &str = "[difference [translate 50.0 40.0 -5.0 [cylinder 12.0 20.0]] [cube 100.0 80.0 10.0]]";
+    fn holed_plate(b: &Builder) -> Shape {
+        b.cube(100.0, 80.0, 10.0).difference(b.cylinder(12.0, 20.0).at(50.0, 40.0, -5.0))
+    }
+
+    /// The cup `sims/marble` models as a bore and a slot, at its own numbers:
+    /// centre (90, 0), inside radius 22, wall 3, 14 mm of it.
+    fn marble_cup(b: &Builder) -> Shape {
+        let (cup_x, cup_r, cup_wall, cup_h) = (90.0, 22.0, 3.0, 14.0);
+        let cup_big = cup_r + cup_wall;
+        let tube = b
+            .cylinder(cup_big, cup_h)
+            .at(cup_x, 0.0, 0.0)
+            .difference(b.cylinder(cup_r, 1.1 * cup_h).at(cup_x, 0.0, 0.0));
+        let mouth = b
+            .boxed(1.4444 * cup_big, 1.6630 * cup_big, 1.2 * cup_h)
+            .at(cup_x - 1.2778 * cup_big, 0.0, 0.5 * cup_h);
+        tube.difference(mouth)
+    }
 
     #[test]
     fn hollow_cylinder_decomposes_and_leaves_the_bore_empty() {
-        let d = derive(HOLLOW_CYLINDER);
+        let d = derive(hollow_cylinder);
         assert!(d.warnings.is_empty(), "should not have fallen back: {:?}", d.warnings);
         assert!(d.colliders.len() >= 6, "expected a ring of pieces, got {}", d.colliders.len());
         assert_eq!(hulls(&d).len(), d.colliders.len(), "every piece should be a hull");
@@ -964,7 +981,7 @@ mod tests {
 
     #[test]
     fn plate_with_a_through_hole_keeps_the_hole() {
-        let d = derive(HOLED_PLATE);
+        let d = derive(holed_plate);
         assert!(d.warnings.is_empty(), "should not have fallen back: {:?}", d.warnings);
         assert!(d.colliders.len() >= 6, "expected several pieces, got {}", d.colliders.len());
 
@@ -982,7 +999,7 @@ mod tests {
     fn the_plate_beside_the_hole_is_still_solid() {
         // Sanity in the other direction: a decomposition that leaves the hole
         // empty by leaving *everything* empty would pass the test above.
-        let d = derive(HOLED_PLATE);
+        let d = derive(holed_plate);
         for (dx, dy) in [(-40.0, -30.0), (40.0, 30.0), (-40.0, 30.0), (20.0, -10.0)] {
             let p = Vec3::new((50.0 + dx) * MM, (40.0 + dy) * MM, 5.0 * MM);
             assert!(
@@ -997,17 +1014,20 @@ mod tests {
         // The unchanged path. Boxes tessellate exactly, so their support
         // functions must agree with the mesh to round-off — no tolerance to
         // hide a regression behind.
-        let src = "[union [translate 30.0 0.0 0.0 [cube 20.0 20.0 20.0]] \
-                   [union [rotate 0.0 0.0 15.0 [cube 40.0 20.0 10.0]] \
-                          [translate -30.0 5.0 0.0 [rotate 30.0 0.0 0.0 [cube 10.0 10.0 40.0]]]]]";
-        let doc = doc_of(src);
-        let d = colliders_from_document(&doc).expect("colliders derive");
+        let built = build(&Params::default(), |b| {
+            b.body("part")
+                .add(b.cube(20.0, 20.0, 20.0).at(30.0, 0.0, 0.0))
+                .add(b.cube(40.0, 20.0, 10.0).rotate_z(15.0))
+                .add(b.cube(10.0, 10.0, 40.0).rotate_x(30.0).at(-30.0, 5.0, 0.0));
+        })
+        .expect("builds");
+        let d = &built.bodies[0].colliders;
         assert!(d.warnings.is_empty(), "primitives should not warn: {:?}", d.warnings);
         assert_eq!(d.colliders.len(), 3);
         assert!(d.removed.is_empty());
-        let worst = verify_against_mesh(&doc, &d).expect("verify");
+        let worst = verify_against_mesh(&built.document, d).expect("verify");
         assert!(worst < 1e-6, "support functions disagree by {worst:.3e} m");
-        assert_eq!(verify_no_intrusion(&d), 0.0);
+        assert_eq!(verify_no_intrusion(d), 0.0);
     }
 
     #[test]
@@ -1015,25 +1035,27 @@ mod tests {
         // A sphere and a cylinder are exact colliders but chordal meshes, so
         // the collider legitimately stands proud of the tessellation by the
         // sagitta. It is a few microns, and it is one-sided.
-        let src = "[union [translate 30.0 0.0 0.0 [sphere 8.0]] [translate -30.0 0.0 0.0 [cylinder 6.0 20.0]]]";
-        let doc = doc_of(src);
-        let d = colliders_from_document(&doc).expect("colliders derive");
+        let built = build(&Params::default(), |b| {
+            b.body("part")
+                .add(b.sphere(8.0).at(30.0, 0.0, 0.0))
+                .add(b.cylinder(6.0, 20.0).at(-30.0, 0.0, 0.0));
+        })
+        .expect("builds");
+        let d = &built.bodies[0].colliders;
         assert!(d.warnings.is_empty(), "primitives should not warn: {:?}", d.warnings);
         assert_eq!(d.colliders.len(), 2);
-        let worst = verify_against_mesh(&doc, &d).expect("verify");
+        let worst = verify_against_mesh(&built.document, d).expect("verify");
         assert!(worst < 1e-5, "support functions disagree by {worst:.3e} m, more than a chord sagitta");
     }
 
-    /// The level this module exists for: `marble-cup.loon` models its cup as a
+    /// The level this module exists for: `sims/marble` models its cup as a
     /// bore and a slot, and the marble has to be able to get inside it.
     #[test]
     fn the_cup_level_leaves_its_cup_hollow() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sims/marble/marble-cup.loon");
-        let src = std::fs::read_to_string(path).expect("level file");
-        let d = derive(&src);
+        let d = derive(marble_cup);
         assert!(d.warnings.is_empty(), "the cup should not have fallen back: {:?}", d.warnings);
-        // Cup centre is (cup_x, 0) = (90, 0) mm; the bore is 22 mm in radius and
-        // runs the full 14 mm of the wall.
+        // Cup centre is (cup_x, 0) = (90, 0) mm; the bore is 22 mm in radius
+        // and runs the full 14 mm of the wall.
         for z in [1.0, 7.0, 13.0] {
             let inside_cup = Vec3::new(90.0 * MM, 0.0, z * MM);
             for (i, (p, f)) in hulls(&d).iter().enumerate() {
@@ -1051,7 +1073,7 @@ mod tests {
     fn an_intersection_of_convex_solids_is_one_exact_collider() {
         // Two overlapping boxes: the result is a box, so the convex fast path
         // takes it and there is nothing to decompose or warn about.
-        let d = derive("[intersection [translate 10.0 10.0 10.0 [cube 20.0 20.0 20.0]] [cube 20.0 20.0 20.0]]");
+        let d = derive(|b| b.cube(20.0, 20.0, 20.0).intersection(b.cube(20.0, 20.0, 20.0).at(10.0, 10.0, 10.0)));
         assert!(d.warnings.is_empty(), "a convex result should not warn: {:?}", d.warnings);
         assert_eq!(d.colliders.len(), 1);
         assert_eq!(d.notes.len(), 1);

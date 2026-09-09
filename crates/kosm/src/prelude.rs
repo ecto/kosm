@@ -30,7 +30,7 @@ pub use crate::step::{Action, PhyzStep, Policy, Step, Trajectory, Zero, rollout,
 pub use crate::task::{Invariant, Task, check_invariants};
 pub use crate::world::{Light, Material, Param, World};
 
-// the build side, as it exists today: authored geometry and its colliders
+// the build side: geometry in rust, and the colliders derived from it
+pub use crate::build::{Authored, Built, Params, build};
 pub use crate::colliders::{Derived as DerivedColliders, colliders_from_document};
-pub use crate::build::{Built, Params, build};
-pub use crate::scene::{AuthoredScene, MM};
+pub use crate::scene::MM;

@@ -36,7 +36,6 @@ vcad.workspace = true
 vcad-kernel.workspace = true
 vcad-eval.workspace = true
 vcad-ir.workspace = true
-vcad-loon.workspace = true
 vcad-kernel-export.workspace = true
 vcad-render.workspace = true
 vcad-kernel-acoustics.workspace = true

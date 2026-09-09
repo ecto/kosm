@@ -1,6 +1,6 @@
 //! The court, baked into a map the K1 can stand on.
 //!
-//! The skatepark's bake path, pointed at [`levels/court.loon`]: every root
+//! The skatepark's bake path, pointed at [`super::scene`]: every root
 //! [`parts::collides`] admits — the slab, the gym's floor, walls and ceiling,
 //! the hoop's board, rim, bracket, pole and arm, the pads, the bleachers —
 //! goes into `mesh.stl` and decides the sign of the field; the ball, the net
@@ -26,7 +26,6 @@ use kosm::build::{Built, Params};
 use kosm::scene::MM;
 use crate::skatepark::{self, BakeOpts, Baked, Part};
 
-pub const DEFAULT_COURT_LEVEL: &str = "levels/court.loon";
 
 /// The court's bake knobs, resolved to metres.
 pub struct CourtBake {

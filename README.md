@@ -1,15 +1,18 @@
 # Kosm
 
-A game engine where the level is a CAD file, the physics is the robot's
-simulator, and every knob has a gradient. Built on
+A game engine where the level is a Rust function that emits CAD, the physics
+is the robot's simulator, and every knob has a gradient. Built on
 [vcad](https://github.com/ecto/vcad) (geometry), [phyz](https://github.com/ecto/phyz)
-(differentiable multi-physics), [tang](https://github.com/ecto/tang) (one scalar,
-one IR) and loon (scripting).
+(differentiable multi-physics) and [tang](https://github.com/ecto/tang) (one
+scalar, one IR).
 
-`AuthoredScene` is the narrow shared boundary: it evaluates a Loon/vcad source,
-resolves its parameters, converts authored millimetres at the computation edge,
-and can write solved parameters back. Marble and pool then attach different
-computations to that source; they do not share an artificial simulation loop.
+`kosm::build` is the narrow shared boundary: a `scene(&Params) -> Built` writes
+its geometry in Rust over vcad's kernel, its knobs are `Param`s that resolve to
+`f64` at build time and land on the world, and `built.with(&[..])` re-runs the
+function with one of them turned. What comes out is a vcad document — the same
+one a `.loon` used to evaluate to — so the printer, the colliders and the
+picture all read one description. Each sim then attaches different computations
+to that document; they do not share an artificial simulation loop.
 
 The tree: `crates/kosm` is the engine (worlds, colliders, materials, audio,
 light, `brep`, `denoise`, `fluid`), `crates/kosm-render` the camera lens,
@@ -28,9 +31,9 @@ kosm run court --view        # a window (needs --features view)
 
 ## the marble (`sims/marble`)
 
-The first spike. The level is [`sims/marble/marble.loon`](sims/marble/marble.loon):
-geometry in vcad's loon vocabulary, knobs as `defparam`s (tilt, release point,
-marble, horizon). Everything else is derived from that one file:
+The first spike. The level is [`sims/marble/scene.rs`](sims/marble/scene.rs):
+geometry in Rust over `kosm::build`, knobs as `Param`s (tilt, release point,
+marble, horizon). Everything else is derived from that one function:
 
 - a vcad document, written as a printable STL and an isometric SVG
 - a phyz rollout of a glass marble on a tilted plate
@@ -41,10 +44,10 @@ marble, horizon). Everything else is derived from that one file:
 - `out/marble.wav`: the hinted run, heard — modal synthesis in a room, no samples
 
 ```bash
-cargo run --release -p kosm-cli -- run marble   # or: kosm run marble other.loon
+cargo run --release -p kosm-cli -- run marble   # or: kosm run marble cup
 open out/track.svg out/frame_before.png out/frame_hint.png out/frame_tilted.png
 afplay out/marble.wav
-diff sims/marble/marble.loon out/solved/marble.loon   # the solved knobs, written back
+cat out/<run>/solved/marble.json                # the solved knobs, as CAD
 ```
 
 The document is the only description of the geometry. `colliders.rs` walks
@@ -54,7 +57,7 @@ fixed track body, and checks every collider's support function against the
 tessellation before the first step. Plate, walls and cup are all real colliders;
 the cup is a ring of box segments with a mouth facing uphill so it catches.
 
-### a cup that is actually hollow ([`sims/marble/marble-cup.loon`](sims/marble/marble-cup.loon))
+### a cup that is actually hollow (`scene::scene_hollow`)
 
 A ring of box segments is a union of convex primitives, which is what a phyz
 collider is. Modelled the way a person would actually model it — a cylinder with
@@ -79,12 +82,12 @@ support test. The support test only ever sees the outside of the level, where a
 cup and a puck are the same shape — it is exactly blind to this bug.
 
 ```bash
-cargo run --release -p kosm-cli -- run marble sims/marble/marble-cup.loon
+cargo run --release -p kosm-cli -- run marble cup
 ```
 
 The cup comes out as 24 wedges reaching 0.376 mm into the bore, and the marble
-is caught after the same hint and tilt solves as `marble.loon`. Both levels run;
-the pattern-based cup is still there.
+is caught after the same hint and tilt solves as the ring cup. Both cups run;
+the pattern-based one is still there.
 
 ### the frame
 
@@ -131,7 +134,7 @@ for the caustic tracer. Sizes are level knobs (`cube_mm`, `pyramid_mm`,
 ### the pool
 
 `kosm run pool --frames N` drops a watermelon into the authored scene
-[`sims/pool/pool.loon`](sims/pool/pool.loon) (`sims/pool/`). Drop height, melon geometry
+[`sims/pool/scene.rs`](sims/pool/scene.rs) (`sims/pool/`). Drop height, melon geometry
 and density, water parameters, and recording cadence come from that scene.
 Typed pool geometry is carried through rigid dynamics, snapshots, and both the
 reference and live renderers. The fine-water/far-field solver still requires the
@@ -290,7 +293,7 @@ contact normal (gradients off by 100×). Tests: `phyz/tests/sphere_on_fixed_box.
 ### the court
 
 `kosm run court --frames N` is a gym: the authored scene
-[`sims/court/court.loon`](sims/court/court.loon) (`sims/court/`) has a maple slab, a
+[`sims/court/scene.rs`](sims/court/scene.rs) (`sims/court/`) has a maple slab, a
 regulation hoop at one end — backboard, a rim of 24 rod segments, bracket, arm
 and pole, all vcad geometry derived into colliders the same way the marble
 track is — and basketballs that are phyz free bodies. Three are dropped from
@@ -346,7 +349,7 @@ that scaling makes them the same length, so the direction points at the answer
 instead of down a valley. The level's own 7.40 m/s at 52° already goes in, but
 its centre is 85 mm off the rim's middle at the horizon; two iterations take it
 to 7.319 m/s at 51.77° and 23.5 mm, through at 1.00 s, and the knobs go back to
-`out/hinted/court.loon`. Off target, `shot_speed 6.8` is a plain miss; the same
+`out/hinted/court.json`. Off target, `shot_speed 6.8` is a plain miss; the same
 solve returns 7.128 m/s at 47.94° in two iterations and it drops at 0.86 s. The
 whole thing is about 15 s, and `aim 0` in the level turns it off for the
 render-only path. `tests/aim.rs` gates both halves.
@@ -433,7 +436,7 @@ simulator.
 cargo run --release -p kosm-cli -- run court          # out/court.mp4, out/court_still.png
 KOSM_SPP=4 cargo run --release -p kosm-cli -- run court --frames 30  # a quick look
 cargo run --release -p kosm-cli --example court_trace      # one ball, height and speed through each impact
-diff sims/court/court.loon out/hinted/court.loon                 # the aimed shot, written back
+cat out/hinted/court.json                                        # the aimed shot, as CAD
 ```
 
 The balls did not bounce until phyz did. Its soft contact is a resting-contact
@@ -459,7 +462,7 @@ rather than a guard on the measured shortfall.
 flat floor. Its terrain is an `ipse-map` directory — a collision mesh and a
 signed-distance grid baked from it — that a scenario file points at, so the
 park is authored here as vcad geometry
-([`sims/skatepark/skatepark.loon`](sims/skatepark/skatepark.loon): a mini ramp, one solid, the
+([`sims/skatepark/scene.rs`](sims/skatepark/scene.rs): a mini ramp, one solid, the
 transition radius, lip, width, flat, deck and coping as `defparam`s) and
 baked with ipse-map's own baker into `out/maps/skatepark/` (`mesh.stl`,
 `sdf.bin`, `map.toml`, `park.svg`, and a `scenario.toml` that stands the K1
@@ -488,7 +491,7 @@ the start-of-step frame, and turns the solved velocity into the end-of-step
 frame exactly afterwards; the adjoint carries the turn's tangent. Tests:
 `phyz/tests/spinning_free_body.rs`, `ipse-map` `sdf::tests::outside_is_none`.
 
-`sims/skatepark/warehouse/warehouse.loon` (`kosm run skatepark/warehouse`) is the same machinery at level scale: THPS1's first
+`sims/skatepark/warehouse/scene.rs` (`kosm run skatepark/warehouse`) is the same machinery at level scale: THPS1's first
 level scaled to the K1 inside a 16 × 9 m shed — half pipe, mezzanine, two
 quarter pipes either side of an open door, a platform, a bent rail, kickers,
 box piles, a ledge, and the building itself. One root per piece, each with a
@@ -1443,7 +1446,7 @@ estimation found a blocker, returned black, and the only way light got into a
 glazed room was a BSDF path that happened to refract through the pane and then
 wander into the sun's 0.27° cone. That is one ray in tens of thousands, which
 over the passes a frame gets is salt-and-pepper, not daylight — and it is why
-`sims/court/court.loon` had its clerestory band cut open as a *hole* for a while,
+The court had its clerestory band cut open as a *hole* for a while,
 with a comment saying so.
 
 A thin sheet is not a blocker, it is a filter. `occluded` is now

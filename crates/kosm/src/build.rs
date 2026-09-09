@@ -88,9 +88,10 @@ impl FromIterator<(String, f64)> for Params {
 }
 
 /// A source of authored geometry: the document, what its roots are called,
-/// and where it came from. Implemented by [`Built`] and, while it lasts, by
-/// [`crate::scene::AuthoredScene`], so the bake and the parts walk take
-/// either.
+/// and where it came from. The bake and the parts walk take one of these
+/// rather than a `Built`, so a caller with a document from somewhere else —
+/// a URDF import, a scan — can hand it over without going through the
+/// builder.
 pub trait Authored {
     fn document(&self) -> &Document;
     /// The roots' names, in document order. vcad's `SceneEntry` carries a
@@ -169,7 +170,7 @@ impl Built {
         self.param(name).map(|v| v * MM)
     }
 
-    /// A knob, or an error naming it. The spelling `AuthoredScene` used.
+    /// A knob, or an error naming it.
     pub fn parameter(&self, name: &str) -> anyhow::Result<f64> {
         self.param(name).ok_or_else(|| anyhow::anyhow!("the level has no `{name}`"))
     }
