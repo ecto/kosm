@@ -2261,9 +2261,9 @@ which is also what makes a run hash mean something.
 
 If you *do* have the sibling repos checked out and want a kosm build to pick up
 your edits to them, that is `.cargo/config.toml`: it `[patch]`es each of those
-git sources back to a local path. The committed copy holds Cam's paths (his is
-the only dev machine today); move it aside to see exactly what a clean clone
-sees, and note that CI must run without it. The manifest is the truth; that
+git sources back to a local path. It is untracked: copy
+`.cargo/config.toml.example` and point it at your checkouts. Remove it to see
+exactly what a clean clone sees, and note that CI runs without it. The manifest is the truth; that
 file is the developer override.
 
 The patches are also what keeps one phyz and one tang in the graph: `vcad`

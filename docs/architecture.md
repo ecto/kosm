@@ -309,8 +309,8 @@ stays in ipse, on a generic `kosm::build::urdf`.
    traits, `_template`, the run hash and `out/<hash>/`, `--out`, and a
    `CLAUDE.md`, so the agent loop closes before any level loses its loon.
 2. Externals to git revs. Replace the phyz worktree paths and vcad branch
-   with revs; local-checkout overrides go in `.cargo/config.toml`, so a clean
-   clone builds.
+   with revs; local-checkout overrides go in an untracked `.cargo/config.toml`
+   (from `.cargo/config.toml.example`), so a clean clone builds.
 3. The demo. One file under fifty lines: the K1 on a board, an ollie, the
    gradient of the landing score with respect to wheelbase and deck concave,
    step the geometry, re-render, before and after. If it runs, every claim

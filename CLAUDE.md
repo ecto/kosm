@@ -251,9 +251,10 @@ four stages (build → run → observe → optimise-optional). Copy it.
   A test or a template stays small.
 - **Externals.** phyz, vcad and tang are git revs in the workspace
   `Cargo.toml` — a clean clone builds with no sibling checkouts. `.cargo/config.toml`
-  patches those same sources back to the local checkouts on this machine, so
-  edits next door still land in a kosm build; it is committed, it overrides the
-  manifest's patches, and CI must run without it. `tang` is unified by a
+  (untracked; copy `.cargo/config.toml.example` and point it at your
+  checkouts) patches those same sources back to local paths, so edits next
+  door still land in a kosm build; it overrides the manifest's patches, and
+  CI runs without it. `tang` is unified by a
   `[patch.crates-io]` so `tang::Scalar` is one trait across the graph. Changing
   any of it is a full rebuild.
 - **One phyz.** There used to be a gap here: ipse-map pinned phyz twelve commits

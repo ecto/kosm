@@ -19,8 +19,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Externals are git revs, not paths: a clean clone of this repo must resolve and
 # build without any of Cam's sibling checkouts existing. Local development still
-# builds the working trees — `.cargo/config.toml` patches every one of these back
-# to a path on this machine. The manifest is the truth; that file is the override.
+# builds the working trees — an untracked `.cargo/config.toml` (copy
+# `.cargo/config.toml.example`) patches every one of these back to a local path.
+# The manifest is the truth; that file is the override.
 #
 # phyz: `claude/rigid-impact-restitution` HEAD (the free-joint Coriolis fix).
 # Pushed, but NOT on `origin/main` yet — bump this to the merge commit when it lands.
