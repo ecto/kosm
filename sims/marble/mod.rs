@@ -711,6 +711,12 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
         level.with_params(&[("pitch_deg", t.pitch.to_degrees()), ("roll_deg", t.roll.to_degrees())]),
     )?;
 
+    // Everything the headless loop needs is decided by here, so the metrics
+    // and the manifest land now: the lamp, frame and light stages below are
+    // minutes of ray casting and an agent should not have to wait for them
+    // to read a number.
+    recorder.finish()?;
+
     // 5. the lamp: the objective is the marble's *shadow*. light is analytic,
     //    motion is the adjoint, one chain rule joins them.
     if level.parameters.contains_key("lamp_x") {
@@ -824,8 +830,6 @@ fn run_marble(level_path: &Path, out_root: &Path) -> anyhow::Result<()> {
 
     // 7. a captured place: the marble on the real garage floor, and the
     //    splat as the frame's backdrop. rung 4 in miniature.
-    recorder.finish()?;
-
     let map_dir = std::env::var("KOSM_MAP").unwrap_or_else(|_| "/Users/cam/Developer/ipse/maps/garage-perim".into());
     if Path::new(&map_dir).join("map.toml").exists() {
         garage_stage(&level, Path::new(&map_dir), out)?;
