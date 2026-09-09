@@ -61,6 +61,22 @@ pub struct CoveScene {
     pub aperture_z: f64,
     /// The score that opens the door.
     pub open_frac: f64,
+    /// The hint, as light. The aperture's rim is an emissive ring on the door
+    /// face whose radiance is `glow_floor + glow_gain · score`: the floor is
+    /// what makes the keyhole findable from across the beach at a score of
+    /// zero, and the gain is what makes holding it obvious. `rim_w` is how
+    /// wide the ring is outside `aperture_r`.
+    pub glow_floor: f64,
+    pub glow_gain: f64,
+    pub rim_w: f64,
+    /// The glint: after `glint_after` seconds without the score rising, a
+    /// small emissive sphere of radius `glint_r` appears on the sand
+    /// `glint_step` along the horizontal part of the hint's gradient, and
+    /// shines at `glint_glow`.
+    pub glint_after: f64,
+    pub glint_step: f64,
+    pub glint_r: f64,
+    pub glint_glow: f64,
     /// Toward the sun: azimuth about z from +x toward +y, elevation above the
     /// horizon. Radians.
     pub sun_az: f64,
@@ -99,6 +115,13 @@ impl CoveScene {
             aperture_r: a.millimetres("aperture_r_mm")?,
             aperture_z: a.millimetres("aperture_z_mm")?,
             open_frac: a.parameter_or("open_frac", 0.3),
+            glow_floor: a.parameter_or("glow_floor", 0.8),
+            glow_gain: a.parameter_or("glow_gain", 4.0),
+            rim_w: a.parameter_or("rim_w_mm", 30.0) * MM,
+            glint_after: a.parameter_or("glint_after_s", 30.0),
+            glint_step: a.parameter_or("glint_step_m", 1.5),
+            glint_r: a.parameter_or("glint_r_mm", 60.0) * MM,
+            glint_glow: a.parameter_or("glint_glow", 6.0),
             sun_az: a.parameter("sun_az_deg")?.to_radians(),
             sun_el: a.parameter("sun_el_deg")?.to_radians(),
             being_r: a.millimetres("being_r_mm")?,

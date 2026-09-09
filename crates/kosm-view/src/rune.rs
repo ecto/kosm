@@ -73,7 +73,7 @@ use kosm_render::math::{Point3, Vec3 as RVec3};
 use kosm_render::pathtrace::{self, Camera, Film, PathTraceOptions};
 use kosm_spike::cove::being::{Cove, Input, Snapshot};
 use kosm_spike::cove::render::{self as cove_render, PER_M, Placement};
-use kosm_spike::cove::{CoveScene, DEFAULT_COVE_SCENE, bake, rune};
+use kosm_spike::cove::{CoveScene, DEFAULT_COVE_SCENE, bake, hint, rune};
 use kosm_spike::scene::AuthoredScene;
 use phyz_math::{Mat3, Vec3};
 
@@ -190,6 +190,127 @@ impl Gate {
     }
 }
 
+// ---- the glint ---------------------------------------------------------------
+
+/// The other half of the design's hint: a spark on the sand when the player
+/// has stopped getting anywhere.
+///
+/// "After thirty seconds without progress a glint appears on the sand a short
+/// step along the gradient." Progress is the *best score so far* rising — not
+/// the instantaneous one, which wanders with every photon budget and every
+/// footstep and would reset the clock forever. A rise resets the clock and puts
+/// the glint away; `after` seconds without one brings it back.
+///
+/// Two rules beyond that, and both are the design's. The glint never appears
+/// while the score is already over `open_frac`: a player holding the rune is
+/// not stuck, and a hint pointing somewhere else while the door is unlatching
+/// would be a lie. And the clock is *simulated* time, the same clock
+/// [`Gate`] runs on, so a slow renderer never makes the level more helpful.
+///
+/// The state machine and the gradient are deliberately separate: this says
+/// *whether* there is a glint, [`glint_at`] says where it goes, and only the
+/// first of them is cheap enough to run at the rune thread's rate.
+#[derive(Clone, Copy, Debug)]
+pub struct Glint {
+    after: f64,
+    open_frac: f64,
+    best: f64,
+    since: Option<f64>,
+    on: bool,
+}
+
+/// What counts as the score having risen. A photon count of fifty thousand has
+/// a percent or so of noise on it, so a rise has to be bigger than that or the
+/// clock never runs.
+const ROSE_BY: f64 = 0.005;
+
+impl Glint {
+    pub fn new(after: f64, open_frac: f64) -> Self {
+        Self { after, open_frac, best: 0.0, since: None, on: false }
+    }
+
+    /// Read the score at simulated time `t`, and say whether the sand should
+    /// spark.
+    pub fn read(&mut self, t: f64, frac: f64) -> bool {
+        let start = self.since.get_or_insert(t);
+        if frac > self.best + ROSE_BY {
+            self.best = frac;
+            *start = t;
+            self.on = false;
+        } else if t - *start >= self.after {
+            self.on = true;
+        }
+        // holding the rune is not being stuck
+        if frac >= self.open_frac {
+            self.on = false;
+        }
+        self.on
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.on
+    }
+}
+
+/// How long the level waits before it sparks. `KOSM_GLINT_AFTER` overrides the
+/// document, which is how a headless still of the glint is taken without
+/// editing the level.
+fn glint_after(scene: &CoveScene) -> f64 {
+    std::env::var("KOSM_GLINT_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(scene.glint_after)
+        .max(0.0)
+}
+
+/// Where the glint goes: `glint_step` along the horizontal part of the hint's
+/// gradient, sitting on the sand.
+///
+/// The gradient is [`hint::guided_gradient`] and not [`hint::gradient`], and
+/// that is the whole point. The bare score is flat over most of the beach — a
+/// caustic thrown ten metres wide of the door deposits exactly nothing in the
+/// keyhole, and the derivative of nothing points nowhere — so a glint that
+/// followed it would sit still until the player had already solved the level.
+/// The guided objective is the one the solvability sweep climbed from every
+/// spawn in the cove, which is precisely the claim "following this gets you
+/// there"; the glint shows the player the same direction the level was proved
+/// solvable along.
+///
+/// It costs six lattice traces, so the caller is expected to be a thread that
+/// is not the renderer and to ask rarely. Returns the centre in world metres
+/// and the horizontal direction it stepped, for the line on stderr.
+fn glint_at(scene: &CoveScene, pose: &rune::Pose) -> Option<(Vec3, [f64; 2])> {
+    let g = hint::guided_gradient(scene, pose, hint::SWEEP_RAYS)?;
+    let n = g[0].hypot(g[1]);
+    if !n.is_finite() || n < 1e-12 {
+        return None;
+    }
+    let (ux, uy) = (g[0] / n, g[1] / n);
+    let (x, y) = (pose.x + ux * scene.glint_step, pose.y + uy * scene.glint_step);
+    Some((Vec3::new(x, y, scene.sand_z_at(x, y) + scene.glint_r), [ux, uy]))
+}
+
+/// How often the glint's direction is recomputed while it is showing. It is
+/// six lattice traces; the player is stuck, and a hint that twitches is worse
+/// than one that waits.
+const GLINT_EVERY: Duration = Duration::from_secs(2);
+
+// ---- what the rune thread tells the picture ----------------------------------
+
+/// The hint, as the renderer needs it: the newest score (which is the rim's
+/// radiance) and where the glint sits, if there is one.
+///
+/// A mutex and not a channel, for the same reason [`Latest`] is one: the
+/// picture wants the newest answer and has no use for the ones it was too slow
+/// to draw.
+#[derive(Clone, Copy, Default)]
+struct Lit {
+    score: f64,
+    glint: Option<Vec3>,
+}
+
+type Glow = Arc<Mutex<Lit>>;
+
 // ---- the being, as the picture and the rune each want it ----------------------
 
 /// The live being read as the rune's two-knob pose.
@@ -230,7 +351,12 @@ fn placement_of(snap: &Snapshot) -> Placement {
         if alt.norm() > 1e-6 { alt.normalize() } else { Vec3::y() }
     };
     let right = facing.cross(&up);
-    Placement { being: (centre, columns(right, facing, up)), door_angle: snap.door_angle }
+    Placement {
+        being: (centre, columns(right, facing, up)),
+        door_angle: snap.door_angle,
+        score: 0.0,
+        glint: None,
+    }
 }
 
 /// A rotation from its three axes, as columns.
@@ -276,9 +402,9 @@ fn quantised(cam: &Camera) -> Camera {
 /// full one that converges. Appending on the frames the caustic moved is
 /// exactly the signal the mask wants, because the list growing is what
 /// `mask_rects` repaints.
-fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool) -> Vec<Pose> {
+fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool, glint: Option<Vec3>) -> Vec<Pose> {
     let (centre, _) = snap.being;
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(4);
     let c = centre * PER_M;
     out.push(Pose::still([c.x, c.y, c.z], (scene.being_h / 2.0 + scene.being_r) * PER_M));
     if let Some((s, r)) = shadow(scene, centre) {
@@ -288,6 +414,14 @@ fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool) -> Vec<Pose> {
     if caustic_moved {
         let f = Vec3::new(scene.door_x, scene.cliff_face_y(), scene.door_sill() + scene.door_h / 2.0) * PER_M;
         out.push(Pose::still([f.x, f.y, f.z], 0.5 * scene.door_w.hypot(scene.door_h) * PER_M));
+    }
+    // The glint is a moving instance like the being: the list *growing* when it
+    // appears, changing when it steps, and shrinking when it goes is exactly
+    // what `mask_rects` needs to repaint the sand under it. A glow that
+    // appeared into converged history and was never repainted would ghost.
+    if let Some(g) = glint {
+        let g = g * PER_M;
+        out.push(Pose::still([g.x, g.y, g.z], 2.0 * scene.glint_r * PER_M));
     }
     out
 }
@@ -465,12 +599,18 @@ fn simulate(
 /// afford to be the puzzle's clock at all. The renderer's caustic map is a
 /// different trace of a different scene, for a different purpose: that one has
 /// to look right, this one has to be a number.
-fn rune_worker(level: PathBuf, latest: Latest, gate: Arc<AtomicBool>, photons: usize) {
+fn rune_worker(level: PathBuf, latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow) {
     let scene = match CoveScene::load(&level) {
         Ok(s) => s,
         Err(e) => return eprintln!("rune: the score could not load {}: {e}", level.display()),
     };
     let mut g = Gate::new(scene.open_frac);
+    let after = glint_after(&scene);
+    let mut glint = Glint::new(after, scene.open_frac);
+    let mut placed: Option<Vec3> = None;
+    // The first aim is forced by `placed` being empty, so this only has to be
+    // a moment in the past that exists on every platform.
+    let mut aimed = Instant::now();
     let mut scored = f64::NEG_INFINITY;
     let mut said = Instant::now();
     let mut said_cost = false;
@@ -501,6 +641,36 @@ fn rune_worker(level: PathBuf, latest: Latest, gate: Arc<AtomicBool>, photons: u
             eprintln!("rune   the door is unlatched at t = {:.2} s", snap.t);
         }
         gate.store(g.is_open(), Ordering::Relaxed);
+
+        // The hint. The state machine is a comparison and runs every pass; the
+        // direction is six lattice traces and runs at most every
+        // `GLINT_EVERY`, on this thread, because the renderer must never wait
+        // for one.
+        if glint.read(snap.t, frac) {
+            if placed.is_none() || aimed.elapsed() >= GLINT_EVERY {
+                aimed = Instant::now();
+                match glint_at(&scene, &pose) {
+                    Some((at, [ux, uy])) => {
+                        if placed.is_none() {
+                            eprintln!(
+                                "rune   {after:.0} s without the score rising: a glint on the sand at \
+                                 ({:+.2}, {:+.2}) m, {:.1} m along ({ux:+.2}, {uy:+.2})",
+                                at.x, at.y, scene.glint_step
+                            );
+                        }
+                        placed = Some(at);
+                    }
+                    // Nothing of the being's light reaches the door's plane at
+                    // all from here, so there is no direction to point in and
+                    // the level says nothing rather than something wrong.
+                    None => placed = None,
+                }
+            }
+        } else if placed.take().is_some() {
+            eprintln!("rune   the score rose: the glint is gone");
+        }
+        *glow.lock().unwrap_or_else(|e| e.into_inner()) = Lit { score: frac, glint: placed };
+
         // The only thing on screen is the picture, so what the player is told
         // about the rune is told here. Below a hundredth it is silence: an
         // unlit door has nothing to say and would say it every second.
@@ -719,12 +889,12 @@ impl Tracer {
     /// retraces pays for it inside its own milliseconds, and a pass that does
     /// not shows the last map, which is what "keep showing the last map while
     /// walking" is.
-    fn pass(&mut self, frame: &Snapshot, size: (u32, u32)) -> (Vec<u8>, f32, f32) {
+    fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit) -> (Vec<u8>, f32, f32) {
         self.history.resample(size);
         if (self.film.width, self.film.height) != size {
             self.film = Film::new(size.0, size.1);
         }
-        let placement = placement_of(frame);
+        let placement = placement_of(frame).with_score(lit.score).with_glint(lit.glint);
         let moved = self.caustic_is_stale(&placement);
         if moved {
             self.caustics = self.picture.caustic_map(&placement);
@@ -732,7 +902,7 @@ impl Tracer {
         }
         let cam = quantised(&cove_render::camera(&self.scene, &placement));
         let view = View::of(&cam, size.0, size.1);
-        let poses = poses(&self.scene, frame, moved);
+        let poses = poses(&self.scene, frame, moved, lit.glint);
         let plan: Plan = self.history.plan(&view, &poses, &[]);
         let frame_px = (size.0 as u64) * (size.1 as u64);
         let patch_px: u64 = plan.rects.iter().map(|r| (r[2] as u64) * (r[3] as u64)).sum();
@@ -760,7 +930,7 @@ impl Tracer {
 /// the window last asked for. The court's worker, with the GPU branch and the
 /// tuner's cost model taken out, because there is one tier here and it has
 /// nothing to choose.
-fn render_worker(level: PathBuf, jobs: Receiver<Job>, out: Sender<Shot>) {
+fn render_worker(level: PathBuf, jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow) {
     eprintln!("rune   evaluating the level…");
     let mut tracer = match Tracer::new(&level, (WIDTH, HEIGHT)) {
         Ok(t) => t,
@@ -792,7 +962,8 @@ fn render_worker(level: PathBuf, jobs: Receiver<Job>, out: Sender<Shot>) {
             continue;
         }
         let lap = Instant::now();
-        let (rgba, mask, mean_spp) = tracer.pass(&job.frame, job.size);
+        let lit = *glow.lock().unwrap_or_else(|e| e.into_inner());
+        let (rgba, mask, mean_spp) = tracer.pass(&job.frame, job.size, lit);
         let shot = Shot { size: job.size, rgba, ms: lap.elapsed().as_millis(), mask, mean_spp, due: job.due };
         if said_at.elapsed().as_secs() >= 2 {
             said_at = Instant::now();
@@ -824,7 +995,13 @@ fn render_worker(level: PathBuf, jobs: Receiver<Job>, out: Sender<Shot>) {
 pub fn still(level: &Path, path: &Path, size: (u32, u32), passes: u32) -> anyhow::Result<()> {
     let scene = CoveScene::load(level)?;
     let solution = rune::Pose::solution(&scene);
-    let (x, y, tilt) = if solution.is_solved() {
+    // `KOSM_RUNE_SPAWN=1` stands the being where the player finds it even on a
+    // solved level. It is how the glint is photographed: the hint is a picture
+    // of being stuck, and the solved pose is the one place in the cove nobody
+    // is stuck. Paired with `KOSM_GLINT_AFTER`, that is a still of the level's
+    // whole hint without a level file of its own.
+    let at_spawn = std::env::var("KOSM_RUNE_SPAWN").is_ok_and(|v| v != "0");
+    let (x, y, tilt) = if solution.is_solved() && !at_spawn {
         (solution.x, solution.y, solution.tilt)
     } else {
         (scene.spawn_x, scene.spawn_y, 0.0)
@@ -835,12 +1012,35 @@ pub fn still(level: &Path, path: &Path, size: (u32, u32), passes: u32) -> anyhow
     let stand = Placement::standing(&scene, x, y, tilt);
     let frame = snapshot_of(&stand, &scene);
 
+    // The hint, exactly as the window would have it after standing here long
+    // enough to earn it. The score is taken once and reused for every pass, so
+    // the rim's radiance is a fact about the pose and not about the photon
+    // budget's noise, and the still is reproducible.
+    let pose = rune_pose(&frame);
+    let frac = rune::score(&scene, &pose, live_photons(&scene.authored)).frac;
+    let after = glint_after(&scene);
+    let mut glint = Glint::new(after, scene.open_frac);
+    glint.read(0.0, frac);
+    glint.read(after + 1.0, frac);
+    let stuck = glint.is_on();
+    let aimed = stuck.then(|| glint_at(&scene, &pose)).flatten();
+    let lit = Lit { score: frac, glint: aimed.map(|(at, _)| at) };
+    match (stuck, aimed) {
+        (true, Some((at, [ux, uy]))) => eprintln!(
+            "rune   the still is stuck ({after:.0} s without the score rising): a glint at \
+             ({:+.2}, {:+.2}) m, {:.1} m along ({ux:+.2}, {uy:+.2})",
+            at.x, at.y, scene.glint_step
+        ),
+        (true, None) => eprintln!("rune   stuck, but nothing of the being reaches the door's plane: no glint"),
+        _ => {}
+    }
+
     let mut tracer = Tracer::new(level, size)?;
     let t0 = Instant::now();
     let mut rgba = Vec::new();
     let mut mean = 0.0;
     for _ in 0..passes.max(1) {
-        let (px, _, m) = tracer.pass(&frame, size);
+        let (px, _, m) = tracer.pass(&frame, size, lit);
         rgba = px;
         mean = m;
     }
@@ -850,11 +1050,14 @@ pub fn still(level: &Path, path: &Path, size: (u32, u32), passes: u32) -> anyhow
     image::RgbaImage::from_raw(size.0, size.1, rgba)
         .ok_or_else(|| anyhow::anyhow!("the history is the wrong size"))?
         .save(path)?;
-    let frac = rune::score(&scene, &rune_pose(&frame), live_photons(&scene.authored)).frac;
     println!(
         "rune   the being {} at ({x:+.2}, {y:+.2}) m, {:.1}° of lean; the rune scores {frac:.3} \
          of {:.2}; {}×{} over {} passes ({:.1} samples a pixel) in {:.1} s → {}",
-        if solution.is_solved() { "at the solved pose" } else { "at its spawn (nothing solved yet)" },
+        match (solution.is_solved(), at_spawn) {
+            (true, false) => "at the solved pose",
+            (true, true) => "at its spawn (the level is solved; KOSM_RUNE_SPAWN asked)",
+            _ => "at its spawn (nothing solved yet)",
+        },
         tilt.to_degrees(),
         scene.open_frac,
         size.0,
@@ -912,6 +1115,7 @@ struct App {
     pending: Option<(Receiver<Job>, Sender<Shot>)>,
     started: bool,
     level: PathBuf,
+    glow: Glow,
 
     lookahead: Lookahead,
     latency_ms: f64,
@@ -980,8 +1184,8 @@ impl viewport::Scene for App {
         let Some((jobs, shots)) = self.pending.take() else {
             return;
         };
-        let level = self.level.clone();
-        std::thread::spawn(move || render_worker(level, jobs, shots));
+        let (level, glow) = (self.level.clone(), self.glow.clone());
+        std::thread::spawn(move || render_worker(level, jobs, shots, glow));
     }
 
     fn event(&mut self, event: viewport::Event) {
@@ -1085,6 +1289,7 @@ pub fn run(level: PathBuf, frames: usize, width: u32) -> anyhow::Result<()> {
     let held: Held = Arc::new(Mutex::new(Controls::default()));
     let latest: Latest = Arc::new(Mutex::new(None));
     let gate = Arc::new(AtomicBool::new(false));
+    let glow: Glow = Arc::new(Mutex::new(Lit::default()));
 
     let photons = live_photons(&CoveScene::load(&level)?.authored);
 
@@ -1094,8 +1299,8 @@ pub fn run(level: PathBuf, frames: usize, width: u32) -> anyhow::Result<()> {
         std::thread::spawn(move || simulate(level, tx, held, latest, gate, frames, lookahead));
     }
     {
-        let (level, latest, gate) = (level.clone(), latest.clone(), gate.clone());
-        std::thread::spawn(move || rune_worker(level, latest, gate, photons));
+        let (level, latest, gate, glow) = (level.clone(), latest.clone(), gate.clone(), glow.clone());
+        std::thread::spawn(move || rune_worker(level, latest, gate, photons, glow));
     }
 
     let size = (width.max(64), (width.max(64) * 9 / 16).max(36));
@@ -1115,6 +1320,7 @@ pub fn run(level: PathBuf, frames: usize, width: u32) -> anyhow::Result<()> {
             pending: Some((job_rx, shot_tx)),
             started: false,
             level,
+            glow,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
@@ -1346,6 +1552,155 @@ mod tests {
             let back = rune_pose(&snapshot_of(&off, &scene));
             assert!((back.tilt - tilt).abs() < 0.01 * tilt.abs().max(1e-3), "{tilt} read back as {} off the door's line", back.tilt);
         }
+        Ok(())
+    }
+
+    /// **Step 8, the rim.** The keyhole's ring is visible at a score of zero,
+    /// rises with the score, and at `open_frac` is plainly brighter than the
+    /// sunlit stone it sits on — which is the whole of "the rim glows in
+    /// proportion to the score" as a picture rather than as a sentence.
+    ///
+    /// The comparison is against the door's own outgoing radiance under the
+    /// level's sun, `E·cosθ·albedo/π`, because that is what the rim has to beat
+    /// to read as a mark on the stone rather than as part of it.
+    #[test]
+    fn the_rims_radiance_rises_with_the_score_and_beats_the_sunlit_door() -> anyhow::Result<()> {
+        use kosm_spike::cove::render::materials;
+        let scene = CoveScene::bundled()?;
+        let lum = |c: [f32; 3]| 0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64;
+        let rim = |frac: f64| lum(materials::rim(scene.glow_floor, scene.glow_gain, frac).emissive);
+
+        assert!(rim(0.0) > 0.0, "an unlit keyhole is not a puzzle, it is a wall");
+        let mut last = rim(0.0);
+        for k in 1..=20 {
+            let now = rim(k as f64 / 20.0);
+            assert!(now > last, "the rim did not rise between {} and {}", (k - 1) as f64 / 20.0, k as f64 / 20.0);
+            last = now;
+        }
+
+        // the sunlit door, as the integrator will draw it
+        let doc = &scene.authored.document;
+        let stone = lum(materials::pbr(doc, "stone").base_color);
+        let irr = scene.authored.parameter_or("sun_irradiance", 6.2);
+        let cos = scene.sun_dir().dot(&scene.door_frame().normal).abs();
+        let sunlit = irr * cos * stone / std::f64::consts::PI;
+        assert!(
+            rim(scene.open_frac) > 2.0 * sunlit,
+            "at open_frac the rim is {:.3} against the sunlit door's {sunlit:.3}",
+            rim(scene.open_frac)
+        );
+        // …and the floor is a mark, not a second sun. It has to sit *above* the
+        // sunlit door or a keyhole twenty metres down the beach is a dark dot on
+        // bright stone and reads as a hole rather than as a light; it has to sit
+        // well under what the score buys, or holding the rune says nothing.
+        assert!(rim(0.0) > sunlit, "the floor at {:.3} is darker than the door it marks", rim(0.0));
+        assert!(rim(scene.open_frac) > 2.0 * rim(0.0), "holding the rune barely changes the rim");
+        Ok(())
+    }
+
+    /// **Step 8, the glint's clock.** `glint_after_s` of the best score not
+    /// rising brings the glint; a rise takes it away again; and it never
+    /// appears while the player is already over `open_frac`.
+    ///
+    /// Driven on a synthetic clock and synthetic scores, because that is what
+    /// the rule is made of — [`glint_at`] is the part that costs a trace and it
+    /// is not this test's business.
+    #[test]
+    fn the_glint_waits_for_thirty_seconds_and_leaves_when_the_score_rises() {
+        let mut g = Glint::new(30.0, 0.3);
+        // twenty-nine seconds of standing still is not stuck yet
+        assert!(!g.read(0.0, 0.05));
+        assert!(!g.read(29.0, 0.05));
+        assert!(g.read(30.0, 0.05), "thirty seconds without progress did not spark the sand");
+        assert!(g.is_on());
+
+        // a rise puts it away and restarts the clock
+        assert!(!g.read(31.0, 0.09), "the glint stayed after the score rose");
+        assert!(!g.read(60.0, 0.09), "the clock did not restart at the rise");
+        assert!(g.read(61.0, 0.09), "and it did not come back thirty seconds later");
+
+        // noise is not progress: half a percent of wander must not reset it
+        let mut n = Glint::new(30.0, 0.3);
+        let mut t = 0.0;
+        while t < 40.0 {
+            n.read(t, 0.05 + 0.002 * (t * 7.0).sin());
+            t += 0.5;
+        }
+        assert!(n.is_on(), "photon noise kept the glint from ever appearing");
+
+        // and holding the rune is not being stuck
+        let mut h = Glint::new(30.0, 0.3);
+        h.read(0.0, 0.4);
+        assert!(!h.read(100.0, 0.4), "the glint appeared while the door was unlatching");
+    }
+
+    /// **Step 8, the camera at the door.** Wherever the being stands within
+    /// three metres of the cliff face — and at any lean, and facing any way —
+    /// the eye stays in front of that face, so the picture is never taken from
+    /// inside the rock.
+    ///
+    /// The clearance is the being's own radius and half a metre, which is the
+    /// rule the camera states; the assertion is the weaker one that matters,
+    /// that the eye is in front of the *face*.
+    #[test]
+    fn the_camera_never_stands_inside_the_cliff() -> anyhow::Result<()> {
+        let scene = CoveScene::bundled()?;
+        let face = scene.cliff_face_y() * PER_M;
+        let clear = (scene.cliff_face_y() - scene.being_r) * PER_M - 500.0;
+        let mut worst = f64::NEG_INFINITY;
+        for i in 0..13 {
+            let y = scene.cliff_face_y() - 3.0 * i as f64 / 12.0 - scene.being_r;
+            for j in 0..13 {
+                let x = scene.door_x - 6.0 + 12.0 * j as f64 / 12.0;
+                for tilt in [-0.35, -0.17, 0.0, 0.17, 0.35] {
+                    let p = Placement::standing(&scene, x, y, tilt);
+                    let cam = cove_render::camera(&scene, &p);
+                    worst = worst.max(cam.eye.y);
+                    assert!(
+                        cam.eye.y <= clear + 1e-6,
+                        "the eye at ({:.0}, {:.0}, {:.0}) mm is past the cliff face at {face:.0} \
+                         for a being at ({x:+.2}, {y:+.2}) m leaning {:.0}°",
+                        cam.eye.x,
+                        cam.eye.y,
+                        cam.eye.z,
+                        tilt.to_degrees()
+                    );
+                    // and it is above the sand it is looking over
+                    assert!(cam.eye.z > scene.sand_z_at(cam.eye.x * 1e-3, cam.eye.y * 1e-3) * PER_M);
+                }
+            }
+        }
+        assert!(worst > face - 2000.0, "the doorstep camera never came near the door at all");
+        Ok(())
+    }
+
+    /// The doorstep framing is the one that makes the still readable: at the
+    /// solved pose the eye is above the being, off to its shoulder side, and
+    /// looking down at the keyhole rather than level with the being's back.
+    #[test]
+    fn the_solved_pose_is_seen_over_the_shoulder_and_from_above() -> anyhow::Result<()> {
+        let scene = CoveScene::bundled()?;
+        let solution = rune::Pose::solution(&scene);
+        if !solution.is_solved() {
+            return Ok(());
+        }
+        let p = Placement::standing(&scene, solution.x, solution.y, solution.tilt);
+        let cam = cove_render::camera(&scene, &p);
+        let (c, _) = p.being;
+        assert!(cam.eye.z > (c.z + scene.being_h / 2.0) * PER_M, "the eye is not above the being's head");
+        assert!(cam.forward.z < -0.25, "the eye is not looking down at the door");
+        // the aperture is in front of the camera and not behind the being: the
+        // sightline to it passes clear of the capsule's own radius
+        let ap = scene.door_frame().origin * PER_M;
+        let e = kosm_render::math::Vec3::new(ap.x - cam.eye.x, ap.y - cam.eye.y, ap.z - cam.eye.z);
+        assert!(e.dot(&cam.forward) > 0.0, "the keyhole is behind the camera");
+        let d = e.normalize();
+        let b = kosm_render::math::Vec3::new(c.x * PER_M - cam.eye.x, c.y * PER_M - cam.eye.y, c.z * PER_M - cam.eye.z);
+        let off = (b - d * b.dot(&d)).norm();
+        assert!(
+            off > scene.being_r * PER_M * 0.9,
+            "the being sits on the keyhole: the sightline passes {off:.0} mm from its axis"
+        );
         Ok(())
     }
 

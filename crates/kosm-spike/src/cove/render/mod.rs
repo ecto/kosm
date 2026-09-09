@@ -128,6 +128,18 @@ pub struct Placement {
     /// How far the door has swung, radians. Zero is shut; positive opens it
     /// out of the cliff into the cove.
     pub door_angle: f64,
+    /// The rune's score at this pose, in `[0, 1]`.
+    ///
+    /// The picture carries it because the *rim* carries it: the keyhole's ring
+    /// glows `glow_floor + glow_gain · score` and there is no other channel for
+    /// it — no text, no HUD. It rides on the placement rather than on the
+    /// [`Scene`] because it changes at the rune thread's rate, not the level's,
+    /// and because a still is then a pose and a number and needs no simulation.
+    pub score: f64,
+    /// Where the glint is, if the player has been stuck long enough to earn
+    /// one: the centre of a small emissive sphere sitting on the sand, in world
+    /// metres. [`None`] is the ordinary case and draws nothing.
+    pub glint: Option<PVec3>,
 }
 
 impl Placement {
@@ -152,7 +164,24 @@ impl Placement {
         let (s, c) = tilt.sin_cos();
         let lean_up = up * c - facing * s;
         let lean_facing = facing * c + up * s;
-        Self { being: (centre, columns(right, lean_facing, lean_up)), door_angle: 0.0 }
+        Self {
+            being: (centre, columns(right, lean_facing, lean_up)),
+            door_angle: 0.0,
+            score: 0.0,
+            glint: None,
+        }
+    }
+
+    /// The same pose, with the rune's score on it.
+    pub fn with_score(mut self, score: f64) -> Self {
+        self.score = score;
+        self
+    }
+
+    /// The same pose, with the glint where the hint put it.
+    pub fn with_glint(mut self, glint: Option<PVec3>) -> Self {
+        self.glint = glint;
+        self
     }
 
     /// Where the being is looking: its body +y, in world.
@@ -192,6 +221,16 @@ pub struct Scene {
     door: Vec<Placed>,
     /// The hinge: the world point the door turns about, in millimetres.
     hinge: Point3,
+    /// The keyhole's rim, in the door's own shut frame, so the hinge carries
+    /// it. Its material is rebuilt per pose from the score; only its geometry
+    /// is here.
+    rim: Arc<Bvh<CoveGeom>>,
+    /// What the rim glows at a score of zero, and what the score buys.
+    glow_floor: f64,
+    glow_gain: f64,
+    /// The glint's sphere, centred on the origin, and its radiance.
+    glint: Arc<Bvh<CoveGeom>>,
+    glint_glow: f64,
     /// The being, centred on the origin with its axis along +z.
     being: Placed,
     env: Environment,
@@ -278,6 +317,29 @@ impl Scene {
             0.0,
         );
 
+        // The keyhole's ring, on the door's face and a few millimetres proud of
+        // it. It is built in the door's *shut* world frame, exactly as the
+        // door's own parts are, so the one hinge transform carries both and the
+        // rim can never drift off the stone it is cut into.
+        let rim = Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(annulus_mesh(
+            Point3::new(
+                scene.door_x * PER_M,
+                (scene.cliff_face_y() - RIM_PROUD_MM * MM) * PER_M,
+                (scene.door_sill() + scene.aperture_z) * PER_M,
+            ),
+            scene.aperture_r * PER_M,
+            (scene.aperture_r + scene.rim_w) * PER_M,
+            a.parameter_or("rim_segments", 96.0).max(8.0) as usize,
+        )))));
+        // A capsule whose height is two radii is the sphere, exactly.
+        let glint_r = scene.glint_r * PER_M;
+        let glint = Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(capsule_mesh(
+            glint_r,
+            2.0 * glint_r,
+            a.parameter_or("glint_segments", 32.0).max(8.0) as usize,
+            a.parameter_or("glint_rings", 12.0).max(3.0) as usize,
+        )))));
+
         let (env, sun) = daylight(scene);
         // The ocean past the sea's own lattice: a plane at the waterline, set
         // a hand's breadth under it so the swell never fights it, which is
@@ -291,6 +353,11 @@ impl Scene {
             statics,
             door,
             hinge,
+            rim,
+            glow_floor: scene.glow_floor,
+            glow_gain: scene.glow_gain,
+            glint,
+            glint_glow: scene.glint_glow,
             being,
             env,
             sun,
@@ -344,6 +411,21 @@ impl Scene {
                 part.bvh.clone(),
                 part.pbr,
                 Transform::from_matrix(swing.matrix * part.to_world.matrix),
+            ));
+        }
+        // The rim rides the same swing the door does, and its radiance is the
+        // score. Emissive and not a light: see [`materials::rim`].
+        objects.push(Object::placed(
+            self.rim.clone(),
+            materials::rim(self.glow_floor, self.glow_gain, p.score),
+            swing,
+        ));
+        if let Some(g) = p.glint {
+            let g = g * PER_M;
+            objects.push(Object::placed(
+                self.glint.clone(),
+                materials::glint(self.glint_glow),
+                Transform::translation(g.x, g.y, g.z),
             ));
         }
         let (centre, rot) = p.being;
@@ -530,6 +612,43 @@ fn capsule_mesh(r: f64, h: f64, segments: usize, rings: usize) -> TriMesh {
     TriMesh::new(positions, normals, &indices)
 }
 
+/// How far out of the door's face the rim sits, millimetres.
+///
+/// Small enough that it reads as cut into the stone rather than hung on it,
+/// large enough that no ray ever has to choose between two surfaces at the same
+/// depth. At the sun's twenty-nine degrees off the door's normal it shades
+/// under three millimetres of a hundred-and-twenty-millimetre keyhole, which is
+/// why the rune's own photons do not notice it is there.
+const RIM_PROUD_MM: f64 = 5.0;
+
+/// A flat ring in the plane `y = centre.y`, facing -y: the keyhole's rim.
+///
+/// Millimetres, and world-placed rather than centred on the origin, because it
+/// belongs to the door's shut frame and is swung by the door's own hinge. Two
+/// rings of vertices and one quad between each pair; the normal is the door's,
+/// which is exact for a flat annulus and is all a self-lit surface needs.
+fn annulus_mesh(centre: Point3, r_in: f64, r_out: f64, segments: usize) -> TriMesh {
+    let n = Vec3::new(0.0, -1.0, 0.0);
+    let mut positions = Vec::with_capacity(2 * segments);
+    let mut normals = Vec::with_capacity(2 * segments);
+    for i in 0..segments {
+        let th = std::f64::consts::TAU * i as f64 / segments as f64;
+        let (s, c) = th.sin_cos();
+        for r in [r_in, r_out] {
+            positions.push(Point3::new(centre.x + r * c, centre.y, centre.z + r * s));
+            normals.push(n);
+        }
+    }
+    let mut indices: Vec<u32> = Vec::with_capacity(6 * segments);
+    for i in 0..segments as u32 {
+        let j = (i + 1) % segments as u32;
+        let (a0, a1, b0, b1) = (2 * i, 2 * i + 1, 2 * j, 2 * j + 1);
+        indices.extend_from_slice(&[a0, a1, b1]);
+        indices.extend_from_slice(&[a0, b1, b0]);
+    }
+    TriMesh::new(positions, normals, &indices)
+}
+
 /// The geometry a solid is traced as: its analytic BRep if it has one, its
 /// tessellation if a boolean took the BRep away — the same fallback the court
 /// takes, and the same one `vcad-render --photoreal` takes.
@@ -574,33 +693,88 @@ fn rigid(r: &Mat3, x: f64, y: f64, z: f64) -> Transform {
 
 // ---- the camera and the frame ----------------------------------------------
 
-/// Third person, over the shoulder: behind the being along its facing and
-/// above it, looking down the way it looks — which is at the door, in the
-/// still. Millimetres.
+/// Third person, over the shoulder — except at the door, where over the
+/// shoulder is inside the cliff. Millimetres.
 ///
-/// The knobs are `cam_back_mm`, `cam_up_mm`, `cam_side_mm`, `cam_ahead_mm`
-/// and `cam_vfov_deg`; the level authors none of them yet, and the defaults
-/// are the design's three metres back and one and a half up at 50°, stepped
-/// a shoulder's width to the right so the being sits off centre and the door
-/// it is walking at is not behind its own head. A level that wants a fixed
-/// camera instead says `cam_x_mm`/`cam_y_mm`/`cam_z_mm` and those win.
+/// The far framing is the design's: three metres behind the being along its
+/// facing and one and a half above, stepped a shoulder's width to the right so
+/// the being sits off centre and the door it is walking at is not behind its
+/// own head. It is right everywhere on the beach and wrong at exactly the place
+/// the game ends. The solved pose stands the being four hundred millimetres off
+/// the cliff face; three metres behind it, the eye is nearly in the stone, the
+/// door fills the frame, and the being's own body sits over the keyhole it is
+/// solving. A camera that hides the puzzle at the moment it is solved is not a
+/// camera.
+///
+/// So there is a second framing, the doorstep: two metres out from the *face*
+/// rather than from the being, two and a fifth up, a step to the being's right,
+/// and aimed at the aperture itself. From there the door is seen from above and
+/// to one side, the being leans into frame, and the keyhole and its rim stay
+/// clear of it. The two are blended by how close the being is to the face —
+/// `t = clamp((2 − d)/2, 0, 1)` — so nothing snaps: walking the last two metres
+/// to the door raises the camera and swings it round as you go.
+///
+/// Two things are then true whatever the pose. The eye is never behind the
+/// cliff's face plane, because it is clamped to a body's radius and half a
+/// metre in front of it; and the level's own `cam_x_mm`/`cam_y_mm`/`cam_z_mm`
+/// still win outright, because a fixed camera is an author's decision and not
+/// a rule this function gets to overrule. The rest of the knobs are
+/// `cam_back_mm`, `cam_up_mm`, `cam_side_mm`, `cam_ahead_mm`, `cam_vfov_deg`
+/// and, for the doorstep, `cam_door_back_mm`, `cam_door_up_mm`,
+/// `cam_door_side_mm`, `cam_door_reach_m` and `cam_face_clear_mm`.
 pub fn camera(scene: &CoveScene, p: &Placement) -> Camera {
     let a = &scene.authored;
     let (centre, _) = p.being;
     let c = centre * PER_M;
     let f = p.facing();
-    // the being's own right, which is where "over the shoulder" is measured
+    // the being's own right, which is where "over the shoulder" is measured.
+    // `f × ẑ` is horizontal whatever the being's lean, which is what a camera
+    // that steps sideways wants.
     let r = f.cross(&PVec3::new(0.0, 0.0, 1.0));
+    let r = if r.norm() > 1e-9 { r.normalize() } else { PVec3::new(1.0, 0.0, 0.0) };
+
+    // the far framing: over the shoulder, following
     let back = a.parameter_or("cam_back_mm", 3000.0);
     let up = a.parameter_or("cam_up_mm", 1500.0);
-    let side = a.parameter_or("cam_side_mm", 1200.0);
+    let side = a.parameter_or("cam_side_mm", 2000.0);
     let ahead = a.parameter_or("cam_ahead_mm", 3500.0);
+    let far_eye = [c.x - f.x * back + r.x * side, c.y - f.y * back + r.y * side, c.z + up];
+    let far_target = [c.x + f.x * ahead, c.y + f.y * ahead, c.z];
+
+    // the doorstep framing: off the face, up, and round to the shoulder side
+    let face = scene.cliff_face_y();
+    let d_back = a.parameter_or("cam_door_back_mm", 1500.0);
+    let d_up = a.parameter_or("cam_door_up_mm", 1500.0);
+    let d_side = a.parameter_or("cam_door_side_mm", 2400.0);
+    let (ex, ey) = (c.x + r.x * d_side, (face * PER_M - d_back).min(c.y));
+    let near_eye = [ex, ey, scene.sand_z_at(ex * MM, ey * MM) * PER_M + d_up];
+    let ap = scene.door_frame().origin * PER_M;
+    let near_target = [ap.x, ap.y, ap.z];
+
+    // how much of the doorstep this pose wants
+    let reach = a.parameter_or("cam_door_reach_m", 2.0).max(1e-3);
+    let t = ((reach - (face - centre.y)) / reach).clamp(0.0, 1.0);
+    let mix = |lo: f64, hi: f64| lo + (hi - lo) * t;
+
+    // and the one thing that is not negotiable: the eye stays out of the rock.
+    let clear = (face - scene.being_r) * PER_M - a.parameter_or("cam_face_clear_mm", 500.0);
     let eye = Point3::new(
-        a.parameter_or("cam_x_mm", c.x - f.x * back + r.x * side),
-        a.parameter_or("cam_y_mm", c.y - f.y * back + r.y * side),
-        a.parameter_or("cam_z_mm", c.z + up),
+        a.parameter_or("cam_x_mm", mix(far_eye[0], near_eye[0])),
+        a.parameter_or("cam_y_mm", mix(far_eye[1], near_eye[1]).min(clear)),
+        a.parameter_or("cam_z_mm", mix(far_eye[2], near_eye[2])),
     );
-    let target = Point3::new(c.x + f.x * ahead, c.y + f.y * ahead, c.z);
+    // The *aim* turns to the keyhole faster than the eye walks round to it.
+    // Both on the same `t` and the last twenty per cent of the blend leaves the
+    // door a fifth of a frame off centre with the cliff filling the rest, which
+    // is a picture of the wrong thing; `√t` spends that fifth on the aim, where
+    // it costs nothing and buys the composition.
+    let ta = t.sqrt();
+    let aim = |lo: f64, hi: f64| lo + (hi - lo) * ta;
+    let target = Point3::new(
+        aim(far_target[0], near_target[0]),
+        aim(far_target[1], near_target[1]),
+        aim(far_target[2], near_target[2]),
+    );
     Camera::look_at(eye, target, Vec3::new(0.0, 0.0, 1.0), a.parameter_or("cam_vfov_deg", 50.0))
 }
 
@@ -710,3 +884,5 @@ mod tests {
         assert!(f.dot(&PVec3::new(to_door.x, to_door.y, 0.0)) > 0.0, "and it points at the door");
     }
 }
+
+

@@ -121,6 +121,58 @@ pub fn being_achromatic(n_d: f64) -> Pbr {
     achromatic(being(n_d))
 }
 
+/// The keyhole's rim, glowing in proportion to the score.
+///
+/// The design's hint is light and nothing else: "the aperture's rim glows in
+/// proportion to the score". So the rim is an emissive surface — a `Pbr` with
+/// `emissive`, not an `AreaLight` — which is the cheap and correct way to put
+/// a small self-lit thing in this integrator: a path that lands on it adds the
+/// radiance and stops, and no next-event estimator spends a shadow ray on a
+/// ring a hundred and fifty millimetres across. It has no transmission, so
+/// [`kosm_render::caustics::is_caustic_refractor`] passes over it and the
+/// rune's photons are still spent entirely on the being.
+///
+/// `floor` is what the rim shows at a score of zero, and it is not decoration:
+/// a keyhole nobody can see from across the beach is not a puzzle. `gain` is
+/// what the score buys on top of it, and it is set so that at `open_frac` the
+/// rim is several times the radiance of the sunlit door it sits on.
+///
+/// Warm white-gold, because the level's one warm light is the low sun and a
+/// cold rim would read as a different world's UI.
+pub fn rim(floor: f64, gain: f64, score: f64) -> Pbr {
+    let r = (floor + gain * score.max(0.0)).max(0.0) as f32;
+    Pbr {
+        // Dark under its own light: what the rim shows is what it emits, so a
+        // bright albedo would only add a second, duller ring of bounced sun.
+        base_color: [0.06, 0.05, 0.04],
+        roughness: 0.6,
+        specular: 0.2,
+        emissive: [RIM_TINT[0] * r, RIM_TINT[1] * r, RIM_TINT[2] * r],
+        ..Default::default()
+    }
+}
+
+/// The glint: the same light, on the sand, a step along the gradient.
+///
+/// Modest on purpose. The rim says "here is the lock"; the glint says "this
+/// way", and a glint as bright as the rim would read as a second keyhole.
+pub fn glint(radiance: f64) -> Pbr {
+    let r = radiance.max(0.0) as f32;
+    Pbr {
+        base_color: [0.06, 0.05, 0.04],
+        roughness: 0.6,
+        specular: 0.2,
+        emissive: [GLINT_TINT[0] * r, GLINT_TINT[1] * r, GLINT_TINT[2] * r],
+        ..Default::default()
+    }
+}
+
+/// White-gold: the sun's own warmth, a little further toward gold.
+const RIM_TINT: [f32; 3] = [1.0, 0.86, 0.58];
+
+/// The glint is whiter than the rim — it is a spark on wet sand, not the lock.
+const GLINT_TINT: [f32; 3] = [1.0, 0.93, 0.78];
+
 /// The same material with its index made flat across the spectrum.
 ///
 /// Taken off the caller's own `Pbr` rather than rebuilt from an index, so a
@@ -161,5 +213,24 @@ mod tests {
         assert!(a.sellmeier.is_none() && !a.is_dispersive());
         assert_eq!((a.ior, a.transmission, a.roughness), (g.ior, g.transmission, g.roughness));
         assert_eq!(a.attenuation_color, g.attenuation_color);
+    }
+
+    /// The rim is always visible and always rises with the score, and it is
+    /// neither a refractor nor a light the caustic pass would aim at.
+    #[test]
+    fn the_rim_glows_from_a_floor_and_rises_with_the_score() {
+        let lum = |p: Pbr| 0.2126 * p.emissive[0] + 0.7152 * p.emissive[1] + 0.0722 * p.emissive[2];
+        let dark = rim(0.8, 4.0, 0.0);
+        assert!(lum(dark) > 0.0, "an unlit keyhole is not findable");
+        let mut last = lum(dark);
+        for k in 1..=10 {
+            let now = lum(rim(0.8, 4.0, k as f64 / 10.0));
+            assert!(now > last, "the rim did not rise at score {}", k as f64 / 10.0);
+            last = now;
+        }
+        // …and nothing about it joins the rune's photon budget
+        for p in [rim(0.8, 4.0, 0.5), glint(6.0)] {
+            assert_eq!(p.transmission, 0.0);
+        }
     }
 }
