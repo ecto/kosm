@@ -107,6 +107,10 @@ back-edge (the `[patch]` in Cargo.toml). The tag it waits on now exists:
 until then vcad's pinned rev drags a second kosm-render into the graph and the
 `Geometry` impls stop lining up. See step 6 below for the push order.
 
+Which of these crates is publishable, in what order the git revs above turn
+into crates.io versions, and what each upstream repo owes before that can
+happen: `docs/publishing.md`.
+
 ## Sims
 
 The filesystem is the registry, and nesting is composition. This is the

@@ -1,6 +1,8 @@
 # kosm, for an agent
 
 Three nouns and one loop. `docs/architecture.md` is the why; this is the how.
+`docs/publishing.md` is the dependency order, the publish flags, and how a git
+rev in `[workspace.dependencies]` becomes a crates.io version.
 
 - **World** — columns (phyz's `Model` + `State`, plus materials, lights,
   params). No method on it runs anything.
@@ -254,7 +256,8 @@ four stages (build → run → observe → optimise-optional). Copy it.
   (untracked; copy `.cargo/config.toml.example` and point it at your
   checkouts) patches those same sources back to local paths, so edits next
   door still land in a kosm build; it overrides the manifest's patches, and
-  CI runs without it. `tang` is unified by a
+  CI runs without it. `docs/publishing.md` says which of those revs is waiting
+  on which upstream release. `tang` is unified by a
   `[patch.crates-io]` so `tang::Scalar` is one trait across the graph. Changing
   any of it is a full rebuild.
 - **One phyz.** There used to be a gap here: ipse-map pinned phyz twelve commits
