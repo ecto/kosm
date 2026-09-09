@@ -262,3 +262,11 @@ four stages (build → run → observe → optimise-optional). Copy it.
   ipse-map lifted into this workspace, so ipse is no longer a dependency and the
   problem is gone — every phyz in the graph is the one rev the manifest pins, on a
   clean clone as much as here.
+
+## Cargo.lock and the local override
+
+The committed `Cargo.lock` is the clean-clone form: phyz and tang resolve
+from their git revs. With `.cargo/config.toml` present, cargo rewrites those
+entries to local paths on the first build. That churn is expected; do not
+commit a `Cargo.lock` whose phyz/tang sources are local paths. `git checkout
+-- Cargo.lock` before committing, or resolve once with the config moved aside.
