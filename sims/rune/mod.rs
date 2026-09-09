@@ -39,6 +39,8 @@ pub mod automaton;
 pub mod bake;
 pub mod being;
 pub mod creature;
+/// The adventurer, as four path-traced stills. `kosm run rune/hero`.
+pub mod hero;
 pub mod hint;
 pub mod materials;
 pub mod render;
