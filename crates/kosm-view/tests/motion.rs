@@ -1,80 +1,128 @@
-//! What the window's motion vectors rest on.
+//! What the viewer's history does when things move.
 //!
-//! A game renderer estimates motion from screen space. This one does not have
-//! to: the physics is right there, and the two claims checked here are the
-//! whole of why the picture can be both exact and early.
+//! The viewer talks to one trait, [`TemporalHistory`], and
+//! `kosm_render::gpu::History` is the implementation a tier without a device
+//! gets: a per-pixel running mean with no reprojection and no filter. These
+//! tests pin what that means at the seams — a still camera accumulates, a
+//! moved camera or a moved ball does not, and a size step is a new picture.
 //!
-//! 1. **Motion is the physics'.** The displacement of a ball in flight, taken
-//!    from the two frames' velocities alone, is the displacement the solver
-//!    actually applied — to the last bit, not to a tolerance.
-//! 2. **Ahead is computed, not predicted.** The frame the renderer aims at,
-//!    reached by running the deterministic sim on, is the same state as
-//!    stepping straight to that time.
+//! The device tier's own history is pinned in kosm-render's `gpu_temporal`
+//! tests; the one here that needs an adapter only checks that the type those
+//! tests read back is the type this trait drives, and skips cleanly when
+//! there is no adapter, the same way they do.
 
-use kosm_spike::court::render::Snapshot;
-use kosm_spike::court::{Court, CourtScene};
+use kosm_render::gpu::GpuContext;
+use kosm_view::temporal::{self, Pose, TemporalHistory, View};
+use vcad_kernel_math::{Point3, Vec3};
+use vcad_kernel_raytrace::pathtrace::{Camera, Film};
 
-fn scene() -> CourtScene {
-    CourtScene::bundled().expect("the bundled court scene")
+const W: u32 = 8;
+const H: u32 = 8;
+
+fn view_from(eye: [f64; 3]) -> View {
+    let cam = Camera::look_at(
+        Point3::new(eye[0], eye[1], eye[2]),
+        Point3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        45.0,
+    );
+    View::of(&cam, W, H)
 }
 
-/// Step to just after `t`, so the ball is in free flight and nothing has been
-/// touched.
-fn stepped_to(scene: &CourtScene, t: f64) -> Court {
-    let mut court = Court::from_scene(scene).expect("the court");
-    while court.time() < t {
-        court.step();
-    }
-    court
+/// A flat film of one brightness, so a mean is easy to read.
+fn film(value: f32) -> Film {
+    let mut f = Film::new(W, H);
+    f.rgb.fill(value);
+    f.alpha.fill(1.0);
+    f
+}
+
+fn ball(x: f64) -> Vec<Pose> {
+    vec![Pose::still([x, 0.0, 0.0], 100.0)]
 }
 
 #[test]
-fn velocity_is_the_motion_vector() {
-    let scene = scene();
-    let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
-    // Early: the balls are released above the slab and have touched nothing,
-    // so the whole frame is one constant acceleration.
-    let mut court = stepped_to(&scene, 0.05);
-    let prev = Snapshot::of(&court);
-    for _ in 0..steps_per_frame {
-        court.step();
+fn a_still_camera_accumulates() {
+    let mut h = temporal::empty((W, H));
+    let view = view_from([1000.0, 0.0, 200.0]);
+    for value in [0.0f32, 1.0, 2.0, 3.0] {
+        assert!(h.reproject(&view, &ball(0.0)) >= 0.0);
+        h.accumulate(&film(value));
     }
-    let now = Snapshot::of(&court);
-    assert!(now.t > prev.t);
-    for k in 0..now.balls.len() {
-        let posed = now.balls[k].0 - prev.balls[k].0;
-        let from_v = now.ball_displacement(&prev, k);
-        let err = (posed - from_v).norm();
-        assert!(
-            err < 1e-6,
-            "ball {k}: the pose moved {posed:?}, the velocities say {from_v:?} ({err:e} m apart)"
-        );
-    }
+    assert_eq!(h.mean_samples(), 4.0, "four passes, four samples a pixel");
+    // The running mean of 0, 1, 2, 3.
+    assert!((h.rgb[0] - 1.5).abs() < 1e-5, "mean was {}", h.rgb[0]);
 }
 
 #[test]
-fn a_frame_ahead_is_the_frames_own_state() {
-    let scene = scene();
-    let steps_per_frame = (1.0 / scene.fps / scene.dt).round().max(1.0) as usize;
-    // Two frames of lookahead over a bounce, which is where a *predicted*
-    // world and a *computed* one part company.
-    let ahead = 2 * steps_per_frame;
-    let mut running = stepped_to(&scene, 0.60);
-    let target = running.time() + ahead as f64 * scene.dt;
-    for _ in 0..ahead {
-        running.step();
-    }
-    let run_on = Snapshot::of(&running);
+fn a_moved_camera_starts_the_picture_over() {
+    let mut h = temporal::empty((W, H));
+    let view = view_from([1000.0, 0.0, 200.0]);
+    h.reproject(&view, &ball(0.0));
+    h.accumulate(&film(1.0));
+    h.accumulate(&film(1.0));
+    assert_eq!(h.mean_samples(), 2.0);
 
-    // The same time, reached from the beginning instead of from a frame the
-    // renderer happened to be holding.
-    let direct = stepped_to(&scene, target - 0.5 * scene.dt);
-    let straight = Snapshot::of(&direct);
+    let kept = h.reproject(&view_from([1000.0, 400.0, 200.0]), &ball(0.0));
+    assert_eq!(kept, 0.0, "no pixel survives a camera move on this tier");
+    assert_eq!(h.mean_samples(), 0.0);
+    h.accumulate(&film(4.0));
+    assert!((h.rgb[0] - 4.0).abs() < 1e-5, "the new pass is the picture");
+}
 
-    assert!((run_on.t - straight.t).abs() < 1e-9, "{} vs {}", run_on.t, straight.t);
-    for k in 0..run_on.balls.len() {
-        assert_eq!(run_on.balls[k].0, straight.balls[k].0, "ball {k}");
-        assert_eq!(run_on.vel[k].0, straight.vel[k].0, "ball {k} velocity");
-    }
-    assert_eq!(run_on.extras.len(), straight.extras.len());
+#[test]
+fn a_moved_ball_starts_the_picture_over_and_a_still_one_does_not() {
+    let mut h = temporal::empty((W, H));
+    let view = view_from([1000.0, 0.0, 200.0]);
+    h.reproject(&view, &ball(0.0));
+    h.accumulate(&film(1.0));
+
+    assert_eq!(h.reproject(&view, &ball(0.0001)), 1.0, "a micron is not a move");
+    h.accumulate(&film(1.0));
+    assert_eq!(h.mean_samples(), 2.0);
+
+    assert_eq!(h.reproject(&view, &ball(50.0)), 0.0, "50 mm is");
+    assert_eq!(h.mean_samples(), 0.0);
+}
+
+#[test]
+fn a_size_step_is_a_new_picture() {
+    let mut h = temporal::empty((W, H));
+    h.accumulate(&film(1.0));
+    assert_eq!(h.mean_samples(), 1.0);
+    h.begin((W, H));
+    assert_eq!(h.mean_samples(), 1.0, "the same size is the same picture");
+    h.begin((W * 2, H));
+    assert_eq!((h.width, h.height), (W * 2, H));
+    assert_eq!(h.mean_samples(), 0.0);
+}
+
+#[test]
+fn resolve_is_srgb_bytes_of_the_mean() {
+    let mut h = temporal::empty((W, H));
+    h.accumulate(&film(0.0));
+    let dark = h.resolve(1.0);
+    assert_eq!(dark.len() as u32, W * H * 4);
+    h.reset();
+    h.accumulate(&film(1.0));
+    let bright = h.resolve(1.0);
+    assert!(bright[0] > dark[0], "a brighter mean resolves brighter");
+}
+
+/// The type the device hands back is the type the trait drives.
+///
+/// `read_history` returns exactly this struct, so a tier that reads its
+/// history off the device and a tier that keeps one on the host speak the same
+/// planes. Skips when there is no adapter, like kosm-render's `gpu_*` tests.
+#[test]
+fn gpu_history_is_the_same_history_the_trait_drives() {
+    let Ok(_ctx) = GpuContext::init_blocking() else {
+        eprintln!("skipping gpu_history_is_the_same_history_the_trait_drives: no GPU");
+        return;
+    };
+    let mut h: kosm_render::gpu::History = temporal::empty((W, H));
+    h.accumulate(&film(2.0));
+    assert_eq!(h.count[0], 1);
+    assert_eq!((h.width, h.height), (W, H));
+    assert_eq!(h.rgb.len(), (W * H * 3) as usize);
 }

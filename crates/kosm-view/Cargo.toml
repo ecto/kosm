@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "The window: a wgpu surface, a blitted image, and nothing else on it"
+repository.workspace = true
+# Not publishable until vcad 0.10: this depends on vcad-kernel, -raytrace, -gpu
+# and -math, none of which exist on crates.io, and cargo refuses to publish a
+# crate with git dependencies. Flip to the default once those are versions.
+publish = false
+
+[lib]
+name = "kosm_view"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kosm-view"
+path = "src/main.rs"
 
 [dependencies]
-kosm-spike = { path = "../kosm-spike" }
-kosm-render = { path = "../kosm-render", features = ["gpu"] }
+kosm-render = { path = "../kosm-render", version = "0.1", features = ["gpu"] }
 # the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
 wgpu = "30"
 winit = "0.30"
@@ -19,11 +31,11 @@ phyz-math.workspace = true
 tang.workspace = true
 anyhow = "1"
 log = "0.4"
-# The skatepark's ride viewer (`--ride`, `--live`) is an egui app from main; it
-# is behind a feature so the default binary stays the bare viewport.
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"], optional = true }
-egui = { version = "0.36", optional = true }
-ipse-map = { workspace = true, optional = true }
+# egui backs the ride player and the camera/readback a sim's own viewer mode
+# shares with it.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.36"
+kosm-scan = { path = "../kosm-scan", version = "0.0.1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
@@ -33,7 +45,6 @@ vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
 vcad-kernel-gpu.workspace = true
 vcad-kernel-math.workspace = true
 vcad-kernel.workspace = true
-vcad-eval.workspace = true
 [features]
 default = []
-ride = ["dep:eframe", "dep:egui", "dep:ipse-map", "dep:serde", "dep:serde_json"]
+ride = ["dep:kosm-scan", "dep:serde", "dep:serde_json"]

@@ -1,0 +1,12 @@
+[package]
+name = "kosm-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "the build-script walker: the filesystem under sims/ is the registry"
+keywords = ["build-script", "registry", "codegen", "simulation"]
+categories = ["development-tools::build-utils", "simulation"]
+exclude = ["out/"]
+
+[dependencies]

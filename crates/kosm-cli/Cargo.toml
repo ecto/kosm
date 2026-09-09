@@ -1,0 +1,68 @@
+[package]
+name = "kosm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kosm's front door: the filesystem under sims/ is the registry"
+repository.workspace = true
+# Never publishable: `build.rs` walks `sims/` at the workspace root and compiles
+# what it finds there, and `cargo package` cannot carry files from outside the
+# crate directory. The binary is built from a clone, not installed from crates.io.
+publish = false
+
+[lib]
+name = "kosm_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kosm"
+path = "src/main.rs"
+
+[build-dependencies]
+kosm-registry = { path = "../kosm-registry", version = "0.0.1" }
+
+[dependencies]
+kosm = { path = "../kosm", version = "0.0.1" }
+kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
+kosm-render = { path = "../kosm-render", version = "0.1" }
+kosm-view = { path = "../kosm-view", version = "0.0.1", optional = true }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"], optional = true }
+egui = { version = "0.36", optional = true }
+bytemuck = { version = "1", optional = true }
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+phyz.workspace = true
+phyz-math.workspace = true
+phyz-model.workspace = true
+phyz-rigid.workspace = true
+phyz-contact.workspace = true
+phyz-diff.workspace = true
+phyz-world.workspace = true
+phyz-camera.workspace = true
+phyz-collision.workspace = true
+vcad.workspace = true
+vcad-kernel.workspace = true
+vcad-eval.workspace = true
+vcad-ir.workspace = true
+vcad-kernel-export.workspace = true
+vcad-render.workspace = true
+vcad-kernel-acoustics.workspace = true
+vcad-kernel-optics.workspace = true
+vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
+vcad-kernel-gpu = { workspace = true, optional = true }
+vcad-kernel-math.workspace = true
+vcad-kernel-primitives.workspace = true
+kosm-scan = { path = "../kosm-scan", version = "0.0.1" }
+image.workspace = true
+hound.workspace = true
+tang.workspace = true
+tang-3dgs.workspace = true
+rayon = "1"
+rustfft = "6"
+anyhow = "1"
+
+[features]
+default = []
+# A sim's own viewer mode (`kosm run court --view`). Off by default: egui and
+# eframe are the heaviest thing in the graph and the agent loop is headless.
+view = ["dep:kosm-view", "dep:eframe", "dep:egui", "dep:bytemuck", "dep:wgpu", "dep:pollster", "dep:vcad-kernel-gpu", "kosm-render/gpu"]
