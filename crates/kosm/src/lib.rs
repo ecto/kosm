@@ -1,6 +1,16 @@
-//! kosm: the engine. Worlds, colliders, materials, audio, light, the BRep
-//! path the picture is traced over, the denoiser and the fluid. The levels
-//! that used to live here are `sims/` now.
+//! kosm: the engine.
+//!
+//! The public vocabulary is three words, and nothing else is a first-class
+//! thing: [`World`](world::World) is columns, [`Step`](step::Step) is
+//! `World → World` and pure, [`Lens`](lens::Lens) is `World → observation`.
+//! Around them: [`diff`] between two worlds, [`snapshot`] assertions,
+//! [`run`]'s hash and recorder, and [`task`], [`gate`] and [`ledger`], which
+//! are contracts over the three nouns with no loop of their own.
+//!
+//! One import: [`prelude`]. The rest of the crate is what those three are
+//! built out of — colliders, materials, audio, light, the BRep path the
+//! picture is traced over, the denoiser and the fluid. The levels that used
+//! to live here are `sims/` now.
 pub mod analytic;
 pub mod audio;
 pub mod brep;
