@@ -251,6 +251,11 @@ pub struct Scene {
     /// `sqrt(gather_photons / photons)`, so the offline frame is bit-identical
     /// and the walking picture has a caustic instead of sparkle.
     gather_photons: f64,
+    /// Solids a caller has put in the cove that the cove knows nothing about.
+    /// See [`Scene::push_part`]. Empty for `kosm run rune`.
+    extras: Vec<Placed>,
+    /// Whether the being is drawn at all. See [`Scene::set_being_visible`].
+    show_being: bool,
     /// Whether the *camera's* being disperses. The caustic pass's always does.
     ///
     /// See [`materials::being_achromatic`]: at one sample a pixel a pass the
@@ -370,6 +375,8 @@ impl Scene {
             // rune is actually read at, so it is the scale to gather at.
             gather: a.parameter_or("caustic_radius_mm", scene.aperture_r * PER_M / 2.0),
             gather_photons: a.parameter_or("caustic_radius_photons", 600_000.0).max(1.0),
+            extras: Vec::new(),
+            show_being: true,
             body_dispersion: true,
         })
     }
@@ -383,6 +390,51 @@ impl Scene {
     /// whatever this says.
     pub fn set_body_dispersion(&mut self, on: bool) {
         self.body_dispersion = on;
+    }
+
+    /// Draw one more thing in every picture this scene makes: a BVH over this
+    /// picture's geometry, a material, and an object → world placement in
+    /// millimetres.
+    ///
+    /// Additive and orthogonal to everything above it — the cove itself never
+    /// calls this. A character, a prop, a second refractor: anything a caller
+    /// holds as a placed BVH can be put in the cove's own light without the
+    /// cove having to know what it is. A `pbr` that transmits joins the caustic
+    /// pass's aim for nothing, because [`kosm_render::caustics`] looks at the
+    /// picture's materials and at nothing else — so a lens pushed in here
+    /// throws a rune exactly the way the being does.
+    ///
+    /// [`geometry_of`] turns a placed vcad solid into the geometry this wants;
+    /// [`mesh_geometry`] does the same for a caller that has tessellated
+    /// something itself.
+    pub fn push_object(&mut self, bvh: Arc<Bvh<CoveGeom>>, pbr: Pbr, to_world: Transform) {
+        self.extras.push(Placed { bvh, pbr, to_world });
+    }
+
+    /// Whether the being is in the picture. On by default, which is the cove.
+    ///
+    /// A still of something *else* standing in this cove wants the level, the
+    /// light and the door and not the capsule — and, because the being is a
+    /// dielectric, leaving it in would also spend half the rune's photons on a
+    /// body that is not in shot.
+    pub fn set_being_visible(&mut self, on: bool) {
+        self.show_being = on;
+    }
+
+    /// The gather radius the caustic is read at, millimetres.
+    ///
+    /// The authored default is half the keyhole, which is the scale a being's
+    /// broad, aberrated focus is read at. A refractor that focuses tighter than
+    /// that — a figured lens rather than a body — wants a smaller disc or the
+    /// estimate averages its own spot away.
+    pub fn set_gather(&mut self, radius_mm: f64) {
+        self.gather = radius_mm.max(1e-6);
+        self.gather_photons = self.photons.max(1) as f64;
+    }
+
+    /// How many photons the rune is traced with. Zero is off.
+    pub fn set_photons(&mut self, photons: usize) {
+        self.photons = photons;
     }
 
     /// The gather radius a map of `photons` photons is asked for, in
@@ -429,9 +481,12 @@ impl Scene {
                 Transform::translation(g.x, g.y, g.z),
             ));
         }
-        let (centre, rot) = p.being;
-        let c = centre * PER_M;
-        objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
+        objects.extend(self.extras.iter().map(Placed::object));
+        if self.show_being {
+            let (centre, rot) = p.being;
+            let c = centre * PER_M;
+            objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
+        }
         Picture {
             objects,
             lights: Vec::new(),
@@ -518,7 +573,7 @@ fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
 /// flat and bright. The defaults put roughly as much irradiance on the sand
 /// from the sky as from the sun at this elevation, which leaves a shadow that
 /// is soft, blue, and unmistakably there.
-fn daylight(scene: &CoveScene) -> (Environment, Sun) {
+pub fn daylight(scene: &CoveScene) -> (Environment, Sun) {
     let a = &scene.authored;
     let sky = a.parameter_or("sky_intensity", 0.42) as f32;
     let env = Environment::Gradient(GradientEnv {
@@ -661,7 +716,18 @@ fn annulus_mesh(centre: Point3, r_in: f64, r_out: f64, segments: usize) -> TriMe
 /// The geometry a solid is traced as: its analytic BRep if it has one, its
 /// tessellation if a boolean took the BRep away — the same fallback the court
 /// takes, and the same one `vcad-render --photoreal` takes.
-fn geometry_of(solid: &Solid) -> CoveGeom {
+/// A caller's own triangles, as this picture's geometry.
+///
+/// The way in for a shape the kernel will not hand over as a *trimmed* B-rep —
+/// the being's capsule is one, and so is a lens cut as the intersection of two
+/// spheres. Give the mesh exact analytic normals and the shading is exact even
+/// where the silhouette is a polygon, which is the same trade [`capsule_mesh`]
+/// makes.
+pub fn mesh_geometry(mesh: TriMesh) -> CoveGeom {
+    CoveGeom::Brep(BrepGeom::Mesh(mesh))
+}
+
+pub fn geometry_of(solid: &Solid) -> CoveGeom {
     if let Some(brep) = solid.as_brep() {
         let brep = Arc::new(brep.clone());
         let faces = brep.topology.faces.iter().map(|(id, _)| id).collect();

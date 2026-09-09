@@ -73,6 +73,29 @@ fn cove(name: &str) -> Option<Pbr> {
             ior: 1.333,
             ..Default::default()
         },
+        // ---- the automaton -------------------------------------------------
+        // The player is a made thing on an island of made things, and its
+        // three surfaces are the three a doll is actually made of. Same rule
+        // as the cove's: one colour and one roughness each, nothing layered,
+        // and the interest comes from the shapes and the light. Chosen against
+        // *both* backdrops it has to stand on — warm pale sand and a cool
+        // blue-grey cliff — which is what rules out a cool body colour: teal
+        // lacquer sits in front of that cliff and disappears into it.
+        //
+        // Porcelain: near-white with the warmth a glaze has, and smooth enough
+        // that the low sun leaves a soft sheen on the head rather than a flat
+        // chalk field. It is the brightest thing in the picture after the sand,
+        // so the head and the hands are where the eye goes.
+        "porcelain" => Pbr { base_color: [0.88, 0.845, 0.79], roughness: 0.15, specular: 0.5, ..Default::default() },
+        // Brass: the joints and the filigree. A real metal, so `metallic` is
+        // one and the base colour is F0 rather than an albedo; rough enough
+        // that the highlight is a smear along a ball and not a mirror.
+        "brass" => Pbr { base_color: [0.72, 0.53, 0.22], metallic: 1.0, roughness: 0.30, ..Default::default() },
+        // Lacquered wood, deep vermilion. The complement of the cliff and
+        // darker than the sand, so the limbs read as a silhouette from across
+        // the beach and as a colour up close. Smooth, because lacquer is: the
+        // long soft highlight down a rod is the whole reason to lacquer it.
+        "lacquer" => Pbr { base_color: [0.34, 0.038, 0.028], roughness: 0.10, specular: 0.6, ..Default::default() },
         _ => return None,
     })
 }

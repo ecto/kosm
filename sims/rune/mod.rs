@@ -34,8 +34,11 @@ use kosm::build::{Built, Params};
 use kosm::scene::MM;
 use crate::skatepark::{self, BakeOpts, Part};
 
+/// The player, as a made thing: a porcelain automaton with a lens for a tool.
+pub mod automaton;
 pub mod bake;
 pub mod being;
+pub mod creature;
 pub mod hint;
 pub mod materials;
 pub mod render;
