@@ -28,6 +28,7 @@ use phyz_math::Vec3;
 use crate::scene::{AuthoredScene, MM};
 use crate::skatepark::{self, BakeOpts, Part};
 
+pub mod being;
 pub mod bake;
 pub mod sim;
 #[cfg(test)]

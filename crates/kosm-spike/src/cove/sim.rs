@@ -89,10 +89,42 @@ impl BeachRoll {
     }
 }
 
+/// The beach as a plane, carried away from the scene.
+///
+/// A body standing on the sand needs the sand, and the sand is one plane; this
+/// is that plane, read out of [`CoveScene`] once so that a `Cove` stepping in
+/// a window does not have to keep the document alive to know where the ground
+/// is. It is not a second statement of where the beach is — the point and the
+/// normal both come from the scene's own two functions.
+#[derive(Clone, Copy, Debug)]
+pub struct Beach {
+    /// A point the sand passes through.
+    pub origin: Vec3,
+    /// The sand's upward unit normal.
+    pub normal: Vec3,
+}
+
+impl Beach {
+    pub fn of(scene: &CoveScene) -> Self {
+        Self { origin: Vec3::new(0.0, 0.0, scene.sand_z_at(0.0, 0.0)), normal: scene.sand_normal() }
+    }
+
+    /// The top of the sand at `(x, y)`: the plane, solved for z.
+    pub fn z_at(&self, x: f64, y: f64) -> f64 {
+        self.origin.z - (self.normal.x * (x - self.origin.x) + self.normal.y * (y - self.origin.y)) / self.normal.z
+    }
+
+    /// A sphere of radius `r` at rest on the sand at `(x, y)`: its centre is
+    /// one radius up the sand's normal from the surface.
+    pub fn resting_centre(&self, x: f64, y: f64, r: f64) -> Vec3 {
+        Vec3::new(x, y, self.z_at(x, y)) + self.normal * r
+    }
+}
+
 /// A sphere of radius `r` at rest on the sand at `(x, y)`: its centre is one
 /// radius up the sand's normal from the surface.
 pub fn resting_centre(scene: &CoveScene, x: f64, y: f64, r: f64) -> Vec3 {
-    Vec3::new(x, y, scene.sand_z_at(x, y)) + scene.sand_normal() * r
+    Beach::of(scene).resting_centre(x, y, r)
 }
 
 /// Release a glass sphere at rest on the sand and roll it down the beach on
