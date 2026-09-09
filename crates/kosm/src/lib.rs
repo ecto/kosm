@@ -14,6 +14,7 @@
 pub mod analytic;
 pub mod audio;
 pub mod brep;
+pub mod build;
 pub mod colliders;
 pub mod denoise;
 pub mod diff;

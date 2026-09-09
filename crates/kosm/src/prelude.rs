@@ -32,4 +32,5 @@ pub use crate::world::{Light, Material, Param, World};
 
 // the build side, as it exists today: authored geometry and its colliders
 pub use crate::colliders::{Derived as DerivedColliders, colliders_from_document};
+pub use crate::build::{Built, Params, build};
 pub use crate::scene::{AuthoredScene, MM};
