@@ -29,7 +29,7 @@ image.workspace = true
 rayon = "1"
 rustfft = "6"
 kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
-kosm-render = { path = "../kosm-render", version = "0.1" }
+kosm-render = { path = "../kosm-render", version = "0.2" }
 tang.workspace = true
 tang-3dgs.workspace = true
 tang-tensor.workspace = true

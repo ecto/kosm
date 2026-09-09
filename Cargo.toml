@@ -28,38 +28,39 @@ rust-version = "1.95"
 # `.cargo/config.toml.example`) patches every one of these back to a local path.
 # The manifest is the truth; that file is the override.
 #
-# phyz: `claude/rigid-impact-restitution` HEAD (the free-joint Coriolis fix).
-# Pushed, but NOT on `origin/main` yet — bump this to the merge commit when it lands.
-# crates.io has phyz 0.3.0 and the subcrates at 0.1.0; none of them carry this fix,
-# and phyz-camera is not published at all. → phyz 0.4 (see docs/publishing.md).
-phyz         = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-math    = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-model   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-rigid   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-contact = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-diff    = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-world   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-camera  = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-phyz-collision = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
-# vcad: the rev on `claude/wgpu-30` (vcad PR #864) that this repo has been
-# building and testing against — the one Cargo.lock already held. A rev, not a
-# branch, so the resolve is reproducible and the branch cannot move under us:
-# the current branch tip (29fa77b) changes Difference tessellation and fails
-# `colliders::the_cup_level_leaves_its_cup_hollow`. Bump deliberately, not by
-# drift. Once #864 merges this should track `main` (or a published version).
-vcad         = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", default-features = false }
-vcad-kernel  = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", features = ["no-builtin-font"] }
-vcad-eval    = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-ir      = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-loon    = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-export = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-render  = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687", default-features = false }
-vcad-kernel-acoustics = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-optics = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-raytrace = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-math = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
-vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
+# phyz: the `v0.4.0` tag commit (fbba8ab) — the free-joint Coriolis fix, merged to
+# main and published. crates.io now has phyz 0.4.0 and every subcrate (phyz-camera
+# included, first publish), so each dep carries `version = "0.4"` beside the rev:
+# the git tree is what builds here, the version is what `cargo package` embeds.
+# The old pin (61fe0a4) was a pre-release tree still calling itself 0.3.1, which
+# `version = "0.4"` correctly refuses. See docs/publishing.md.
+phyz         = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-math    = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-model   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-rigid   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-contact = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-diff    = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-world   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-camera  = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz-collision = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+# vcad: `origin/main` (ecto/vcad#867 merged). This rev consumes kosm-render from
+# crates.io-style by tag — `kosm-render-v0.2.0`, `version = "0.2"` — so the
+# workspace no longer needs a `[patch."https://github.com/ecto/kosm"]` back-edge
+# to keep one kosm-render in the graph. A rev, not a branch, so the resolve is
+# reproducible and main cannot move under us. Bump deliberately, not by drift.
+vcad         = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09", default-features = false }
+vcad-kernel  = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09", features = ["no-builtin-font"] }
+vcad-eval    = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-ir      = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-loon    = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-export = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-render  = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09", default-features = false }
+vcad-kernel-acoustics = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-optics = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-raytrace = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-math = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
+vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", rev = "64e0ec4abec03eae89d26457af2d4ee0560e9f09" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
 # tang: `main` HEAD. crates.io has tang 0.2.0, but eighteen commits touch
@@ -94,15 +95,21 @@ tang-ad   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69
 # workspace, ipse is no longer a dependency, and the problem is gone: every phyz
 # in the graph is the rev pinned above.
 
-# vcad pulls kosm-render from this repo by git rev; without this patch cargo
-# builds two copies and the Geometry impls stop lining up. This is the documented
-# temporary back-edge and stays in the manifest (a path inside this repo works on
-# a clean clone). It goes away when kosm-render is tagged and vcad tracks the tag.
-# drop once vcad tracks tag kosm-render-v0.2.0 (vcad branch claude/kosm-render-tag)
+
+# vcad consumes kosm-render from this repo — now by tag (`kosm-render-v0.2.0`,
+# `version = "0.2"`) rather than by rev, as of ecto/vcad#867. That is still a
+# back-edge into this workspace: cargo treats the git source and the path member
+# as two different packages and builds BOTH unless they are patched together, and
+# two kosm-render in one graph means `pathtrace::Scene` from vcad's copy meeting
+# `kosm_render::caustics::trace` from ours — E0308 in `kosm/src/brep/mod.rs`.
 #
-# Verified 2026-09-09: without this, `cargo metadata --offline` still "resolves",
-# but it resolves by ADDING a second kosm-render — `Adding kosm-render v0.1.0
-# (https://github.com/ecto/kosm?rev=5c42c287…)` — pulled in by vcad's pinned rev.
-# Two copies in one graph is exactly the breakage this patch exists to prevent.
+# What the tag changed is that this patch now APPLIES. A `[patch]` may only
+# replace a dependency with one that satisfies its requirement; while vcad asked
+# for `0.1.0` the local 0.2.0 silently did not, and cargo added the git copy
+# beside ours. At `version = "0.2"` on both sides it unifies. Verified with
+# `cargo metadata`: exactly one kosm-render, the path one.
+#
+# It goes away for real when kosm-render is published to crates.io and vcad
+# depends on the registry crate.
 [patch."https://github.com/ecto/kosm"]
 kosm-render = { path = "crates/kosm-render" }
