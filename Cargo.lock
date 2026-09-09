@@ -1572,7 +1572,7 @@ version = "0.0.1"
 
 [[package]]
 name = "kosm-render"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "js-sys",
@@ -2370,8 +2370,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phyz"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2383,8 +2383,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-camera"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "bytemuck",
  "phyz-collision",
@@ -2398,8 +2398,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-collision"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2407,8 +2407,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-contact"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-collision",
  "phyz-math",
@@ -2418,8 +2418,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-diff"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2433,8 +2433,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-math"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "libm",
  "tang",
@@ -2443,16 +2443,16 @@ dependencies = [
 
 [[package]]
 name = "phyz-model"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-math",
 ]
 
 [[package]]
 name = "phyz-rigid"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2460,8 +2460,8 @@ dependencies = [
 
 [[package]]
 name = "phyz-world"
-version = "0.3.1"
-source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "phyz-collision",
  "phyz-math",
@@ -3166,7 +3166,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stepperoni"
 version = "0.1.0"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -3239,8 +3239,9 @@ dependencies = [
 
 [[package]]
 name = "tang"
-version = "0.2.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01222e2be85bd48a1b129975a3b4045f425adaceb6ecda6e7a97cdb8dd96a75a"
 dependencies = [
  "paste",
  "robust",
@@ -3249,7 +3250,8 @@ dependencies = [
 [[package]]
 name = "tang-3dgs"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71ccf01db7a140c414808d9846e2f5942c0aa0c575e8c9f9dea0a2dbe327269d"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
@@ -3262,8 +3264,9 @@ dependencies = [
 
 [[package]]
 name = "tang-ad"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67759a0059717e6704887054248a7aa765fb9ba12ab803233be8cb3b3dfbcce"
 dependencies = [
  "tang",
  "tang-la",
@@ -3271,8 +3274,9 @@ dependencies = [
 
 [[package]]
 name = "tang-expr"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f1fdb85a4a0335eb38eac4635d080d54f2cb093e66ef54ce0c5460d35457e90"
 dependencies = [
  "tang",
 ]
@@ -3280,7 +3284,8 @@ dependencies = [
 [[package]]
 name = "tang-gpu"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbb08edc2c436d7261562a42b6d257215cbf9d31ea4ec4d97fd9c58d7eb65812"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
@@ -3292,16 +3297,18 @@ dependencies = [
 
 [[package]]
 name = "tang-la"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a1cf961cd2968a09fb079624db1eae07390acbe238fe61f075555b5302009d"
 dependencies = [
  "tang",
 ]
 
 [[package]]
 name = "tang-optim"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8611ed6ffd0d7f627cb8c2c93bcc9923038888f8401574396bf450ce51d7143"
 dependencies = [
  "tang",
  "tang-ad",
@@ -3311,7 +3318,8 @@ dependencies = [
 [[package]]
 name = "tang-tensor"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f251895b91826650fbcc68f39b8f7d76a62c88af88418582460a3aa686b436b8"
 dependencies = [
  "tang",
  "tang-la",
@@ -3320,7 +3328,8 @@ dependencies = [
 [[package]]
 name = "tang-train"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0c5ee63dd1cfeb75a9f2fbadbc8b4399f1b755b2e04031a4f8c77520a82d97"
 dependencies = [
  "tang",
  "tang-ad",
@@ -3575,7 +3584,7 @@ checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 [[package]]
 name = "vcad"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "anyhow",
  "serde",
@@ -3590,7 +3599,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-package"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "vcad-ir",
 ]
@@ -3598,7 +3607,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-pcb"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "log",
  "rayon",
@@ -3619,7 +3628,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-schematic"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3630,7 +3639,7 @@ dependencies = [
 [[package]]
 name = "vcad-ecad-sim"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "tang",
@@ -3645,7 +3654,7 @@ dependencies = [
 [[package]]
 name = "vcad-eval"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3668,7 +3677,7 @@ dependencies = [
 [[package]]
 name = "vcad-gdsii"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "geo",
  "thiserror 2.0.20",
@@ -3678,7 +3687,7 @@ dependencies = [
 [[package]]
 name = "vcad-ir"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3688,7 +3697,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-kernel-acoustics",
@@ -3729,7 +3738,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-acoustics"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3738,7 +3747,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-adjoint"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3747,7 +3756,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-antenna"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3756,7 +3765,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-booleans"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "rayon",
  "vcad-kernel-geom",
@@ -3769,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-calibration"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "ryu",
  "serde",
@@ -3779,7 +3788,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cam"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "geo",
  "geo-clipper",
@@ -3792,7 +3801,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-constraints"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "slotmap",
  "tang",
@@ -3806,7 +3815,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cost"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3815,7 +3824,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-dfm"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3833,7 +3842,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-diff"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "tang",
  "vcad-kernel-geom",
@@ -3847,7 +3856,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-em"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3856,7 +3865,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-enclosure"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3865,7 +3874,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-export"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -3874,7 +3883,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-fea"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-kernel-tessellate",
@@ -3884,7 +3893,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-fillet"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -3896,7 +3905,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-flow"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-kernel-adjoint",
@@ -3907,7 +3916,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-geom"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "tang",
  "vcad-kernel-math",
@@ -3916,7 +3925,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-gpu"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "bytemuck",
  "kosm-render",
@@ -3932,7 +3941,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-math"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "tang",
 ]
@@ -3940,7 +3949,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-naming"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -3951,7 +3960,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-neutronics"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3960,7 +3969,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-nurbs"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "tang",
  "vcad-kernel-geom",
@@ -3970,7 +3979,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-optics"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3979,7 +3988,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-particle"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -3988,7 +3997,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-photonics"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-gdsii",
@@ -3998,7 +4007,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-primitives"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -4008,7 +4017,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-qcd"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
 ]
@@ -4016,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-raytrace"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "bytemuck",
  "js-sys",
@@ -4040,7 +4049,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sheet"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -4051,7 +4060,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-shell"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "vcad-kernel-geom",
  "vcad-kernel-math",
@@ -4063,7 +4072,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sketch"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "thiserror 2.0.20",
  "vcad-kernel-geom",
@@ -4075,7 +4084,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-step"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "stepperoni",
  "thiserror 2.0.20",
@@ -4089,7 +4098,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-stocksim"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -4101,7 +4110,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sweep"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "rustc-hash 1.1.0",
  "thiserror 2.0.20",
@@ -4115,7 +4124,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-tessellate"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "earcutr",
  "tang",
@@ -4128,7 +4137,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-text"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "thiserror 2.0.20",
  "ttf-parser",
@@ -4139,7 +4148,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-thermal"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-receipt",
@@ -4148,7 +4157,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-tolerance"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-kernel-adjoint",
@@ -4158,7 +4167,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-topo"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "slotmap",
  "vcad-kernel-math",
@@ -4167,7 +4176,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-topopt"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "vcad-kernel-tessellate",
@@ -4176,7 +4185,7 @@ dependencies = [
 [[package]]
 name = "vcad-receipt"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -4185,7 +4194,7 @@ dependencies = [
 [[package]]
 name = "vcad-render"
 version = "0.9.3"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde_json",
  "vcad-ecad-pcb",
@@ -4197,7 +4206,7 @@ dependencies = [
 [[package]]
 name = "vcad-tool-derive"
 version = "0.9.4"
-source = "git+https://github.com/ecto/vcad?rev=504047fb0920a27365b4212b0bd7d376e183e687#504047fb0920a27365b4212b0bd7d376e183e687"
+source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "proc-macro2",
  "quote",

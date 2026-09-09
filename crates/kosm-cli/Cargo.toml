@@ -24,7 +24,7 @@ kosm-registry = { path = "../kosm-registry", version = "0.0.1" }
 [dependencies]
 kosm = { path = "../kosm", version = "0.0.1" }
 kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
-kosm-render = { path = "../kosm-render", version = "0.1" }
+kosm-render = { path = "../kosm-render", version = "0.2" }
 kosm-view = { path = "../kosm-view", version = "0.0.1", optional = true }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"], optional = true }
 egui = { version = "0.36", optional = true }
