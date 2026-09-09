@@ -86,6 +86,15 @@ const FAR_MM: f64 = 1.0e7;
 /// only soften it.
 const DENOISE_UNTIL: u32 = 32;
 
+/// Samples a pixel must already hold before [`History::set_firefly_cap`]
+/// engages. Below it the running mean is not a measurement of anything and a
+/// cap read off it would clamp the picture to its first sample.
+const FIREFLY_WARMUP: u32 = 8;
+
+/// Below this luminance a pixel is dark enough that the cap would be
+/// clamping noise against noise, so it is left alone.
+const FIREFLY_FLOOR: f32 = 1e-3;
+
 // ---- the camera, as the reprojection needs it -------------------------------
 
 /// A pinhole view: where the eye is, the screen basis, and the tangent
@@ -342,6 +351,14 @@ pub struct History {
     poses: Vec<Pose>,
     /// The share of the screen the last merge threw away.
     mask_fraction: f32,
+    /// The least the à-trous filter may contribute to a *converged* pixel.
+    /// Zero — the default, and the court's — is [`History::resolve`]'s
+    /// original behaviour, to the float. See [`History::set_denoise_floor`].
+    denoise_floor: f32,
+    /// A ceiling on one sample's luminance, as a multiple of what the pixel
+    /// has already measured. `None` — the default, and the court's — folds
+    /// every sample in whole. See [`History::set_firefly_cap`].
+    firefly_cap: Option<f32>,
 }
 
 impl History {
@@ -359,7 +376,55 @@ impl History {
             view: None,
             poses: Vec::new(),
             mask_fraction: 1.0,
+            denoise_floor: 0.0,
+            firefly_cap: None,
         }
+    }
+
+    /// Cap one sample's luminance at `cap` times the pixel's running mean.
+    ///
+    /// The integrator's own `firefly_clamp` is an absolute number against a
+    /// quantity whose scale is the scene's, and it exempts the direct term at
+    /// depth zero and every read of a caustic map — so a spike that arrives
+    /// through the first hit gets past it whatever it is set to. Measured on
+    /// the cove: taking it from 8 to 2 moved the dots on the cliff by nothing
+    /// at all.
+    ///
+    /// What catches those is a cap read off the pixel itself. A pixel that has
+    /// already seen [`FIREFLY_WARMUP`] samples knows roughly how bright it is;
+    /// a sample `cap` times brighter than that is a path the estimator will
+    /// spend hundreds more samples apologising for, and scaling it back to the
+    /// ceiling — all three channels by the same factor, so its hue survives —
+    /// costs a little energy in exchange for a picture that stops flashing. It
+    /// is scale-free, so a pixel inside the caustic has a high mean and keeps
+    /// its energy while one on the shaded cliff does not, which is the trade
+    /// this level wants.
+    ///
+    /// `None` is the default and the court's, and folds every sample in whole.
+    pub fn set_firefly_cap(&mut self, cap: Option<f32>) {
+        self.firefly_cap = cap.filter(|c| c.is_finite() && *c > 0.0);
+    }
+
+    /// Keep the filter engaged on pixels that have passed [`DENOISE_UNTIL`].
+    ///
+    /// The blend in [`Self::resolve`] fades the à-trous filter out as a pixel
+    /// accumulates, on the reasoning that a wall which has been averaging for
+    /// a minute should not be smeared by a filter tuned for one sample. That
+    /// is right whenever the residual noise falls as `1/sqrt(n)` — the
+    /// court's does — and wrong for a tier whose noise does not. The cove's
+    /// glass is a rough dielectric behind twelve bounces: a handful of paths
+    /// out of a thousand carry a hundred times the mean, so a pixel is still
+    /// visibly speckled at two hundred samples and the fade has long since
+    /// handed it back its own raw estimate.
+    ///
+    /// This is the floor under that fade: `0.0` (the default) is the court,
+    /// unchanged; `k` leaves a converged pixel at `k` of the filtered value
+    /// and `1 − k` of its own. Only the rune tier sets it, and it costs the
+    /// filter's fixed pass on every resolve rather than only while the picture
+    /// is young — the short-circuit that skips the filter once *every* pixel
+    /// is converged cannot fire while a floor is asking for it.
+    pub fn set_denoise_floor(&mut self, k: f32) {
+        self.denoise_floor = k.clamp(0.0, 1.0);
     }
 
     pub fn mask_fraction(&self) -> f32 {
@@ -519,12 +584,31 @@ impl History {
                 continue;
             }
             if live[i] {
-                let c = self.count[i] + 1;
+                let held = self.count[i];
+                let c = held + 1;
                 self.count[i] = c;
                 let k = 1.0 / c as f32;
+                // The sample, scaled back to the pixel's own ceiling if it is
+                // a firefly. See `set_firefly_cap`.
+                let mut s = [
+                    film.rgb[i * 3],
+                    film.rgb[i * 3 + 1],
+                    film.rgb[i * 3 + 2],
+                ];
+                if let Some(cap) = self.firefly_cap
+                    && held >= FIREFLY_WARMUP
+                {
+                    let was = luminance(&self.mean[i * 3..i * 3 + 3]);
+                    let now = luminance(&s);
+                    let ceiling = cap * was.max(FIREFLY_FLOOR);
+                    if now > ceiling && now > 0.0 {
+                        let scale = ceiling / now;
+                        s.iter_mut().for_each(|v| *v *= scale);
+                    }
+                }
                 for c3 in 0..3 {
                     let m = self.mean[i * 3 + c3];
-                    self.mean[i * 3 + c3] = m + (film.rgb[i * 3 + c3] - m) * k;
+                    self.mean[i * 3 + c3] = m + (s[c3] - m) * k;
                 }
                 self.alpha[i] += (film.alpha[i] - self.alpha[i]) * k;
                 self.variance[i] += (film.variance[i] - self.variance[i]) * k;
@@ -811,6 +895,9 @@ impl History {
     /// picture is 170x96 or 512x288, and a still window reaches
     /// [`DENOISE_UNTIL`] everywhere in a couple of seconds and would then pay
     /// it forever for an answer the blend throws away.
+    ///
+    /// [`Self::set_denoise_floor`] is the opt-out, for a tier whose noise does
+    /// not fall the way that reasoning assumes.
     pub fn resolve(&self, exposure: f32, opts: &PathTraceOptions) -> Vec<u8> {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
         let mut film = Film {
@@ -823,7 +910,8 @@ impl History {
             albedo: self.albedo.clone(),
             variance: self.variance.clone(),
         };
-        if opts.denoise && self.count.iter().any(|&c| c.max(1) < DENOISE_UNTIL) {
+        let floor = self.denoise_floor.clamp(0.0, 1.0);
+        if opts.denoise && (floor > 0.0 || self.count.iter().any(|&c| c.max(1) < DENOISE_UNTIL)) {
             let mut filtered = Film {
                 width: film.width,
                 height: film.height,
@@ -837,10 +925,14 @@ impl History {
             pathtrace::denoise(&mut filtered, opts);
             for i in 0..n {
                 let c = self.count[i].max(1);
-                if c >= DENOISE_UNTIL {
+                let k = if c >= DENOISE_UNTIL {
+                    floor
+                } else {
+                    (1.0 - (c - 1) as f32 / (DENOISE_UNTIL - 1) as f32).max(floor)
+                };
+                if k <= 0.0 {
                     continue;
                 }
-                let k = 1.0 - (c - 1) as f32 / (DENOISE_UNTIL - 1) as f32;
                 for c3 in 0..3 {
                     let raw = film.rgb[i * 3 + c3];
                     film.rgb[i * 3 + c3] = raw + (filtered.rgb[i * 3 + c3] - raw) * k;
@@ -849,6 +941,11 @@ impl History {
         }
         film.to_srgb8(exposure, false)
     }
+}
+
+/// Rec. 709 luminance, the scalar a firefly is measured on.
+fn luminance(rgb: &[f32]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
 
 /// Rectangles merged until none of them overlap.
@@ -1216,6 +1313,100 @@ mod tests {
             }
         }
         film
+    }
+
+    #[test]
+    /// The two opt-in fields are off by default, which is the whole promise
+    /// the court is owed: a `History` nobody has spoken to behaves exactly as
+    /// it did before either existed.
+    #[test]
+    fn the_new_knobs_are_off_until_they_are_asked_for() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
+        let dim = plane_film(&view, 1.0);
+        let mut spike = plane_film(&view, 1.0);
+        spike.rgb[..3].copy_from_slice(&[500.0; 3]);
+
+        // Default: the spike is folded in whole, and a converged pixel is left
+        // alone by the filter.
+        let mut plain = History::new((W, H));
+        // …and the same history with both knobs set.
+        let mut tuned = History::new((W, H));
+        tuned.set_firefly_cap(Some(4.0));
+        tuned.set_denoise_floor(1.0);
+        for k in 0..(DENOISE_UNTIL + 8) {
+            let film = if k == DENOISE_UNTIL + 4 { &spike } else { &dim };
+            plain.merge(film, &view, &poses, &[], None);
+            tuned.merge(film, &view, &poses, &[], None);
+        }
+        // The uncapped mean carries the spike; the capped one is near the four
+        // times its own mean it was allowed.
+        assert!(plain.mean[0] > 10.0, "the spike went in whole: {}", plain.mean[0]);
+        assert!(tuned.mean[0] < 1.2, "the cap held it back: {}", tuned.mean[0]);
+
+        let opts = PathTraceOptions { denoise: true, ..Default::default() };
+        let plain_px = plain.resolve(1.0, &opts);
+        // With no floor a converged pixel is its own mean, filter or no filter.
+        let raw = History { denoise_floor: 0.0, ..clone_of(&plain) }
+            .resolve(1.0, &PathTraceOptions { denoise: false, ..opts.clone() });
+        assert_eq!(plain_px, raw, "the default resolve leaves a converged pixel alone");
+    }
+
+    /// A copy of a history, so a resolve can be compared against another
+    /// resolve of the same samples under different knobs.
+    fn clone_of(h: &History) -> History {
+        History {
+            size: h.size,
+            mean: h.mean.clone(),
+            alpha: h.alpha.clone(),
+            count: h.count.clone(),
+            normal: h.normal.clone(),
+            depth: h.depth.clone(),
+            albedo: h.albedo.clone(),
+            variance: h.variance.clone(),
+            view: h.view,
+            poses: h.poses.clone(),
+            mask_fraction: h.mask_fraction,
+            denoise_floor: h.denoise_floor,
+            firefly_cap: h.firefly_cap,
+        }
+    }
+
+    /// A floor keeps the filter engaged on a picture every pixel of which has
+    /// long since passed [`DENOISE_UNTIL`] — which is the state a still window
+    /// reaches in a couple of seconds and the state the cove's glass is still
+    /// speckled in.
+    #[test]
+    fn a_denoise_floor_keeps_the_filter_on_past_the_fade() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let view = View::of(&cam, W, H);
+        let poses = [Pose::still([0.0, 0.0, 500.0], 120.0)];
+        let flat = plane_film(&view, 0.2);
+        let mut h = History::new((W, H));
+        for _ in 0..(DENOISE_UNTIL + 8) {
+            h.merge(&flat, &view, &poses, &[], None);
+        }
+        // One pixel that disagrees with a converged, otherwise uniform field,
+        // kept well under the tonemap's shoulder so the bytes still move.
+        let hot = (H / 2 * W + W / 2) as usize;
+        h.mean[hot * 3..hot * 3 + 3].copy_from_slice(&[0.6; 3]);
+        // The filter's luminance weight is scaled by the variance plane, and
+        // a film of zeros tells it every pixel is exact — which is a real
+        // failure mode of this tier and not the one under test here.
+        h.variance.iter_mut().for_each(|v| *v = 0.05);
+        let opts = PathTraceOptions { denoise: true, ..Default::default() };
+
+        let mut with_floor = clone_of(&h);
+        with_floor.set_denoise_floor(1.0);
+        let a = h.resolve(1.0, &opts);
+        let b = with_floor.resolve(1.0, &opts);
+        assert!(
+            b[hot * 4] < a[hot * 4],
+            "the floor pulled the outlier down: {} against {}",
+            b[hot * 4],
+            a[hot * 4]
+        );
     }
 
     #[test]

@@ -199,8 +199,24 @@ pub struct Scene {
     ground: Option<Ground>,
     /// How many photons the rune's caustic is traced with. Zero is off.
     photons: usize,
-    /// The gather radius, millimetres.
+    /// The gather radius, millimetres, at [`Self::gather_photons`].
     gather: f64,
+    /// The photon count [`Self::gather`] was authored for.
+    ///
+    /// A density estimate's noise inside the disc falls as `1/sqrt(N·r²)`, so
+    /// a map shot with a tenth of the photons wants a radius `sqrt(10)` wider
+    /// to read as smooth rather than as confetti. The authored radius is the
+    /// scale the *rune* is read at and it belongs to the still's budget; a
+    /// live map at `caustic_photons_live` gets it scaled by
+    /// `sqrt(gather_photons / photons)`, so the offline frame is bit-identical
+    /// and the walking picture has a caustic instead of sparkle.
+    gather_photons: f64,
+    /// Whether the *camera's* being disperses. The caustic pass's always does.
+    ///
+    /// See [`materials::being_achromatic`]: at one sample a pixel a pass the
+    /// hero-wavelength draw is what makes the live body confetti, and the
+    /// dispersion the level is about lives in the photon map.
+    body_dispersion: bool,
 }
 
 impl Scene {
@@ -285,12 +301,42 @@ impl Scene {
             // sparkle and not a caustic. Half the aperture is the scale the
             // rune is actually read at, so it is the scale to gather at.
             gather: a.parameter_or("caustic_radius_mm", scene.aperture_r * PER_M / 2.0),
+            gather_photons: a.parameter_or("caustic_radius_photons", 600_000.0).max(1.0),
+            body_dispersion: true,
         })
+    }
+
+    /// Whether the camera's being carries its dispersion curve.
+    ///
+    /// On by default, which is the offline frame. A tier that traces one raw
+    /// sample a pixel a pass turns it off (see
+    /// [`materials::being_achromatic`]) and loses nothing the level is about:
+    /// [`Self::caustic_map`] shoots its photons through the dispersive glass
+    /// whatever this says.
+    pub fn set_body_dispersion(&mut self, on: bool) {
+        self.body_dispersion = on;
+    }
+
+    /// The gather radius a map of `photons` photons is asked for, in
+    /// millimetres. See [`Self::gather_photons`].
+    fn gather_for(&self, photons: usize) -> f64 {
+        let widen = (self.gather_photons / (photons.max(1) as f64)).sqrt();
+        self.gather * widen.clamp(1.0, MAX_WIDENING)
     }
 
     /// The picture at one pose: the static half, the being where it stands,
     /// the door at its hinge angle.
     pub fn at(&mut self, p: &Placement) -> Picture {
+        let pbr = if self.body_dispersion {
+            self.being.pbr
+        } else {
+            materials::achromatic(self.being.pbr)
+        };
+        self.picture_at(p, pbr)
+    }
+
+    /// The picture at one pose with the being made of `pbr`.
+    fn picture_at(&self, p: &Placement, being_pbr: Pbr) -> Picture {
         let mut objects: Vec<CoveObject> = self.statics.iter().map(Placed::object).collect();
         let swing = self.swing(p.door_angle);
         for part in &self.door {
@@ -302,7 +348,7 @@ impl Scene {
         }
         let (centre, rot) = p.being;
         let c = centre * PER_M;
-        objects.push(Object::placed(self.being.bvh.clone(), self.being.pbr, rigid(&rot, c.x, c.y, c.z)));
+        objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
         Picture {
             objects,
             lights: Vec::new(),
@@ -324,10 +370,17 @@ impl Scene {
         if self.photons == 0 {
             return CausticMap::empty();
         }
-        let picture = self.at(p);
+        // Always the dispersive glass, whatever the camera's being is made of:
+        // the rune's spectral rim is the photon map's, and it is the one place
+        // in this level where the dispersion is the point.
+        let picture = self.picture_at(p, self.being.pbr);
         caustics::trace(
             &picture,
-            &CausticOptions { photons: self.photons, radius: Some(self.gather), ..Default::default() },
+            &CausticOptions {
+                photons: self.photons,
+                radius: Some(self.gather_for(self.photons)),
+                ..Default::default()
+            },
         )
     }
 
@@ -591,6 +644,17 @@ pub fn frame(
     Ok(to_image(&film, scene.authored.parameter_or("exposure", 0.7)))
 }
 
+/// The most [`Scene::gather_for`] may widen the authored gather radius.
+///
+/// The `1/sqrt(N)` law would ask for three and a half times the still's radius
+/// at the live tier's fiftieth of its photons, and measured at two hundred
+/// passes the last of that widening buys almost nothing — the caustic's
+/// Laplacian falls by seven per cent between twice and three and a half times
+/// — while it plainly costs the thing the rune is *for*: at two hundred
+/// millimetres the disc is a fifth of the patch and the spectral rim is
+/// averaged into the sand. Twice is where the trade turns.
+const MAX_WIDENING: f64 = 2.0;
+
 /// The still's seed. Fixed, so two runs of `--cove` differ only where the
 /// level does.
 const STILL_SEED: u64 = 0xc0_be_51_11;
@@ -613,6 +677,25 @@ mod tests {
             let d = ((p.x * p.x + p.y * p.y) + (p.z - z) * (p.z - z)).sqrt();
             assert!((d - 350.0).abs() < 1e-9, "{p:?} is {d} from the axis");
         }
+    }
+
+    /// The offline frame's radius is the authored one, to the float, and the
+    /// live tier's is widened — bounded. The first half is the promise that
+    /// nothing here moved `--cove`'s picture.
+    #[test]
+    fn the_gather_widens_for_a_smaller_map_and_never_for_the_still() {
+        let scene = CoveScene::bundled().expect("the bundled cove");
+        let picture = Scene::new(&scene).expect("the cove's picture");
+        let authored = picture.gather;
+        assert_eq!(picture.gather_for(picture.photons), authored, "the still's own budget");
+        assert_eq!(picture.gather_for(picture.photons * 2), authored, "and it never narrows");
+        let live = picture.gather_for(picture.photons / 50);
+        assert!(live > authored, "a fiftieth of the photons wants a wider disc: {live}");
+        assert!(live <= authored * MAX_WIDENING + 1e-9, "and not an unbounded one: {live}");
+        // …and the camera's being is the dispersive one until it is told not
+        // to be, which is what keeps `--cove` spectral.
+        assert!(picture.being.pbr.is_dispersive());
+        assert!(!materials::achromatic(picture.being.pbr).is_dispersive());
     }
 
     #[test]

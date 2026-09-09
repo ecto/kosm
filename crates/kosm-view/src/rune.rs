@@ -537,6 +537,56 @@ struct Shot {
     due: Instant,
 }
 
+/// The live tier's clamp on indirect radiance.
+///
+/// The still's is the integrator's own — twelve — and at sixty-four samples a
+/// pixel a spike that survives it is one sample in a mean of sixty-four. At
+/// *one* sample a pass a spike is the whole pixel, the history keeps it for
+/// as long as it takes another two hundred samples to average it away, and
+/// what the player sees is a white dot sitting on the cliff. So the live tier
+/// clamps harder, and the number it can afford to is set by what it is *not*
+/// allowed to touch: a [`CausticMap`] read is never clamped at all (the
+/// integrator exempts it by construction — it is a density estimate, not a
+/// Monte Carlo spike), so the rune's energy is out of reach of this knob and
+/// the only thing a tighter clamp can shave is a specular-through-glass path
+/// on the cliff and the sky.
+///
+/// It is not, however, what fixed the cove's picture, and the measurement
+/// saying so is why [`History::set_firefly_cap`] exists: 8 → 3 moved the
+/// cliff's Laplacian by two and a half per cent and its firefly count by
+/// nothing at all, because the dots on this cliff arrive through the *first*
+/// hit and the clamp only bounds depths past it. Three is kept because a
+/// tighter bound on the indirect term is free and costs the sunlit sand less
+/// than one level of sRGB.
+const FIREFLY_CLAMP: f32 = 3.0;
+
+/// A ceiling on one sample's luminance, as a multiple of the pixel's running
+/// mean. See [`History::set_firefly_cap`] for why the integrator's own clamp
+/// is not enough.
+const FIREFLY_CAP: f32 = 4.0;
+
+/// À-trous iterations on the resolve.
+///
+/// The integrator's own default, and left there deliberately. The filter is a
+/// fixed cost — measured at 480×270 as about thirteen milliseconds an
+/// iteration, sixty-five for all five, against a trace of the same order — and
+/// [`DENOISE_FLOOR`] makes it a cost of *every* pass rather than only of the
+/// first thirty-two. Dropping to three iterations buys twenty-six of those
+/// milliseconds back and is indistinguishable at sixty passes, but it is
+/// measurably worse at two (the cliff's Laplacian 2.75 against 2.23, the
+/// being's fireflies half again as many) — and two passes is what a pixel the
+/// mask just threw away has, which is to say it is the walking picture. The
+/// milliseconds are cheap in the state where they are spent: a *standing*
+/// picture is the only one whose pixels are converged, and a standing picture
+/// is the one that can afford them.
+const DENOISE_ITERS: u32 = 5;
+
+/// How much of the à-trous filter a *converged* pixel of this tier keeps.
+///
+/// See [`History::set_denoise_floor`]. Zero is the court's behaviour and is
+/// what this tier used to have.
+const DENOISE_FLOOR: f32 = 0.6;
+
 /// The integrator's settings for one raw sample of the cove.
 ///
 /// The level's own `max_depth` — twelve, against the court's five — because
@@ -546,9 +596,10 @@ struct Shot {
 fn options(scene: &CoveScene, seed: u64, denoise: bool) -> PathTraceOptions {
     PathTraceOptions {
         spp: 1,
+        denoise_iters: scene.authored.parameter_or("denoise_iters_live", DENOISE_ITERS as f64) as u32,
         max_depth: scene.authored.parameter_or("max_depth", 12.0).max(1.0) as u32,
         rr_start: 2,
-        firefly_clamp: Some(8.0),
+        firefly_clamp: Some(scene.authored.parameter_or("firefly_clamp_live", FIREFLY_CLAMP as f64) as f32),
         show_background: true,
         seed,
         denoise,
@@ -591,17 +642,48 @@ impl Tracer {
         scene.authored.parameters.insert("caustic_photons".into(), photons as f64);
         let exposure = scene.authored.parameter_or("exposure", 0.7) as f32;
         let t0 = Instant::now();
-        let picture = cove_render::Scene::new(&scene)?;
+        let mut picture = cove_render::Scene::new(&scene)?;
+        // The live body is achromatic. A dispersive surface draws one hero
+        // wavelength per path the first time a camera ray touches it, and at
+        // one sample a pixel a pass that is a saturated *coloured* sample: the
+        // body's luminance converges in a second and its colour is confetti
+        // for a minute. The level's dispersion is the rune's, and
+        // `caustic_map` shoots its photons through the real glass whatever
+        // this says, so the spectral rim on the caustic is untouched.
+        picture.set_body_dispersion(scene.authored.parameter_or("body_dispersion_live", 0.0) > 0.5);
         eprintln!(
             "rune   the level evaluated: {} static solids, {} live photons, in {:.1} s",
             picture.static_count(),
             photons,
             t0.elapsed().as_secs_f64()
         );
+        let mut history = History::new(size);
+        // The court's fade hands a pixel back its own raw estimate once it has
+        // thirty-two samples, which is right for noise that falls as
+        // `1/sqrt(n)` and wrong here: the being is a rough dielectric behind
+        // twelve bounces and a few paths in a thousand carry a hundred times
+        // the mean, so the body is still speckled at two hundred samples and
+        // the filter has been off for a hundred and seventy of them. This is
+        // the floor under the fade — a converged pixel keeps this much of the
+        // filtered value — and it is the only reason a still of this tier
+        // looks like glass rather than like confetti.
+        history.set_denoise_floor(
+            scene.authored.parameter_or("denoise_floor_live", DENOISE_FLOOR as f64) as f32,
+        );
+        // …and the filter alone cannot reach a firefly. Its luminance
+        // edge-stopping is scaled by the variance plane, and a one-sample pass
+        // has almost nothing to put there, so an isolated spike reads to the
+        // filter as an edge worth keeping rather than as noise: with the floor
+        // at 0.6 and no cap the being still carried forty-eight bright dots
+        // per ten thousand pixels at two hundred passes, and with the cap it
+        // carries four. So the spikes are caught where they arrive instead.
+        history.set_firefly_cap(Some(
+            scene.authored.parameter_or("firefly_cap_live", FIREFLY_CAP as f64) as f32,
+        ));
         Ok(Self {
             scene,
             picture,
-            history: History::new(size),
+            history,
             film: Film::new(size.0, size.1),
             exposure,
             caustics: CausticMap::empty(),

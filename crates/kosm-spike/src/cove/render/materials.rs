@@ -104,6 +104,32 @@ pub fn being(n_d: f64) -> Pbr {
     }
 }
 
+/// The being with its dispersion curve taken off, for a tier that cannot
+/// afford the spectral variance.
+///
+/// One hero wavelength is drawn per path the moment a camera ray meets a
+/// dispersive surface, and every one of the being's paths meets it: at one
+/// sample a pixel a pass that is a *coloured* sample, not a grey one, and the
+/// live tier's body is confetti long after its luminance has converged. The
+/// dispersion that matters in this level is the caustic's — the rune is a
+/// spectral rim on a bright ellipse, and [`Scene::caustic_map`] traces its
+/// photons through the real [`being`] either way — so the live picture drops
+/// it on the body alone and keeps it where it is the point.
+///
+/// [`Scene::caustic_map`]: super::Scene::caustic_map
+pub fn being_achromatic(n_d: f64) -> Pbr {
+    achromatic(being(n_d))
+}
+
+/// The same material with its index made flat across the spectrum.
+///
+/// Taken off the caller's own `Pbr` rather than rebuilt from an index, so a
+/// document that repainted the being keeps everything about it but the
+/// dispersion.
+pub fn achromatic(pbr: Pbr) -> Pbr {
+    Pbr { sellmeier: None, abbe: 0.0, ..pbr }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +155,11 @@ mod tests {
         let g = being(1.5168);
         assert!(g.transmission > 0.0 && !g.thin_walled);
         assert!(g.sellmeier.is_some());
+        // …and the live tier's body is the same glass with the curve off, so
+        // the two differ in nothing but their dispersion.
+        let a = being_achromatic(1.5168);
+        assert!(a.sellmeier.is_none() && !a.is_dispersive());
+        assert_eq!((a.ior, a.transmission, a.roughness), (g.ior, g.transmission, g.roughness));
+        assert_eq!(a.attenuation_color, g.attenuation_color);
     }
 }
