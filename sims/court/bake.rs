@@ -22,14 +22,15 @@ use std::path::Path;
 use phyz_math::Vec3;
 
 use super::{Hoop, parts};
-use kosm::scene::{AuthoredScene, MM};
+use kosm::build::{Built, Params};
+use kosm::scene::MM;
 use crate::skatepark::{self, BakeOpts, Baked, Part};
 
 pub const DEFAULT_COURT_LEVEL: &str = "levels/court.loon";
 
 /// The court's bake knobs, resolved to metres.
 pub struct CourtBake {
-    pub authored: AuthoredScene,
+    pub authored: Built,
     /// The slab: its x and y extent and thickness; its top is z = 0.
     pub court_x: f64,
     pub court_y: f64,
@@ -50,11 +51,10 @@ pub struct CourtBake {
 
 impl CourtBake {
     pub fn bundled() -> anyhow::Result<Self> {
-        Self::load(AuthoredScene::bundled_path(super::DEFAULT_COURT_SCENE))
+        Self::of(super::scene::scene(&Params::default())?)
     }
 
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let a = AuthoredScene::load(path)?;
+    pub fn of(a: Built) -> anyhow::Result<Self> {
         let s = Self {
             court_x: a.millimetres("court_x_mm")?,
             court_y: a.millimetres("court_y_mm")?,
@@ -130,20 +130,19 @@ pub fn scenario_toml(court: &CourtBake, map_dir: &Path) -> String {
 }
 
 /// `kosm --court-bake [level]`: bake, sample, report.
-pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
-    let court = CourtBake::load(level)?;
+pub fn run(built: Built, out: &Path) -> anyhow::Result<()> {
+    let court = CourtBake::of(built)?;
     for w in &court.authored.warnings {
         eprintln!("court warning: {w}");
     }
-    let stem = level.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "court".into());
-    let dir = out.join("maps").join(&stem);
+    let dir = out.join("maps").join("court");
     let t0 = std::time::Instant::now();
     let baked = bake(&court, &dir)?;
     let s = &baked.sdf;
     let bytes: u64 = ["sdf.bin", "mesh.stl"].iter().filter_map(|f| fs::metadata(dir.join(f)).ok()).map(|m| m.len()).sum();
     println!(
         "court {}: {} roots, {} collision tris → {}  sdf {}×{}×{} at {:.0} mm cells ({:.0} MB, {:.0} MB on disk with the mesh), baked in {:.1} s",
-        level.display(),
+        "court::scene",
         baked.parts,
         baked.tris,
         dir.display(),

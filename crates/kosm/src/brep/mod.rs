@@ -37,7 +37,8 @@ use vcad_kernel_raytrace::{BrepBvh, Bvh};
 
 pub use vcad_kernel_raytrace::pathtrace::{Camera, Film};
 
-use crate::scene::{AuthoredScene, MM};
+use crate::build::Built;
+use crate::scene::MM;
 
 mod parts;
 pub use parts::PlacedSolid;
@@ -140,7 +141,7 @@ pub struct Scene {
 
 impl Scene {
     /// The static picture, built once: the level's geometry and the gym's light.
-    pub fn new(a: &AuthoredScene, ball_r: f64) -> anyhow::Result<Self> {
+    pub fn new(a: &Built, ball_r: f64) -> anyhow::Result<Self> {
         let doc = a.document.clone();
 
         // Each root, walked to the placed primitives it is a union of, rather
@@ -439,7 +440,7 @@ impl Scene {
 /// Both tiers call this. The CPU integrator gets the `Environment` and the
 /// `Sun` straight; the GPU tier uploads the same gradient through
 /// `set_gradient_env` and the same disc through `set_sun`.
-fn daylight(a: &AuthoredScene) -> (Environment, Option<Sun>) {
+fn daylight(a: &Built) -> (Environment, Option<Sun>) {
     let grey = a.parameter_or("env_radiance", 0.05) as f32;
     if a.parameter_or("sky", 0.0) <= 0.5 {
         return (Environment::constant([grey; 3]), None);
@@ -496,7 +497,7 @@ fn rigid(r: &phyz_math::Mat3, x: f64, y: f64, z: f64) -> Transform {
 }
 
 /// The camera the level asks for, in millimetres.
-pub fn camera(a: &AuthoredScene) -> anyhow::Result<Camera> {
+pub fn camera(a: &Built) -> anyhow::Result<Camera> {
     let eye = Point3::new(a.parameter("cam_x_mm")?, a.parameter("cam_y_mm")?, a.parameter("cam_z_mm")?);
     let target = Point3::new(a.parameter("cam_at_x_mm")?, a.parameter("cam_at_y_mm")?, a.parameter("cam_at_z_mm")?);
     let mut cam = Camera::look_at(eye, target, Vec3::z(), a.parameter_or("cam_vfov_deg", 42.0));
@@ -510,7 +511,7 @@ pub fn camera(a: &AuthoredScene) -> anyhow::Result<Camera> {
 }
 
 /// Integrator settings the level asks for, at a given sample count.
-pub fn options(a: &AuthoredScene, spp: usize, seed: u64) -> PathTraceOptions {
+pub fn options(a: &Built, spp: usize, seed: u64) -> PathTraceOptions {
     PathTraceOptions {
         spp: spp.max(1) as u32,
         max_depth: a.parameter_or("max_depth", 6.0).max(1.0) as u32,

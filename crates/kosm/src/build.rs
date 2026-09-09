@@ -236,10 +236,17 @@ fn finish(inner: Inner, recipe: Recipe) -> anyhow::Result<Built> {
 
     let mut built_bodies = Vec::new();
     for body in &bodies {
-        let mut one = Document::new();
-        one.nodes = doc.nodes.clone();
-        one.roots = vec![SceneEntry { root: body.root, material: body.material.clone(), visible: None }];
-        let colliders = colliders_from_document(&one)?;
+        // A body that is only drawn — the `no-collide` marker, or an explicit
+        // `decorative()` — is never walked for colliders: a decomposition it
+        // would only warn about is a decomposition nobody asked for.
+        let colliders = if body.drawn_only || !crate::materials::split(&body.material).0 {
+            Derived { colliders: Vec::new(), warnings: Vec::new(), notes: Vec::new(), removed: Vec::new() }
+        } else {
+            let mut one = Document::new();
+            one.nodes = doc.nodes.clone();
+            one.roots = vec![SceneEntry { root: body.root, material: body.material.clone(), visible: None }];
+            colliders_from_document(&one)?
+        };
         built_bodies.push(BuiltBody {
             name: body.name.clone(),
             material: body.material.clone(),
@@ -343,6 +350,7 @@ struct BodyDef {
     mass: Option<f64>,
     origin: [f64; 3],
     root: NodeId,
+    drawn_only: bool,
 }
 
 struct Inner {
@@ -413,6 +421,11 @@ impl Builder {
         self.shape(CsgOp::Cylinder { radius, height, segments: 0 })
     }
 
+    /// Centred on the origin, axis along z.
+    pub fn torus(&self, major_radius: f64, minor_radius: f64) -> Shape {
+        self.shape(CsgOp::Torus { major_radius, minor_radius, segments: 0 })
+    }
+
     /// Centred on the origin.
     pub fn sphere(&self, radius: f64) -> Shape {
         self.shape(CsgOp::Sphere { radius, segments: 0 })
@@ -460,6 +473,7 @@ impl Builder {
             mass: None,
             origin: [0.0; 3],
             root,
+            drawn_only: false,
         });
         let index = inner.bodies.len() - 1;
         drop(inner);
@@ -682,6 +696,13 @@ impl Body {
     /// Fixed to the world. The default.
     pub fn static_(&self) -> &Self {
         self.inner.borrow_mut().bodies[self.index].mass = None;
+        self
+    }
+
+    /// Drawn, never collided: the world leaves it out and no colliders are
+    /// derived for it. A `no-collide` material means the same thing.
+    pub fn decorative(&self) -> &Self {
+        self.inner.borrow_mut().bodies[self.index].drawn_only = true;
         self
     }
 

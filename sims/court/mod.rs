@@ -22,8 +22,9 @@ use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
+use kosm::build::{Built, Params};
 use kosm::colliders;
-use kosm::scene::{AuthoredScene, MM};
+use kosm::scene::MM;
 
 pub mod net;
 pub mod aim;
@@ -52,11 +53,11 @@ pub use kosm::brep as render;
 /// The denoiser is [`kosm::denoise`](kosm::denoise) now.
 pub use kosm::denoise;
 
-pub const DEFAULT_COURT_SCENE: &str = "court.loon";
+pub mod scene;
 
 /// The court scene's knobs, resolved to simulation units.
 pub struct CourtScene {
-    pub authored: AuthoredScene,
+    pub authored: Built,
     pub n_balls: usize,
     pub drop_x: f64,
     pub shot: Option<Shot>,
@@ -75,12 +76,13 @@ pub struct CourtScene {
 }
 
 impl CourtScene {
+    /// The court at its authored defaults.
     pub fn bundled() -> anyhow::Result<Self> {
-        Self::load(AuthoredScene::bundled_path(DEFAULT_COURT_SCENE))
+        Self::of(scene::scene(&Params::default())?)
     }
 
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let authored = AuthoredScene::load(path)?;
+    /// The court's knobs, read off a built level.
+    pub fn of(authored: Built) -> anyhow::Result<Self> {
         let scene = Self {
             n_balls: authored.parameter("n_balls")?.round().max(0.0) as usize,
             drop_x: authored.millimetres("drop_x_mm")?,
@@ -137,7 +139,7 @@ pub struct Hoop {
 }
 
 impl Hoop {
-    fn from_scene(s: &AuthoredScene) -> anyhow::Result<Self> {
+    fn from_scene(s: &Built) -> anyhow::Result<Self> {
         let board_x = s.millimetres("board_x_mm")?;
         Ok(Self {
             rim_centre: Vec3::new(board_x - s.millimetres("rim_offset_mm")?, 0.0, s.millimetres("rim_z_mm")?),
@@ -159,7 +161,7 @@ pub struct Shot {
 }
 
 impl Shot {
-    fn from_scene(s: &AuthoredScene) -> anyhow::Result<Option<Self>> {
+    fn from_scene(s: &Built) -> anyhow::Result<Option<Self>> {
         let speed = s.parameter_or("shot_speed", 0.0);
         if speed <= 0.0 {
             return Ok(None);
@@ -444,7 +446,7 @@ pub fn render_frames(out: &Path, frames: Option<usize>, width: u32, height: u32)
     let mut court = Court::from_scene(&scene)?;
     println!(
         "level  {} evaluated in {:.0} ms: {} roots, {} of them stood on as {} colliders",
-        scene.authored.path().display(),
+        "court::scene",
         evaluated.as_secs_f64() * 1e3,
         scene.authored.document.roots.len(),
         scene.authored.document.roots.iter().filter(|r| parts::collides(&r.material)).count(),
@@ -650,11 +652,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         );
     }
     if args.flag("bake") {
-        let level = args
-            .value("level")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path(DEFAULT_COURT_SCENE));
-        return bake::run(&level, args.out());
+        return bake::run(scene::scene(&Params::default())?, args.out());
     }
     let frames = args.value("frames").and_then(|v| v.parse().ok());
     render_frames(args.out(), frames, 0, 0)

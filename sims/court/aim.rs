@@ -420,9 +420,9 @@ pub fn solve(scene: &mut CourtScene, steps: usize, log: &mut Vec<String>) -> any
 /// The whole hint, as lines for the caller to print.
 ///
 /// Reloads the level so it has a scene of its own to move the shot around in.
-pub fn hint(scene: &CourtScene) -> anyhow::Result<Vec<String>> {
+pub fn hint(_scene: &CourtScene) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
-    let mut work = CourtScene::load(scene.authored.path())?;
+    let mut work = CourtScene::bundled()?;
     let Some(base) = work.shot else {
         out.push("this court has no shot; nothing to aim".into());
         return Ok(out);
@@ -469,14 +469,12 @@ pub fn hint(scene: &CourtScene) -> anyhow::Result<Vec<String>> {
 
     let path = std::path::Path::new("out/hinted");
     std::fs::create_dir_all(path)?;
-    let file = path.join("court.loon");
-    std::fs::write(
-        &file,
-        work.authored.with_parameters(&[
-            ("shot_speed", solved.speed),
-            ("shot_elev_deg", solved.elevation.to_degrees()),
-        ]),
-    )?;
+    let file = path.join("court.json");
+    let aimed = work.authored.with(&[
+        ("shot_speed", solved.speed),
+        ("shot_elev_deg", solved.elevation.to_degrees()),
+    ])?;
+    std::fs::write(&file, aimed.document.to_json()?)?;
     out.push(format!("wrote {} ({:.4} m/s, {:.3}°)", file.display(), solved.speed, solved.elevation.to_degrees()));
 
     // 4. an off target: a short shot, brought back
