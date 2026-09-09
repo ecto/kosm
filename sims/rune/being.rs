@@ -9,6 +9,14 @@
 //! That is the whole difference between a weeble and a ragdoll, and it is one
 //! torque.
 //!
+//! The sea is the third thing, and it does not move so much as it *is* moving:
+//! wading out, the being meets buoyancy, form drag and a shore break running
+//! shoreward, all of it in [`Cove::water`] and all of it through the same
+//! `ctrl` the walk goes in by. What comes out of that is the cove's −y edge:
+//! the water gets heavier with every step until, somewhere between the waist
+//! and the chest, it wins — and then it walks you back out. No wall, no
+//! trigger, and nowhere to drown.
+//!
 //! The door is a slab of stone on a revolute joint at its own vertical edge,
 //! hinged into the cliff, with a soft limit at [`DOOR_LIMIT`] and a spring
 //! that drives it open only while the gate is set. It is a body with mass: it
@@ -79,6 +87,21 @@ pub const STOP_TAU: f64 = 0.15;
 
 /// Stone, kg/m³.
 pub const STONE_DENSITY: f64 = 2500.0;
+
+/// Sea water, kg/m³. Glass is [`GLASS_DENSITY`], two and a half times this, so
+/// a being in the sea gets lighter and keeps its feet: it never floats off the
+/// bed, and there is nothing to swim.
+pub const WATER_DENSITY: f64 = 1000.0;
+
+/// The drag coefficient of a bluff body in water. A capsule broadside is about
+/// a cylinder, which is about one.
+pub const WATER_DRAG_CD: f64 = 1.0;
+
+/// How much of the upright spring's own damping the water adds when the being
+/// is fully under, as a fraction. A quarter is "a little": the recovery from a
+/// shove goes from critically damped to visibly sluggish without the spring
+/// ever losing the argument.
+pub const WATER_SPIN_DAMP: f64 = 0.25;
 
 /// How far the door swings before the recess stops it, radians.
 pub const DOOR_LIMIT: f64 = 100.0 * PI / 180.0;
@@ -236,6 +259,16 @@ pub struct Cove {
     beach: Beach,
     being: Being,
     door: Door,
+    /// The flat waterline. The *rendered* sea has a swell on it; the physics
+    /// uses the plane, because a being that bobbed with a 30 mm sine wave would
+    /// be reporting the renderer's authored decoration as a force.
+    sea_z: f64,
+    /// How fast the shore break runs shoreward, m/s. See [`Cove::water`].
+    surf: f64,
+    /// The net: a plane at the bake volume's floor, under everything.
+    floor: f64,
+    /// How many steps the net has carried. It should stay at zero.
+    net_caught: usize,
     material: ContactMaterial,
     cache: ContactCache,
     gate: bool,
@@ -306,6 +339,10 @@ impl Cove {
             beach: Beach::of(scene),
             being,
             door,
+            sea_z: scene.sea_z,
+            surf: scene.surf,
+            floor: scene.floor(),
+            net_caught: 0,
             cache: ContactCache::new(material.margin.max(1e-3)),
             material,
             gate: false,
@@ -389,6 +426,11 @@ impl Cove {
             Vec3::new(velocity.x, velocity.y, 0.0) * (-self.being.mass / STOP_TAU)
         };
 
+        // The sea, if the being is standing in it. Its own function, and the
+        // only thing it needs from above is where the being is and how fast.
+        let (water_force, water_torque) = self.water(self.being_centre(), axis, velocity, omega);
+        let (torque, force) = (torque + water_torque, force + water_force);
+
         let (torque, force) = (r_bw.transpose().mul_vec(torque), r_bw.transpose().mul_vec(force));
         for (i, v) in [torque.x, torque.y, torque.z, force.x, force.y, force.z].into_iter().enumerate() {
             self.state.ctrl[i] = v;
@@ -401,7 +443,69 @@ impl Cove {
         let drive = if self.gate { self.door.k * (DOOR_LIMIT - angle) } else { 0.0 };
         self.state.ctrl[self.door.v] = drive - self.door.c * rate;
 
-        sim::step_on_sdf(&self.model, &mut self.state, &self.sdf, &self.material, &mut self.cache);
+        if sim::step_on_sdf_over(&self.model, &mut self.state, &self.sdf, &self.material, &mut self.cache, Some(self.floor)) {
+            self.net_caught += 1;
+        }
+    }
+
+    /// The sea's forces on the being, in world axes: buoyancy, drag, and the
+    /// spin the water takes out of a shove. Zero everywhere the sand is dry.
+    ///
+    /// **Buoyancy** is Archimedes on whatever of the capsule is under
+    /// [`Cove::sea_z`]: `ρ_water · V_submerged · g`, up. Glass is two and a half
+    /// times sea water, so at full submersion this is forty per cent of the
+    /// being's weight — enough to make it light on its feet, never enough to
+    /// take them off the bed.
+    ///
+    /// **Drag** is the one asked for, `½ ρ C_d A |v| v`, on the submerged
+    /// silhouette — with the important word being **relative**. The sea is not
+    /// still. The swell the picture already rolls up the beach is water
+    /// *moving*: a shore break runs shoreward at [`Cove::surf`], and what the
+    /// drag law sees is the being's velocity through that water, not through
+    /// the ground. Standing still with the water at your chest is then a
+    /// several-kilonewton push toward the sand, and wading further out is
+    /// wading up a river.
+    ///
+    /// That asymmetry is the whole design, and it is why the drag is written
+    /// against a current instead of against still water:
+    ///
+    /// - Form drag in still water cannot stop this being. At C_d = 1 and a
+    ///   walking pace the sea is worth about two hundred newtons against a
+    ///   walk force of four and a half kilonewtons; a coefficient large enough
+    ///   to hold the being still would be a wall with a number painted on it.
+    /// - Neither can anything that resists *both* ways — more friction, less
+    ///   purchase, a thicker medium. Buoyancy already takes the bed's grip away
+    ///   faster than it takes the being's weight away, so any symmetric
+    ///   resistance strong enough to stop the being walking in is also strong
+    ///   enough to stop it walking back out, and the sea becomes a hole you
+    ///   drown in slowly. There is no dying in this game.
+    ///
+    /// The current does both jobs with one force: it stalls you on the way out
+    /// and it carries you on the way in. Let go of the controls at the deep end
+    /// and the sea walks you back up the beach.
+    ///
+    /// **The spin** is [`WATER_SPIN_DAMP`] of the upright spring's own damping,
+    /// in proportion to how much of the being is under: water damps a wobble.
+    fn water(&self, centre: Vec3, axis: Vec3, velocity: Vec3, omega: Vec3) -> (Vec3, Vec3) {
+        let (r, half) = (self.being.r, self.being.half);
+        // The capsule stands within ten degrees of vertical, so its wetted
+        // profile is the upright one to a part in seventy: the barrel's span
+        // along z, and a cap of radius `r` at each end of it.
+        let rise = axis.z.abs() * half;
+        let foot = centre.z - rise - r;
+        let depth = (self.sea_z - foot).clamp(0.0, 2.0 * (rise + r));
+        if depth <= 0.0 {
+            return (Vec3::zeros(), Vec3::zeros());
+        }
+        let (volume, area) = wetted(r, 2.0 * rise, depth);
+        let submerged = volume / capsule_volume(r, 2.0 * half);
+
+        let up = Vec3::z() * (WATER_DENSITY * volume * GRAVITY);
+        // Shoreward is +y: the waterline is the cove's -y edge.
+        let through_water = velocity - Vec3::new(0.0, self.surf, 0.0);
+        let drag = through_water * (-0.5 * WATER_DENSITY * WATER_DRAG_CD * area * through_water.norm());
+        let spin = omega * (-WATER_SPIN_DAMP * self.being.c * submerged);
+        (up + drag, spin)
     }
 
     /// Step for `seconds` with nobody at the controls.
@@ -471,6 +575,34 @@ impl Cove {
         self.beach.resting_centre(x, y, self.being.r) + Vec3::z() * self.being.half
     }
 
+    /// How much of the being is under water, 0 on dry sand and 1 with its head
+    /// gone. What the water forces are proportional to, and what a test reads
+    /// to say how deep the sea let the player wade.
+    pub fn submerged(&self) -> f64 {
+        let (r, half) = (self.being.r, self.being.half);
+        let rise = self.being_axis().z.abs() * half;
+        let depth = (self.sea_z - (self.being_centre().z - rise - r)).clamp(0.0, 2.0 * (rise + r));
+        wetted(r, 2.0 * rise, depth).0 / capsule_volume(r, 2.0 * half)
+    }
+
+    /// How deep the water is where the being is standing, metres: the waterline
+    /// less the sand under its feet. Negative on dry sand.
+    pub fn wading_depth(&self) -> f64 {
+        let p = self.being_centre();
+        self.sea_z - self.beach.z_at(p.x, p.y)
+    }
+
+    /// How many steps the net under the level has carried. Zero, on a cove that
+    /// is closed: see [`sim::step_on_sdf_over`].
+    pub fn net_caught(&self) -> usize {
+        self.net_caught
+    }
+
+    /// The floor the net sits at, metres.
+    pub fn net_floor(&self) -> f64 {
+        self.floor
+    }
+
     pub fn time(&self) -> f64 {
         self.state.time
     }
@@ -529,6 +661,40 @@ impl Cove {
     fn linear_velocity_body(&self) -> Vec3 {
         Vec3::new(self.state.v[POS], self.state.v[POS + 1], self.state.v[POS + 2])
     }
+}
+
+/// A capsule's volume: a barrel of length `l` and a sphere of radius `r`.
+fn capsule_volume(r: f64, l: f64) -> f64 {
+    PI * r * r * l + 4.0 / 3.0 * PI * r * r * r
+}
+
+/// What is under water, for an upright capsule of radius `r` and barrel length
+/// `l` whose foot is `depth` below the surface: the submerged volume, and the
+/// submerged area of its side-on silhouette.
+///
+/// Both are the same integral up the capsule with a different integrand — a
+/// disc of the local radius for the volume, the local width for the silhouette
+/// — and both are exact rather than sampled, so buoyancy is continuous as the
+/// being wades and the drag does not step. Above the barrel the capsule is its
+/// own mirror image, so the far half is "everything, less what is still dry".
+fn wetted(r: f64, l: f64, depth: f64) -> (f64, f64) {
+    fn below(r: f64, l: f64, d: f64) -> (f64, f64) {
+        if d <= 0.0 {
+            (0.0, 0.0)
+        } else if d <= r {
+            // a spherical cap of height `d`, and the circular segment under it
+            let t = d - r;
+            (PI * d * d * (3.0 * r - d) / 3.0, t * (r * r - t * t).sqrt() + r * r * ((t / r).asin() + PI / 2.0))
+        } else if d <= r + l {
+            (2.0 / 3.0 * PI * r * r * r + PI * r * r * (d - r), PI * r * r / 2.0 + 2.0 * r * (d - r))
+        } else {
+            let (v, a) = below(r, l, 2.0 * r + l - d);
+            (capsule_volume(r, l) - v, PI * r * r + 2.0 * r * l - a)
+        }
+    }
+    let (whole_v, whole_a) = (capsule_volume(r, l), PI * r * r + 2.0 * r * l);
+    let (v, a) = below(r, l, depth.min(2.0 * r + l));
+    (v.clamp(0.0, whole_v), a.clamp(0.0, whole_a))
 }
 
 /// Wrap an angle into `(-π, π]`, so a facing that has been spun a hundred

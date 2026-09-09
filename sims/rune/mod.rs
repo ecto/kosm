@@ -57,6 +57,15 @@ pub struct CoveScene {
     pub cove: f64,
     pub beach_slope: f64,
     pub sea_z: f64,
+    /// How far past the waterline the sand carries on, at the same grade: the
+    /// seabed the being wades over. The cove is closed along -y by the reef at
+    /// the far end of it, not by the sand running out.
+    pub seabed: f64,
+    /// The inner face of the headlands that close +/-x. Rock beyond it.
+    pub headland_x: f64,
+    /// The shore break: how fast the water runs shoreward, m/s. The one knob
+    /// the sea has, and the one that decides how deep the being can wade.
+    pub surf: f64,
     /// The cliff above the sand at its foot, and how deep it is along y.
     pub cliff_h: f64,
     pub cliff_t: f64,
@@ -118,6 +127,9 @@ impl CoveScene {
             cove: a.millimetres("cove_mm")?,
             beach_slope: a.parameter("beach_slope")?,
             sea_z: a.millimetres("sea_z_mm")?,
+            seabed: a.parameter_or("seabed_mm", 14000.0) * MM,
+            headland_x: a.parameter_or("headland_x_mm", 15000.0) * MM,
+            surf: a.parameter_or("surf_mps", 4.0),
             cliff_h: a.millimetres("cliff_h_mm")?,
             cliff_t: a.millimetres("cliff_t_mm")?,
             door_w: a.millimetres("door_w_mm")?,
@@ -151,6 +163,8 @@ impl CoveScene {
         };
         anyhow::ensure!(s.cove > 0.0 && s.cell > 0.0 && s.pad >= 0.0, "the cove needs a positive size and cell and a non-negative pad");
         anyhow::ensure!(s.beach_slope > 0.0, "the beach must rise out of the sea");
+        anyhow::ensure!(s.seabed > 0.0, "the sea needs a floor: seabed_mm carries the sand past the waterline");
+        anyhow::ensure!(s.headland_x > 0.0 && s.headland_x < s.cove / 2.0, "the headlands must stand inside the cove square");
         anyhow::ensure!(s.being_h > 2.0 * s.being_r, "being_h_mm is the capsule's whole height, so it must clear two radii");
         anyhow::ensure!(s.aperture_z + s.aperture_r < s.door_h, "the aperture must be inside the door");
         anyhow::ensure!(s.door_w.min(s.door_h) > 0.0 && s.door_t > 0.0, "the door needs a size");
@@ -160,6 +174,26 @@ impl CoveScene {
     /// The waterline: the sea meets the sand at this y.
     pub fn waterline(&self) -> f64 {
         -self.cove / 2.0
+    }
+
+    /// The seaward edge of the seabed: where the sand, and with it the baked
+    /// field, finally stops. The reef stands just inside it.
+    pub fn seabed_y(&self) -> f64 {
+        self.waterline() - self.seabed
+    }
+
+    /// The top of the seabed at that edge — the deepest ground in the cove, and
+    /// the floor the bake is sampled down from.
+    pub fn seabed_z(&self) -> f64 {
+        self.sand_z_at(0.0, self.seabed_y())
+    }
+
+    /// The floor of the sampled volume: a metre under the deepest ground there
+    /// is. What is under *that* is [`being::Cove`]'s net and nothing else.
+    ///
+    /// [`being::Cove`]: super::being::Cove
+    pub fn floor(&self) -> f64 {
+        self.seabed_z().min(self.sea_z) - 1.0
     }
 
     /// The cliff's face — the plane the door and its aperture live in.
@@ -216,19 +250,20 @@ impl CoveScene {
         }
     }
 
-    /// The playable footprint: the cove square, from the sea floor to the sand
-    /// at the cliff.
+    /// The playable footprint: the cove square and the seabed under the water,
+    /// from the field's floor to the sand at the cliff.
     pub fn extent(&self) -> (Vec3, Vec3) {
         let h = self.cove / 2.0;
-        (Vec3::new(-h, -h, self.sea_z - 1.0), Vec3::new(h, self.cliff_face_y(), self.door_sill()))
+        (Vec3::new(-h, self.seabed_y(), self.floor()), Vec3::new(h, self.cliff_face_y(), self.door_sill()))
     }
 
-    /// The volume the field is sampled over: the cove square, from a metre
-    /// under the waterline to the top of the cliff and the pad. Past it there
-    /// is no floor, which is the rule the park has past its padding.
+    /// The volume the field is sampled over: the cove square *and the seabed*,
+    /// from the field's floor to the top of the cliff and the pad. Past it
+    /// there is no floor, which is the rule the park has past its padding —
+    /// which is why the headlands, the cliff and the reef stand well inside it.
     pub fn volume(&self) -> (Vec3, Vec3) {
         let h = self.cove / 2.0;
-        (Vec3::new(-h, -h, self.sea_z - 1.0), Vec3::new(h, h, self.cliff_top() + self.pad))
+        (Vec3::new(-h, self.seabed_y(), self.floor()), Vec3::new(h, h, self.cliff_top() + self.pad))
     }
 
     pub fn opts(&self) -> BakeOpts {
@@ -323,6 +358,27 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     still(&scene, &dir)
 }
 
+/// The wide shot, for an agent who cannot open a window.
+///
+/// [`still`] frames the *solution*, which since step 8 means the doorstep
+/// camera: two metres of cliff and a being's shoulder. That is the right
+/// picture of the puzzle and it is no picture at all of the level, and the
+/// level now has edges — the headlands, the seabed, the reef — that exist
+/// precisely so the player cannot leave and that appear nowhere in a close-up.
+/// So `kosm run rune` writes a second frame, from the spawn, at a quarter of
+/// the still's samples: the far framing, over the shoulder, with the sand
+/// running up to the cliff between two headlands of rock.
+fn wide(scene: &CoveScene, dir: &Path) -> anyhow::Result<()> {
+    let a = &scene.authored;
+    let placement = render::Placement::standing(scene, scene.spawn_x, scene.spawn_y, 0.0);
+    let (w, h) = (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32);
+    let spp = (a.parameter_or("render_spp", 64.0) as usize / 4).max(1);
+    let path = dir.join("spawn.png");
+    render::frame(scene, &placement, (w, h), spp)?.save(&path)?;
+    println!("cove spawn: the being where the player finds it, at ({:+.2}, {:+.2}) m; {w}×{h} at {spp} spp → {}", scene.spawn_x, scene.spawn_y, path.display());
+    Ok(())
+}
+
 /// One picture of the cove: the being at the solved pose if there is one, at
 /// its spawn if there is not, standing on the sand and facing the door.
 ///
@@ -352,5 +408,5 @@ fn still(scene: &CoveScene, dir: &Path) -> anyhow::Result<()> {
         path.display(),
         t0.elapsed().as_secs_f64()
     );
-    Ok(())
+    wide(scene, dir)
 }

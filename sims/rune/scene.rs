@@ -14,6 +14,17 @@
 //! and the keyhole is the disc on it the score is read over. [`super`] reads
 //! this function's knobs and nothing else.
 //!
+//! **The cove is closed, and it is closed with rock.** Past the baked field
+//! there is no floor ([`kosm_scan::SdfGrid::sample`] returns nothing outside
+//! its volume and the contact producer skips the candidate), so a level whose
+//! sand simply stops is a level you can walk out of the bottom of. Rune's rule
+//! is that nothing is a trigger and nothing is an invisible wall, so the four
+//! edges are four pieces of geometry you can see: the cliff along +y, a
+//! stepped **headland** on each of ±x, and along −y the sand carries on under
+//! the water as a **seabed** and ends in a **reef** of rock that breaks the
+//! surface. Everything is unioned into the one `ground` solid, because the
+//! bake wants one inside.
+//!
 //! Both roots are [`decorative`](kosm::build::Body::decorative): nothing in the
 //! cove ever stands on a convex decomposition. The ground is baked into a
 //! signed distance field ([`super::bake`]) that the marble and the being step
@@ -31,6 +42,27 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         let sea_z = b.param("sea_z_mm", 0.0); // the waterline, at y = −cove_mm/2
         let cliff_h = b.param("cliff_h_mm", 6000.0); // the back wall, above the sand at its foot
         let cliff_t = b.param("cliff_t_mm", 4000.0); // how deep the cliff is along y; its −y face carries the door
+
+        // ---- what closes the cove -------------------------------------------
+        // The three edges that are not the cliff. Every one of them is rock the
+        // player can see, and every one of them is far enough out that the
+        // solvability sweep (x within ±8 m of the door) and the spawn never
+        // touch it.
+        let seabed = b.param("seabed_mm", 14000.0); // the sand carries on past the waterline this far, at the same grade
+        let headland_x = b.param("headland_x_mm", 15000.0); // the inner face of each headland: |x| beyond this is rock
+        let headland_step = b.param("headland_step_mm", 1600.0); // how far each step sets back toward the outside
+        let headland_rise = b.param("headland_rise_mm", 1600.0); // and how high it stands over the one below it
+        let headland_steps = b.param("headland_steps", 3.0).max(1.0) as usize; // three steps is 4.8 m of rock, higher than the being can reach
+        let reef_r = b.param("reef_r_mm", 1800.0); // the reef's rocks, before the varied radius
+        let reef_gap = b.param("reef_gap_mm", 2000.0); // and how far apart their centres sit along x
+
+        // The sea is water, and water moves. The swell the picture rolls up the
+        // beach is a shore break running shoreward at `surf_mps`, and that is
+        // the number that decides how deep you can wade: see
+        // [`being::Cove::water`](super::being::Cove). Everything else about the
+        // water — buoyancy, the drag coefficient — comes from the being's own
+        // size and from the density of sea water, and is not a knob.
+        b.param("surf_mps", 4.0);
 
         // ---- the door ------------------------------------------------------
         // A slab of stone standing on the sand in a recess in the cliff face,
@@ -76,6 +108,7 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         b.param("cam_door_side_mm", 2400.0); // round to the being's right, so the keyhole clears it
         b.param("cam_door_reach_m", 2.0); // the last two metres are where the framing turns
         b.param("cam_face_clear_mm", 500.0); // and the eye never gets nearer the face than this
+        b.param("cam_sea_clear_mm", 400.0); // nor lower than this over the waterline: the picture never dips under
 
         // ---- the sun ---------------------------------------------------------
         // A low afternoon sun out over the sea, so what it throws through the
@@ -114,18 +147,87 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         // the top of the sand at y, which is the plane the being walks on
         let sand_z = |y: f64| sea_z + beach_slope * (y + half_cove);
 
-        // ---- the beach ---------------------------------------------------------
-        // A slab modelled flat with its top face through the origin, tilted
-        // about x, then lifted so the sand meets the sea at the waterline.
-        // Tilting shortens its y footprint by cos a, so it is authored 1/cos a
-        // long and ends up exactly the cove square.
+        // ---- the beach and the seabed ------------------------------------------
+        // One slab, modelled flat with its top face through the origin, tilted
+        // about x, then lifted so the sand passes through the waterline. It runs
+        // from the cliff at +cove/2 out to `seabed_mm` past the waterline, so
+        // the same plane is dry sand above `sea_z_mm` and seabed below it — the
+        // sea has a floor, which is what lets the being wade instead of fall.
+        // Tilting shortens the y footprint by cos a, so it is authored 1/cos a
+        // long and ends up exactly that span.
         let beach_t = b.param("beach_t_mm", 2000.0);
-        let beach_l = cove * (1.0 + beach_slope * beach_slope).sqrt();
-        let beach = b
-            .boxed(cove, beach_l, beach_t)
-            .at(0.0, 0.0, -0.5 * beach_t)
-            .rotate_x(beach_deg)
-            .at(0.0, 0.0, sand_z(0.0));
+        let sand_y0 = -half_cove - seabed; // the seaward edge of the seabed
+        let sand_span = half_cove - sand_y0;
+        let sand_mid = 0.5 * (sand_y0 + half_cove);
+        let beach_l = sand_span * (1.0 + beach_slope * beach_slope).sqrt();
+        // `rotate_x` turns about the world x axis through the origin, so a slab
+        // authored centred on y = 0 comes out of the turn with its top face
+        // through the origin at the beach's grade; translating it to
+        // `(0, ym, sand_z(ym))` then puts that face on the sand plane exactly.
+        let on_sand = |shape: kosm::build::Shape, x: f64, t: f64, lift: f64| {
+            shape.at(0.0, 0.0, -0.5 * t).rotate_x(beach_deg).at(x, sand_mid, sand_z(sand_mid) + lift)
+        };
+        let beach = on_sand(b.boxed(cove, beach_l, beach_t), 0.0, beach_t, 0.0);
+
+        // ---- the headlands -------------------------------------------------------
+        // Rock on both ±x edges, running the whole length of the sand — out of
+        // the water at the seaward end, up under the cliff at the other. Each is
+        // a stair of slabs cut like the beach, so every tread follows the grade
+        // and every riser is a vertical face `headland_rise_mm` tall: at 1.6 m
+        // that is higher than the being (1 m) can put a foot, and there are
+        // three of them. They overlap the beach slab, so the union has one
+        // inside, and their inner face is 15 m out — clear of the spawn at
+        // −9 m and of the sweep's ±8 m band about the door.
+        let headland_t = 4000.0; // deep enough that the bottom step is buried in the seabed
+        let mut headlands: Option<kosm::build::Shape> = None;
+        for step in 0..headland_steps {
+            let inner = headland_x + step as f64 * headland_step;
+            // out past the cove square, so the sampled volume never ends on a
+            // face of the rock
+            let outer = half_cove + 2000.0;
+            let lift = (step as f64 + 1.0) * headland_rise;
+            for side in [-1.0, 1.0] {
+                let slab = on_sand(
+                    b.boxed(outer - inner, beach_l, headland_t),
+                    side * 0.5 * (inner + outer),
+                    headland_t,
+                    lift,
+                );
+                headlands = Some(match headlands {
+                    Some(h) => h.union(slab),
+                    None => slab,
+                });
+            }
+        }
+        let headlands = headlands.expect("headland_steps is at least one");
+
+        // ---- the reef --------------------------------------------------------------
+        // The −y edge, where the seabed ends. Not a wall: a line of boulders of
+        // varied size, half buried in the seabed and overlapping each other, so
+        // there is no gap a being 700 mm across can walk through and the tops
+        // break the surface. The jitter is a fixed function of the index rather
+        // than a draw, so the reef is the same reef in every run and in the
+        // baked field's hash.
+        let reef_y = sand_y0 + 2200.0; // in from the edge, so no boulder hangs off the slab
+        let reef_n = ((2.0 * headland_x / reef_gap).round() as usize).max(2);
+        let mut reef: Option<kosm::build::Shape> = None;
+        for k in 0..=reef_n {
+            let t = k as f64;
+            let x = -headland_x + 2.0 * headland_x * t / reef_n as f64;
+            let r = reef_r * (1.0 + 0.22 * (t * 2.399).sin());
+            let y = reef_y + 700.0 * (t * 1.7).sin();
+            // A boulder's centre sits on the seabed or above it, never under
+            // it, so the shortest of them still stands `reef_r_mm` less its
+            // variation — 1.4 m — out of ground the sea is 0.8 m deep over.
+            // The being is a metre tall: there is nothing here to step onto.
+            let z = sand_z(y) + 0.15 * r * (1.0 + (t * 0.9).sin());
+            let rock = b.sphere(r).at(x, y, z);
+            reef = Some(match reef {
+                Some(s) => s.union(rock),
+                None => rock,
+            });
+        }
+        let reef = reef.expect("the reef has at least three boulders");
 
         // ---- the cliff ----------------------------------------------------------
         // The +y edge of the cove, from below the sand to cliff_h_mm above the
@@ -157,7 +259,7 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         // One solid, so the baked signed distance has one inside.
         let ground = b.body("ground");
         ground.material("sand").decorative();
-        ground.add(beach.union(cliff).union(rocks));
+        ground.add(beach.union(cliff).union(rocks).union(headlands).union(reef));
 
         // ---- the door -------------------------------------------------------------
         let door = b.body("door");

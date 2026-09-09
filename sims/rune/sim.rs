@@ -15,7 +15,7 @@
 //! Metres, z up.
 
 use kosm_scan::SdfGrid;
-use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, solve_contacts_warm};
+use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, find_ground_contacts_model, solve_contacts_warm};
 use phyz_math::{GRAVITY, Vec3};
 use phyz_model::{Model, State};
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
@@ -36,10 +36,42 @@ pub const GLASS_DENSITY: f64 = 2510.0;
 /// One contact step against a baked map: `Simulator::step_with_contacts` with
 /// the plane swapped for the field, normals as the field reports them.
 pub fn step_on_sdf(model: &Model, state: &mut State, sdf: &SdfGrid, material: &ContactMaterial, cache: &mut ContactCache) {
+    step_on_sdf_over(model, state, sdf, material, cache, None);
+}
+
+/// The same step with a plane under the map: the net.
+///
+/// [`kosm_scan::find_terrain_contacts_model`] skips any candidate whose sample
+/// point is outside the sampled volume, because beyond the map there is no
+/// floor ([`kosm_scan::sdf`]) — which is the honest reading of a scan and is
+/// exactly wrong for a *level*, where walking off the edge means falling for
+/// ever. `net` is a horizontal plane at that z, produced by phyz's own ground
+/// contacts, and it is consulted only when the field has nothing to say: it is
+/// the floor under the level, not a feature of it. The cove is closed by rock
+/// on all four sides, so `sims/rune/tests.rs` walks the being at the edges for
+/// three quarters of a minute in every direction and counts how often this
+/// fires, and the count it asserts is zero.
+///
+/// Returns whether the net carried the step.
+pub fn step_on_sdf_over(
+    model: &Model,
+    state: &mut State,
+    sdf: &SdfGrid,
+    material: &ContactMaterial,
+    cache: &mut ContactCache,
+    net: Option<f64>,
+) -> bool {
     let dt = model.dt;
     let (xforms, _) = forward_kinematics(model, state);
     state.body_xform = xforms;
-    let contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let mut contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let mut caught = false;
+    if contacts.is_empty() {
+        if let Some(z) = net {
+            contacts = find_ground_contacts_model(model, state, z, material.margin);
+            caught = !contacts.is_empty();
+        }
+    }
     // In the frame the contacts were assembled in: a free joint's body-frame
     // turn is taken out here and put back, exactly, after the solve (phyz).
     let mut qdd = aba(model, state);
@@ -61,6 +93,7 @@ pub fn step_on_sdf(model: &Model, state: &mut State, sdf: &SdfGrid, material: &C
     let v = state.v.clone();
     integrate_configuration(model, state.q.as_mut_slice(), v.as_slice(), dt);
     state.time += dt;
+    caught
 }
 
 /// What the marble did on the beach.

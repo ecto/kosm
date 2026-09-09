@@ -491,15 +491,23 @@ impl Scene {
 
 /// Which of the cove's surfaces one primitive of the `ground` root is.
 ///
-/// The document unions the beach, the cliff and the boulders into one solid
-/// because the bake wants one inside; the picture wants three colours out of
-/// it. The instance walk hands back the primitives that union was made of, so
-/// the split is geometric and is stated here once: the beach is the only one
-/// of them whose footprint is the cove itself, and everything standing on it
-/// — the cliff along +y, the boulders, the sea stack — is rock. Millimetres,
-/// because these are world bounds of a vcad solid.
+/// The document unions the beach, the cliff, the boulders, the headlands and
+/// the reef into one solid because the bake wants one inside; the picture wants
+/// two colours out of it. The instance walk hands back the primitives that
+/// union was made of, so the split is geometric and is stated here once: the
+/// sand — beach and seabed, which are one slab — is the only primitive that
+/// covers the cove in *both* directions, and everything standing on it is rock.
+///
+/// Both halves of that test are load-bearing now that the slab runs on past the
+/// waterline. The headlands are cut like the beach and so are just as long in y
+/// as it is; what separates them is that they are five metres wide in x, not
+/// forty. The cliff is the mirror image — the width, not the length. So the
+/// rule is the conjunction, and a primitive has to be the whole floor to be
+/// sand. Millimetres, because these are world bounds of a vcad solid.
 fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
-    if world.max.y - world.min.y > 0.5 * scene.cove * PER_M { "sand" } else { "rock" }
+    let half = 0.5 * scene.cove * PER_M;
+    let (w, l) = (world.max.x - world.min.x, world.max.y - world.min.y);
+    if w > half && l > half { "sand" } else { "rock" }
 }
 
 /// The level's daylight: a low afternoon sun and the sky it hangs in.
@@ -757,12 +765,18 @@ pub fn camera(scene: &CoveScene, p: &Placement) -> Camera {
     let t = ((reach - (face - centre.y)) / reach).clamp(0.0, 1.0);
     let mix = |lo: f64, hi: f64| lo + (hi - lo) * t;
 
-    // and the one thing that is not negotiable: the eye stays out of the rock.
+    // and the two things that are not negotiable: the eye stays out of the rock,
+    // and it stays out of the sea. Wading, the being's centre drops toward the
+    // waterline and the far framing's `cam_up_mm` drops with it; a metre of
+    // that and the eye would be under the swell, looking at the inside of an
+    // opaque teal surface. So the eye is floored a hand's breadth above the
+    // flat waterline — the being in the water is seen from over it.
     let clear = (face - scene.being_r) * PER_M - a.parameter_or("cam_face_clear_mm", 500.0);
+    let afloat = (scene.sea_z * PER_M) + a.parameter_or("cam_sea_clear_mm", 400.0);
     let eye = Point3::new(
         a.parameter_or("cam_x_mm", mix(far_eye[0], near_eye[0])),
         a.parameter_or("cam_y_mm", mix(far_eye[1], near_eye[1]).min(clear)),
-        a.parameter_or("cam_z_mm", mix(far_eye[2], near_eye[2])),
+        a.parameter_or("cam_z_mm", mix(far_eye[2], near_eye[2]).max(afloat)),
     );
     // The *aim* turns to the keyhole faster than the eye walks round to it.
     // Both on the same `t` and the last twenty per cent of the blend leaves the
@@ -871,6 +885,53 @@ mod tests {
         // to be, which is what keeps `kosm run rune` spectral.
         assert!(picture.being.pbr.is_dispersive());
         assert!(!materials::achromatic(picture.being.pbr).is_dispersive());
+    }
+
+    /// One primitive of the `ground` root is the floor and every other one is
+    /// rock. The rule is a footprint test (see [`ground_material`]) and the
+    /// footprints moved when the cove was closed: the sand slab now runs
+    /// fourteen metres past the waterline, and the headlands cut out of the
+    /// same plane are exactly as long as it is. So the check is that there is
+    /// still precisely *one* sand — the beach and its seabed — and that the
+    /// cliff, the boulders, the headlands and the reef are all rock.
+    #[test]
+    fn the_ground_is_one_beach_and_the_rest_of_it_is_rock() -> anyhow::Result<()> {
+        let scene = CoveScene::bundled()?;
+        let picture = Scene::new(&scene)?;
+        let sand = materials::pbr(&scene.authored.document, "sand").base_color;
+        let rock = materials::pbr(&scene.authored.document, "rock").base_color;
+        // the sea is in `statics` too, and it is neither
+        let water = materials::pbr(&scene.authored.document, "water").base_color;
+        let (mut sands, mut rocks) = (0, 0);
+        for p in &picture.statics {
+            match p.pbr.base_color {
+                c if c == sand => sands += 1,
+                c if c == rock => rocks += 1,
+                c if c == water => {}
+                c => panic!("the ground grew a surface that is neither sand nor rock: {c:?}"),
+            }
+        }
+        assert_eq!(sands, 1, "the beach and its seabed are one slab, so exactly one primitive is sand");
+        // three boulders, a sea stack, the cliff, six headland steps and the reef
+        assert!(rocks >= 10, "only {rocks} of the cove's primitives came out as rock");
+        Ok(())
+    }
+
+    /// The picture never dips under the sea. Wading, the being's centre falls
+    /// toward the waterline and the far framing's eye falls with it; the floor
+    /// is what keeps the camera over the water looking down at a being in it
+    /// rather than inside an opaque teal surface looking at nothing.
+    #[test]
+    fn the_eye_stays_over_the_water() {
+        let scene = CoveScene::bundled().expect("the bundled cove");
+        let floor = (scene.sea_z + scene.authored.parameter_or("cam_sea_clear_mm", 400.0) * MM) * PER_M;
+        // out along the seabed, until the being is under
+        for k in 0..20 {
+            let y = scene.waterline() - scene.seabed * k as f64 / 19.0;
+            let p = Placement::standing(&scene, 0.0, y, 0.0);
+            let cam = camera(&scene, &p);
+            assert!(cam.eye.z >= floor - 1e-9, "wading at y = {y:+.1} m the eye is at {:.0} mm, under the waterline's floor at {floor:.0}", cam.eye.z);
+        }
     }
 
     #[test]
