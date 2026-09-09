@@ -3,10 +3,14 @@ name = "kosm-train"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Loops that produce policies: PPO, behaviour cloning, CEM, MAP-Elites"
+keywords = ["reinforcement-learning", "ppo", "cem", "map-elites", "policy"]
+categories = ["simulation", "science"]
+exclude = ["out/"]
 
 [dependencies]
-kosm = { path = "../kosm" }
+kosm = { path = "../kosm", version = "0.0.1" }
 tang-tensor.workspace = true
 tang-train.workspace = true
 rayon = "1"

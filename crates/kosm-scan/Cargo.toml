@@ -3,7 +3,11 @@ name = "kosm-scan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Captured environment scans: splat appearance layer + SDF physics layer, baked into a World"
+keywords = ["sdf", "gaussian-splatting", "scan", "physics", "baking"]
+categories = ["simulation", "science"]
+exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
 phyz-math.workspace = true

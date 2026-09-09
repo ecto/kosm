@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "The window: a wgpu surface, a blitted image, and nothing else on it"
+repository.workspace = true
+# Not publishable until vcad 0.10: this depends on vcad-kernel, -raytrace, -gpu
+# and -math, none of which exist on crates.io, and cargo refuses to publish a
+# crate with git dependencies. Flip to the default once those are versions.
+publish = false
 
 [lib]
 name = "kosm_view"
@@ -14,7 +19,7 @@ name = "kosm-view"
 path = "src/main.rs"
 
 [dependencies]
-kosm-render = { path = "../kosm-render", features = ["gpu"] }
+kosm-render = { path = "../kosm-render", version = "0.1", features = ["gpu"] }
 # the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
 wgpu = "30"
 winit = "0.30"
@@ -30,7 +35,7 @@ log = "0.4"
 # shares with it.
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.36"
-kosm-scan = { path = "../kosm-scan", optional = true }
+kosm-scan = { path = "../kosm-scan", version = "0.0.1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 

@@ -3,7 +3,11 @@ name = "kosm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "The marble: one capture-free level that is a CAD file, a physics rollout, a gradient, a frame, and a print"
+keywords = ["simulation", "physics", "cad", "raytracing", "gradient"]
+categories = ["simulation", "science", "game-development"]
+exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
 phyz.workspace = true
@@ -24,13 +28,13 @@ vcad-render.workspace = true
 image.workspace = true
 rayon = "1"
 rustfft = "6"
-kosm-mpm = { path = "../kosm-mpm" }
-kosm-render = { path = "../kosm-render" }
+kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
+kosm-render = { path = "../kosm-render", version = "0.1" }
 tang.workspace = true
 tang-3dgs.workspace = true
 tang-tensor.workspace = true
 tang-train.workspace = true
-kosm-scan = { path = "../kosm-scan" }
+kosm-scan = { path = "../kosm-scan", version = "0.0.1" }
 vcad-kernel-acoustics.workspace = true
 vcad-kernel-optics.workspace = true
 vcad-kernel-raytrace.workspace = true

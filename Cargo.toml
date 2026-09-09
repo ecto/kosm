@@ -15,6 +15,11 @@ members = [
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
+authors = ["Cam Pedersen <cam@campedersen.com>"]
+repository = "https://github.com/ecto/kosm"
+# Edition 2024 needs 1.85; the highest `rust-version` anywhere in the resolved
+# graph is egui/eframe 0.36's 1.95, so that is the floor kosm can honestly claim.
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Externals are git revs, not paths: a clean clone of this repo must resolve and
@@ -25,6 +30,8 @@ license = "Apache-2.0"
 #
 # phyz: `claude/rigid-impact-restitution` HEAD (the free-joint Coriolis fix).
 # Pushed, but NOT on `origin/main` yet — bump this to the merge commit when it lands.
+# crates.io has phyz 0.3.0 and the subcrates at 0.1.0; none of them carry this fix,
+# and phyz-camera is not published at all. → phyz 0.4 (see docs/publishing.md).
 phyz         = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
 phyz-math    = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
 phyz-model   = { git = "https://github.com/ecto/phyz", rev = "61fe0a42bd3a8c675b150db1bf173caf7195b4a2" }
@@ -55,17 +62,25 @@ vcad-kernel-primitives = { git = "https://github.com/ecto/vcad", rev = "504047fb
 vcad-kernel-gpu = { git = "https://github.com/ecto/vcad", rev = "504047fb0920a27365b4212b0bd7d376e183e687" }
 hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
-# tang: `main` HEAD. The `version` is what `cargo package` would embed if kosm
-# is ever published; the git rev is what every build actually resolves.
+# tang: `main` HEAD. crates.io has tang 0.2.0, but eighteen commits touch
+# `crates/tang` between the 0.2.0 publish (f82c629) and this rev — SIMD moments,
+# the `algebraic` reduction feature, new GEMM kernels — so 0.2.0 is NOT what kosm
+# builds against. The `version` is what `cargo package` would embed; the git rev is
+# what every build resolves. → tang 0.2.1.
 tang         = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913", version = "0.2" }
+# not published → tang-3dgs 0.1
 tang-3dgs    = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 # The denoiser's training loop: `Parameter` holds the weights, `ModuleAdam` steps
 # them. The convolutions themselves are ours; see `court::denoise::kpn`.
+# Neither is published → tang-tensor 0.1, tang-train 0.1.
 tang-tensor  = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 tang-train   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 
 # One tang. vcad and phyz both depend on crates.io `tang`; unify them on the same
 # git rev this workspace uses, or `tang::Scalar` is two traits across the graph.
+# This is not a local-path override (those live in an untracked `.cargo/config.toml`)
+# — it is a graph-correctness pin a clean clone needs too. It goes away when tang
+# 0.2.1 / tang-la, -ad, -expr 0.1.1 are published with these commits in them.
 [patch.crates-io]
 tang      = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 tang-la   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }

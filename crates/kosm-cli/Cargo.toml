@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "kosm's front door: the filesystem under sims/ is the registry"
+repository.workspace = true
+# Never publishable: `build.rs` walks `sims/` at the workspace root and compiles
+# what it finds there, and `cargo package` cannot carry files from outside the
+# crate directory. The binary is built from a clone, not installed from crates.io.
+publish = false
 
 [lib]
 name = "kosm_cli"
@@ -14,13 +19,13 @@ name = "kosm"
 path = "src/main.rs"
 
 [build-dependencies]
-kosm-registry = { path = "../kosm-registry" }
+kosm-registry = { path = "../kosm-registry", version = "0.0.1" }
 
 [dependencies]
-kosm = { path = "../kosm" }
-kosm-mpm = { path = "../kosm-mpm" }
-kosm-render = { path = "../kosm-render" }
-kosm-view = { path = "../kosm-view", optional = true }
+kosm = { path = "../kosm", version = "0.0.1" }
+kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
+kosm-render = { path = "../kosm-render", version = "0.1" }
+kosm-view = { path = "../kosm-view", version = "0.0.1", optional = true }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"], optional = true }
 egui = { version = "0.36", optional = true }
 bytemuck = { version = "1", optional = true }
@@ -47,7 +52,7 @@ vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
 vcad-kernel-gpu = { workspace = true, optional = true }
 vcad-kernel-math.workspace = true
 vcad-kernel-primitives.workspace = true
-kosm-scan = { path = "../kosm-scan" }
+kosm-scan = { path = "../kosm-scan", version = "0.0.1" }
 image.workspace = true
 hound.workspace = true
 tang.workspace = true
