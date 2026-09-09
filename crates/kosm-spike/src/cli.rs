@@ -9,6 +9,7 @@ const DEFAULT_LEVEL: &str = "levels/marble.loon";
 const DEFAULT_FRAMES: usize = 150;
 const DEFAULT_SKATEPARK: &str = "levels/skatepark.loon";
 const DEFAULT_COURT_LEVEL: &str = "levels/court.loon";
+const DEFAULT_COVE: &str = "levels/cove.loon";
 
 pub use crate::pool::PoolRenderer;
 
@@ -20,6 +21,7 @@ pub enum Command {
     Splash { frames: usize },
     Splat { ply: PathBuf },
     Skatepark { level: PathBuf },
+    Cove { level: PathBuf },
     CourtBake { level: PathBuf },
 }
 
@@ -65,6 +67,9 @@ impl Command {
             }),
             "--skatepark" => Ok(Self::Skatepark {
                 level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_SKATEPARK.into()),
+            }),
+            "--cove" => Ok(Self::Cove {
+                level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_COVE.into()),
             }),
             "--court-bake" => Ok(Self::CourtBake {
                 level: args.next().map(PathBuf::from).unwrap_or_else(|| DEFAULT_COURT_LEVEL.into()),
@@ -142,6 +147,12 @@ mod tests {
         );
         assert!(parse(&["--pool", "--pool-render", "opengl"]).is_err());
         assert!(parse(&["--pool", "--pool-render"]).is_err());
+    }
+
+    #[test]
+    fn cove_defaults_to_the_bundled_level() {
+        assert_eq!(parse(&["--cove"]).unwrap(), Command::Cove { level: DEFAULT_COVE.into() });
+        assert_eq!(parse(&["--cove", "levels/other.loon"]).unwrap(), Command::Cove { level: "levels/other.loon".into() });
     }
 
     #[test]

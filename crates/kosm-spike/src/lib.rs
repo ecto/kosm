@@ -4,6 +4,7 @@ pub mod analytic;
 pub mod audio;
 pub mod colliders;
 pub mod court;
+pub mod cove;
 pub mod far;
 pub mod frame;
 pub mod garage;

@@ -24,11 +24,9 @@ use std::path::{Path, PathBuf};
 
 use ipse_map::manifest::{CollisionLayer, Extent, MapManifest, Provenance};
 use ipse_map::{Map, SdfGrid, TriMesh, stl};
-use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, solve_contacts_warm};
+use phyz_contact::{ContactCache, ContactMaterial};
 use phyz_math::{GRAVITY, Vec3};
-use phyz_model::{Model, State};
 use rayon::prelude::*;
-use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
 use crate::garage::marble_model;
 use crate::materials;
@@ -392,36 +390,6 @@ pub fn arc_error(scene: &SkateparkScene, sdf: &SdfGrid, n: usize) -> anyhow::Res
     Ok(worst)
 }
 
-/// One contact step against the map: `Simulator::step_with_contacts` with the
-/// plane swapped for the field, normals as the field reports them.
-fn step(model: &Model, state: &mut State, sdf: &SdfGrid, material: &ContactMaterial, cache: &mut ContactCache) {
-    let dt = model.dt;
-    let (xforms, _) = forward_kinematics(model, state);
-    state.body_xform = xforms;
-    let contacts = ipse_map::find_terrain_contacts_model(model, state, sdf, material.margin);
-    // In the frame the contacts were assembled in: a free joint's body-frame
-    // turn is taken out here and put back, exactly, after the solve (phyz).
-    let mut qdd = aba(model, state);
-    let v_before = state.v.clone();
-    strip_free_joint_coriolis(model, v_before.as_slice(), qdd.as_mut_slice());
-    let free_qd = &state.v + &(&qdd * dt);
-    if contacts.is_empty() {
-        state.v = free_qd;
-    } else {
-        let materials = model.contact_materials(material);
-        let config = ContactSolverConfig::simulation();
-        let asm = assemble(model, state, &contacts, &materials, &free_qd, dt, &config);
-        let seed = cache.warm_start(state, &contacts);
-        let solution = solve_contacts_warm(&asm.problem, &config, &seed);
-        cache.store(state, &contacts, &solution.impulses);
-        state.v = &free_qd + &asm.velocity_delta(&solution.impulses);
-    }
-    rotate_free_joint_velocities(model, v_before.as_slice(), state.v.as_mut_slice(), dt);
-    let v = state.v.clone();
-    integrate_configuration(model, state.q.as_mut_slice(), v.as_slice(), dt);
-    state.time += dt;
-}
-
 /// What the rolled wheel did.
 #[derive(Clone, Debug)]
 pub struct RollReport {
@@ -468,7 +436,7 @@ pub fn roll_from(scene: &SkateparkScene, sdf: &SdfGrid, c0: Vec3, v0: Vec3, t_en
     let on_flat = scene.half_flat() - scene.wheel_r;
     let trace = std::env::var_os("KOSM_TRACE").is_some();
     for k in 0..steps {
-        step(&model, &mut state, sdf, &material, &mut cache);
+        crate::cove::sim::step_on_sdf(&model, &mut state, sdf, &material, &mut cache);
         let p = Vec3::new(state.q[POS], state.q[POS + 1], state.q[POS + 2]);
         if trace && k % 100 == 0 {
             eprintln!(
