@@ -30,8 +30,12 @@ use crate::skatepark::{self, BakeOpts, Part};
 
 pub mod bake;
 pub mod being;
+pub mod hint;
 pub mod render;
+pub mod rune;
 pub mod sim;
+#[cfg(test)]
+mod rune_tests;
 #[cfg(test)]
 mod tests;
 
