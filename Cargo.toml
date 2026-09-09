@@ -4,6 +4,7 @@ members = [
     "crates/kosm-render",
     "crates/kosm",
     "crates/kosm-cli",
+    "crates/kosm-registry",
     "crates/kosm-view",
     "crates/kosm-mpm",
     "crates/kosm-scan",

@@ -1524,6 +1524,7 @@ dependencies = [
  "image",
  "kosm",
  "kosm-mpm",
+ "kosm-registry",
  "kosm-render",
  "kosm-scan",
  "kosm-view",
@@ -1564,6 +1565,10 @@ dependencies = [
  "pollster 0.4.0",
  "wgpu 30.0.1",
 ]
+
+[[package]]
+name = "kosm-registry"
+version = "0.0.1"
 
 [[package]]
 name = "kosm-render"

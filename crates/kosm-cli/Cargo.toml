@@ -13,6 +13,9 @@ path = "src/lib.rs"
 name = "kosm"
 path = "src/main.rs"
 
+[build-dependencies]
+kosm-registry = { path = "../kosm-registry" }
+
 [dependencies]
 kosm = { path = "../kosm" }
 kosm-mpm = { path = "../kosm-mpm" }
