@@ -858,17 +858,17 @@ fn band_index(nm: &str) -> Option<usize> {
 ///
 /// Kept as a free function with one caller so the mapping is one edit when
 /// `Pbr` grows a field. `subsurface_color` is the *surface* albedo the walk
-/// is asked to produce — which is what [`Material::albedo`] already is — and
-/// `subsurface_radius` is already in metres, the scene's own unit.
+/// is asked to produce — which is what [`Material::albedo`] already is —
+/// `subsurface_radius` is already in metres, the scene's own unit, and
+/// `subsurface_anisotropy` is the medium's Henyey–Greenstein `g` under
+/// similarity theory, which is what [`Subsurface::anisotropy`] holds.
 ///
-/// TODO: `Pbr::subsurface_anisotropy` (OpenPBR's
-/// `subsurface_scatter_anisotropy`) is landing in `kosm-render`'s CPU tier;
-/// once it is on `Pbr`, `p.subsurface_anisotropy = s.anisotropy as f32;` here
-/// is the whole migration and [`Subsurface::anisotropy`] stops being inert.
+/// The GPU tier ignores every one of these; its walk is a shorter one.
 pub fn sss_onto_pbr(p: &mut Pbr, s: &Subsurface, albedo: Spectrum) {
     p.subsurface = s.weight as f32;
     p.subsurface_color = albedo.to_rgb32();
     p.subsurface_radius = s.radius_m;
+    p.subsurface_anisotropy = s.anisotropy as f32;
 }
 
 #[cfg(test)]
@@ -980,9 +980,15 @@ mod tests {
     fn subsurface_reaches_the_pbr() {
         let wax = named("beeswax").expect("beeswax");
         let p = wax.pbr();
+        let sss = wax.sss.expect("beeswax scatters");
         assert!(p.subsurface > 0.0);
         assert_eq!(p.subsurface_color, wax.albedo.to_rgb32());
-        assert_eq!(p.subsurface_radius, wax.sss.unwrap().radius_m);
+        assert_eq!(p.subsurface_radius, sss.radius_m);
+        assert_eq!(p.subsurface_anisotropy, sss.anisotropy as f32);
+        // red reaches furthest, which is why a candle's edge goes red
+        assert!(sss.radius_m[0] > sss.radius_m[2]);
+        // and a substance with no walk switches the lobe off outright
+        assert_eq!(named("granite").expect("granite").pbr().subsurface, 0.0);
     }
 
     #[test]
