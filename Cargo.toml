@@ -28,21 +28,23 @@ rust-version = "1.95"
 # `.cargo/config.toml.example`) patches every one of these back to a local path.
 # The manifest is the truth; that file is the override.
 #
-# phyz: the `v0.4.0` tag commit (fbba8ab) — the free-joint Coriolis fix, merged to
-# main and published. crates.io now has phyz 0.4.0 and every subcrate (phyz-camera
-# included, first publish), so each dep carries `version = "0.4"` beside the rev:
+# phyz: main at 68fc142 — the device-tau line (ecto/phyz#103), which adds
+# `phyz_gpu::policy_pipeline::TauChannel` and `PolicySpec.tau` on top of the
+# `v0.4.0` tag commit (fbba8ab, the free-joint Coriolis fix). The workspace still
+# calls itself 0.4.0 and crates.io has phyz 0.4.0 and every subcrate (phyz-camera
+# included), so each dep carries `version = "0.4"` beside the rev:
 # the git tree is what builds here, the version is what `cargo package` embeds.
 # The old pin (61fe0a4) was a pre-release tree still calling itself 0.3.1, which
 # `version = "0.4"` correctly refuses. See docs/publishing.md.
-phyz         = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-math    = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-model   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-rigid   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-contact = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-diff    = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-world   = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-camera  = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
-phyz-collision = { git = "https://github.com/ecto/phyz", rev = "fbba8abe2d02799f5fee6a7b28b6e619083f0caf", version = "0.4" }
+phyz         = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-math    = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-model   = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-rigid   = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-contact = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-diff    = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-world   = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-camera  = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
+phyz-collision = { git = "https://github.com/ecto/phyz", rev = "68fc142ae26fab62102517fccbb966ade9548be4", version = "0.4" }
 # vcad: an interim rev, `claude/kosm-render-by-version-at-504047f` = 504047f
 # plus #870's crates.io kosm-render line. Not main: main's Difference evaluation
 # regressed since 504047f (ecto/vcad#871; the marble's hollow cup comes out

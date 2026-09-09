@@ -2371,7 +2371,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "phyz"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2384,7 +2384,7 @@ dependencies = [
 [[package]]
 name = "phyz-camera"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "bytemuck",
  "phyz-collision",
@@ -2399,7 +2399,7 @@ dependencies = [
 [[package]]
 name = "phyz-collision"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2408,7 +2408,7 @@ dependencies = [
 [[package]]
 name = "phyz-contact"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-collision",
  "phyz-math",
@@ -2419,7 +2419,7 @@ dependencies = [
 [[package]]
 name = "phyz-diff"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2434,7 +2434,7 @@ dependencies = [
 [[package]]
 name = "phyz-math"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "libm",
  "tang",
@@ -2444,7 +2444,7 @@ dependencies = [
 [[package]]
 name = "phyz-model"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-math",
 ]
@@ -2452,7 +2452,7 @@ dependencies = [
 [[package]]
 name = "phyz-rigid"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2461,7 +2461,7 @@ dependencies = [
 [[package]]
 name = "phyz-world"
 version = "0.4.0"
-source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
+source = "git+https://github.com/ecto/phyz?rev=68fc142ae26fab62102517fccbb966ade9548be4#68fc142ae26fab62102517fccbb966ade9548be4"
 dependencies = [
  "phyz-collision",
  "phyz-math",
