@@ -44,27 +44,25 @@
 //! will not pack, and it is the reference the GPU picture is checked against.
 //!
 //! Whichever traced it, a pass is **one raw sample** and neither tracer
-//! accumulates. [`kosm_view::history`] does: a running mean and a sample count per
-//! pixel, a reprojection through a moved camera, and a geometric mask that
-//! throws away only the pixels a moved ball, its shadow, or a moved extra
-//! actually landed on. Both tiers bring the guide buffers the reprojection
-//! and the denoiser read — vcad's `render_resident_linear` fills them on the
-//! GPU exactly as `pathtrace::render` does on the CPU — and both answer the
-//! same `Job` with the same `Shot`, so the window's tuner does not know which
-//! one it is talking to. This file's job is the pace: how big to ask for, at
-//! how many samples, which rectangles, and when a measurement was fair enough
+//! accumulates. A [`kosm_view::TemporalHistory`] does. The GPU tier's lives on
+//! the device, in `kosm_render::gpu`: a running mean and a sample count per
+//! pixel, a reprojection through both the moved camera and each moved
+//! instance, and an à-trous filter on the short-history pixels. The CPU tier
+//! runs the same trait over `kosm_render::gpu::History` on this side of the
+//! bus — a plain running mean, started over whenever the camera or a ball
+//! moves, and no filter; it is the fallback tier and it is honest about being
+//! one. Both answer the same `Job` with the same `Shot`, so the window's tuner
+//! does not know which one it is talking to. This file's job is the pace: how
+//! big to ask for, at how many samples, and when a measurement was fair enough
 //! to believe.
 //!
-//! ## the pass is the mask
+//! ## the pass is the frame
 //!
-//! [`kosm_view::history`] answers, before a pass runs, which rectangles the world
-//! moved under. The CPU tier re-traces exactly those with
-//! `pathtrace::render_into`, into a `Film` it keeps between passes so the
-//! pixels it did not touch are last pass's rather than black; the GPU tier
-//! sets the shader's scissor to their bounding box. A masked pass is only
-//! taken when it saves more than half the frame, because the pixels outside it
-//! gain nothing and a picture that is always masked never converges — so the
-//! bounces buy cheap passes and the quiet between them buys full ones.
+//! Every pass is the whole frame on both tiers now. The masked pass — a set of
+//! rectangles the world moved under, re-traced with `pathtrace::render_into` —
+//! went with the CPU history it belonged to; the GPU tier stopped repainting
+//! rectangles when its history learnt to carry each pixel across the move
+//! instead.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -78,7 +76,8 @@ use vcad_kernel_math::{Point3, Vec3 as KVec3};
 use vcad_kernel_raytrace::pathtrace;
 
 use super::game_gpu as court_gpu;
-use kosm_view::history::{History, Plan, Pose, View};
+use kosm_render::gpu::History;
+use kosm_view::temporal::{self, Pose, TemporalHistory, View};
 use kosm_view::viewport;
 
 // ---- the recording ----------------------------------------------------------
@@ -307,17 +306,16 @@ pub struct Shot {
     pub ms: u128,
     /// The share of the screen this pass had to start over on.
     pub mask: f32,
-    /// Pixels this pass actually traced. A masked pass traces its rectangles
-    /// and nothing else, so this — not the frame — is what the pass cost is
-    /// per, and it is what the tuner's model is fitted against.
+    /// Pixels this pass actually traced. Every pass is the whole frame on
+    /// both tiers now, but the tuner's cost model is still fitted per traced
+    /// pixel rather than per frame.
     pub traced_px: u64,
     /// Samples behind the average pixel of the picture that came back.
     pub mean_spp: f32,
     /// Whether stepping the render size would throw the accumulated picture
-    /// away. False on the CPU tier, which resamples its history across a size
-    /// step; true on the GPU one, whose history is in device buffers vcad
-    /// reallocates — nothing on this side can resample them without a
-    /// readback, and the whole point of that tier is that nothing comes back.
+    /// away. True on both tiers: the GPU history is in device buffers vcad
+    /// reallocates on a resize, and the CPU tier's running mean has no
+    /// resampler now that the old CPU history is gone.
     pub resize_costs_history: bool,
     /// The due time of the frame this pass was of.
     pub due: Instant,
@@ -443,8 +441,12 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         })
         .unwrap_or(Tracer::Cpu);
     eprintln!("court  the {} path tracer", tracer.name());
-
-    let lights = stage.light_centres();
+    if matches!(tracer, Tracer::Cpu) {
+        eprintln!(
+            "court  the cpu tier accumulates but does not reproject or filter: \
+             the picture restarts whenever the camera or a ball moves"
+        );
+    }
 
     // The history is the picture — on whichever side of the bus it lives.
     // The CPU tier keeps it here: a running mean, a count, a reprojection.
@@ -452,7 +454,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
     // is the one question the device cannot answer — which pixels last
     // frame's mean is still true for.
     let mut current: Option<Job> = None;
-    let mut history = History::new((0, 0));
+    let mut history: History = temporal::empty((0, 0));
     // The device's own mean history length, read back at most every two
     // seconds and only for the log and the resize freeze — a pass still reads
     // nothing back.
@@ -485,13 +487,12 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         if job.size.0 == 0 || job.size.1 == 0 {
             continue;
         }
-        // A size step is a new grid, not a new picture. The CPU tier carries
-        // its whole history across — mean, count and guides, bilinearly — so
-        // the tuner can step the resolution without the window going back to
-        // looking like a blizzard. The GPU tier cannot: its history is in
-        // device buffers vcad reallocates on a resize, so there the tuner is
-        // asked not to step a converged picture at all (see `App::image`).
-        history.resample(job.size);
+        // A size step is a new grid, and neither tier's history survives one:
+        // the GPU tier's lives in device buffers vcad reallocates on a resize,
+        // and this side's is a plain running mean with no resampler. So the
+        // tuner is asked not to step a converged picture at all (see
+        // `App::image`).
+        history.begin(job.size);
         if (film.width, film.height) != job.size {
             film = pathtrace::Film::new(job.size.0, job.size.1);
         }
@@ -502,7 +503,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
         // does the picture look like now, what did it cost, how much of it
         // started over — and the tuner above does not know which one it is
         // talking to.
-        let resize_costs_history = matches!(tracer, Tracer::Gpu(_));
+        let resize_costs_history = true;
         // Whether this pass carried its history across a camera move, for the
         // log: a moved camera used to repaint the frame and now mostly does
         // not.
@@ -549,15 +550,16 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     Err(error) => {
                         eprintln!("court  gpu: {error}; falling back to the CPU tracer");
                         tracer = Tracer::Cpu;
-                        history = History::new(job.size);
+                        history = temporal::empty(job.size);
                         film = pathtrace::Film::new(job.size.0, job.size.1);
                         continue;
                     }
                 }
             }
-            // On this side: the mask comes first, the tracer re-traces exactly
-            // the rectangles it names, and the history folds the film in and
-            // denoises it.
+            // On this side: one full pass, folded into the running mean the
+            // trait hands back. A camera or ball that moved starts the mean
+            // over — this tier has no reprojection, and pretending otherwise
+            // would smear the picture rather than keep it.
             Tracer::Cpu => {
                 let cam = job.camera.to_pathtrace();
                 let view = View::of(&cam, job.size.0, job.size.1);
@@ -566,37 +568,15 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                     ^ (job.generation << 20)
                     ^ (lap.elapsed().as_nanos() as u64)
                     ^ passes_seed(&history);
-                let plan: Plan = history.plan(&view, &poses, &lights);
-                let patch_px: u64 = plan
-                    .rects
-                    .iter()
-                    .map(|r| (r[2] as u64) * (r[3] as u64))
-                    .sum();
-                // A masked pass is only worth having when it is genuinely
-                // most of the frame cheaper. The pixels outside it get
-                // *nothing*, so a picture that is always masked never
-                // converges; half the frame is where the two stop trading
-                // evenly.
-                let full = plan.full || plan.rects.is_empty() || patch_px * 2 > frame_px;
+                let kept = history.reproject(&view, &poses);
                 let scene = stage.at_snapshot(&job.frame);
-                let opts = options(job.spp, seed, false);
-                let traced = if full {
-                    film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts);
-                    None
-                } else {
-                    // `render_into` patches the film in place and never
-                    // denoises, so the pixels outside the rectangles are still
-                    // the previous pass's — which is what the history wants,
-                    // since it is about to be told not to look at them.
-                    pathtrace::render_into(&scene, &cam, &mut film, &opts, &plan.rects);
-                    Some(plan.rects.clone())
-                };
+                let opts = options(job.spp, seed, true);
+                film = pathtrace::render(&scene, &cam, job.size.0, job.size.1, &opts);
                 let t_merge = Instant::now();
-                history.merge(&film, &view, &poses, &lights, traced.as_deref());
+                history.accumulate(&film);
                 let merge_ms = t_merge.elapsed().as_secs_f64() * 1e3;
                 let t_res = Instant::now();
-                let opts = options(job.spp, seed, true);
-                let rgba = history.resolve(job.camera.exposure, &opts);
+                let rgba = history.resolve(job.camera.exposure);
                 if std::env::var("KOSM_GPU_TIMING").is_ok() {
                     eprintln!(
                         "court  history: {}\u{d7}{} \u{2014} {merge_ms:.1} ms merging, {:.1} ms resolving",
@@ -605,24 +585,15 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, gpu: Option<(wgpu::Devi
                         t_res.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                let traced_px = if full { frame_px } else { patch_px };
                 (
                     viewport::Image::Bytes {
                         size: job.size,
                         rgba,
                     },
-                    history.mask_fraction(),
+                    1.0 - kept,
                     history.mean_samples(),
-                    traced_px,
-                    if full {
-                        "full".to_string()
-                    } else {
-                        format!(
-                            "{}-box ({:.0}%)",
-                            plan.rects.len(),
-                            100.0 * traced_px as f64 / frame_px as f64
-                        )
-                    },
+                    frame_px,
+                    "full".to_string(),
                 )
             }
         };
@@ -1510,13 +1481,13 @@ const CLIMB_AFTER: u32 = 6;
 /// is. At five samples a pixel, growing the picture costs a frame; at six
 /// hundred it costs a minute of accumulation, and the log showed exactly
 /// that — the mean sample count falling from 599 to 26 on a 426→365 step.
-/// The CPU tier resamples its history and pays neither price. The GPU tier's
-/// history lives in device buffers vcad reallocates on a resize, and reading
-/// them back to resample them is the one thing that tier is built not to do,
-/// so it takes the other design: **the size is free to move while it is cheap
-/// to move it, and frozen once it is dear.** The tuner's other knobs — the
-/// sample count and the scissor — go on working either way, and when the
-/// world starts moving again the mask restarts pixels, the mean falls back
+/// Neither tier can carry its history across the step: the GPU one's lives in
+/// device buffers vcad reallocates on a resize, and reading them back to
+/// resample them is the one thing that tier is built not to do; the CPU one's
+/// is a plain running mean with no resampler. So both take the same design:
+/// **the size is free to move while it is cheap to move it, and frozen once it
+/// is dear.** The tuner's other knobs go on working either way, and when the
+/// world starts moving again the history restarts pixels, the mean falls back
 /// under this line, and the size is the tuner's again.
 const RESIZE_UNTIL: f32 = 48.0;
 

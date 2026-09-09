@@ -635,22 +635,22 @@ where the surface and the tracer share a device and a queue, from two to four
 *seconds* a pass to twenty-five milliseconds. `--cpu` picks the CPU
 integrator, which is the reference and the fallback.
 
-Neither tracer accumulates, and each tier now has its own accumulator. A pass
+Neither tracer accumulates, and both tiers accumulate behind one trait. A pass
 is one raw sample; what makes one sample a pixel watchable is refusing to throw
-the last frame away. Every pixel keeps a running mean and a count, and when
-something moves the renderer knows which something — the bounding sphere of
-each ball and extra whose pose changed, at its old pose and its new, plus the
-disc its shadow throws from each panel. That mask is geometric and it is computed before a ray is cast, from the
-poses alone. It is the **CPU tier's** now: the GPU tier stopped drawing
-rectangles and decides per pixel, on the device (see below).
+the last frame away. `kosm_view::TemporalHistory` is that refusal: begin a pass
+at a size, carry the history across what moved, fold the film in, resolve for
+the glass. The GPU tier implements it on the device, in `kosm_render::gpu` —
+reprojection through the moved camera and each moved instance, a per-pixel
+clamp, an à-trous filter on the short-history pixels.
 
-On the CPU tier the accumulator is `history.rs`: `History::plan` hands the
-renderer disjoint rectangles, `pathtrace::render_into` re-traces exactly those
-into a film kept between passes, `History::merge` leaves every other pixel's
-mean *and* its count alone, and a reprojection carries the picture through a
-moved camera. A masked pass is taken only when it saves more than half the
-frame — the pixels outside it get nothing, and a picture that is always masked
-never converges.
+`--cpu` picks the CPU integrator, and it is a fallback tier and says so: it
+runs the same trait over `kosm_render::gpu::History` on the host, which is a
+plain running mean with **no reprojection and no filter**, so any camera or
+ball move restarts the picture. The old 1,600-line CPU history — the geometric
+change mask, the disjoint rectangles `pathtrace::render_into` re-traced, the
+host-side reprojection — went with the render port rather than being kept as a
+second copy of what the device already does properly. A CPU tier that wants
+its history back grows one behind the trait.
 
 One box was not enough. The change rects used to be reduced to a single
 bounding box, and with four balls spread across the court that box is most of
