@@ -69,14 +69,13 @@ image        = { version = "0.25", default-features = false, features = ["png"] 
 # the `algebraic` reduction feature, new GEMM kernels — so 0.2.0 is NOT what kosm
 # builds against. The `version` is what `cargo package` would embed; the git rev is
 # what every build resolves. → tang 0.2.1.
-tang         = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913", version = "0.2" }
-# not published → tang-3dgs 0.1
-tang-3dgs    = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+tang         = "0.2.1"
+tang-3dgs    = "0.1"
 # The denoiser's training loop: `Parameter` holds the weights, `ModuleAdam` steps
 # them. The convolutions themselves are ours; see `court::denoise::kpn`.
-# Neither is published → tang-tensor 0.1, tang-train 0.1.
-tang-tensor  = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
-tang-train   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
+# All on crates.io since 2026-09-09.
+tang-tensor  = "0.1"
+tang-train   = "0.1"
 
 # One phyz, on a clean clone too. This used to be a known gap: ipse-map pinned
 # phyz twelve commits behind ours, cargo refuses a `[patch]` whose replacement is

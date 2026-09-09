@@ -1494,7 +1494,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tang 0.2.0",
+ "tang",
  "tang-3dgs",
  "tang-tensor",
  "tang-train",
@@ -1540,7 +1540,7 @@ dependencies = [
  "pollster 0.4.0",
  "rayon",
  "rustfft",
- "tang 0.2.0",
+ "tang",
  "tang-3dgs",
  "vcad",
  "vcad-eval",
@@ -1578,7 +1578,7 @@ dependencies = [
  "js-sys",
  "pollster 0.4.0",
  "rayon",
- "tang 0.2.1",
+ "tang",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wgpu 30.0.1",
@@ -1624,7 +1624,7 @@ dependencies = [
  "pollster 0.4.0",
  "serde",
  "serde_json",
- "tang 0.2.0",
+ "tang",
  "vcad-kernel",
  "vcad-kernel-gpu",
  "vcad-kernel-math",
@@ -2426,9 +2426,9 @@ dependencies = [
  "phyz-math",
  "phyz-model",
  "phyz-rigid",
- "tang 0.2.1",
- "tang-expr 0.1.1",
- "tang-la 0.1.1",
+ "tang",
+ "tang-expr",
+ "tang-la",
 ]
 
 [[package]]
@@ -2437,8 +2437,8 @@ version = "0.4.0"
 source = "git+https://github.com/ecto/phyz?rev=fbba8abe2d02799f5fee6a7b28b6e619083f0caf#fbba8abe2d02799f5fee6a7b28b6e619083f0caf"
 dependencies = [
  "libm",
- "tang 0.2.1",
- "tang-la 0.1.1",
+ "tang",
+ "tang-la",
 ]
 
 [[package]]
@@ -3239,14 +3239,6 @@ dependencies = [
 
 [[package]]
 name = "tang"
-version = "0.2.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
-dependencies = [
- "paste",
-]
-
-[[package]]
-name = "tang"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01222e2be85bd48a1b129975a3b4045f425adaceb6ecda6e7a97cdb8dd96a75a"
@@ -3258,12 +3250,13 @@ dependencies = [
 [[package]]
 name = "tang-3dgs"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71ccf01db7a140c414808d9846e2f5942c0aa0c575e8c9f9dea0a2dbe327269d"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
- "tang 0.2.0",
- "tang-expr 0.1.0",
+ "tang",
+ "tang-expr",
  "tang-gpu",
  "tang-tensor",
  "wgpu 24.0.5",
@@ -3271,19 +3264,12 @@ dependencies = [
 
 [[package]]
 name = "tang-ad"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67759a0059717e6704887054248a7aa765fb9ba12ab803233be8cb3b3dfbcce"
 dependencies = [
- "tang 0.2.0",
- "tang-la 0.1.0",
-]
-
-[[package]]
-name = "tang-expr"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
-dependencies = [
- "tang 0.2.0",
+ "tang",
+ "tang-la",
 ]
 
 [[package]]
@@ -3292,28 +3278,21 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f1fdb85a4a0335eb38eac4635d080d54f2cb093e66ef54ce0c5460d35457e90"
 dependencies = [
- "tang 0.2.1",
+ "tang",
 ]
 
 [[package]]
 name = "tang-gpu"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbb08edc2c436d7261562a42b6d257215cbf9d31ea4ec4d97fd9c58d7eb65812"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
  "safetensors",
- "tang 0.2.0",
- "tang-expr 0.1.0",
+ "tang",
+ "tang-expr",
  "wgpu 24.0.5",
-]
-
-[[package]]
-name = "tang-la"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
-dependencies = [
- "tang 0.2.0",
 ]
 
 [[package]]
@@ -3322,36 +3301,39 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a1cf961cd2968a09fb079624db1eae07390acbe238fe61f075555b5302009d"
 dependencies = [
- "tang 0.2.1",
+ "tang",
 ]
 
 [[package]]
 name = "tang-optim"
-version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8611ed6ffd0d7f627cb8c2c93bcc9923038888f8401574396bf450ce51d7143"
 dependencies = [
- "tang 0.2.0",
+ "tang",
  "tang-ad",
- "tang-la 0.1.0",
+ "tang-la",
 ]
 
 [[package]]
 name = "tang-tensor"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f251895b91826650fbcc68f39b8f7d76a62c88af88418582460a3aa686b436b8"
 dependencies = [
- "tang 0.2.0",
- "tang-la 0.1.0",
+ "tang",
+ "tang-la",
 ]
 
 [[package]]
 name = "tang-train"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0c5ee63dd1cfeb75a9f2fbadbc8b4399f1b755b2e04031a4f8c77520a82d97"
 dependencies = [
- "tang 0.2.0",
+ "tang",
  "tang-ad",
- "tang-la 0.1.0",
+ "tang-la",
  "tang-optim",
  "tang-tensor",
 ]
@@ -3606,7 +3588,7 @@ source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc
 dependencies = [
  "anyhow",
  "serde",
- "tang 0.2.1",
+ "tang",
  "thiserror 2.0.20",
  "toml",
  "vcad-ir",
@@ -3632,7 +3614,7 @@ dependencies = [
  "rstar",
  "serde",
  "serde_json",
- "tang-expr 0.1.1",
+ "tang-expr",
  "thiserror 2.0.20",
  "toml",
  "vcad-ecad-package",
@@ -3660,7 +3642,7 @@ version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "serde",
- "tang 0.2.1",
+ "tang",
  "thiserror 2.0.20",
  "vcad-ecad-schematic",
  "vcad-ir",
@@ -3822,9 +3804,9 @@ version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "slotmap",
- "tang 0.2.1",
- "tang-expr 0.1.1",
- "tang-la 0.1.1",
+ "tang",
+ "tang-expr",
+ "tang-la",
  "thiserror 2.0.20",
  "vcad-kernel-math",
  "vcad-kernel-sketch",
@@ -3862,7 +3844,7 @@ name = "vcad-kernel-diff"
 version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
- "tang 0.2.1",
+ "tang",
  "vcad-kernel-geom",
  "vcad-kernel-math",
  "vcad-kernel-nurbs",
@@ -3936,7 +3918,7 @@ name = "vcad-kernel-geom"
 version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
- "tang 0.2.1",
+ "tang",
  "vcad-kernel-math",
 ]
 
@@ -3948,7 +3930,7 @@ dependencies = [
  "bytemuck",
  "kosm-render",
  "pollster 0.4.0",
- "tang-expr 0.1.1",
+ "tang-expr",
  "thiserror 2.0.20",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3961,7 +3943,7 @@ name = "vcad-kernel-math"
 version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
- "tang 0.2.1",
+ "tang",
 ]
 
 [[package]]
@@ -3989,7 +3971,7 @@ name = "vcad-kernel-nurbs"
 version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
- "tang 0.2.1",
+ "tang",
  "vcad-kernel-geom",
  "vcad-kernel-math",
 ]
@@ -4049,7 +4031,7 @@ dependencies = [
  "js-sys",
  "kosm-render",
  "rayon",
- "tang 0.2.1",
+ "tang",
  "thiserror 2.0.20",
  "vcad-ir",
  "vcad-kernel-booleans",
@@ -4145,7 +4127,7 @@ version = "0.9.4"
 source = "git+https://github.com/ecto/vcad?rev=8c5ec7d9cab9ef59501d94029630f28fc46a9d4c#8c5ec7d9cab9ef59501d94029630f28fc46a9d4c"
 dependencies = [
  "earcutr",
- "tang 0.2.1",
+ "tang",
  "vcad-kernel-geom",
  "vcad-kernel-math",
  "vcad-kernel-primitives",
