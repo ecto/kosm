@@ -126,11 +126,24 @@ impl ActStats {
 /// [`crate::ppo::train_from`] overwrites it with
 /// [`set_init_std`](crate::ppo::set_init_std) regardless.
 pub fn fit_actor(actor: &mut Actor, samples: &[BcSample], fit: BcFit) -> Vec<f64> {
+    let act_dim = actor.act_dim();
+    fit_net(&mut actor.net, act_dim, samples, fit)
+}
+
+/// [`fit_actor`] against the mean network alone.
+///
+/// [`fit_actor`] touches nothing but `actor.net` and `actor.act_dim()`, so a
+/// consumer whose actor is its own type — ipse's carries a per-dimension
+/// clamp and a command block this crate's does not — can share this fit
+/// instead of keeping a second copy of it. Two copies of a regression whose
+/// standardise-and-fold step is the difference between the fit working and
+/// the fit being a null is not redundancy; it is a divergence waiting for
+/// somebody to patch one of them.
+pub fn fit_net(net: &mut Mlp, act_dim: usize, samples: &[BcSample], fit: BcFit) -> Vec<f64> {
     if samples.is_empty() {
         return Vec::new();
     }
-    let a_in = actor.net.dims.0;
-    let act_dim = actor.act_dim();
+    let a_in = net.dims.0;
     let stats = ActStats::of(samples, act_dim);
     // Variance per dimension, to convert a standardised loss back to the
     // action's own squared units.
@@ -156,8 +169,8 @@ pub fn fit_actor(actor: &mut Actor, samples: &[BcSample], fit: BcFit) -> Vec<f64
                 let k = s.obs.len().min(a_in);
                 x.data_mut()[row * a_in..row * a_in + k].copy_from_slice(&s.obs[..k]);
             }
-            actor.net.zero_grad();
-            let out = actor.net.forward(&x);
+            net.zero_grad();
+            let out = net.forward(&x);
             let mut grad = Tensor::zeros(Shape::from_slice(&[b, act_dim]));
             let mut loss = 0.0;
             for (row, &i) in chunk.iter().enumerate() {
@@ -170,15 +183,15 @@ pub fn fit_actor(actor: &mut Actor, samples: &[BcSample], fit: BcFit) -> Vec<f64
                     grad.data_mut()[row * act_dim + d] = 2.0 * err / (b * act_dim) as f64;
                 }
             }
-            actor.net.backward(&grad);
-            let mut params = actor.net.parameters_mut();
+            net.backward(&grad);
+            let mut params = net.parameters_mut();
             opt.step(&mut params);
             acc += loss / (b * act_dim) as f64;
             batches += 1;
         }
         losses.push(acc / batches.max(1) as f64);
     }
-    stats.fold_into(&mut actor.net);
+    stats.fold_into(net);
     losses
 }
 
