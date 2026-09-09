@@ -257,13 +257,19 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
 
         // ---- the ground ----------------------------------------------------------
         // One solid, so the baked signed distance has one inside.
+        // `sand` is the library's `dry sand`; the one thing the cove overrides
+        // about it is the friction the marble check is stated on, and that
+        // override lives in `sim::SAND_FRICTION` and says why.
         let ground = b.body("ground");
         ground.material("sand").decorative();
         ground.add(beach.union(cliff).union(rocks).union(headlands).union(reef));
 
         // ---- the door -------------------------------------------------------------
+        // Granite, and the library's: `BuiltBody::substance` resolves the name
+        // and `being.rs` weighs the slab out of what it hands back, so the
+        // door's density is stated once, in `kosm::material`, and nowhere here.
         let door = b.body("door");
-        door.material("stone").decorative();
+        door.material(super::materials::DOOR).decorative();
         door.add(
             b.boxed(door_w, door_t, door_h)
                 .at(door_x, cliff_face_y + 0.5 * door_t, door_sill + 0.5 * door_h),

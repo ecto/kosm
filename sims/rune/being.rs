@@ -30,6 +30,7 @@
 //! Metres, radians, seconds; z up.
 
 use std::f64::consts::PI;
+use std::sync::LazyLock;
 
 use kosm_scan::SdfGrid;
 use phyz_contact::{ContactCache, ContactMaterial};
@@ -38,7 +39,8 @@ use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
 use super::CoveScene;
-use super::sim::{self, Beach, GLASS_DENSITY};
+use super::sim::{self, Beach, GLASS};
+use kosm::material::{self, Material as Substance};
 
 /// The being is body 0, on the free joint the whole model starts with.
 pub const BEING: usize = 0;
@@ -73,10 +75,14 @@ pub const UPRIGHT_OMEGA: f64 = 6.0;
 /// 0.4 s from a standstill to `walk_mps`.
 pub const WALK_GAIN: f64 = 6.0;
 
-/// Glass on wet sand.
+/// Glass on wet sand, and the cove's own number rather than the library's.
 ///
 /// Deliberately far below [`sim::SAND_FRICTION`], which is what the *marble*
 /// rolls on: a rolling sphere needs grip and a sliding being needs to slide.
+/// Neither is `kosm::material`'s sand — `dry sand` is μ = 0.55 and its wetted
+/// form 0.6875 — because neither is a measurement. They are the two ends the
+/// level wants a body to sit at: 0.8 so the marble cannot slip and the roll
+/// measures the field, 0.35 so the being slides at a speed a player can steer.
 /// The being's own material wins for its terrain contacts — a contact against
 /// the ground combines with nothing — so the two coexist in one scene.
 pub const BEING_FRICTION: f64 = 0.35;
@@ -85,13 +91,19 @@ pub const BEING_FRICTION: f64 = 0.35;
 /// damping is `−m v_h / τ`; the sand takes over below what friction can hold.
 pub const STOP_TAU: f64 = 0.15;
 
-/// Stone, kg/m³.
-pub const STONE_DENSITY: f64 = 2500.0;
-
-/// Sea water, kg/m³. Glass is [`GLASS_DENSITY`], two and a half times this, so
-/// a being in the sea gets lighter and keeps its feet: it never floats off the
-/// bed, and there is nothing to swim.
-pub const WATER_DENSITY: f64 = 1000.0;
+/// The sea: `sea water` out of `kosm::material`, 1025 kg/m^3.
+///
+/// Glass ([`sim::GLASS`]) is two and a half times as dense, so a being in the
+/// sea gets lighter and keeps its feet: it never floats off the bed, and there
+/// is nothing to swim. This was a `1000.0` written here; fresh water is not what
+/// the cove is full of, and the library has the substance that is.
+///
+/// The two and a half per cent it adds is two and a half per cent more buoyancy
+/// and two and a half per cent more drag, and it stops the being one centimetre
+/// sooner: `tests.rs` walks it out to sea and the water wins at **0.58 m with
+/// 60 % of the being under**, where fresh water's 1000 kg/m^3 gave 0.59 m and
+/// 62 %. Waist to chest either way, which is the design's own tolerance.
+pub static SEA: LazyLock<Substance> = LazyLock::new(|| material::named("sea water").expect("sea water is in kosm's material library"));
 
 /// The drag coefficient of a bluff body in water. A capsule broadside is about
 /// a cylinder, which is about one.
@@ -110,6 +122,23 @@ pub const DOOR_LIMIT: f64 = 100.0 * PI / 180.0;
 /// angle rises monotonically and settles on it instead of slamming into it.
 /// At 3 rad/s the swing is 1.6 s of the 3 s the rune holds it open for.
 pub const DOOR_OMEGA: f64 = 3.0;
+
+/// The door's substance, read off the door body the level built.
+///
+/// `scene.rs` says `door.material("granite")` and that is the whole statement:
+/// the density this returns is `kosm::material`'s granite, and the day the door
+/// is cut out of basalt instead there is one word to change and no constant in
+/// this file to keep in step with it.
+fn door_substance(scene: &CoveScene) -> anyhow::Result<Substance> {
+    scene
+        .authored
+        .bodies
+        .iter()
+        .find(|b| b.name == "door")
+        .ok_or_else(|| anyhow::anyhow!("the cove has no `door` body to take a substance from"))?
+        .substance()
+        .ok_or_else(|| anyhow::anyhow!("the door's material is not in kosm's material library"))
+}
 
 /// What the player is asking for on one step.
 ///
@@ -182,7 +211,8 @@ impl Being {
     /// a cylinder of length `2·half` and two hemispherical caps.
     fn new(r: f64, height: f64, walk_mps: f64) -> Self {
         let half = (height - 2.0 * r) / 2.0;
-        let (m_cyl, m_cap) = (GLASS_DENSITY * PI * r * r * 2.0 * half, GLASS_DENSITY * 2.0 / 3.0 * PI * r * r * r);
+        let rho = GLASS.density;
+        let (m_cyl, m_cap) = (rho * PI * r * r * 2.0 * half, rho * 2.0 / 3.0 * PI * r * r * r);
         let mass = m_cyl + 2.0 * m_cap;
         // Transverse inertia about the capsule's centre. The cylinder is the
         // textbook `m(3r² + L²)/12`; a cap is a hemisphere whose own centre of
@@ -286,7 +316,14 @@ impl Cove {
         // cliff and into the cove, which is the way a door opens.
         let (w, h, t) = (scene.door_w, scene.door_h, scene.door_t);
         let hinge = Vec3::new(scene.door_x + w / 2.0, scene.cliff_face_y() + t / 2.0, scene.door_sill());
-        let door_mass = STONE_DENSITY * w * h * t;
+        // The door's substance is the door body's, not a `STONE_DENSITY` of
+        // this module's: `scene.rs` authors the slab as granite and
+        // `BuiltBody::substance` hands the constants back here. A two-tonne
+        // slab is the only thing the mass decides — the swing is critically
+        // damped in *its own* inertia (`DOOR_OMEGA`), so a denser door swings
+        // the same and only pushes harder on the limit.
+        let stone = door_substance(scene)?;
+        let door_mass = stone.density * w * h * t;
         let door_com = Vec3::new(-w / 2.0, 0.0, h / 2.0);
         let slab = |a: f64, b: f64| door_mass * (a * a + b * b) / 12.0;
         let door_inertia = SpatialInertia::new(door_mass, door_com, Mat3::from_diagonal(&Vec3::new(slab(t, h), slab(w, h), slab(w, t))));
@@ -500,10 +537,14 @@ impl Cove {
         let (volume, area) = wetted(r, 2.0 * rise, depth);
         let submerged = volume / capsule_volume(r, 2.0 * half);
 
-        let up = Vec3::z() * (WATER_DENSITY * volume * GRAVITY);
+        // The fluid facet of the substance in [`SEA`]: both of these forces are
+        // one density, and it is the sea's, not a number of this module's.
+        let rho = SEA.fluid().density;
+
+        let up = Vec3::z() * (rho * volume * GRAVITY);
         // Shoreward is +y: the waterline is the cove's -y edge.
         let through_water = velocity - Vec3::new(0.0, self.surf, 0.0);
-        let drag = through_water * (-0.5 * WATER_DENSITY * WATER_DRAG_CD * area * through_water.norm());
+        let drag = through_water * (-0.5 * rho * WATER_DRAG_CD * area * through_water.norm());
         let spin = omega * (-WATER_SPIN_DAMP * self.being.c * submerged);
         (up + drag, spin)
     }

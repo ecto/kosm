@@ -1606,7 +1606,7 @@ mod tests {
 
         // the sunlit door, as the integrator will draw it
         let doc = &scene.authored.document;
-        let stone = lum(materials::pbr(doc, "stone").base_color);
+        let stone = lum(materials::pbr(doc, materials::DOOR).base_color);
         let irr = scene.authored.parameter_or("sun_irradiance", 6.2);
         let cos = scene.sun_dir().dot(&scene.door_frame().normal).abs();
         let sunlit = irr * cos * stone / std::f64::consts::PI;

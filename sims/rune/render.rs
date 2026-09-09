@@ -285,8 +285,8 @@ impl Scene {
                     .clone();
                 let Some(local) = bvh.bounds() else { continue };
                 let to_world = placement(&inst.to_world);
-                if root.material == "door" || root.material == "stone" {
-                    door.push(Placed { bvh, pbr: materials::pbr(doc, "stone"), to_world });
+                if root.material == "door" || root.material == materials::DOOR {
+                    door.push(Placed { bvh, pbr: materials::pbr(doc, materials::DOOR), to_world });
                 } else {
                     // one root, three surfaces; see `ground_material`
                     let name = ground_material(&transform_aabb(&local, &to_world), scene);

@@ -166,6 +166,11 @@ After the port to `sims/rune` (2026-09-09), one sim directory:
   `bake.rs`, `sim.rs`, `being.rs`, `rune.rs` (score, hint gradient, solve),
   `hint.rs`, `render.rs` and `materials.rs` beside it. Was
   `crates/kosm-spike/src/cove/**`.
+- The cove's substances come from `kosm::material` now: the glass is `N-BK7`,
+  the sand `dry sand`, the door and the cliff `granite`, the sea `sea water`,
+  and `materials.rs` is one art-direction layer over their `pbr()` rather than
+  a second table of constants. What the level still authors for itself is the
+  friction the marble check is stated on and the being's, and both say why.
 - `sims/rune/game.rs`: the window tier, `kosm run rune --view`. Input,
   camera, the loop. Was `crates/kosm-view/src/rune.rs`.
 - `crates/kosm/src/{glass,light}.rs`: the capsule, the receiver frame and
