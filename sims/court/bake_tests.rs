@@ -12,7 +12,7 @@ use crate::skatepark::{self, BakeOpts};
 use phyz_math::Vec3;
 
 /// A half-metre box of field around `p`, at the level's own cell.
-fn field_around(court: &CourtBake, mesh: &ipse_map::TriMesh, p: Vec3) -> impl Fn(Vec3) -> f64 {
+fn field_around(court: &CourtBake, mesh: &kosm_scan::TriMesh, p: Vec3) -> impl Fn(Vec3) -> f64 {
     let half = Vec3::splat(0.25);
     let sdf = skatepark::bake_sdf_within(mesh, court.cell, p - half, p + half);
     move |q: Vec3| sdf.sample(q).unwrap_or_else(|| panic!("{q:?} is outside the sampled box"))
@@ -72,7 +72,7 @@ fn a_small_map_bakes_with_the_courts_extent() {
     // manifest are the same, the field is a thousandth the size
     let opts = BakeOpts { volume: Some((Vec3::new(-0.5, -0.5, -0.1), Vec3::new(0.5, 0.5, 0.4))), ..court.opts() };
     let baked = skatepark::bake_parts(&court.authored, &parts, opts, &dir).expect("bakes");
-    let map = ipse_map::Map::load(&dir).expect("loads back");
+    let map = kosm_scan::Map::load(&dir).expect("loads back");
     let sdf = map.standable().expect("has a floor");
     assert!(sdf.sample(Vec3::zero()).unwrap().abs() < 0.5 * court.cell);
     assert!(sdf.sample(Vec3::new(0.0, 0.0, 1.0)).is_none(), "the volume is the box, not the gym");

@@ -9,13 +9,13 @@
 //! we read it.
 //!
 //! The step is phyz's own contact pipeline with the ground plane swapped for
-//! the SDF (`ipse_map::find_terrain_contacts_model`), exactly as ipse-sim does
+//! the SDF (`kosm_scan::find_terrain_contacts_model`), exactly as ipse-sim does
 //! it for the robot. The frame is the splat, rendered by tang-3dgs on the GPU,
 //! with the ray-cast marble composited where its primary rays hit.
 
 use std::path::Path;
 
-use ipse_map::Map;
+use kosm_scan::Map;
 use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, find_contacts, solve_contacts_warm};
 use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{Geometry, Model, ModelBuilder, State};
@@ -57,11 +57,11 @@ impl Garage {
     }
 }
 
-fn floor_under(sdf: &ipse_map::SdfGrid, x: f64, y: f64) -> Option<f64> {
+fn floor_under(sdf: &kosm_scan::SdfGrid, x: f64, y: f64) -> Option<f64> {
     floor_under_from(sdf, x, y, 1.0)
 }
 
-fn floor_under_from(sdf: &ipse_map::SdfGrid, x: f64, y: f64, z0: f64) -> Option<f64> {
+fn floor_under_from(sdf: &kosm_scan::SdfGrid, x: f64, y: f64, z0: f64) -> Option<f64> {
     let mut z = z0;
     let mut prev = sdf.sample(Vec3::new(x, y, z))?;
     while z > -0.5 {
@@ -86,7 +86,7 @@ fn floor_under_from(sdf: &ipse_map::SdfGrid, x: f64, y: f64, z0: f64) -> Option<
 /// component. Measured: with the gradient normal a frictionless marble slid
 /// 2.2 m in 2.2 s across a floor that is flat to 1 mm; a 5 cm ball with
 /// friction stayed put only because static friction can hide a 3° lie.
-fn smoothed_normal(sdf: &ipse_map::SdfGrid, p: Vec3, h: f64) -> Option<Vec3> {
+fn smoothed_normal(sdf: &kosm_scan::SdfGrid, p: Vec3, h: f64) -> Option<Vec3> {
     let z0 = p.z + 0.05;
     let zx1 = floor_under_from(sdf, p.x + h, p.y, z0)?;
     let zx0 = floor_under_from(sdf, p.x - h, p.y, z0)?;
@@ -114,7 +114,7 @@ pub fn step(model: &Model, state: &mut State, garage: &Garage, material: &Contac
     let sdf = garage.map.sdf.as_ref().expect("standable");
     let (xforms, _) = forward_kinematics(model, state);
     state.body_xform = xforms;
-    let mut contacts = ipse_map::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let mut contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
     // The fused field's gradient wobbles 1–10° cell to cell on a floor that is
     // flat to ±5 mm, and a 1 cm marble reads that as a slope. Keep the depth
     // the field reports; take the normal from a stencil the size of the ball.

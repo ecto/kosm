@@ -44,7 +44,7 @@ vcad-kernel-raytrace = { workspace = true, features = ["gpu"] }
 vcad-kernel-gpu = { workspace = true, optional = true }
 vcad-kernel-math.workspace = true
 vcad-kernel-primitives.workspace = true
-ipse-map.workspace = true
+kosm-scan = { path = "../kosm-scan" }
 image.workspace = true
 hound.workspace = true
 tang.workspace = true

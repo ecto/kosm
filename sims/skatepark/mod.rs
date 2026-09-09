@@ -1,16 +1,16 @@
 //! The skatepark: a mini ramp, baked into a map the K1 can stand on.
 //!
 //! ipse already has the skateboard and a K1 that rides it on a flat floor;
-//! its terrain is an `ipse-map` directory (a collision mesh and a signed
+//! its terrain is a `kosm-scan` directory (a collision mesh and a signed
 //! distance grid baked from it) that a scenario file points at. This module
 //! is the park: [`scene`] authored as vcad geometry in Rust, its mesh baked
-//! with ipse-map's own baker into `out/maps/skatepark/`, and the physics of
+//! with kosm-scan's own baker into `out/maps/skatepark/`, and the physics of
 //! *that map* checked before a robot sees it.
 //!
 //! The check is the court's e² test for a ramp. A wheel-sized solid sphere is
 //! set on the +x transition with its contact point `drop_mm` above the flat
 //! and released, and rolled with the same SDF contact path the K1's feet use
-//! (`ipse_map::find_terrain_contacts_model`, raw normals — this is an exact
+//! (`kosm_scan::find_terrain_contacts_model`, raw normals — this is an exact
 //! bake, not a fused scan, so the gradient is the normal). Rolling without
 //! slip, the centre reaches the flat at `v² = 10/7 · g · Δ`, where `Δ` is the
 //! centre's drop, and climbs the far wall back to the same height minus what
@@ -22,8 +22,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ipse_map::manifest::{CollisionLayer, Extent, MapManifest, Provenance};
-use ipse_map::{Map, SdfGrid, TriMesh, stl};
+use kosm_scan::manifest::{CollisionLayer, Extent, MapManifest, Provenance};
+use kosm_scan::{Map, SdfGrid, TriMesh, stl};
 use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, solve_contacts_warm};
 use phyz_math::{GRAVITY, Vec3};
 use phyz_model::{Model, State};
@@ -275,7 +275,7 @@ pub fn bake_parts(authored: &dyn Authored, parts: &[Part], opts: BakeOpts, dir: 
         None => SdfGrid::bake(&mesh, opts.cell, opts.pad),
         Some((lo, hi)) => bake_sdf_within(&mesh, opts.cell, lo, hi),
     };
-    let err = |e: ipse_map::MapError| anyhow::anyhow!("{e:?}");
+    let err = |e: kosm_scan::MapError| anyhow::anyhow!("{e:?}");
     stl::write_binary_stl(&dir.join("mesh.stl"), &tris).map_err(err)?;
     sdf.save(&dir.join("sdf.bin")).map_err(err)?;
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "level".into());
@@ -341,7 +341,7 @@ pub fn bake_sdf_within(mesh: &TriMesh, cell: f64, lo: Vec3, hi: Vec3) -> SdfGrid
 fn write_parts(parts: &[Part], dir: &Path) -> anyhow::Result<()> {
     let sub = dir.join("parts");
     fs::create_dir_all(&sub)?;
-    let err = |e: ipse_map::MapError| anyhow::anyhow!("{e:?}");
+    let err = |e: kosm_scan::MapError| anyhow::anyhow!("{e:?}");
     let mut json = String::from("[\n");
     for (i, part) in parts.iter().enumerate() {
         let path = sub.join(format!("{}.stl", part.name));
@@ -388,7 +388,7 @@ fn step(model: &Model, state: &mut State, sdf: &SdfGrid, material: &ContactMater
     let dt = model.dt;
     let (xforms, _) = forward_kinematics(model, state);
     state.body_xform = xforms;
-    let contacts = ipse_map::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
     // In the frame the contacts were assembled in: a free joint's body-frame
     // turn is taken out here and put back, exactly, after the solve (phyz).
     let mut qdd = aba(model, state);

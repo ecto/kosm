@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/kosm-render", "crates/kosm", "crates/kosm-cli", "crates/kosm-view", "crates/kosm-mpm"]
+members = [
+    "crates/kosm-render",
+    "crates/kosm",
+    "crates/kosm-cli",
+    "crates/kosm-view",
+    "crates/kosm-mpm",
+    "crates/kosm-scan",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -53,8 +60,6 @@ tang-3dgs    = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14e
 # them. The convolutions themselves are ours; see `court::denoise::kpn`.
 tang-tensor  = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 tang-train   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
-# ipse: `main` HEAD.
-ipse-map     = { git = "https://github.com/ecto/ipse", rev = "942523bd269e3110a84fbf3952d7ae5e37a3ceea" }
 
 # One tang. vcad and phyz both depend on crates.io `tang`; unify them on the same
 # git rev this workspace uses, or `tang::Scalar` is two traits across the graph.
@@ -64,13 +69,12 @@ tang-la   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69
 tang-expr = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 tang-ad   = { git = "https://github.com/ecto/tang", rev = "c9ef210498e5e3e14ee69257108f8112837de913" }
 
-# KNOWN GAP, one phyz is not yet true on a clean clone. ipse pins phyz at
-# b79e35afe1f3286e18de3b51a260e15839340a14 (12 commits behind ours), so an
-# untouched clone resolves two phyz and `Model` splits into two types. It cannot
-# be fixed here: cargo refuses a `[patch]` whose replacement is the same git URL
-# it patches, so we cannot pull ipse's phyz forward onto ours from this manifest.
-# `.cargo/config.toml` collapses them for local builds. The real fix is to bump
-# ipse's phyz pin to this rev and re-pin ipse-map above.
+# One phyz, on a clean clone too. This used to be a known gap: ipse-map pinned
+# phyz twelve commits behind ours, cargo refuses a `[patch]` whose replacement is
+# the same git URL it patches, and so an untouched clone resolved two phyz and
+# `Model` split into two types. `crates/kosm-scan` is ipse-map lifted into this
+# workspace, ipse is no longer a dependency, and the problem is gone: every phyz
+# in the graph is the rev pinned above.
 
 # vcad pulls kosm-render from this repo by git rev; without this patch cargo
 # builds two copies and the Geometry impls stop lining up. This is the documented

@@ -12,8 +12,8 @@
 #
 # A `[patch]` here overrides a `[patch]` for the same source in Cargo.toml
 # (config wins, silently) and applies workspace-wide, which is what makes
-# "one phyz, one tang for the whole graph" true: ipse-map pins phyz at an older
-# rev and vcad/phyz pull tang from crates.io, and both are collapsed here.
+# "one tang for the whole graph" true: vcad and phyz both pull tang from
+# crates.io, and both are collapsed here.
 
 [patch."https://github.com/ecto/phyz"]
 phyz         = { path = "/Users/cam/Developer/phyz/.claude/worktrees/game-engine-vcad-phyz-tang-ee6b50/crates/phyz" }
@@ -32,8 +32,6 @@ tang-3dgs    = { path = "/Users/cam/Developer/tang/crates/tang-3dgs" }
 tang-tensor  = { path = "/Users/cam/Developer/tang/crates/tang-tensor" }
 tang-train   = { path = "/Users/cam/Developer/tang/crates/tang-train" }
 
-[patch."https://github.com/ecto/ipse"]
-ipse-map     = { path = "/Users/cam/Developer/ipse/crates/ipse-map" }
 
 # vcad and phyz reach tang through crates.io; the manifest sends that to the git
 # rev, this sends it the rest of the way to the checkout.

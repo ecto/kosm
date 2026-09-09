@@ -1351,19 +1351,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ipse-map"
-version = "0.0.1"
-dependencies = [
- "phyz-collision",
- "phyz-math",
- "phyz-model",
- "rayon",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,9 +1477,9 @@ dependencies = [
  "anyhow",
  "hound",
  "image",
- "ipse-map",
  "kosm-mpm",
  "kosm-render",
+ "kosm-scan",
  "phyz",
  "phyz-camera",
  "phyz-collision",
@@ -1535,10 +1522,10 @@ dependencies = [
  "egui",
  "hound",
  "image",
- "ipse-map",
  "kosm",
  "kosm-mpm",
  "kosm-render",
+ "kosm-scan",
  "kosm-view",
  "phyz",
  "phyz-camera",
@@ -1593,6 +1580,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosm-scan"
+version = "0.0.1"
+dependencies = [
+ "phyz-collision",
+ "phyz-contact",
+ "phyz-math",
+ "phyz-model",
+ "rayon",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "kosm-view"
 version = "0.0.1"
 dependencies = [
@@ -1601,8 +1602,8 @@ dependencies = [
  "eframe",
  "egui",
  "image",
- "ipse-map",
  "kosm-render",
+ "kosm-scan",
  "log",
  "phyz-math",
  "pollster 0.4.0",

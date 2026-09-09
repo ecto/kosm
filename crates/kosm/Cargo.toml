@@ -30,7 +30,7 @@ tang.workspace = true
 tang-3dgs.workspace = true
 tang-tensor.workspace = true
 tang-train.workspace = true
-ipse-map.workspace = true
+kosm-scan = { path = "../kosm-scan" }
 vcad-kernel-acoustics.workspace = true
 vcad-kernel-optics.workspace = true
 vcad-kernel-raytrace.workspace = true

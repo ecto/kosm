@@ -914,7 +914,7 @@ fn garage_stage(level: &Level, map_dir: &Path, out: &Path) -> anyhow::Result<()>
     let (w, h) = (800u32, 600u32);
     let intr = CameraIntrinsics::from_vfov(w, h, 0.75, 0.05, 50.0);
     let target = Vec3::new(b.x, b.y, b.z);
-    // Up close the splat is mush (ipse-map's own warning: the SDF exists for a
+    // Up close the splat is mush (kosm-scan's own warning: the SDF exists for a
     // reason), so the frame is the room view with the marble's path drawn on.
     let eye = match std::env::var("KOSM_VIEW").ok().as_deref() {
         Some("top") => Vec3::new(cx, cy, 3.0),

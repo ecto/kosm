@@ -1,0 +1,28 @@
+[package]
+name = "kosm-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Captured environment scans: splat appearance layer + SDF physics layer, baked into a World"
+
+[dependencies]
+phyz-math.workspace = true
+phyz-model.workspace = true
+phyz-collision.workspace = true
+phyz-contact.workspace = true
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[[bin]]
+name = "mapbake"
+path = "src/bin/mapbake.rs"
+
+[[bin]]
+name = "objbake"
+path = "src/bin/objbake.rs"
+
+[[bin]]
+name = "roombake"
+path = "src/bin/roombake.rs"

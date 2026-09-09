@@ -229,7 +229,7 @@ fn tessellate(def: &MeshDef) -> anyhow::Result<Vec<Vertex>> {
     match def {
         MeshDef::Stl { path, scale } => {
             let s = *scale as f32;
-            let soup = ipse_map::stl::read_binary_stl(path)?;
+            let soup = kosm_scan::stl::read_binary_stl(path)?;
             for t in soup {
                 let p = |i: usize| [t[i][0] * s, t[i][1] * s, t[i][2] * s];
                 tri(&mut v, p(0), p(1), p(2));
