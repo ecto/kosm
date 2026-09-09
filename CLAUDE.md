@@ -28,7 +28,7 @@ cargo run -p kosm-cli -- run _template --out out/   # a few seconds, tiny render
 Same id, same bytes: a changed frame means changed code. `--view` opens
 kosm-view and is never what you want here.
 
-## Six recipes
+## Seven recipes
 
 ### 1. Build a world
 
@@ -89,7 +89,39 @@ model.bodies[1].collisions = vec![GeomInstance {
 }];
 ```
 
-### 3. Batch a step
+### 3. Pick a material
+
+A material is a **substance**, not a look: physical constants as columns, and
+every facet a solver wants derived from them. There is one brass.
+
+```rust
+use kosm::prelude::*;
+let brass = material::named("brass").expect("brass is in the library");
+let pbr     = brass.pbr();       // kosm-render: metallic 1, F0 from the albedo bands
+let contact = brass.contact();   // phyz: friction, restitution, stiffness
+let modal   = brass.modal();     // audio: rho, E, nu, loss
+let fluid   = brass.fluid();     // density, and a viscosity if it flows
+assert_eq!(kosm::materials::colour("brass"), brass.colour());   // the window's tier
+
+// every constant is a Param, so a run hash includes its materials
+let softer = brass.with_params(&[Param::new("brass.young", 90e9)]);
+assert_eq!(softer.young, 90e9);
+```
+
+`Body::material(name)` still resolves through the library at build time, and
+`b.body("bell").substance(&bronze)` takes one by value; either way
+`built.bodies[i].substance()` hands the constants back, so a sim never keeps a
+second table. `wet()` is the granular state (darker, grippier, heavier),
+`coated()` is a clear coat, and `fit(loss, &["n_d"], steps)` walks named
+constants down a loss by central differences — `crates/kosm/tests/material.rs`
+recovers N-BK7's index from the caustic a sphere of it throws, the zeroth-order
+version of what `sims/marble` does with duals. Every constant carries a source
+and a `Measured | Estimated` mark; an unknown name still draws clay grey but
+warns once instead of silently. `material::datasheet(&m, dir)` writes
+`ball.png` and a `datasheet.json` of measured bounce, ring and settle numbers —
+the ball is a `Lens` over one canonical world.
+
+### 4. Batch a step
 
 A batch is a `Vec<World>`; `step_batch` walks it with rayon.
 
@@ -110,7 +142,7 @@ assert_eq!(stepped.len(), 8);
 `step_batch` takes either no actions (every world gets `Action::none()`) or
 exactly one per world; anything else panics rather than quietly recycling.
 
-### 4. Take a gradient
+### 5. Take a gradient
 
 Gradients are one estimator, not the estimator (architecture.md rule 4).
 Batched rollouts are the zeroth-order path and cost nothing to reach:
@@ -134,7 +166,7 @@ The first-order path is phyz's convex-contact adjoint through
 `sims/marble/mod.rs` does all three and checks each against central
 differences — read it before writing a fourth.
 
-### 5. Add a lens
+### 6. Add a lens
 
 ```rust
 use kosm::prelude::*;
@@ -164,7 +196,7 @@ impl kosm::lens::Lens for MissDistance {
 }
 ```
 
-### 6. Train a policy
+### 7. Train a policy
 
 Loops live in `kosm-train`, contracts in `kosm`. A `Task` says what the
 episode is; `TaskEnv` turns it into the flat thing a trainer wants — an

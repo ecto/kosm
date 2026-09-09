@@ -29,6 +29,10 @@ pub use crate::snapshot::{assert_close, assert_image_close};
 pub use crate::step::{Action, PhyzStep, Policy, Step, Trajectory, Zero, rollout, step_batch};
 pub use crate::task::{Invariant, Task, check_invariants};
 pub use crate::world::{Light, Material, Param, World};
+// substances: one `Material` per stuff, every facet derived from its
+// constants. Spelled `Substance` here because `Material` above is the render
+// column on a `World`, and the two are different nouns.
+pub use crate::material::{self, Fluid, Material as Substance, Optics, Spectrum};
 
 // the build side: geometry in rust, and the colliders derived from it
 pub use crate::build::{Authored, Built, Params, build};
