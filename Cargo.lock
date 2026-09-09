@@ -2371,6 +2371,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "phyz"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2383,6 +2384,7 @@ dependencies = [
 [[package]]
 name = "phyz-camera"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "bytemuck",
  "phyz-collision",
@@ -2397,6 +2399,7 @@ dependencies = [
 [[package]]
 name = "phyz-collision"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2405,6 +2408,7 @@ dependencies = [
 [[package]]
 name = "phyz-contact"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-collision",
  "phyz-math",
@@ -2415,6 +2419,7 @@ dependencies = [
 [[package]]
 name = "phyz-diff"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-collision",
  "phyz-contact",
@@ -2429,6 +2434,7 @@ dependencies = [
 [[package]]
 name = "phyz-math"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "libm",
  "tang",
@@ -2438,6 +2444,7 @@ dependencies = [
 [[package]]
 name = "phyz-model"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-math",
 ]
@@ -2445,6 +2452,7 @@ dependencies = [
 [[package]]
 name = "phyz-rigid"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-math",
  "phyz-model",
@@ -2453,6 +2461,7 @@ dependencies = [
 [[package]]
 name = "phyz-world"
 version = "0.3.1"
+source = "git+https://github.com/ecto/phyz?rev=61fe0a42bd3a8c675b150db1bf173caf7195b4a2#61fe0a42bd3a8c675b150db1bf173caf7195b4a2"
 dependencies = [
  "phyz-collision",
  "phyz-math",
@@ -3231,6 +3240,7 @@ dependencies = [
 [[package]]
 name = "tang"
 version = "0.2.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "paste",
  "robust",
@@ -3239,6 +3249,7 @@ dependencies = [
 [[package]]
 name = "tang-3dgs"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
@@ -3252,6 +3263,7 @@ dependencies = [
 [[package]]
 name = "tang-ad"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
  "tang-la",
@@ -3260,6 +3272,7 @@ dependencies = [
 [[package]]
 name = "tang-expr"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
 ]
@@ -3267,6 +3280,7 @@ dependencies = [
 [[package]]
 name = "tang-gpu"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "bytemuck",
  "pollster 0.4.0",
@@ -3279,6 +3293,7 @@ dependencies = [
 [[package]]
 name = "tang-la"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
 ]
@@ -3286,6 +3301,7 @@ dependencies = [
 [[package]]
 name = "tang-optim"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
  "tang-ad",
@@ -3295,6 +3311,7 @@ dependencies = [
 [[package]]
 name = "tang-tensor"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
  "tang-la",
@@ -3303,6 +3320,7 @@ dependencies = [
 [[package]]
 name = "tang-train"
 version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=c9ef210498e5e3e14ee69257108f8112837de913#c9ef210498e5e3e14ee69257108f8112837de913"
 dependencies = [
  "tang",
  "tang-ad",
