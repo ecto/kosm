@@ -1,6 +1,8 @@
 # Rune: one cove, a glass being, one rune door
 
-Date: 2026-09-09. Status: design, nothing built.
+Date: 2026-09-09. Status: built the same day (see the plan and the commits
+on `claude/rune-game-brainstorm-9f5c1d`); the "What the cove taught us"
+section at the end records where the physics overruled the design.
 
 ## The claim
 
@@ -185,3 +187,34 @@ is what the court and the skatepark are.
 - The sea is a rendered plane with a wall. When the tide becomes the clock,
   the Zakharov far field and the MPM residual replace it, and the design
   for that is the pool's.
+
+## What the cove taught us (2026-09-09, after building it)
+
+The solver found that the cove as first authored had no solution, for two
+reasons that are geometry, not bugs:
+
+- A glass body of index n focuses at n·r/(2(n−1)), about 1.47 radii from
+  its own axis. Standing against a wall its axis is at least r away, so the
+  sun must be within 47° of the door's normal or the focus falls inside the
+  being's own shadow. Both sides scale with r, so no body size changes it.
+- Sunlight travels downward. The caustic can never land above the being's
+  head, so a keyhole at 1.5 m was out of reach of a 1.4 m being.
+
+The level now has the sun at 250° azimuth, the keyhole at 0.4 m, and a 1.0 m
+being; the solved pose leans 10°, the most the player can, and puts 42% of
+the sun through the keyhole. All 36 spawns in the sweep open the door.
+
+The consequence for the design: every solution has the being touching the
+door. "Stand in the right place on the beach" is not a real place puzzle
+with one lens of this focal length. The candidates for a puzzle that is:
+
+- a rune-shaped window scored by shape overlap, so distance sets the
+  caustic's width and the answer is a place, not a wall;
+- a fixed lens in the door, the being as its condenser;
+- the drinkable index: a lower n lengthens the focus (n = 1.15 gives 3.8 r).
+
+Also learned: the being renders as a tessellated capsule with analytic
+normals (a cylinder-plus-spheres boolean is tangential, the kernel's worst
+case), and the GPU tracer has no triangle path, so the live tier is the CPU
+integrator at 480×270 with the history filter kept on. The design's cel
+pass and the tide remain follow-ups.

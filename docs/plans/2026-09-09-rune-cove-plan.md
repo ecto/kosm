@@ -1,6 +1,8 @@
 # Rune cove: implementation plan
 
-Date: 2026-09-09. Design: `2026-09-09-rune-cove-design.md`. Status: not started.
+Date: 2026-09-09. Design: `2026-09-09-rune-cove-design.md`. Status: steps 1–7
+built and committed the same day; test 5 (GPU vs CPU) not written because the
+GPU tracer cannot trace the being's mesh, so the window runs the CPU tier.
 
 Eight steps. Each names the files it touches, what it builds on, and the
 check that says it is done. Steps 3, 4+5 and 6 are independent once 1 and 2
