@@ -1572,7 +1572,7 @@ version = "0.0.1"
 
 [[package]]
 name = "kosm-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "js-sys",
