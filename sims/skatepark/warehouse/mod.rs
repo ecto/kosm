@@ -1,10 +1,12 @@
-//! The warehouse: the skatepark's code over `warehouse.loon`.
+//! The warehouse: the skatepark's code over a bigger level.
+
+pub mod scene;
 
 #[cfg(test)]
 mod tests;
 
 /// `kosm run skatepark/warehouse`.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
-    let level = kosm::scene::AuthoredScene::bundled_path("warehouse.loon");
-    super::run_level(&level, args.out())
+    let built = scene::scene(&kosm::build::Params::default())?;
+    super::run_level("warehouse", built, args.out())
 }

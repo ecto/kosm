@@ -87,6 +87,31 @@ impl FromIterator<(String, f64)> for Params {
     }
 }
 
+/// A source of authored geometry: the document, what its roots are called,
+/// and where it came from. Implemented by [`Built`] and, while it lasts, by
+/// [`crate::scene::AuthoredScene`], so the bake and the parts walk take
+/// either.
+pub trait Authored {
+    fn document(&self) -> &Document;
+    /// The roots' names, in document order. vcad's `SceneEntry` carries a
+    /// material and nothing else, so the name lives with the author.
+    fn root_names(&self) -> Vec<String>;
+    /// What to record in a baked map's provenance.
+    fn origin(&self) -> String;
+}
+
+impl Authored for Built {
+    fn document(&self) -> &Document {
+        &self.document
+    }
+    fn root_names(&self) -> Vec<String> {
+        self.bodies.iter().map(|b| b.name.clone()).collect()
+    }
+    fn origin(&self) -> String {
+        format!("{} bodies built in rust", self.bodies.len())
+    }
+}
+
 /// What a build produced: the CAD, the knobs, the colliders, the world, and
 /// the recipe to do it again with a knob turned.
 pub struct Built {
@@ -396,6 +421,28 @@ impl Builder {
     /// Along +z, base at `z = 0`; `radius_top` of zero is a point.
     pub fn cone(&self, radius_bottom: f64, radius_top: f64, height: f64) -> Shape {
         self.shape(CsgOp::Cone { radius_bottom, radius_top, height, segments: 0 })
+    }
+
+    /// The box spanning `[x0, x1] × [y0, y1] × [z0, z1]`. Two opposite
+    /// corners, which is how a level usually knows where a thing goes.
+    pub fn box_at(&self, x: [f64; 2], y: [f64; 2], z: [f64; 2]) -> Shape {
+        self.cube(x[1] - x[0], y[1] - y[0], z[1] - z[0]).at(x[0], y[0], z[0])
+    }
+
+    /// A cylinder of radius `r` and length `l` lying along x, centred on the
+    /// origin.
+    pub fn rod_x(&self, r: f64, l: f64) -> Shape {
+        self.cylinder(r, l).rotate_y(90.0).at(-0.5 * l, 0.0, 0.0)
+    }
+
+    /// The same, along y.
+    pub fn rod_y(&self, r: f64, l: f64) -> Shape {
+        self.cylinder(r, l).rotate_x(90.0).at(0.0, 0.5 * l, 0.0)
+    }
+
+    /// The same, along z.
+    pub fn rod_z(&self, r: f64, l: f64) -> Shape {
+        self.cylinder(r, l).at(0.0, 0.0, -0.5 * l)
     }
 
     /// Nothing — the identity for union, and a body that is switched off.

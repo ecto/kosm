@@ -11,7 +11,7 @@ use phyz_math::Vec3;
 
 #[test]
 fn the_quarter_pipe_the_kicker_and_the_rail_are_what_the_level_says() {
-    let scene = SkateparkScene::load(kosm::scene::AuthoredScene::bundled_path("warehouse.loon")).expect("level loads");
+    let scene = SkateparkScene::of(super::scene::scene(&kosm::build::Params::default()).expect("level builds")).expect("level loads");
     let dir = std::env::temp_dir().join("kosm-warehouse-test");
     let baked = skatepark::bake(&scene, &dir).expect("bakes");
     let sdf = &baked.sdf;
@@ -26,7 +26,7 @@ fn the_quarter_pipe_the_kicker_and_the_rail_are_what_the_level_says() {
     // The +x quarter pipe, beside the door. It has no far wall and no flat of
     // its own, so the check moves to it: `check_x` is where its transition
     // meets the floor and `flat` is the run of clear floor in front of it.
-    let mut qp = SkateparkScene::load(kosm::scene::AuthoredScene::bundled_path("warehouse.loon")).expect("level loads");
+    let mut qp = SkateparkScene::of(super::scene::scene(&kosm::build::Params::default()).expect("level builds")).expect("level loads");
     qp.check_x = qp.authored.millimetres("qp_x_mm").expect("qp_x_mm");
     qp.check_y = -(qp.authored.millimetres("door_w_mm").expect("door_w_mm") / 2.0
         + qp.authored.millimetres("qp_gap_mm").expect("qp_gap_mm")

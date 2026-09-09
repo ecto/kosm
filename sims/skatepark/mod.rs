@@ -3,9 +3,9 @@
 //! ipse already has the skateboard and a K1 that rides it on a flat floor;
 //! its terrain is an `ipse-map` directory (a collision mesh and a signed
 //! distance grid baked from it) that a scenario file points at. This module
-//! is the park: [`levels/skatepark.loon`] authored as vcad geometry, its
-//! mesh baked with ipse-map's own baker into `out/maps/skatepark/`, and the
-//! physics of *that map* checked before a robot sees it.
+//! is the park: [`scene`] authored as vcad geometry in Rust, its mesh baked
+//! with ipse-map's own baker into `out/maps/skatepark/`, and the physics of
+//! *that map* checked before a robot sees it.
 //!
 //! The check is the court's e² test for a ramp. A wheel-sized solid sphere is
 //! set on the +x transition with its contact point `drop_mm` above the flat
@@ -30,18 +30,19 @@ use phyz_model::{Model, State};
 use rayon::prelude::*;
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
+use kosm::build::{Authored, Built, Params};
 use kosm::garage::marble_model;
 use kosm::materials;
-use kosm::scene::{AuthoredScene, MM};
+use kosm::scene::MM;
 
-pub const DEFAULT_SKATEPARK_SCENE: &str = "skatepark.loon";
+pub mod scene;
 
 /// Free-joint q is [wx, wy, wz, x, y, z]; the wheel is joint 0.
 const POS: usize = 3;
 
 /// The park's knobs, resolved to simulation units.
 pub struct SkateparkScene {
-    pub authored: AuthoredScene,
+    pub authored: Built,
     pub tr_r: f64,
     pub lip: f64,
     pub width: f64,
@@ -72,12 +73,13 @@ pub struct SkateparkScene {
 }
 
 impl SkateparkScene {
+    /// The mini ramp at its authored defaults.
     pub fn bundled() -> anyhow::Result<Self> {
-        Self::load(AuthoredScene::bundled_path(DEFAULT_SKATEPARK_SCENE))
+        Self::of(scene::scene(&Params::default())?)
     }
 
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let a = AuthoredScene::load(path)?;
+    /// The park's knobs, read off whatever level was built.
+    pub fn of(a: Built) -> anyhow::Result<Self> {
         let s = Self {
             tr_r: a.millimetres("tr_r_mm")?,
             lip: a.millimetres("lip_mm")?,
@@ -179,10 +181,10 @@ impl SkateparkScene {
 /// level's own order. `collides` says, from a root's material, whether the
 /// bake may see it: the park reads a `no-collide` prefix, the court has a
 /// list of appearance-only names, and the bake itself does not care which.
-pub fn parts_of(authored: &AuthoredScene, collides: &dyn Fn(&str) -> bool) -> anyhow::Result<Vec<Part>> {
+pub fn parts_of(authored: &dyn Authored, collides: &dyn Fn(&str) -> bool) -> anyhow::Result<Vec<Part>> {
     let opts = vcad_eval::EvalOptions { skip_clash_detection: true, ..Default::default() };
-    let scene = vcad_eval::evaluate_document(&authored.document, &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let names = root_names(authored.source());
+    let scene = vcad_eval::evaluate_document(authored.document(), &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let names = authored.root_names();
     let mut parts = Vec::with_capacity(scene.parts.len());
     for (i, part) in scene.parts.iter().enumerate() {
         let p = &part.mesh.positions;
@@ -225,18 +227,6 @@ impl Part {
     }
 }
 
-/// The root names, in document order, read off the Loon source: a root is
-/// written `[root <name> "<material>"]` and vcad keeps nothing but the
-/// material, so the name survives only in the text that produced it.
-fn root_names(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter_map(|line| line.trim_start().strip_prefix("[root "))
-        .filter_map(|rest| rest.split_whitespace().next())
-        .map(|name| name.trim_end_matches(']').to_string())
-        .collect()
-}
-
 /// A baked map directory.
 pub struct Baked {
     pub dir: PathBuf,
@@ -277,7 +267,7 @@ pub fn bake(scene: &SkateparkScene, dir: &Path) -> anyhow::Result<Baked> {
 /// Only colliding roots reach `mesh.stl` and the field. The drawn set is
 /// larger — a roof the K1 cannot touch is still a roof — so the two are
 /// written separately rather than one being filtered out of the other.
-pub fn bake_parts(authored: &AuthoredScene, parts: &[Part], opts: BakeOpts, dir: &Path) -> anyhow::Result<Baked> {
+pub fn bake_parts(authored: &dyn Authored, parts: &[Part], opts: BakeOpts, dir: &Path) -> anyhow::Result<Baked> {
     fs::create_dir_all(dir)?;
     write_parts(parts, dir)?;
     let (tris, mesh) = collision_mesh(parts)?;
@@ -297,13 +287,13 @@ pub fn bake_parts(authored: &AuthoredScene, parts: &[Part], opts: BakeOpts, dir:
         provenance: Some(Provenance {
             captured: None,
             device: Some("kosm".into()),
-            notes: Some(format!("baked from {}", authored.path().display())),
+            notes: Some(format!("baked from {}", authored.origin())),
         }),
         extent: opts.extent.map(|(lo, hi)| Extent { lo: [lo.x, lo.y, lo.z], hi: [hi.x, hi.y, hi.z] }),
     }
     .save(dir)
     .map_err(err)?;
-    let svg = vcad_render::render_svg_str(&authored.document.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
+    let svg = vcad_render::render_svg_str(&authored.document().to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
     fs::write(dir.join("park.svg"), svg)?;
     Ok(Baked { dir: dir.to_owned(), tris: tris.len(), parts: parts.len(), sdf })
 }
@@ -535,20 +525,20 @@ pub fn scenario_toml(scene: &SkateparkScene, map_dir: &Path) -> String {
     )
 }
 
-/// `kosm --skatepark [level]`: bake, check, report.
-pub fn run_level(level: &Path, out: &Path) -> anyhow::Result<()> {
-    let scene = SkateparkScene::load(level)?;
+/// Bake a built level, check it, report. `name` is what the baked map
+/// directory is called.
+pub fn run_level(name: &str, built: Built, out: &Path) -> anyhow::Result<()> {
+    let scene = SkateparkScene::of(built)?;
     for w in &scene.authored.warnings {
         eprintln!("skatepark warning: {w}");
     }
-    let stem = level.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "skatepark".into());
-    let dir = out.join("maps").join(&stem);
+    let dir = out.join("maps").join(name);
     let t0 = std::time::Instant::now();
     let baked = bake(&scene, &dir)?;
     let s = &baked.sdf;
     println!(
         "skatepark {}: {} roots, {} collision tris → {}  sdf {}×{}×{} at {:.0} mm cells ({:.0} MB), baked in {:.1} s",
-        level.display(),
+        name,
         baked.parts,
         baked.tris,
         dir.display(),
@@ -602,9 +592,5 @@ pub mod warehouse;
 
 /// `kosm run skatepark` — bake the park and ride it.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
-    let level = args
-        .value("level")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| kosm::scene::AuthoredScene::bundled_path("skatepark.loon"));
-    run_level(&level, args.out())
+    run_level("skatepark", scene::scene(&Params::default())?, args.out())
 }

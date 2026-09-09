@@ -104,6 +104,27 @@ impl AuthoredScene {
     }
 }
 
+impl crate::build::Authored for AuthoredScene {
+    fn document(&self) -> &Document {
+        &self.document
+    }
+
+    /// Root names, in document order, read off the Loon source: a root is
+    /// written `[root <name> "<material>"]`.
+    fn root_names(&self) -> Vec<String> {
+        self.source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("[root "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(|name| name.trim_end_matches(']').to_string())
+            .collect()
+    }
+
+    fn origin(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
