@@ -28,8 +28,9 @@ use phyz_math::Vec3;
 use crate::scene::{AuthoredScene, MM};
 use crate::skatepark::{self, BakeOpts, Part};
 
-pub mod being;
 pub mod bake;
+pub mod being;
+pub mod render;
 pub mod sim;
 #[cfg(test)]
 mod tests;
@@ -261,5 +262,38 @@ pub fn run(level: &Path, out: &Path) -> anyhow::Result<()> {
     );
     let sun = scene.sun_dir();
     println!("cove sun: toward ({:+.3}, {:+.3}, {:+.3}), {:.0}° azimuth and {:.0}° up", sun.x, sun.y, sun.z, scene.sun_az.to_degrees(), scene.sun_el.to_degrees());
-    bake::run(&scene, out)
+    bake::run(&scene, out)?;
+    still(&scene, &dir)
+}
+
+/// One picture of the cove: the being at the solved pose if there is one, at
+/// its spawn if there is not, standing on the sand and facing the door.
+///
+/// The solution is a solved parameter and starts at zero (see the document),
+/// so "not solved yet" is exactly "both knobs are zero" — and until step 4
+/// runs, what this draws is the being where the player finds it.
+fn still(scene: &CoveScene, dir: &Path) -> anyhow::Result<()> {
+    let a = &scene.authored;
+    let solved = scene.solution_x != 0.0 || scene.solution_y != 0.0;
+    let (x, y, tilt) = if solved {
+        (scene.solution_x, scene.solution_y, scene.solution_tilt)
+    } else {
+        (scene.spawn_x, scene.spawn_y, 0.0)
+    };
+    let placement = render::Placement::standing(scene, x, y, tilt);
+    let (w, h) = (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32);
+    let spp = std::env::var("KOSM_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(a.parameter_or("render_spp", 64.0) as usize);
+    let path = dir.join("frame.png");
+    let t0 = std::time::Instant::now();
+    render::frame(scene, &placement, (w, h), spp)?.save(&path)?;
+    println!(
+        "cove frame: the being {} at ({:+.2}, {:+.2}) m, leaning {:.1}°, facing the door; {w}×{h} at {spp} spp → {} in {:.1} s",
+        if solved { "at the solved pose" } else { "at its spawn (nothing solved yet)" },
+        x,
+        y,
+        tilt.to_degrees(),
+        path.display(),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
