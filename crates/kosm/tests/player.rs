@@ -9,7 +9,7 @@
 
 use std::f64::consts::PI;
 
-use kosm::player::body::{DRIVE_ASSIST, LEAN_MAX, TAU_ACCEL, TAU_STOP, UPRIGHT_OMEGA, WALK};
+use kosm::player::body::{DRIVE_ASSIST, HERO_MASS, LEAN_MAX, TAU_ACCEL, TAU_STOP, UPRIGHT_OMEGA, WALK};
 use kosm::player::{Air, Body, BodySpec, Drive, Ground, Netted, Plane, Skeleton, Tool};
 use phyz_math::{GRAVITY, Vec3};
 
@@ -245,6 +245,58 @@ fn the_hand_reaches_and_the_tool_follows_it() {
     let after = body.held().unwrap().0.pos;
     println!("reach  the tool travelled {:.0} mm with the walk", (after - before).norm() * 1e3);
     assert!((after - before).norm() > 0.2, "the held tool did not travel with the body");
+}
+
+/// What the figure weighs, and what it would weigh if nobody had said.
+///
+/// `sims/rune/hero/figure.rs` authors a costume out of *overlapping solid
+/// balls*: the head reaches down into the chest, the chest sits inside the
+/// skirt, the boots inside the shins. Summing the parts weighs every overlap
+/// twice and fills every one of them solid, and at the substances' own
+/// densities that is a hundred kilogrammes of 1.11 m adventurer. The mass is
+/// therefore a target — `Skeleton::mass_kg` — and `BodySpec::hero` hits it by
+/// scaling every density by the one ratio that does, which leaves where the
+/// mass sits exactly where the substances put it.
+///
+/// **What moved when it was turned on: the mass, and nothing else.** At
+/// 101.9 kg and at 30.0 kg the centre of mass is the same 583 mm up and 4 mm
+/// forward, and every other number this file prints is the same to the digit
+/// it prints — the hero still settles at 1.410 m/s with a 0.276 s rise and a
+/// 0.349 s stop, still leans 1.82° into a start, still comes back from 20° in
+/// 0.89 s, still stands with a tenth of a millimetre of drift. The upright
+/// spring is what moved: `k` from 2.30 to 0.68 kN·m/rad and `c` from 0.57 to
+/// 0.17 kN·m·s/rad, both by exactly 0.2943. That is the point of scaling
+/// densities rather than retuning: the controller's constants are `ω` and
+/// `τ`, and a torque that falls with the inertia it is holding up leaves both
+/// alone.
+#[test]
+fn the_hero_weighs_what_a_small_adventurer_weighs() {
+    let bare = BodySpec::hero(&Skeleton { mass_kg: None, ..Skeleton::demo_hero() });
+    let loose: f64 = bare.links.iter().flat_map(|l| &l.lumps).map(|l| l.mass()).sum();
+    let body = hero();
+    let com = body.consts().com;
+    println!(
+        "mass   the parts add up to {loose:.1} kg; the target is {HERO_MASS:.1} kg and the body weighs {:.1} kg            centre of mass {:.0} mm up, {:.0} mm forward   k {:.2} kN·m/rad   c {:.2} kN·m·s/rad",
+        body.mass(),
+        body.consts().com_height * 1e3,
+        com.x * 1e3,
+        body.upright_spring().0 / 1e3,
+        body.upright_spring().1 / 1e3,
+    );
+    assert!((body.mass() - HERO_MASS).abs() < 1e-6, "the hero weighs {:.3} kg, not {HERO_MASS}", body.mass());
+    assert!((25.0..=35.0).contains(&HERO_MASS), "a 1.11 m figure of cloth and leather is 25-35 kg");
+    // The scale is a scale: it moves the mass and leaves the distribution.
+    let unscaled = Body::new(bare.with_dt(DT));
+    assert!(
+        (unscaled.consts().com_height - body.consts().com_height).abs() < 1e-9,
+        "scaling the densities moved the centre of mass from {:.4} m to {:.4} m",
+        unscaled.consts().com_height,
+        body.consts().com_height
+    );
+    // and the spring falls by exactly the same ratio, so ω and τ do not move
+    let ratio = body.upright_spring().0 / unscaled.upright_spring().0;
+    println!("mass   the upright spring scaled by {ratio:.4}, the mass by {:.4}", HERO_MASS / loose);
+    assert!((ratio - HERO_MASS / loose).abs() < 1e-6, "the spring scaled by {ratio}, the mass by {}", HERO_MASS / loose);
 }
 
 // ---- the capsule is the cove's being ----------------------------------------

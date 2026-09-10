@@ -48,6 +48,9 @@ use kosm_render::{Hit, Ray};
 use kosm_render::{Bvh, Frame, Prim};
 
 use super::CoveScene;
+use kosm::player::body::{hand_for, parts_for};
+use kosm::player::{BodySpec, Part, Pose as LinkPose};
+use phyz_math::Mat3;
 
 /// The real sun's angular radius, radians. A wider disc would soften the
 /// terminator, which is a nicer picture and a blurrier focus; the rune is
@@ -330,17 +333,25 @@ fn capsule_hits(a: Point3, b: Point3, r: f64, ray: &Ray, out: &mut impl FnMut(f6
 /// below the keyhole shows up as sand instead of as silence.
 pub fn picture(scene: &CoveScene, pose: &Pose) -> Scene<Pieces> {
     let (a, b, r) = being_capsule(scene, pose);
-    picture_of(scene, Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r })
+    picture_of(scene, Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r }, &[])
 }
 
-/// The same scene with any one refractor in it: the being's capsule, or the
-/// lens the hero is holding.
+/// The same scene with any one refractor in it and any number of opaque
+/// bodies beside it: the being's capsule, or the lens the hero is holding and
+/// the hero standing behind it.
 ///
 /// The door and the sand do not care which body throws the caustic, and the
 /// score does not either — it reads the power inside the aperture disc and
 /// divides by the power the sun put into the refractor. So there is one
 /// scene, and [`Piece`] is what changes.
-pub fn picture_of(scene: &CoveScene, refractor: Piece) -> Scene<Pieces> {
+///
+/// `occluders` is the part of that which is *not* optional once the refractor
+/// is small: a lens 220 mm across held beside a head 456 mm across is a lens
+/// that its owner can stand in front of, and a score that did not know it
+/// would happily solve for a pose whose light never reaches the glass. They
+/// are plain diffuse solids — the sun's photons stop there, and nothing is
+/// read off them.
+pub fn picture_of(scene: &CoveScene, refractor: Piece, occluders: &[Piece]) -> Scene<Pieces> {
     let being = Pieces(vec![refractor]);
 
     let face = scene.cliff_face_y();
@@ -362,25 +373,24 @@ pub fn picture_of(scene: &CoveScene, refractor: Piece) -> Scene<Pieces> {
     })]);
 
     let sun = Sun::new(scene.sun_dir(), SUN_ANGULAR_RADIUS, SUN_IRRADIANCE);
-    Scene {
-        objects: vec![
-            // The being's index is the document's `n_d`, flat. A dispersion
-            // curve would be more honest to look at and would put a hero
-            // wavelength on every photon; over a 0.5 m focal length N-BK7
-            // moves that focus by under two millimetres across the visible,
-            // which is nothing against a 120 mm keyhole, and the variance it
-            // adds is not nothing against a number a search differentiates.
-            // `hint.rs` traces the five bands and says how much it costs.
-            Object::new(Arc::new(Bvh::build(being)), Pbr::glass(scene.n_d as f32, 0.0)),
-            Object::new(Arc::new(Bvh::build(door)), Pbr::plastic([0.42, 0.41, 0.39], 0.9, 0.0)),
-            Object::new(Arc::new(Bvh::build(sand)), Pbr::plastic([0.76, 0.70, 0.56], 0.95, 0.0)),
-        ],
-        lights: Vec::new(),
-        env: Environment::default(),
-        sun: Some(sun),
-        ground: None,
-        splats: None,
+    // The being's index is the document's `n_d`, flat. A dispersion curve
+    // would be more honest to look at and would put a hero wavelength on
+    // every photon; over a 0.5 m focal length N-BK7 moves that focus by under
+    // two millimetres across the visible, which is nothing against a 120 mm
+    // keyhole, and the variance it adds is not nothing against a number a
+    // search differentiates. `hint.rs` traces the five bands and says how much
+    // it costs.
+    let mut objects = Vec::with_capacity(4);
+    objects.push(Object::new(Arc::new(Bvh::build(being)), Pbr::glass(scene.n_d as f32, 0.0)));
+    objects.push(Object::new(Arc::new(Bvh::build(door)), Pbr::plastic([0.42, 0.41, 0.39], 0.9, 0.0)));
+    objects.push(Object::new(Arc::new(Bvh::build(sand)), Pbr::plastic([0.76, 0.70, 0.56], 0.95, 0.0)));
+    if !occluders.is_empty() {
+        // One BVH for all of them, and a dull matte: what they are for is
+        // stopping light, and a photon that ends on cloth ends.
+        let body = Pieces(occluders.to_vec());
+        objects.push(Object::new(Arc::new(Bvh::build(body)), Pbr::plastic([0.20, 0.22, 0.24], 0.95, 0.0)));
     }
+    Scene { objects, lights: Vec::new(), env: Environment::default(), sun: Some(sun), ground: None, splats: None }
 }
 
 /// What the door read.
@@ -404,6 +414,7 @@ pub fn trace(scene: &CoveScene, pose: &Pose, photons: usize) -> (CausticMap, Sco
     read(
         scene,
         Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r },
+        &[],
         projected_area(scene, pose),
         photons,
     )
@@ -467,20 +478,33 @@ pub fn lens_projected_area(scene: &CoveScene, held: &Held) -> f64 {
     std::f64::consts::PI * h * h * cos + 2.0 * h * thickness * (1.0 - cos * cos).max(0.0).sqrt()
 }
 
-/// The caustic map the held lens throws, and the score read off it.
-pub fn trace_lens(scene: &CoveScene, held: &Held, photons: usize) -> (CausticMap, Score) {
-    read(scene, lens_piece(held), lens_projected_area(scene, held), photons)
+/// The caustic map the held lens throws, and the score read off it, with
+/// whatever else is standing in the light.
+pub fn trace_lens(scene: &CoveScene, held: &Held, occluders: &[Piece], photons: usize) -> (CausticMap, Score) {
+    read(scene, lens_piece(held), occluders, lens_projected_area(scene, held), photons)
 }
 
-/// The rune's score with the lens as the refractor.
+/// The rune's score with the lens as the refractor and nothing shadowing it.
 pub fn score_lens(scene: &CoveScene, held: &Held, photons: usize) -> Score {
-    trace_lens(scene, held, photons).1
+    trace_lens(scene, held, &[], photons).1
+}
+
+/// The rune's score with the lens as the refractor and a body behind it.
+///
+/// The one entry point the live gate and the hero's solve both go through:
+/// give it a lens somewhere in the world and the opaque solids that can stand
+/// between it and the sun, and it answers the same `frac` the capsule's score
+/// answers. Where the lens *came from* — a solved [`HeroPose`], or the arm of
+/// a body that is being walked about by a player — is the caller's business
+/// and not the tracer's.
+pub fn score_lens_at(scene: &CoveScene, held: &Held, occluders: &[Piece], photons: usize) -> Score {
+    trace_lens(scene, held, occluders, photons).1
 }
 
 /// One refractor, one denominator, one reading of the keyhole. What both
 /// [`trace`] and [`trace_lens`] are.
-fn read(scene: &CoveScene, refractor: Piece, area: f64, photons: usize) -> (CausticMap, Score) {
-    let picture = picture_of(scene, refractor);
+fn read(scene: &CoveScene, refractor: Piece, occluders: &[Piece], area: f64, photons: usize) -> (CausticMap, Score) {
+    let picture = picture_of(scene, refractor, occluders);
     let map = kosm_render::caustics::trace(
         &picture,
         &CausticOptions { photons, radius: Some(0.02), max_bounces: 8, ..Default::default() },
@@ -522,6 +546,267 @@ pub fn landing(scene: &CoveScene, map: &CausticMap, cell: f64) -> Option<([f64; 
         }
     }
     (w > 0.0).then(|| ([mr / w, mu / w], w))
+}
+
+// ─── the hero, and where it holds the glass ───────────────────────────────
+
+/// The knobs the **hero** has.
+///
+/// Six, and every one of them is something a person standing on a beach can
+/// do: walk somewhere (`x`, `y`), turn (`yaw`), hold the lens up at some lift
+/// and swing of the arm (`aim_el`, `aim_az`, measured at the shoulder in the
+/// body's own frame), and turn the glass in its fist (`cant`). There is no z
+/// — the hero stands *on* the sand — and there is no lean, because a lean is
+/// what the walk does to a body and not a thing the puzzle is solved with.
+///
+/// This is the capsule's [`Pose`] grown legs. Where the capsule's whole body
+/// was the lens and a tilt was the only aim it had, the hero's lens is 220 mm
+/// of crown glass on the end of a 404 mm arm, and *where the arm puts it* is
+/// most of the puzzle: the chief ray through the lens's centre is what
+/// decides where the caustic lands, so `aim_el` moves the answer twice as far
+/// as walking does. Radians and metres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeroPose {
+    pub x: f64,
+    pub y: f64,
+    /// Which way it faces, radians, zero along `+x` — [`kosm::player::Body`]'s
+    /// own convention, so a pose read off a body and a pose handed to one are
+    /// the same number.
+    pub yaw: f64,
+    /// The arm's lift and swing at the shoulder, radians, in the body's frame
+    /// (`+x` forward, `+y` left, `+z` up). A negative swing is out to the
+    /// hero's right, which is the hand the lens is in.
+    pub aim_el: f64,
+    pub aim_az: f64,
+    /// The turn of the wrist: how far the glass is canted off the forearm's
+    /// line. See `being::lens_grip`.
+    pub cant: f64,
+}
+
+impl Default for HeroPose {
+    /// Standing at the origin facing `+x`, holding the lens the way
+    /// `being.rs` holds it. The knobs the level ships before it is solved.
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            yaw: 0.0,
+            aim_el: super::being::LENS_AIM_EL,
+            aim_az: super::being::LENS_AIM_AZ,
+            cant: 0.0,
+        }
+    }
+}
+
+impl HeroPose {
+    /// The pose the document last recorded as solved.
+    pub fn solution(scene: &CoveScene) -> Self {
+        Self {
+            x: scene.hero_x,
+            y: scene.hero_y,
+            yaw: scene.hero_yaw,
+            aim_el: scene.hero_aim_el,
+            aim_az: scene.hero_aim_az,
+            cant: scene.hero_cant,
+        }
+    }
+
+    /// Whether the document has a hero solution at all: an unsolved level
+    /// ships zeros for where it stands, and nobody solves for the origin.
+    pub fn is_solved(&self) -> bool {
+        self.x != 0.0 || self.y != 0.0
+    }
+
+    /// The same pose, turned to face a point on the sand.
+    ///
+    /// A hero solving the rune is looking at the door, and the yaw that does
+    /// that is a function of where it is standing rather than a seventh
+    /// number for a search to wander in.
+    pub fn facing(self, at: Vec3) -> Self {
+        Self { yaw: (at.y - self.y).atan2(at.x - self.x), ..self }
+    }
+
+    /// One knob, by index: 0 x, 1 y, 2 yaw, 3 aim_el, 4 aim_az, 5 cant.
+    pub fn knob(&mut self, k: usize) -> &mut f64 {
+        match k {
+            0 => &mut self.x,
+            1 => &mut self.y,
+            2 => &mut self.yaw,
+            3 => &mut self.aim_el,
+            4 => &mut self.aim_az,
+            _ => &mut self.cant,
+        }
+    }
+}
+
+/// The hero's root frame — the pelvis — standing upright on the sand.
+///
+/// Upright, and that is the one thing this arithmetic asserts that a stepped
+/// body does not quite honour: a figure holding an arm up leans a fraction of
+/// a degree into it. `rune_tests` measures the gap.
+pub fn hero_root(scene: &CoveScene, pose: &HeroPose) -> LinkPose {
+    let rig = &*super::being::HERO_RIG;
+    let z = scene.sand_z_at(pose.x, pose.y) + rig.foot_drop;
+    LinkPose::new(Vec3::new(pose.x, pose.y, z), Mat3::rotation_z(pose.yaw))
+}
+
+/// Where the gripping hand is asked to go, world metres: the same point
+/// `being::Cove::hold_lens_up` asks the arm for, off the same shoulder.
+pub fn hero_aim(scene: &CoveScene, pose: &HeroPose) -> Vec3 {
+    let rig = &*super::being::HERO_RIG;
+    let spec = &rig.spec;
+    let arm = spec.arm.expect("the hero has an arm");
+    let out = super::being::LENS_REACH * (arm.upper + arm.lower);
+    let local = spec.links[arm.shoulder].pivot + super::being::lens_aim_dir(pose.aim_el, pose.aim_az) * out
+        - spec.links[0].pivot;
+    let root = hero_root(scene, pose);
+    root.pos + root.rot.mul_vec(local)
+}
+
+/// Where the hand ends up, world: the two-link solve and the forward
+/// kinematics under it, with no dynamics — [`kosm::player::body::hand_for`].
+pub fn hero_hand(scene: &CoveScene, pose: &HeroPose) -> LinkPose {
+    let rig = &*super::being::HERO_RIG;
+    hand_for(&rig.spec, hero_root(scene, pose), hero_aim(scene, pose)).expect("the hero has an arm")
+}
+
+/// Every link of the figure, placed at a [`HeroPose`]: the rig at rest with
+/// the lens arm solved. What the still draws the solution from.
+pub fn hero_parts(scene: &CoveScene, pose: &HeroPose) -> Vec<Part> {
+    let rig = &*super::being::HERO_RIG;
+    parts_for(&rig.spec, hero_root(scene, pose), Some(hero_aim(scene, pose)))
+}
+
+/// The glass, where the hero is holding it: the centre and the optical axis.
+///
+/// The hand, then the grip. This is the whole of the map from the puzzle's
+/// six knobs to the one thing the light cares about, and it is the same two
+/// steps [`kosm::player::Body::held`] takes on a body that has been stepped —
+/// which is what `rune_tests` holds it to.
+pub fn hero_lens(scene: &CoveScene, pose: &HeroPose) -> Held {
+    let placed = hero_lens_pose(scene, pose);
+    Held { centre: placed.pos, axis: placed.rot.mul_vec(Vec3::z()) }
+}
+
+/// The same, as a whole frame: what the *picture* needs, because a disc of
+/// glass has a rim as well as an axis. `+z` is the optical axis, which is
+/// what `hero/kit.rs` cuts the lens about.
+pub fn hero_lens_pose(scene: &CoveScene, pose: &HeroPose) -> LinkPose {
+    super::being::lens_grip(pose.cant).then(&hero_hand(scene, pose))
+}
+
+/// Which of the hero's links can stand between the sun and the glass: the
+/// skirt, the chest and the head.
+///
+/// The trunk and not the whole figure. An arm that is holding a lens up is
+/// beside it and not behind it, the legs are half a metre below the light,
+/// and every extra solid is a BVH the photon pass walks a million times. The
+/// three that matter are the three that are *big*: on a 1.11 m frame the head
+/// alone is 456 mm across.
+const SHADES: [&str; 3] = ["pelvis", "torso", "neck"];
+
+/// The hero's trunk as opaque [`Piece`]s, from wherever its links actually
+/// are. `parts` is [`kosm::player::Snapshot::parts`], in the spec's link
+/// order.
+pub fn occluders(spec: &BodySpec, parts: &[Part]) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for (i, link) in spec.links.iter().enumerate() {
+        if !SHADES.contains(&link.name.as_str()) {
+            continue;
+        }
+        let Some(part) = parts.get(i) else { continue };
+        for lump in &link.lumps {
+            let at = |p: Vec3| part.pose.pos + part.pose.rot.mul_vec(p - link.pivot);
+            out.push(Piece::Capsule {
+                a: Point3::from_vec(at(lump.from)),
+                b: Point3::from_vec(at(lump.to)),
+                r: lump.radius,
+            });
+        }
+    }
+    out
+}
+
+/// The same, for a hero standing at a [`HeroPose`].
+pub fn hero_occluders(scene: &CoveScene, pose: &HeroPose) -> Vec<Piece> {
+    let rig = &*super::being::HERO_RIG;
+    occluders(&rig.spec, &hero_parts(scene, pose))
+}
+
+/// The lens's centre in the **hero's own frame**, relative to the point its
+/// boots are on: what the arm and the wrist alone decide.
+///
+/// Read off [`hero_lens`] at the origin facing `+x`, so there is one
+/// statement of the kinematics and this is a projection of it rather than a
+/// second one. The sand's height cancels: it enters `hero_root` and comes
+/// straight back out.
+pub fn hero_lens_local(scene: &CoveScene, pose: &HeroPose) -> Vec3 {
+    let at_origin = HeroPose { x: 0.0, y: 0.0, yaw: 0.0, ..*pose };
+    hero_lens(scene, &at_origin).centre - Vec3::new(0.0, 0.0, scene.sand_z_at(0.0, 0.0))
+}
+
+/// Where the hero has to stand for the lens it is holding to put the sun in
+/// the keyhole, and which way it has to face. The seed the solve starts from.
+///
+/// One equation, and it is `hero/mod.rs`'s. An ideal lens images a parallel
+/// bundle at the point where its own **chief ray** — the one through the
+/// centre of the glass, which is undeviated — crosses the focal plane, and
+/// tilting the lens moves that point along the chief ray and nowhere else. So
+/// the sun's image lands on the line that leaves the lens's centre along the
+/// sunbeam, whatever the glass is doing, and staging this is two lines:
+///
+/// ```text
+/// lens_z + k_z·(lens_y − face_y) = aim_z          k_z = −d_z/d_y, d the sunbeam
+/// lens_x − k_x·(lens_y − face_y) = door_x         k_x =  d_x/d_y
+/// ```
+///
+/// with the boots on the sand (`z = sand_z(y)`) and the lens wherever the arm
+/// has put it. The first solves for `y` and the second for `x`. Facing
+/// depends on position and position on facing — the arm holds the glass out
+/// to the hero's right, so turning the hero moves the glass — so it is
+/// iterated; six turns is far past convergence for a yaw that only ever moves
+/// thirty degrees.
+///
+/// At the cove's 22° sun and a 1.11 m adventurer with a 404 mm arm this lands
+/// the hero about **1.25 m** from the door, which is `hero/mod.rs`'s own
+/// number and is not 2.5 m: at 2.5 m the glass would have to be 1.48 m over
+/// the sill, 370 mm above the crown of the head holding it. The 2.5 m the
+/// brief asked for is in the *lens* instead, where it belongs — `f = 2.5 m`,
+/// so at this throw the cone has closed to a hundred-millimetre ellipse
+/// beside a 240 mm keyhole.
+pub fn hero_doorstep(scene: &CoveScene, hold: &HeroPose) -> HeroPose {
+    let d = -scene.sun_dir();
+    let face = scene.cliff_face_y();
+    let aim_z = scene.door_sill() + scene.aperture_z;
+    if d.y.abs() < 1e-9 {
+        return *hold;
+    }
+    let (kx, kz) = (d.x / d.y, -d.z / d.y);
+    let local = hero_lens_local(scene, hold);
+    let (lx, ly, lz) = (local.x, local.y, local.z);
+    let door = scene.door_frame().origin;
+    let mut pose = HeroPose { x: scene.door_x, y: face - 1.25, ..*hold };
+    for _ in 0..6 {
+        let (s, c) = pose.yaw.sin_cos();
+        // the lens's own y and z, as functions of where the boots are
+        let y = (aim_z - scene.sea_z + scene.beach_slope * scene.waterline() - lz - kz * (lx * s + ly * c - face))
+            / (scene.beach_slope + kz);
+        let lens_y = y + lx * s + ly * c;
+        let x = scene.door_x + kx * (lens_y - face) - (lx * c - ly * s);
+        pose = HeroPose { x, y, ..pose }.facing(door);
+    }
+    pose
+}
+
+/// The rune's score for a hero at a pose: the caustic its lens throws, with
+/// its own head and trunk in the light.
+pub fn score_hero(scene: &CoveScene, pose: &HeroPose, photons: usize) -> Score {
+    score_lens_at(scene, &hero_lens(scene, pose), &hero_occluders(scene, pose), photons)
+}
+
+/// The caustic map as well as the number, for the diagnostics.
+pub fn trace_hero(scene: &CoveScene, pose: &HeroPose, photons: usize) -> (CausticMap, Score) {
+    trace_lens(scene, &hero_lens(scene, pose), &hero_occluders(scene, pose), photons)
 }
 
 // ─── the solve ────────────────────────────────────────────────────────────
@@ -697,6 +982,299 @@ pub fn solve_within(scene: &CoveScene, photons: usize, margin: f64) -> (Pose, Sc
 /// The plan's solve: the grid it specifies, two metres off the cliff.
 pub fn solve(scene: &CoveScene, photons: usize) -> (Pose, Score) {
     solve_within(scene, photons, 2.0)
+}
+
+// ─── the hero's solve ─────────────────────────────────────────────────────
+
+/// How close to the cliff face the hero's boots may get, metres. Its skirt is
+/// 268 mm across and it leans into the door: half a metre is standing at it,
+/// not standing in it.
+const HERO_MARGIN: f64 = 0.50;
+
+/// Every pose the hero's search may hold, clamped: on the beach, facing the
+/// door, with an arm that can only lift so far and a wrist that can only turn
+/// so far.
+fn hero_clamp(scene: &CoveScene, p: HeroPose) -> HeroPose {
+    let door = scene.door_frame().origin;
+    HeroPose {
+        x: p.x.clamp(scene.door_x - 8.0, scene.door_x + 8.0),
+        y: p.y.clamp(scene.waterline() + 2.0, scene.cliff_face_y() - HERO_MARGIN),
+        aim_el: p.aim_el.clamp(0.0, 1.40),
+        cant: p.cant.clamp(-std::f64::consts::PI, std::f64::consts::PI),
+        ..p
+    }
+    .facing(door)
+}
+
+/// How much better than `open_frac` the solve wants the score before it will
+/// spend any of it on standing further back, as a multiple.
+///
+/// `open_frac` is the *door's* threshold — the least light that turns the
+/// lock — and a level whose authored answer sits on it is a level that fails
+/// the first time a body leans two degrees into the arm it is holding up.
+/// Two and a half is the door open with room to spare; past it there is
+/// nothing to buy, because light already well inside a 240 mm keyhole does
+/// not read as more light. Under it, the score is the only thing that counts.
+const HERO_COMFORT: f64 = 2.5;
+
+/// How far off the cliff face is far enough to stop paying for, metres.
+///
+/// The lens's own focal length. Past it the sun's image is behind the door
+/// and the patch opens out again, so there is nothing to buy; short of it
+/// there is, and the whole of the puzzle is that the hero has to find the
+/// place.
+const HERO_STANDOFF_ENOUGH: f64 = 2.5;
+
+/// What the hero's solve maximises: the score up to a gate, and how far from
+/// the cliff the hero is standing.
+///
+/// **Not the score alone**, and the reason is that the cove is a *place*
+/// puzzle. The score has a broad plateau — at the doorstep the sun's image is
+/// smaller than the keyhole, so once the beam is on it, walking a hand's
+/// breadth either way is free — and on a plateau an optimiser goes wherever
+/// its last step was pointing. The first solve went to 0.58 m off the face,
+/// eighty millimetres from the clamp, which is a hero standing *in* the door
+/// rather than at it: nothing to walk to, nothing to line up, and a still
+/// with a figure's nose against the stone.
+///
+/// So the score is capped at [`HERO_COMFORT`] times `open_frac` and the rest
+/// of the merit is standoff, at four points of frac a metre up to
+/// [`HERO_STANDOFF_ENOUGH`]. Capping and not weighting: a weighted sum trades
+/// score for distance at a fixed exchange rate all the way down, and there is
+/// no rate at which a shut door is worth a longer walk. A cap says the two
+/// things in the right order — under it only the score counts, so the search
+/// finds the door first; over it the score is flat and only the walk counts —
+/// and it is why the bonus can be small. A tenth of frac is the whole of it,
+/// which is under the cap itself, so a pose that does not open the door can
+/// never outrank one that does however far down the beach it stands.
+///
+/// What it is worth on this level: the solve without it stood **0.58 m** off
+/// the face, eighty millimetres from the clamp, at frac 0.92; with it, 1.2 m
+/// off at frac 0.79. The second is `hero/mod.rs`'s own chief-ray answer to
+/// within a hand's breadth, which is the arithmetic and the search agreeing
+/// for the first time.
+fn hero_merit(scene: &CoveScene, pose: &HeroPose, s: &Score) -> f64 {
+    let gate = (scene.open_frac * HERO_COMFORT).min(1.0);
+    let standoff = (scene.cliff_face_y() - pose.y).clamp(0.0, HERO_STANDOFF_ENOUGH);
+    s.frac.min(gate) + 0.04 * standoff
+}
+
+/// Solve for the pose whose lens puts the sun in the keyhole, as far back
+/// from it as the light allows.
+///
+/// Three passes, and the first of them is not a search at all.
+///
+/// 1. **The chief ray.** [`hero_doorstep`] stages the hero analytically for
+///    each way of *holding* the glass — a lens images a parallel bundle where
+///    its own undeviated chief ray crosses the focal plane, so given a lift
+///    and a cant there is exactly one place on the beach to stand, and it is
+///    a division rather than a sweep. The coarse pass is therefore over the
+///    two knobs the hero chooses, `aim_el` and `cant`, with the two that
+///    follow from them solved. A blind grid over `x` and `y` would spend
+///    ninety-nine cells in a hundred confirming that a beam aimed at the sea
+///    lands in the sea.
+/// 2. **The grid the plan asks for**, around the best of those: `x`, `y`,
+///    `aim_el` and `cant` together, on a cheap photon budget. This is what
+///    says whether the analytic staging left anything on the table — it is
+///    exact for a *thin* lens and the hero's is 4.7 mm thick, and it knows
+///    nothing about the hero's own shadow.
+/// 3. **Nelder and Mead's simplex** on the full budget, in the same four.
+///
+/// All three rank on [`hero_merit`] and not on the score: the score is flat
+/// over most of the doorstep and would leave the hero wherever the last step
+/// happened to point, which on the first pass of this was eighty millimetres
+/// from the clamp. What comes out instead is the pose that stands *furthest
+/// back* among those that open the door with room to spare — and because the
+/// only way to stand further back is to hold the glass higher, the answer is
+/// the arm at its limit, which is the same place `hero/mod.rs`'s chief-ray
+/// arithmetic put it.
+///
+/// Prints as it goes. `yaw` is not searched: a hero solving the rune is
+/// looking at the door, and [`HeroPose::facing`] is that. `aim_az` is not
+/// searched either — it is how a person holds a lens up and out of their own
+/// way, not a thing they tune — and it is recorded so that the level can say
+/// what it was.
+pub fn solve_hero(scene: &CoveScene, photons: usize) -> (HeroPose, Score) {
+    let coarse = (photons / 5).max(20_000).min(photons);
+    let start = HeroPose { aim_el: scene.hero_aim_el, aim_az: scene.hero_aim_az, ..Default::default() };
+
+    // 1. the chief ray, for every way of holding the glass
+    let mut best = hero_clamp(scene, hero_doorstep(scene, &start));
+    let mut best_score = score_hero(scene, &best, coarse);
+    let mut best_merit = hero_merit(scene, &best, &best_score);
+    println!(
+        "rune hero  the chief ray stages it {:.3} m off the face at ({:+.3}, {:+.3}) m: {:.5}",
+        scene.cliff_face_y() - best.y,
+        best.x,
+        best.y,
+        best_score.frac
+    );
+    for iel in 0..13 {
+        let aim_el = (20.0 + 5.0 * iel as f64).to_radians();
+        let (mut row, mut row_off) = (0.0f64, 0.0f64);
+        for ic in 0..13 {
+            let cant = (15.0 * ic as f64).to_radians();
+            let hold = HeroPose { aim_el, cant, ..start };
+            let pose = hero_clamp(scene, hero_doorstep(scene, &hold));
+            let s = score_hero(scene, &pose, coarse);
+            let m = hero_merit(scene, &pose, &s);
+            if s.frac > row {
+                row = s.frac;
+                row_off = scene.cliff_face_y() - pose.y;
+            }
+            if m > best_merit {
+                best = pose;
+                best_score = s;
+                best_merit = m;
+            }
+        }
+        println!(
+            "rune hero  holding {:+5.1}° up: best in the row {row:.5} at {row_off:.2} m off   best so far {:.5} at ({:+.3}, {:+.3}) m — {:.2} m off — {:+.1}° up, {:+.1}° canted",
+            aim_el.to_degrees(),
+            best_score.frac,
+            best.x,
+            best.y,
+            scene.cliff_face_y() - best.y,
+            best.aim_el.to_degrees(),
+            best.cant.to_degrees()
+        );
+    }
+
+    // 2. the grid, in all four, around it
+    let seed = best;
+    for ix in -3..=3 {
+        for iy in -3..=3 {
+            for iel in -2..=2 {
+                for ic in -2..=2 {
+                    let pose = hero_clamp(
+                        scene,
+                        HeroPose {
+                            x: seed.x + 0.25 * ix as f64,
+                            y: seed.y + 0.25 * iy as f64,
+                            aim_el: seed.aim_el + (4.0 * iel as f64).to_radians(),
+                            cant: seed.cant + (12.0 * ic as f64).to_radians(),
+                            ..seed
+                        },
+                    );
+                    let s = score_hero(scene, &pose, coarse);
+                    let m = hero_merit(scene, &pose, &s);
+                    if m > best_merit {
+                        best = pose;
+                        best_score = s;
+                        best_merit = m;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "rune hero  grid  {:.5} at ({:+.3}, {:+.3}) m — {:.2} m off the face — {:+.1}° up, {:+.1}° canted",
+        best_score.frac,
+        best.x,
+        best.y,
+        scene.cliff_face_y() - best.y,
+        best.aim_el.to_degrees(),
+        best.cant.to_degrees()
+    );
+
+    // 3. the simplex, on the full budget. Degrees for the two angles, so a
+    // step of one is the same size of move as a step of one metre is not —
+    // but is the size a *person* would call small in each.
+    let unit = std::f64::consts::PI / 180.0;
+    let mut evals = 0usize;
+    let read = |v: &[f64]| {
+        hero_clamp(scene, HeroPose { x: v[0], y: v[1], aim_el: v[2] * unit, cant: v[3] * unit, ..best })
+    };
+    let mut f = |v: &[f64]| -> f64 {
+        evals += 1;
+        let pose = read(v);
+        -hero_merit(scene, &pose, &score_hero(scene, &pose, photons))
+    };
+    let (v, _) = nelder_mead(
+        &mut f,
+        &[best.x, best.y, best.aim_el / unit, best.cant / unit],
+        &[0.15, 0.15, 3.0, 8.0],
+        160,
+    );
+    let pose = read(&v);
+    let s = score_hero(scene, &pose, photons);
+    println!(
+        "rune hero  simplex  {evals} evaluations at {photons} photons: {:.5} at ({:+.3}, {:+.3}) m — {:.2} m off the face — {:+.1}° up, {:+.1}° canted, facing {:+.1}°",
+        s.frac,
+        pose.x,
+        pose.y,
+        scene.cliff_face_y() - pose.y,
+        pose.aim_el.to_degrees(),
+        pose.cant.to_degrees(),
+        pose.yaw.to_degrees()
+    );
+    if hero_merit(scene, &pose, &s) >= best_merit { (pose, s) } else { (best, best_score) }
+}
+
+/// Solve for the hero, report, and write the answer out.
+///
+/// [`solve_and_record`]'s twin, and the same rule: `out/solved/rune.params`
+/// gets the knobs, they are printed as the `b.param` lines `scene.rs` should
+/// carry, and nothing rewrites Rust behind your back.
+pub fn solve_and_record_hero(scene: &CoveScene, photons: usize, out: &Path) -> anyhow::Result<(HeroPose, Score)> {
+    let (pose, s) = solve_hero(scene, photons);
+    let (map, _) = trace_hero(scene, &pose, photons);
+    let held = hero_lens(scene, &pose);
+    println!(
+        "rune hero  best {:.5} at ({:+.3}, {:+.3}) m — {:.3} m off the cliff face — holding the glass at ({:+.3}, {:+.3}, {:+.3}) m, {:.3} m over its own boots; the sun put {:.4} W into the lens and {:.4} W landed in the keyhole",
+        s.frac,
+        pose.x,
+        pose.y,
+        scene.cliff_face_y() - pose.y,
+        held.centre.x,
+        held.centre.y,
+        held.centre.z,
+        held.centre.z - scene.sand_z_at(pose.x, pose.y),
+        s.incident,
+        luminance(s.deposited)
+    );
+    match landing(scene, &map, 0.05) {
+        Some(([r, u], w)) => println!(
+            "rune hero  the caustic's centroid on the door face is {r:+.3} m across and {u:+.3} m above the keyhole, carrying {w:.4} W"
+        ),
+        None => println!("rune hero  nothing reached the door's face at all"),
+    }
+
+    let dir = out.join("solved");
+    std::fs::create_dir_all(&dir)?;
+    let knobs = [
+        ("hero_x_mm", pose.x / MM),
+        ("hero_y_mm", pose.y / MM),
+        ("hero_yaw_deg", pose.yaw.to_degrees()),
+        ("hero_aim_el_deg", pose.aim_el.to_degrees()),
+        ("hero_aim_az_deg", pose.aim_az.to_degrees()),
+        ("hero_cant_deg", pose.cant.to_degrees()),
+    ];
+    let path = dir.join("rune.params");
+    let mut text = String::from(
+        "# the hero's solved pose, from `kosm run rune`.
+# these are the defaults of `scene.rs`'s `hero_*` knobs.
+",
+    );
+    for (name, value) in &knobs {
+        text.push_str(&format!("{name} = {value:.4}
+"));
+    }
+    std::fs::write(&path, &text)?;
+    println!("rune hero  wrote {}", path.display());
+
+    if s.frac >= scene.open_frac {
+        println!("rune hero  the pose opens the door; `scene.rs` should read");
+        for (name, value) in &knobs {
+            println!("rune hero      b.param({name:?}, {value:.4});");
+        }
+    } else {
+        println!(
+            "rune hero  scene.rs keeps whatever it has: the best pose scores {:.5} and the door wants {:.3}",
+            s.frac, scene.open_frac
+        );
+    }
+    Ok((pose, s))
 }
 
 /// Solve, report, and write the answer out.

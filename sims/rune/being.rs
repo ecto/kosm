@@ -178,26 +178,42 @@ pub fn hero_skeleton(rig: &Rig) -> Skeleton {
         arm_density: density("cloak"),
         torso_density: density("cloak"),
         head_density: density("skin"),
+        // What the figure weighs as a body, rather than what a bag of
+        // overlapping solid balls adds up to. See `Rig::mass_kg`.
+        mass_kg: (rig.mass_kg > 0.0).then_some(rig.mass_kg),
         capsule: None,
     }
 }
 
-/// Where the hero's hand is asked to go, in the **body's own frame**: up and
-/// out to its right, at nearly the arm's full reach.
+/// Where the hero's hand is asked to go, in the **body's own frame**: a
+/// bearing at the shoulder, up and out to the hero's right.
 ///
-/// The direction is `hero/mod.rs`'s doorstep swing and elevation — 28° out
-/// and 46° up at the shoulder — read into the player's frame (`+x` forward,
-/// `+y` left, `+z` up) rather than the figure's. That is a pose and not a
-/// solve: it is how a person holds a lens up, and it is what puts the glass
-/// clear of a 456 mm head on a 1113 mm frame. Where the hero has to *stand*
-/// for that lens to put the sun in the keyhole is `hero::doorstep`'s
-/// question, and it is not answered here.
-const LENS_AIM: [f64; 3] = [0.613, -0.326, 0.719];
+/// `LENS_AIM_EL` is the lift and `LENS_AIM_AZ` the swing, which is negative
+/// because the body's `+y` is its *left*. They are `hero/mod.rs`'s doorstep
+/// numbers — 46° up and 28° out — read into the player's frame (`+x` forward,
+/// `+y` left, `+z` up) rather than the figure's, and they are what puts the
+/// glass clear of a 456 mm head on a 1113 mm frame.
+///
+/// Two angles and not a vector, because they are *knobs* now:
+/// [`super::rune::HeroPose`] solves over them, and a solved elevation is what
+/// decides how far off the door the hero has to stand. Where the hero has to
+/// stand is [`super::rune::solve_hero`]'s question and not this constant's.
+pub const LENS_AIM_EL: f64 = 46.0 * PI / 180.0;
+pub const LENS_AIM_AZ: f64 = -28.0 * PI / 180.0;
 
 /// How much of the arm's straight reach the aim asks for.
-const LENS_REACH: f64 = 0.97;
+pub const LENS_REACH: f64 = 0.97;
 
-/// Where the glass sits relative to the fist that is holding its rim.
+/// The hand's target in the body's own frame, from the shoulder, for a lift
+/// and a swing.
+pub fn lens_aim_dir(el: f64, az: f64) -> Vec3 {
+    let (se, ce) = el.sin_cos();
+    let (sa, ca) = az.sin_cos();
+    Vec3::new(ce * ca, ce * sa, se)
+}
+
+/// Where the glass sits relative to the fist that is holding its rim, with
+/// `cant` radians of wrist on top.
 ///
 /// A hand on a rim holds the lens a semi-diameter away in the lens's own
 /// plane, and the optical axis runs across it. So the grip puts the centre of
@@ -205,14 +221,46 @@ const LENS_REACH: f64 = 0.97;
 /// `+z` — which is the optical axis `hero/kit.rs` cuts it about — onto the
 /// body's forward. `hero/mod.rs::GRIP_HINT` is the same offset in the
 /// figure's frame.
-fn lens_grip() -> Pose {
+///
+/// `cant` is a **turn of the wrist**: the whole grip, glass and offset
+/// together, rotated about the hand's own `+z`. It swings the optical axis
+/// off the forearm's line without moving the fist, which is the one thing a
+/// person holding a lens by its rim can do that neither walking nor raising
+/// the arm does. It costs `cos θ` of the sun the glass collects and buys
+/// nothing in *where* the caustic lands — a thin lens images a parallel
+/// bundle wherever its undeviated chief ray crosses the focal plane, and a
+/// cant moves that ray not at all — so what it is really worth is the shape
+/// of the patch, and the solve is what says how much of it to spend.
+/// `hero/mod.rs::LENS_CANT_DEG` is the same turn taken about the world's
+/// vertical, for the stills' framing.
+pub fn lens_grip(cant: f64) -> Pose {
     let hint = Vec3::new(0.15, -0.55, 0.82).normalize();
     let radius = 0.5 * super::hero::kit::LENS_D / 1000.0;
     // the lens's own axes in the hand's frame, as columns: +z forward,
     // +x to the body's left, +y up
     let rot = Mat3::new(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    Pose::new(hint * radius, rot)
+    let roll = Mat3::rotation_z(cant);
+    Pose::new(roll.mul_vec(hint * radius), roll.mul_mat(&rot))
 }
+
+/// The hero's rig, built once: the spec every link and lump of the figure
+/// comes out of, and how far the root sits above the sand under it.
+///
+/// A `BodySpec` is a tree of inertias and is not free to build, and
+/// [`super::rune::solve_hero`] asks for the hero's arm arithmetic tens of
+/// thousands of times without a body anywhere near it. Nothing in here
+/// depends on where the hero is standing, so there is one.
+pub struct HeroRig {
+    pub spec: BodySpec,
+    /// How far up its own axis the root sits from the ground under its feet.
+    pub foot_drop: f64,
+}
+
+pub static HERO_RIG: LazyLock<HeroRig> = LazyLock::new(|| {
+    let spec = BodySpec::hero(&hero_skeleton(&Rig::DEFAULT));
+    let foot_drop = Body::new(spec.clone()).consts().foot_drop;
+    HeroRig { spec, foot_drop }
+});
 
 /// The door's substance, read off the door body the level built.
 fn door_substance(scene: &CoveScene) -> anyhow::Result<Substance> {
@@ -334,6 +382,10 @@ pub struct Cove {
     /// the arm hang, which is the capsule's whole story and is also what a
     /// hero that has put the lens away would be.
     aim: Option<Vec3>,
+    /// How the hero is holding the lens: the arm's lift and swing at the
+    /// shoulder, and the turn of the wrist. Three of
+    /// [`super::rune::HeroPose`]'s six knobs, live.
+    hold: (f64, f64, f64),
 }
 
 impl Cove {
@@ -359,7 +411,7 @@ impl Cove {
         // about the glass: from here on `Body::held` is where the refractor
         // is and `being_pose` is only a proxy.
         if which == Player::Hero {
-            body.hold(Tool::new("lens").with_grip(lens_grip()));
+            body.hold(Tool::new("lens").with_grip(lens_grip(0.0)));
         }
 
         // ---- the door ------------------------------------------------------
@@ -415,6 +467,7 @@ impl Cove {
             which,
             gate: false,
             aim: None,
+            hold: (LENS_AIM_EL, LENS_AIM_AZ, 0.0),
         };
         cove.hold_lens_up();
         cove.place(scene.spawn_x, scene.spawn_y, 0.0);
@@ -487,7 +540,8 @@ impl Cove {
         self.aim
     }
 
-    /// Hold the lens up: the aim, in the body's own frame, at [`LENS_AIM`].
+    /// Hold the lens up: the aim, in the body's own frame, at the lift and
+    /// swing [`Cove::set_hold`] last asked for.
     ///
     /// **Recomputed every step**, and that is not an optimisation to be
     /// undone later — it is the difference between a pose and a tug of war.
@@ -511,9 +565,83 @@ impl Cove {
         let links = &self.body.spec().links;
         let shoulder = links[arm.shoulder].pivot;
         let out = LENS_REACH * (arm.upper + arm.lower);
-        let dir = Vec3::new(LENS_AIM[0], LENS_AIM[1], LENS_AIM[2]);
-        let local = shoulder + dir * out - links[0].pivot;
+        let local = shoulder + lens_aim_dir(self.hold.0, self.hold.1) * out - links[0].pivot;
         self.aim = Some(self.body.root() + self.body.orientation().mul_vec(local));
+    }
+
+    /// How the hero is holding the lens: the arm's lift and swing at the
+    /// shoulder and the turn of the wrist, radians.
+    pub fn hold(&self) -> (f64, f64, f64) {
+        self.hold
+    }
+
+    /// Ask for a different hold. The wrist re-grips at once — the glass is
+    /// bolted to the fist and turning it is not a thing an arm has to reach
+    /// for — and the arm starts for the new aim on the next step.
+    pub fn set_hold(&mut self, aim_el: f64, aim_az: f64, cant: f64) {
+        self.hold = (aim_el, aim_az, cant);
+        if self.which == Player::Hero {
+            self.body.hold(Tool::new("lens").with_grip(lens_grip(cant)));
+        }
+        self.hold_lens_up();
+    }
+
+    /// Stand the hero at a [`super::rune::HeroPose`], holding the lens the
+    /// way that pose says, at rest.
+    ///
+    /// The arithmetic of `rune::hero_lens` says where the glass *will* be;
+    /// this is how a body is put where that arithmetic was talking about. The
+    /// two are not the same to the millimetre and are not meant to be — an
+    /// arm has mass and a body standing with one arm up leans a little into
+    /// it — and `rune_tests` says how far apart they are.
+    pub fn place_hero(&mut self, pose: &super::rune::HeroPose) {
+        self.set_hold(pose.aim_el, pose.aim_az, pose.cant);
+        self.body.place(pose.x, pose.y, self.beach.z_at(pose.x, pose.y), pose.yaw, 0.0);
+        self.hold_lens_up();
+    }
+
+    /// Where the hero is standing and how it is holding the glass, read back
+    /// off the body. The inverse of [`Cove::place_hero`], and what the live
+    /// hint differentiates at.
+    pub fn hero_pose(&self) -> super::rune::HeroPose {
+        let p = self.body.footing();
+        let (aim_el, aim_az, cant) = self.hold;
+        super::rune::HeroPose { x: p.x, y: p.y, yaw: self.body.facing(), aim_el, aim_az, cant }
+    }
+
+    /// The hero's trunk, as the opaque solids the rune's little scene needs.
+    ///
+    /// A lens 220 mm across held beside a head 456 mm across is a lens its
+    /// owner can stand in front of, and the day the caustic pass found the
+    /// refractor *inside the skull* every one of its photons hit hair before
+    /// it hit glass. The score has to know.
+    pub fn shadows(&self) -> Vec<super::rune::Piece> {
+        match self.which {
+            Player::Capsule => Vec::new(),
+            Player::Hero => super::rune::occluders(self.body.spec(), &self.body.snapshot().parts),
+        }
+    }
+
+    /// The rune, live, on whichever body this cove is walking.
+    ///
+    /// The hero is scored on the glass in its hand with its own head and
+    /// trunk in the way ([`super::rune::score_lens_at`]); the capsule is
+    /// scored on itself, which is every number the offline solve and the
+    /// solvability sweep were measured with.
+    pub fn rune_score(&self, scene: &CoveScene, photons: usize) -> f64 {
+        match self.lens() {
+            Some(lens) => super::rune::score_lens_at(scene, &lens, &self.shadows(), photons).frac,
+            None => {
+                let (centre, world_to_body) = self.being_pose();
+                let axis = world_to_body.transpose().mul_vec(Vec3::z());
+                let pose = super::rune::Pose {
+                    x: centre.x,
+                    y: centre.y,
+                    tilt: (-axis.y).atan2(axis.z),
+                };
+                super::rune::score(scene, &pose, photons).frac
+            }
+        }
     }
 
     /// Let the rune drive the door. Step 4 calls this from the score.

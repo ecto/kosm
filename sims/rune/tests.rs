@@ -81,6 +81,14 @@ fn field() -> anyhow::Result<(CoveScene, &'static crate::skatepark::Baked)> {
     Ok((scene, baked))
 }
 
+/// A cove with the **hero** at the spawn, holding the lens. What
+/// `rune_tests.rs` reads the live gate off, sharing the one bake.
+pub(super) fn hero_cove() -> anyhow::Result<(CoveScene, being::Cove)> {
+    let (scene, baked) = field()?;
+    let cove = being::Cove::with_player(&scene, baked.sdf.clone(), being::Player::Hero)?;
+    Ok((scene, cove))
+}
+
 /// A cove with the **capsule** at the spawn, standing.
 ///
 /// Said explicitly and not left to [`being::Player::from_env`], whose default

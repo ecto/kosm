@@ -1201,6 +1201,22 @@ pub fn frame(
     spp: usize,
 ) -> anyhow::Result<image::RgbaImage> {
     let mut picture = Scene::new(scene)?;
+    frame_in(&mut picture, scene, placement, size, spp)
+}
+
+/// The same, on a [`Scene`] the caller has already built.
+///
+/// `sims/rune/mod.rs`'s still needs one: to draw the hero at a solved
+/// [`super::rune::HeroPose`] it has to ask [`Scene::hero_at`] where the
+/// costume goes, and that is a method on a built scene. One statement of the
+/// render, two ways in.
+pub fn frame_in(
+    picture: &mut Scene,
+    scene: &CoveScene,
+    placement: &Placement,
+    size: (u32, u32),
+    spp: usize,
+) -> anyhow::Result<image::RgbaImage> {
     let rune = picture.caustic_map(placement);
     let at = picture.at(placement);
     let cam = camera(scene, placement);

@@ -136,6 +136,28 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         b.param("solution_y_mm", 15600.0);
         b.param("solution_tilt_deg", -10.0);
 
+        // And the hero's, which is the one the default body is walking. Six
+        // knobs rather than three because the lens is on the end of an arm:
+        // where it stands, which way it faces, the arm's lift and swing at
+        // the shoulder, and the turn of the wrist that cants the glass. Same
+        // rule as above — solved, printed, written to
+        // `out/solved/rune.params`, and pasted back here by hand.
+        //
+        // The lift is at its clamp and that is the answer rather than an
+        // accident: `rune::hero_merit` spends score on *standoff* once the
+        // door is comfortably open, and the only way to stand further back
+        // is to hold the glass higher, so the arm's limit is what decides
+        // where the hero stands. It lands 1.14 m off the face, which is
+        // `hero/mod.rs`'s own chief-ray answer for a lens held as high as a
+        // 1.11 m adventurer's arm reaches.
+        b.param("hero_x_mm", -610.4487);
+        b.param("hero_y_mm", 14858.2961); // 1.14 m off the cliff face: a place, not a doorframe
+        b.param("hero_yaw_deg", 58.1072);
+        b.param("hero_aim_el_deg", 80.2141); // the arm at its limit, which is what buys the standoff
+        b.param("hero_aim_az_deg", -28.0000);
+        b.param("hero_cant_deg", 66.5040);
+        b.param("hero_mass_kg", 30.0); // a 1.11 m figure of cloth and leather, not a bollard
+
         // ---- the bake ----------------------------------------------------------
         b.param("sdf_cell_mm", 100.0); // the being's feet are 350 mm across
         b.param("sdf_pad_mm", 300.0); // volume beyond the cove; past it there is no floor

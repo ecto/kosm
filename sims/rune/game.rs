@@ -333,8 +333,17 @@ fn glint_after(scene: &CoveScene) -> f64 {
 /// It costs six lattice traces, so the caller is expected to be a thread that
 /// is not the renderer and to ask rarely. Returns the centre in world metres
 /// and the horizontal direction it stepped, for the line on stderr.
-fn glint_at(scene: &CoveScene, pose: &rune::Pose) -> Option<(Vec3, [f64; 2])> {
-    let g = hint::guided_gradient(scene, pose, hint::SWEEP_RAYS)?;
+fn glint_at(scene: &CoveScene, snap: &Snapshot) -> Option<(Vec3, [f64; 2])> {
+    let pose = rune_pose(snap);
+    let g = match held_lens(snap) {
+        // The hero: the two directions the glass moves when its owner walks.
+        Some(lens) => hint::guided_walk(scene, &lens, hint::SWEEP_RAYS)?,
+        // The capsule, whose whole body is the lens.
+        None => {
+            let g = hint::guided_gradient(scene, &pose, hint::SWEEP_RAYS)?;
+            [g[0], g[1]]
+        }
+    };
     let n = g[0].hypot(g[1]);
     if !n.is_finite() || n < 1e-12 {
         return None;
@@ -390,6 +399,35 @@ fn rune_pose(snap: &Snapshot) -> rune::Pose {
 fn held_lens(snap: &Snapshot) -> Option<rune::Held> {
     let pose = snap.held?;
     Some(rune::Held { centre: pose.pos, axis: pose.rot.mul_vec(Vec3::z()) })
+}
+
+/// What the figure is putting in its own light: its skirt, chest and head,
+/// where they actually are this step.
+///
+/// A lens 220 mm across held beside a head 456 mm across is a lens its owner
+/// can stand in front of, and a live gate that did not know it would unlatch
+/// a door the player cannot see lit. `Snapshot::parts` is in the rig's own
+/// link order, so the spec that names the three is the one static
+/// [`super::being::HERO_RIG`] holds — no body needed, and none available on
+/// this thread.
+fn shadows(snap: &Snapshot) -> Vec<rune::Piece> {
+    match &snap.parts {
+        Some(parts) => rune::occluders(&super::being::HERO_RIG.spec, parts),
+        None => Vec::new(),
+    }
+}
+
+/// The rune's score for whatever body the snapshot is of.
+///
+/// The hero is scored on the glass in its hand with its own trunk in the way;
+/// the capsule is scored on itself, which is every number the offline solve
+/// and the solvability sweep were measured with. [`super::being::Cove::rune_score`]
+/// is the same two cases read off a `Cove` rather than off a snapshot.
+fn live_frac(scene: &CoveScene, snap: &Snapshot, photons: usize) -> f64 {
+    match held_lens(snap) {
+        Some(lens) => rune::score_lens_at(scene, &lens, &shadows(snap), photons).frac,
+        None => rune::score(scene, &rune_pose(snap), photons).frac,
+    }
 }
 
 /// The live being as the renderer's placement.
@@ -718,10 +756,7 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
         // glass is scored on the glass — that is the whole of step 2 — and a
         // capsule is scored on itself, which is every number the sweep and
         // the recorded solution were measured with.
-        let frac = match held_lens(&snap) {
-            Some(lens) => rune::score_lens(&scene, &lens, photons).frac,
-            None => rune::score(&scene, &pose, photons).frac,
-        };
+        let frac = live_frac(&scene, &snap, photons);
         // What the puzzle's clock costs, once. It is the reason this is a
         // thread and not a line in the solver's loop, so it is worth a line.
         if !said_cost {
@@ -746,7 +781,7 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
         if glint.read(snap.t, frac) {
             if placed.is_none() || aimed.elapsed() >= GLINT_EVERY {
                 aimed = Instant::now();
-                match glint_at(&scene, &pose) {
+                match glint_at(&scene, &snap) {
                     Some((at, [ux, uy])) => {
                         if placed.is_none() {
                             eprintln!(
@@ -1581,18 +1616,14 @@ pub fn still(
     // enough to earn it. The score is taken once and reused for every pass, so
     // the rim's radiance is a fact about the pose and not about the photon
     // budget's noise, and the still is reproducible.
-    let pose = rune_pose(&frame);
     let photons = live_photons(&scene.authored);
-    let frac = match held_lens(&frame) {
-        Some(lens) => rune::score_lens(&scene, &lens, photons).frac,
-        None => rune::score(&scene, &pose, photons).frac,
-    };
+    let frac = live_frac(&scene, &frame, photons);
     let after = glint_after(&scene);
     let mut glint = Glint::new(after, scene.open_frac);
     glint.read(0.0, frac);
     glint.read(after + 1.0, frac);
     let stuck = glint.is_on();
-    let aimed = stuck.then(|| glint_at(&scene, &pose)).flatten();
+    let aimed = stuck.then(|| glint_at(&scene, &frame)).flatten();
     let lit = Lit { score: frac, glint: aimed.map(|(at, _)| at) };
     match (stuck, aimed) {
         (true, Some((at, [ux, uy]))) => eprintln!(

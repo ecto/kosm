@@ -123,6 +123,23 @@ pub struct Rig {
     /// Whether the satchel and its strap are drawn. One knob because a
     /// turntable wants them and a silhouette test does not.
     pub satchel: bool,
+    /// What the figure weighs when it is a *body*, kg.
+    ///
+    /// A target and not a derivation, and the reason is that this file
+    /// authors a costume out of overlapping solid balls. Weighing the parts
+    /// and adding them up counts every overlap twice and fills every one of
+    /// them solid: at the substances' own densities — `cream` in the legs,
+    /// `boot` in the boots, `cloak` in the arms and trunk, `skin` in the
+    /// head — a 1.11 m Mii came out at 102 kg. That is not an adventurer of
+    /// cloth and leather on a light frame, it is a bollard, and it is the
+    /// number the upright spring and the walk's drive authority are derived
+    /// from.
+    ///
+    /// Thirty kilogrammes is what such a figure weighs, and
+    /// [`kosm::player::BodySpec::hero`] hits it by scaling every part's
+    /// density by the one ratio that does — so where the mass *sits* stays
+    /// exactly what the substances made it and only the scale moves.
+    pub mass_kg: f64,
 }
 
 impl Rig {
@@ -161,6 +178,7 @@ impl Rig {
         pelvis_y: 0.0,
         toe_out: 11.0,
         satchel: true,
+        mass_kg: kosm::player::body::HERO_MASS,
     };
 
     /// Read the rig through a knob lookup — a `Builder`'s or a `Params`'.
@@ -206,6 +224,7 @@ impl Rig {
             pelvis_y: knob("pelvis_y_mm", d.pelvis_y),
             toe_out: knob("toe_out_deg", d.toe_out),
             satchel: knob("satchel", if d.satchel { 1.0 } else { 0.0 }) > 0.5,
+            mass_kg: knob("hero_mass_kg", d.mass_kg),
         }
     }
 

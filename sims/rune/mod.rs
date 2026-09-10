@@ -33,6 +33,7 @@ use phyz_math::Vec3;
 use kosm::build::{Built, Params};
 use kosm::scene::MM;
 use crate::skatepark::{self, BakeOpts, Part};
+use rune::HeroPose;
 
 /// The player, as a made thing: a porcelain automaton with a lens for a tool.
 pub mod automaton;
@@ -111,9 +112,23 @@ pub struct CoveScene {
     pub spawn_x: f64,
     pub spawn_y: f64,
     /// The solved pose, as the document last recorded it: metres and radians.
+    ///
+    /// Two of them, because there are two bodies. `solution_*` is the glass
+    /// capsule's — where it stands and how far it leans — and is what
+    /// `--player capsule` and every one of `rune_tests.rs`'s recorded numbers
+    /// are on. `hero_*` is the adventurer's: where it stands, which way it
+    /// faces, and how it is holding the lens. The hero is the default body,
+    /// so `hero_*` is the level's answer and `solution_*` is the level's
+    /// history.
     pub solution_x: f64,
     pub solution_y: f64,
     pub solution_tilt: f64,
+    pub hero_x: f64,
+    pub hero_y: f64,
+    pub hero_yaw: f64,
+    pub hero_aim_el: f64,
+    pub hero_aim_az: f64,
+    pub hero_cant: f64,
     pub cell: f64,
     pub pad: f64,
 }
@@ -162,6 +177,12 @@ impl CoveScene {
             solution_x: a.parameter_or("solution_x_mm", 0.0) * MM,
             solution_y: a.parameter_or("solution_y_mm", 0.0) * MM,
             solution_tilt: a.parameter_or("solution_tilt_deg", 0.0).to_radians(),
+            hero_x: a.parameter_or("hero_x_mm", 0.0) * MM,
+            hero_y: a.parameter_or("hero_y_mm", 0.0) * MM,
+            hero_yaw: a.parameter_or("hero_yaw_deg", 0.0).to_radians(),
+            hero_aim_el: a.parameter_or("hero_aim_el_deg", being::LENS_AIM_EL.to_degrees()).to_radians(),
+            hero_aim_az: a.parameter_or("hero_aim_az_deg", being::LENS_AIM_AZ.to_degrees()).to_radians(),
+            hero_cant: a.parameter_or("hero_cant_deg", 0.0).to_radians(),
             cell: a.millimetres("sdf_cell_mm")?,
             pad: a.millimetres("sdf_pad_mm")?,
             authored: a,
@@ -350,17 +371,33 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let sun = scene.sun_dir();
     println!("cove sun: toward ({:+.3}, {:+.3}, {:+.3}), {:.0}° azimuth and {:.0}° up", sun.x, sun.y, sun.z, scene.sun_az.to_degrees(), scene.sun_el.to_degrees());
     bake::run(&scene, out)?;
-    // The solve prints its answer and writes `out/solved/rune.params`; the
-    // level carries the same three numbers as the defaults of its
-    // `solution_*` knobs, so a solve that agrees with them changes nothing
-    // and a solve that does not says so on stdout.
-    rune::solve_and_record(&scene, 100_000, out)?;
-    if scene.solution_x != 0.0 || scene.solution_y != 0.0 {
-        let climbs = hint::solvable(&scene, 6, 200, &dir.join("solvable.txt"))?;
+    // Whose puzzle this is. The hero holding the lens is the level's body and
+    // the level's answer; `--player capsule` is the glass capsule the cove
+    // was written against, and every recorded number in `rune_tests.rs` is
+    // still that one's. The solve prints its answer and writes
+    // `out/solved/rune.params`; the level carries the same numbers as the
+    // defaults of its solved knobs, so a solve that agrees with them changes
+    // nothing and a solve that does not says so on stdout.
+    let capsule = args.value("player") == Some("capsule");
+    if capsule {
+        rune::solve_and_record(&scene, 100_000, out)?;
+        if scene.solution_x != 0.0 || scene.solution_y != 0.0 {
+            let climbs = hint::solvable(&scene, 6, 200, &dir.join("solvable.txt"))?;
+            let opened = climbs.iter().filter(|c| c.solved).count();
+            println!("cove solvable: {opened} of {} spawns open the door -> {}", climbs.len(), dir.join("solvable.txt").display());
+        }
+    } else {
+        rune::solve_and_record_hero(&scene, 100_000, out)?;
+        let climbs = hint::solvable_hero(&scene, 6, 200, &dir.join("solvable.txt"))?;
         let opened = climbs.iter().filter(|c| c.solved).count();
-        println!("cove solvable: {opened} of {} spawns open the door -> {}", climbs.len(), dir.join("solvable.txt").display());
+        let walked = climbs.iter().filter(|c| c.solved && c.steps > 0).count();
+        println!(
+            "cove solvable: {opened} of {} spawns open the door, {walked} of them after walking the guided gradient -> {}",
+            climbs.len(),
+            dir.join("solvable.txt").display()
+        );
     }
-    still(&scene, &dir)
+    still(&scene, &dir, capsule)
 }
 
 /// The wide shot, for an agent who cannot open a window.
@@ -390,26 +427,43 @@ fn wide(scene: &CoveScene, dir: &Path) -> anyhow::Result<()> {
 /// The solution is a solved knob and starts at zero, so "not solved yet" is
 /// exactly "both knobs are zero" — and on a level that has not been solved,
 /// what this draws is the being where the player finds it.
-fn still(scene: &CoveScene, dir: &Path) -> anyhow::Result<()> {
+fn still(scene: &CoveScene, dir: &Path, capsule: bool) -> anyhow::Result<()> {
     let a = &scene.authored;
-    let solved = scene.solution_x != 0.0 || scene.solution_y != 0.0;
-    let (x, y, tilt) = if solved {
-        (scene.solution_x, scene.solution_y, scene.solution_tilt)
-    } else {
-        (scene.spawn_x, scene.spawn_y, 0.0)
+    let hero = HeroPose::solution(scene);
+    let solved = if capsule { scene.solution_x != 0.0 || scene.solution_y != 0.0 } else { hero.is_solved() };
+    let (x, y, tilt) = match (capsule, solved) {
+        (true, true) => (scene.solution_x, scene.solution_y, scene.solution_tilt),
+        (false, true) => (hero.x, hero.y, 0.0),
+        _ => (scene.spawn_x, scene.spawn_y, 0.0),
     };
-    let placement = render::Placement::standing(scene, x, y, tilt);
+    let mut placement = render::Placement::standing(scene, x, y, tilt);
+    // The figure, if this is the hero's frame: every link where the
+    // arithmetic puts it, and the glass where its hand is. Drawn from
+    // `rune::hero_parts` and not from a stepped body, because that is what
+    // the solve scored — the picture and the number are the same pose.
+    let mut picture = render::Scene::new(scene)?;
+    if !capsule {
+        let pose = if solved { hero } else { rune::HeroPose { x, y, ..hero }.facing(scene.door_frame().origin) };
+        let parts = rune::hero_parts(scene, &pose);
+        let pivots = render::Scene::hero_pivots();
+        placement = placement.with_hero(picture.hero_at(&parts, &pivots, Some(rune::hero_lens_pose(scene, &pose))));
+        // and the capsule proxy is *not* switched off here. `Scene::picture`
+        // already draws the figure instead of the capsule when a placement
+        // has one — never both — whereas `set_being_visible(false)` means
+        // "no body in this shot at all" and takes the figure with it. Turning
+        // it off left a still of an empty doorstep.
+    }
     let (w, h) = (a.parameter_or("render_w", 960.0) as u32, a.parameter_or("render_h", 540.0) as u32);
     let spp = std::env::var("KOSM_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(a.parameter_or("render_spp", 64.0) as usize);
     let path = dir.join("frame.png");
     let t0 = std::time::Instant::now();
-    render::frame(scene, &placement, (w, h), spp)?.save(&path)?;
+    render::frame_in(&mut picture, scene, &placement, (w, h), spp)?.save(&path)?;
     println!(
-        "cove frame: the being {} at ({:+.2}, {:+.2}) m, leaning {:.1}°, facing the door; {w}×{h} at {spp} spp → {} in {:.1} s",
+        "cove frame: the {} {} at ({:+.2}, {:+.2}) m, facing the door; {w}×{h} at {spp} spp → {} in {:.1} s",
+        if capsule { "being" } else { "hero" },
         if solved { "at the solved pose" } else { "at its spawn (nothing solved yet)" },
         x,
         y,
-        tilt.to_degrees(),
         path.display(),
         t0.elapsed().as_secs_f64()
     );

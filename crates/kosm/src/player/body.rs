@@ -387,6 +387,27 @@ impl BodySpec {
     /// `sims/rune/being.rs::hero_skeleton` — so there is still exactly one
     /// statement of where each joint is.
     pub fn hero(s: &Skeleton) -> Self {
+        // What the figure should weigh, before a joint is built. The scale is
+        // found by weighing the rig once at the substances' own densities and
+        // dividing — one pass, no iteration, because mass is linear in
+        // density. See [`Skeleton::mass_kg`].
+        if let Some(want) = s.mass_kg.filter(|w| *w > 0.0) {
+            let bare = Self::hero(&Skeleton { mass_kg: None, ..*s });
+            let have = bare.links.iter().flat_map(|l| &l.lumps).map(|l| l.mass()).sum::<f64>();
+            if have > 0.0 && (have - want).abs() > 1e-9 {
+                let k = want / have;
+                return Self::hero(&Skeleton {
+                    mass_kg: None,
+                    leg_density: s.leg_density * k,
+                    boot_density: s.boot_density * k,
+                    arm_density: s.arm_density * k,
+                    torso_density: s.torso_density * k,
+                    head_density: s.head_density * k,
+                    ..*s
+                });
+            }
+            return bare;
+        }
         // The root is the pelvis: the point everything above the hips turns
         // about, and the point everything below them hangs from.
         let root_at = s.torso;
@@ -567,6 +588,27 @@ pub struct Skeleton {
     pub arm_density: f64,
     pub torso_density: f64,
     pub head_density: f64,
+    /// What the whole figure should weigh, kg, or `None` to let the
+    /// substances say.
+    ///
+    /// The substances on their own say something *wrong*, and the reason is
+    /// geometry rather than chemistry: `figure.rs` authors a costume out of
+    /// overlapping solid balls — a head that reaches down into a chest, a
+    /// chest inside a skirt, boots inside shins — and a mass that sums the
+    /// parts weighs every overlap twice while filling every one of them
+    /// solid. A 1.11 m figure of cloth, leather and a light frame came out at
+    /// 102 kg, which is not an adventurer, it is a bollard, and it is the
+    /// number the upright spring and the walk's authority are derived from.
+    ///
+    /// So the target is a knob and not a derivation. [`BodySpec::hero`]
+    /// scales every part's density by the one ratio that hits it, which keeps
+    /// the *distribution* — where the mass sits, and so the centre of mass
+    /// and the whole inertia tensor's shape — exactly what the substances
+    /// made it, and moves only the scale. The inertia is linear in density,
+    /// so `i_pivot`, `k` and `c` all fall by the same factor and the
+    /// controller's time constants (which are `ω` and `τ`, not torques) do
+    /// not move at all.
+    pub mass_kg: Option<f64>,
     /// The capsule the optics still see, if the level has one.
     pub capsule: Option<(f64, f64)>,
 }
@@ -1268,28 +1310,8 @@ impl Body {
     /// point on it. When the target is out of reach the chain straightens and
     /// points at it rather than failing.
     fn arm_targets(&self, xforms: &[SpatialTransform], arm: &Arm, goal: Vec3) -> (Vec3, f64) {
-        let shoulder_link = &self.spec.links[arm.shoulder];
-        let parent = shoulder_link.parent.unwrap_or(0);
-        let parent_rot = xforms[parent].rot.transpose();
-        let shoulder_world = xforms[arm.shoulder].pos;
-
-        let hint = parent_rot.mul_vec(arm.hint);
-        let elbow_world = two_link(shoulder_world, goal, arm.upper, arm.lower, hint);
-
-        // The shoulder: the shortest rotation taking the rest upper-arm
-        // direction onto the one the solve wants, read in the parent's frame.
-        let rest = (self.spec.links[arm.elbow].pivot - shoulder_link.pivot).normalize();
-        let want = parent_rot.transpose().mul_vec((elbow_world - shoulder_world).normalize());
-        let shoulder = shortest_arc(rest, want);
-
-        // The elbow: the interior angle, less the one the rest pose has.
-        let rest_upper = (self.spec.links[arm.elbow].pivot - shoulder_link.pivot).normalize();
-        let rest_lower = (arm.hand - self.spec.links[arm.elbow].pivot).normalize();
-        let rest_angle = rest_upper.dot(rest_lower).clamp(-1.0, 1.0).acos();
-        let upper = (elbow_world - shoulder_world).normalize();
-        let lower = (goal - elbow_world).normalize();
-        let angle = upper.dot(lower).clamp(-1.0, 1.0).acos();
-        (shoulder, angle - rest_angle)
+        let parent = self.spec.links[arm.shoulder].parent.unwrap_or(0);
+        arm_solve(&self.spec, arm, xforms[parent].rot.transpose(), xforms[arm.shoulder].pos, goal)
     }
 
     // ---- reading it back ---------------------------------------------------
@@ -1570,6 +1592,97 @@ fn link_inertia(link: &Link) -> SpatialInertia {
     SpatialInertia::new(mass, com - link.pivot, tensor)
 }
 
+/// The shoulder's target rotation — a rotation vector in the shoulder's
+/// *parent* frame — and the elbow's target angle, for a hand at `goal`.
+///
+/// The two-link solve of `sims/rune/hero/figure.rs::joint`: the elbow lies on
+/// a circle about the line from shoulder to hand, and the hint picks the point
+/// on it. When the target is out of reach the chain straightens and points at
+/// it rather than failing.
+///
+/// A free function and not a method because [`hand_for`] runs it with no body
+/// at all — one statement of the solve, two callers, and the test that holds
+/// them together is `sims/rune`'s.
+pub fn arm_solve(spec: &BodySpec, arm: &Arm, parent_rot: Mat3, shoulder_world: Vec3, goal: Vec3) -> (Vec3, f64) {
+    let shoulder_pivot = spec.links[arm.shoulder].pivot;
+    let elbow_pivot = spec.links[arm.elbow].pivot;
+    let hint = parent_rot.mul_vec(arm.hint);
+    let elbow_world = two_link(shoulder_world, goal, arm.upper, arm.lower, hint);
+
+    // The shoulder: the shortest rotation taking the rest upper-arm
+    // direction onto the one the solve wants, read in the parent's frame.
+    let rest_upper = (elbow_pivot - shoulder_pivot).normalize();
+    let want = parent_rot.transpose().mul_vec((elbow_world - shoulder_world).normalize());
+    let shoulder = shortest_arc(rest_upper, want);
+
+    // The elbow: the interior angle, less the one the rest pose has.
+    let rest_lower = (arm.hand - elbow_pivot).normalize();
+    let rest_angle = rest_upper.dot(rest_lower).clamp(-1.0, 1.0).acos();
+    let upper = (elbow_world - shoulder_world).normalize();
+    let lower = (goal - elbow_world).normalize();
+    let angle = upper.dot(lower).clamp(-1.0, 1.0).acos();
+    (shoulder, angle - rest_angle)
+}
+
+/// Where the hand — and so whatever is gripped in it — ends up when the arm
+/// solves for the world point `goal`, with the body's root at `root` and every
+/// other joint at its rest pose.
+///
+/// The same [`arm_solve`] and the same forward kinematics [`Body`] runs, with
+/// the dynamics left out. A solver that wants to know where a hero's lens
+/// would be if it stood *here* and held it *there* must not have to step a
+/// body for a second to find out — a photon score is expensive enough without
+/// a settle in front of it — and a pose that only the physics can state is a
+/// pose no search can reach. `sims/rune`'s `HeroPose` is written on this, and
+/// `rune_tests` holds this arithmetic and a settled [`Body::held`] within a
+/// centimetre and a degree of each other.
+///
+/// The gap between the two is the arm's own sag, which the joint PD's gravity
+/// compensation makes small but not zero; the root's is that a body standing
+/// with one arm up leans a little into it.
+pub fn hand_for(spec: &BodySpec, root: Pose, goal: Vec3) -> Option<Pose> {
+    let arm = spec.arm?;
+    let parts = parts_for(spec, root, Some(goal));
+    let x = parts[arm.elbow].pose;
+    Some(Pose::new(x.pos + x.rot.mul_vec(arm.hand - spec.links[arm.elbow].pivot), x.rot))
+}
+
+/// Every link of the rig, placed, with the body's root at `root`, every joint
+/// at its rest pose and the tool arm solved for `goal`.
+///
+/// [`Body::snapshot`]'s `parts` without a body: what a solver hands a
+/// renderer to draw the pose it just found, and what a scorer reads the
+/// figure's own shadow off. `None` for `goal` leaves the arm at rest too.
+///
+/// Rest, and that is the honest word: the legs do not take a stride and the
+/// torso does not lean, because a stance is what the *controller* settles to
+/// and this is arithmetic. What it is exactly right about is the arm, which
+/// is the part the puzzle is played with.
+pub fn parts_for(spec: &BodySpec, root: Pose, goal: Option<Vec3>) -> Vec<Part> {
+    let root_pivot = spec.links[0].pivot;
+    // Every link's own frame is its pivot, so a rig at rest is one rigid
+    // offset per link from the root.
+    let mut parts: Vec<Part> = spec
+        .links
+        .iter()
+        .map(|l| Part { name: l.name.clone(), pose: Pose::new(root.pos + root.rot.mul_vec(l.pivot - root_pivot), root.rot) })
+        .collect();
+    let (Some(arm), Some(goal)) = (spec.arm, goal) else { return parts };
+
+    let shoulder_world = parts[arm.shoulder].pose.pos;
+    let (turn, bend) = arm_solve(spec, &arm, root.rot, shoulder_world, goal);
+    let r_upper = root.rot.mul_mat(&quat_exp(&turn).to_matrix());
+    let axis = match spec.links[arm.elbow].kind {
+        PivotKind::Revolute(a) => a.normalize(),
+        PivotKind::Spherical => Vec3::y(),
+    };
+    let r_fore = r_upper.mul_mat(&quat_exp(&(axis * bend)).to_matrix());
+    let elbow_world = shoulder_world + r_upper.mul_vec(spec.links[arm.elbow].pivot - spec.links[arm.shoulder].pivot);
+    parts[arm.shoulder].pose = Pose::new(shoulder_world, r_upper);
+    parts[arm.elbow].pose = Pose::new(elbow_world, r_fore);
+    parts
+}
+
 /// The middle joint of a two-link chain from `root` to `tip`.
 pub fn two_link(root: Vec3, tip: Vec3, upper: f64, lower: f64, hint: Vec3) -> Vec3 {
     let to_tip = tip - root;
@@ -1709,10 +1822,20 @@ impl Skeleton {
             arm_density: d("cloak", 1300.0),
             torso_density: d("cloak", 1300.0),
             head_density: d("skin", 1050.0),
+            mass_kg: Some(HERO_MASS),
             capsule: None,
         }
     }
 }
+
+/// What a 1.11 m adventurer of cloth, leather and a light frame weighs, kg.
+///
+/// The level's own statement is `sims/rune/hero/figure.rs`'s `Rig::mass_kg`,
+/// which defaults to this; the constant is here so [`Skeleton::demo_hero`] —
+/// a fixture, not a second rig — cannot drift from it. See
+/// [`Skeleton::mass_kg`] for why a figure of overlapping solid balls needs to
+/// be told and cannot be asked.
+pub const HERO_MASS: f64 = 30.0;
 
 /// Hero-local millimetres (`+y` forward, `+x` right) as body-local metres
 /// (`+x` forward, `+y` left). The only place the two conventions meet.
