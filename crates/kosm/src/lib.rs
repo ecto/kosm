@@ -30,6 +30,7 @@ pub mod lens;
 pub mod light;
 pub mod material;
 pub mod materials;
+pub mod player;
 pub mod prelude;
 pub mod room;
 pub mod run;
