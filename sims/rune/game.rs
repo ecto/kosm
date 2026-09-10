@@ -6,12 +6,19 @@
 //! - [`simulate`] steps [`Cove`] at its own `dt` in wall-clock time and hands
 //!   over [`Timed`] snapshots, ahead by the latency the window has measured —
 //!   the court's pacing, verbatim, because the court's pacing is right.
-//! - [`rune_worker`] reads the newest snapshot, scores the rune on it, and
-//!   sets the gate. It is its own thread because the score is a photon trace:
-//!   the simulation must never wait for one, and neither must the picture.
+//! - [`rune_worker`] reads the newest snapshot, scores the rune on it, sets
+//!   the gate, and traces the picture's own caustic. It is its own thread
+//!   because both of those are photon traces: the simulation must never wait
+//!   for one, and neither must the picture. See [`Photons`] and [`Retrace`] —
+//!   the map is published into a slot and the render threads take whatever is
+//!   in it, which is what keeps a walking frame at the display's own pace.
 //! - [`render_worker`] traces one raw sample a pass and accumulates it through
 //!   [`crate::history`] with reprojection and the geometric mask.
-//! - the viewport blits whatever came back last.
+//! - the viewport blits whatever came back last, at [`REDRAW`].
+//!
+//! The level's `fps` is what the simulation hands frames over at and is
+//! therefore the ceiling on everything downstream of it: sixty, because the
+//! solver is under a millisecond a frame and the raster tier draws one in two.
 //!
 //! ## the tier is the CPU integrator, and why
 //!
@@ -131,14 +138,33 @@ const PRETTY: u32 = 2;
 const YAW_PER_UNIT: f64 = 0.0025;
 const TILT_PER_UNIT: f64 = 0.0010;
 
-/// How far the being has to move, or lean, before the caustic is retraced.
+/// How far the being has to move, or lean, before the caustic is worth
+/// retracing.
 ///
-/// A photon map is a few tens of milliseconds and a pass is a few hundred, so
-/// this is not a budget — it is what stops a being standing still from
-/// retracing a map that would come back the same and, through the mask, throw
-/// the door's converged pixels away for it.
+/// It is what stops a being standing still from retracing a map that would
+/// come back the same and, through the mask, throw the door's converged pixels
+/// away for it.
+///
+/// It is **not** a budget, and on the raster tier that distinction is the
+/// whole of a frame rate. A walking hero carries the lens in its hand, so a
+/// centimetre is crossed on every single frame, and a photon map is fifty
+/// thousand photons and forty-seven to ninety milliseconds — on the frame path
+/// that was twenty frames a second of a tier that draws in two. So the trigger
+/// stayed and the *trace* moved: see [`Retrace`] and [`CAUSTIC_LIVE_MS`].
 const CAUSTIC_MOVED_M: f64 = 0.01;
 const CAUSTIC_LEANED_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
+
+/// How often the live photon map may be retraced while the lens is moving,
+/// milliseconds. The level's own `caustic_live_ms`.
+///
+/// A hundred milliseconds is ten maps a second against sixty frames, which is
+/// a caustic that lags the hand by up to a tenth of a second while walking and
+/// is exact the moment the player stops — and nothing that reads it is any
+/// tighter than that. The picture reads it as a texture on the door and the
+/// sand, where it is a soft bright patch and not an edge; the gate reads it as
+/// a number it then has to see held for a whole second before it unlatches
+/// anything.
+const CAUSTIC_LIVE_MS: f64 = 100.0;
 
 /// The most presented latency the shutter is allowed to buy, in
 /// milliseconds.
@@ -175,6 +201,12 @@ const SETTLE: f64 = 3.0;
 /// that costs ten times what the court's does: a tier at three frames a second
 /// has a latency of a third of a second, and a head start capped at eighty
 /// milliseconds would never cancel it.
+///
+/// They are ceilings and not settings, which is why sixty frames a second did
+/// not move them: the head start the simulation is actually given is the
+/// latency the *window* measured, and on the raster tier that is twenty
+/// milliseconds rather than four hundred. `--tier trace` is still the case
+/// these numbers were written for.
 const MAX_LOOKAHEAD: Duration = Duration::from_millis(400);
 const MAX_SLIP: Duration = Duration::from_millis(300);
 
@@ -374,6 +406,104 @@ struct Lit {
 }
 
 type Glow = Arc<Mutex<Lit>>;
+
+// ---- the photon map, off the frame path ---------------------------------------
+
+/// The live caustic, as everything that reads it wants it.
+///
+/// **Nothing that needs this map is allowed to block a presented frame.** Two
+/// things want it — the picture, which draws it on the door and the sand, and
+/// the gate, which scores it — and neither is a per-frame quantity: the
+/// picture reads it as a soft patch of irradiance, and the gate holds its
+/// answer for a whole second before the door moves. So it is traced on
+/// [`rune_worker`], at most every [`CAUSTIC_LIVE_MS`] while the lens is
+/// moving, and published here; the render threads take whatever is in the slot
+/// when they get to it and never wait for one.
+///
+/// Both forms are published together because the two tiers read the map
+/// differently and neither conversion belongs on a render thread: `map` is
+/// what the CPU integrator takes per ray, and `quads` is the same map gathered
+/// onto the two receiver rectangles the raster tier uploads as a texture — two
+/// 128² density estimates, which was itself several milliseconds a frame.
+#[derive(Clone)]
+struct Photons {
+    map: Arc<CausticMap>,
+    quads: Arc<Vec<raster::CausticQuad>>,
+    /// Bumped on every publish. A reader holding this number holds the newest
+    /// map there is, and a reader whose number has changed has a *new* one —
+    /// which is exactly the `caustic_moved` the mask and the texture upload
+    /// are driven by.
+    stamp: u64,
+}
+
+impl Default for Photons {
+    fn default() -> Self {
+        Self { map: Arc::new(CausticMap::empty()), quads: Arc::new(Vec::new()), stamp: 0 }
+    }
+}
+
+type Maps = Arc<Mutex<Photons>>;
+
+/// When the live photon map is retraced: the pose rule, and the rate limit on
+/// it.
+///
+/// The pose rule is [`caustic_moved`] and is unchanged — a map is stale when
+/// the lens has left the place it was traced at. What is new is the second
+/// clause: a stale map is retraced *at most* every `every`, so a hero walking
+/// across the cove retraces ten times a second rather than sixty.
+///
+/// The two clauses together give the behaviour the level wants without a third
+/// one for it. While walking, the limit bites and the caustic lags the hand.
+/// When the player stops, the map is still stale — the last trace was at a
+/// pose up to `every` of walking ago — so the next tick past the limit traces
+/// the pose they stopped at, and *then* the pose rule goes quiet and nothing
+/// is retraced until they move again. "Once more when it stops" is not a case;
+/// it is what the two clauses already do.
+struct Retrace {
+    every: Duration,
+    /// The placement the last published map was traced at.
+    at: Option<Placement>,
+    /// When that trace finished. The limit is measured from the end and not
+    /// the start, so it is a bound on the *share* of a thread the map costs
+    /// rather than on how often it is asked for.
+    last: Option<Instant>,
+}
+
+impl Retrace {
+    fn new(every: Duration) -> Self {
+        Self { every, at: None, last: None }
+    }
+
+    /// Whether `p` is worth a new map at `now`.
+    fn due(&self, p: &Placement, now: Instant) -> bool {
+        caustic_moved(self.at.as_ref(), p)
+            && self.last.is_none_or(|t| now.saturating_duration_since(t) >= self.every)
+    }
+
+    /// A map of `p` was published at `now`.
+    fn traced(&mut self, p: &Placement, now: Instant) {
+        self.at = Some(p.clone());
+        self.last = Some(now);
+    }
+}
+
+/// Whether the being has moved or leaned far enough since `was` to be worth a
+/// new photon map. [`None`] is "there has never been one", which always is.
+fn caustic_moved(was: Option<&Placement>, now: &Placement) -> bool {
+    let Some(was) = was else {
+        return true;
+    };
+    let (now_c, now_r) = now.being;
+    let (was_c, was_r) = was.being;
+    if (now_c - was_c).norm() > CAUSTIC_MOVED_M {
+        return true;
+    }
+    // The lean, as the angle between the two axes: the third column of a
+    // body → world rotation is the capsule's own axis.
+    let axis = |m: &Mat3| Vec3::new(m[(0, 2)], m[(1, 2)], m[(2, 2)]);
+    let d = axis(&now_r).dot(&axis(&was_r)).clamp(-1.0, 1.0);
+    d.acos() > CAUSTIC_LEANED_RAD
+}
 
 // ---- the being, as the picture and the rune each want it ----------------------
 
@@ -622,8 +752,21 @@ fn simulate(
         }
     );
     let dt = cove.dt();
-    let fps = scene.authored.parameter_or("fps", 30.0).max(1.0);
+    // **The pace the level is played at, and it is not the pace it is solved
+    // at.** The window can only present a frame the simulation has handed it,
+    // so this knob was the frame rate: at thirty a tier drawing in two
+    // milliseconds still showed thirty. Sixty costs four tenths of a
+    // millisecond a frame of solving — the pace line says so — and the whole
+    // of the rest of this loop is unchanged by it, because every number in it
+    // is derived rather than written down: `steps_per_frame` from `dt`, `cap`
+    // from that, and the window's own `gap` from the first two frames it is
+    // sent.
+    let fps = scene.authored.parameter_or("fps", 60.0).max(1.0);
     let steps_per_frame = (1.0 / fps / dt).round().max(1.0) as usize;
+    // The most a late frame may catch up in one go. Four frames' worth, which
+    // at sixty is 67 ms of simulation against a 17 ms budget — enough slack to
+    // close a hitch, little enough that a stall cannot be paid off in one
+    // enormous step.
     let cap = 4 * steps_per_frame;
 
     let mut start = Instant::now();
@@ -721,14 +864,58 @@ fn simulate(
 ///
 /// The trace is `cove::rune::score`'s own little scene — the being, the door
 /// and the sand, three pieces and no BVH over the level — which is why it can
-/// afford to be the puzzle's clock at all. The renderer's caustic map is a
-/// different trace of a different scene, for a different purpose: that one has
-/// to look right, this one has to be a number.
-fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow) {
+/// afford to be the puzzle's clock at all.
+///
+/// ## and the picture's photon map, for the same reason
+///
+/// This thread also traces the *renderer's* caustic — a different trace of a
+/// different scene, for a different purpose: that one has to look right, this
+/// one has to be a number. It used to live on the render thread, inside
+/// [`Tracer::prepare`], retraced whenever the lens had moved a centimetre; a
+/// hero carries the lens in its hand, so walking retraced it on every frame
+/// and a frame the raster tier drew in two milliseconds took ninety to pose.
+///
+/// It belongs here because of who *waits* for it. Nobody does. The picture
+/// draws the last map it was given until a new one arrives, and the gate holds
+/// its answer for a whole second before the door moves — so a map that lags
+/// the hand by [`CAUSTIC_LIVE_MS`] costs the level nothing it can see, and
+/// costs the window nothing at all. [`Retrace`] is the rule; [`Photons`] is
+/// the slot it is published into.
+///
+/// `gather` is whether the raster tier is the one drawing: it reads the map as
+/// a texture on two receivers, and gathering onto them is another few
+/// milliseconds that has no business on a frame either.
+fn rune_worker(
+    latest: Latest,
+    gate: Arc<AtomicBool>,
+    photons: usize,
+    glow: Glow,
+    maps: Maps,
+    gather: bool,
+) {
     let scene = match CoveScene::bundled() {
         Ok(s) => s,
         Err(e) => return eprintln!("rune: the score could not build the cove: {e}"),
     };
+    // The picture's own copy of the level, for the caustic alone. It is the
+    // level evaluated a second time — a tenth of a second, the same price
+    // `settle_worker` pays — and it buys a photon map that is nobody's frame.
+    let mut picture = match cove_render::Scene::new(&scene) {
+        Ok(mut p) => {
+            p.set_photons(photons);
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("rune: the caustic could not build the cove ({e}); the picture keeps its own");
+            None
+        }
+    };
+    let pivots = cove_render::Scene::hero_pivots();
+    let quads = caustic_quads(&scene);
+    let live_ms = scene.authored.parameter_or("caustic_live_ms", CAUSTIC_LIVE_MS).max(0.0);
+    let mut retrace = Retrace::new(Duration::from_secs_f64(live_ms * 1e-3));
+    let mut stamp = 0u64;
+    let mut said_map = false;
     let mut g = Gate::new(scene.open_frac);
     let after = glint_after(&scene);
     let mut glint = Glint::new(after, scene.open_frac);
@@ -803,6 +990,44 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
             eprintln!("rune   the score rose: the glint is gone");
         }
         *glow.lock().unwrap_or_else(|e| e.into_inner()) = Lit { score: frac, glint: placed };
+
+        // ---- the picture's photon map ------------------------------------
+        // The same placement the render threads build, on the same rule, at
+        // most every `caustic_live_ms` — and then published rather than
+        // drawn. Nothing here is on anybody's frame.
+        if let Some(pic) = picture.as_mut() {
+            let hero = snap.parts.as_ref().and_then(|parts| pic.hero_at(parts, &pivots, snap.held));
+            let placement =
+                placement_of(&snap).with_hero(hero).with_score(frac).with_glint(placed);
+            if retrace.due(&placement, Instant::now()) {
+                let lap = Instant::now();
+                let map = Arc::new(pic.caustic_map(&placement));
+                let traced_ms = lap.elapsed().as_secs_f64() * 1e3;
+                let gathered = Arc::new(if gather { gather_quads(&map, &quads) } else { Vec::new() });
+                // Measured from the *end*: the limit is a bound on the share
+                // of this thread the map costs, not on how often it is asked
+                // for.
+                retrace.traced(&placement, Instant::now());
+                stamp += 1;
+                *maps.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Photons { map, quads: gathered, stamp };
+                if !said_map {
+                    said_map = true;
+                    eprintln!(
+                        "rune   the caustic is {photons} photons in {traced_ms:.1} ms{}, off the \
+                         frame path at most every {live_ms:.0} ms",
+                        if gather {
+                            format!(
+                                " and {:.1} ms gathered",
+                                lap.elapsed().as_secs_f64() * 1e3 - traced_ms
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+            }
+        }
 
         // The only thing on screen is the picture, so what the player is told
         // about the rune is told here. Below a hundredth it is silence: an
@@ -974,8 +1199,25 @@ struct Tracer {
     film: Film,
     exposure: f32,
     /// The last caustic map, and the pose it was traced at.
-    caustics: CausticMap,
+    ///
+    /// `traced_at` is the *offline* path's memory of where its own last trace
+    /// was; a tracer with a [`Maps`] never sets it, because the rule lives on
+    /// the thread that traces (see [`Retrace`]).
+    caustics: Arc<CausticMap>,
     traced_at: Option<Placement>,
+    /// The live photon map, when a thread off the frame path is tracing it.
+    ///
+    /// [`None`] is the offline path — `--shot`, the parity test, `kosm run
+    /// rune`'s own frame — which traces its own map inside
+    /// [`sync_caustics`](Self::sync_caustics) exactly as it always has, and is
+    /// therefore still pixel-identical to what it was.
+    photons: Option<Maps>,
+    /// The stamp of the map this tracer is holding, so "a new map arrived" is
+    /// a comparison and not a trace.
+    stamp: u64,
+    /// That map gathered onto the raster tier's two receivers, when the
+    /// publisher gathered it.
+    quads: Arc<Vec<raster::CausticQuad>>,
     passes: u64,
     /// The view the last pass rendered from, so "the camera moved" is a fact
     /// this side owns rather than one read back out of the history's plan. A
@@ -1075,8 +1317,11 @@ impl Tracer {
             history,
             film: Film::new(size.0, size.1),
             exposure,
-            caustics: CausticMap::empty(),
+            caustics: Arc::new(CausticMap::empty()),
             traced_at: None,
+            photons: None,
+            stamp: 0,
+            quads: Arc::new(Vec::new()),
             passes: 0,
             last_view: None,
             rig: None,
@@ -1085,6 +1330,14 @@ impl Tracer {
             pivots: cove_render::Scene::hero_pivots(),
             projection,
         })
+    }
+
+    /// Take the photon map from a shared slot instead of tracing one.
+    ///
+    /// What the window does and the stills do not. See [`Photons`].
+    fn with_photons(mut self, maps: Maps) -> Self {
+        self.photons = Some(maps);
+        self
     }
 
     /// The map the command line asked for, over the one the level names.
@@ -1154,6 +1407,13 @@ impl Tracer {
         &self.caustics
     }
 
+    /// That map already gathered onto the raster tier's two receivers, when
+    /// the thread that traced it gathered it. Empty on the offline path, which
+    /// gathers for itself.
+    fn caustic_quads(&self) -> &[raster::CausticQuad] {
+        &self.quads
+    }
+
     /// What the light meter has multiplied the authored exposure by. One
     /// until a pass has measured something, which is the authored exposure
     /// exactly — the level's own answer for the picture it opens on.
@@ -1161,33 +1421,14 @@ impl Tracer {
         self.meter.as_ref().map_or(1.0, |m| m.exposure())
     }
 
-    /// Whether the being has moved or leaned far enough to be worth a new map.
-    fn caustic_is_stale(&self, p: &Placement) -> bool {
-        let Some(was) = self.traced_at.as_ref() else {
-            return true;
-        };
-        let (now_c, now_r) = p.being;
-        let (was_c, was_r) = was.being;
-        if (now_c - was_c).norm() > CAUSTIC_MOVED_M {
-            return true;
-        }
-        // The lean, as the angle between the two axes: the third column of a
-        // body → world rotation is the capsule's own axis.
-        let axis = |m: &Mat3| Vec3::new(m[(0, 2)], m[(1, 2)], m[(2, 2)]);
-        let d = axis(&now_r).dot(&axis(&was_r)).clamp(-1.0, 1.0);
-        d.acos() > CAUSTIC_LEANED_RAD
-    }
-
     /// One pass: trace a raw sample, fold it in, resolve.
     ///
-    /// The caustic map is retraced here, on the render thread, when the being
-    /// has moved — which is the CPU tier's shape of "repack the caustic". The
-    /// GPU tier uploads a `CausticPack` once and re-uploads it when the map
-    /// changes; the CPU integrator takes a `&CausticMap` per call, so the map
-    /// only has to be *made* before the trace that reads it. A pass that
-    /// retraces pays for it inside its own milliseconds, and a pass that does
-    /// not shows the last map, which is what "keep showing the last map while
-    /// walking" is.
+    /// The caustic map is *taken* here, not made: the CPU integrator wants a
+    /// `&CausticMap` per call, so the map only has to exist before the trace
+    /// that reads it, and where it came from is [`sync_caustics`](Self::sync_caustics)'s
+    /// business. In the window it came from [`rune_worker`] some milliseconds
+    /// ago; offline this pass traces it itself.
+    ///
     /// `present` is the shutter: `true` resolves the picture for the glass,
     /// `false` folds this pass into the history and stops there. A resolve is
     /// the à-trous filter and a tonemap over the whole frame — a fixed
@@ -1228,21 +1469,38 @@ impl Tracer {
         Ready { placement, caustic_moved: moved, dt, cam }
     }
 
-    /// Retrace the photon map if the lens has moved far enough, and say
-    /// whether it did.
+    /// Bring the photon map up to date, and say whether it changed.
     ///
-    /// The half of [`prepare`](Self::prepare) a tracer that was *handed* its
-    /// pose still has to do for itself: `pass_at` reads `self.caustics`, and
-    /// the rule for when that is stale is a property of the placement, so two
-    /// tracers given the same placements retrace on the same frames and end
-    /// up with the same map.
+    /// **The window never traces one here.** A tracer with a [`Maps`] takes
+    /// whatever the publisher has put in the slot — a mutex, three `Arc`
+    /// clones and a `u64` compare — and a frame on which nothing new arrived
+    /// simply keeps drawing the last map, which is the whole of "let the
+    /// render thread keep showing the last map until a new one arrives". What
+    /// comes back is *a new map arrived*, which is what the mask wants (it
+    /// repaints the door's face on exactly those frames) and what the raster
+    /// tier's texture upload wants.
+    ///
+    /// Without a slot it is the offline rule, unchanged: retrace when the pose
+    /// has left the one the last map was traced at. That is the half of
+    /// [`prepare`](Self::prepare) a tracer that was *handed* its pose still
+    /// has to do for itself, because `pass_at` reads `self.caustics`.
     fn sync_caustics(&mut self, placement: &Placement) -> bool {
-        let stale = self.caustic_is_stale(placement);
-        if stale {
-            self.caustics = self.picture.caustic_map(placement);
-            self.traced_at = Some(placement.clone());
+        let Some(slot) = self.photons.clone() else {
+            let stale = caustic_moved(self.traced_at.as_ref(), placement);
+            if stale {
+                self.caustics = Arc::new(self.picture.caustic_map(placement));
+                self.traced_at = Some(placement.clone());
+            }
+            return stale;
+        };
+        let got = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if got.stamp == self.stamp {
+            return false;
         }
-        stale
+        self.stamp = got.stamp;
+        self.caustics = got.map;
+        self.quads = got.quads;
+        true
     }
 
     /// The rest of it: trace a raw sample into `size`, fold it in, resolve.
@@ -1284,7 +1542,7 @@ impl Tracer {
         let seed = 0x5eed_c0be ^ self.passes.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let picture = self.picture.at(placement);
         let opts = options(&self.scene, seed, false);
-        let map = (!self.caustics.is_empty()).then_some(&self.caustics);
+        let map = (!self.caustics.is_empty()).then_some(&*self.caustics);
         let traced = if full {
             self.film = pathtrace::render_with_caustics(&picture, &cam, size.0, size.1, &opts, map);
             None
@@ -1431,6 +1689,7 @@ struct Passed {
 /// from what this thread measured and nobody else has that number. A job that
 /// asks for a size the budget did not choose is a job whose picture would not
 /// match the history the next pass carries.
+#[allow(clippy::too_many_arguments)]
 fn render_worker(
     jobs: Receiver<Job>,
     out: Sender<Shot>,
@@ -1440,11 +1699,12 @@ fn render_worker(
     sdf: Arc<kosm_scan::SdfGrid>,
     projection: Option<Projection>,
     shutter: Option<bool>,
+    maps: Maps,
 ) {
     eprintln!("rune   evaluating the level…");
     let mut size = budget.size();
     let mut tracer = match Tracer::new(size) {
-        Ok(t) => t.with_rig(sdf, Player::from_env()).with_projection(projection),
+        Ok(t) => t.with_rig(sdf, Player::from_env()).with_projection(projection).with_photons(maps),
         Err(e) => return eprintln!("rune: could not build the picture: {e}"),
     };
     // The flag over the level's own `cam_shutter`, resolved here because this
@@ -1776,15 +2036,54 @@ struct RasterTier {
     glint_glow: f64,
     /// Where the caustic receivers are, so the map can be re-gathered when the
     /// lens moves.
-    door_quad: ([f64; 3], [f64; 3], [f64; 3]),
-    sand_quad: ([f64; 3], [f64; 3], [f64; 3]),
-    caustic_res: (u32, u32),
+    door_quad: Quad,
+    sand_quad: Quad,
 }
 
 /// How fine the two caustic receivers are gathered. 128² over a door a metre
 /// and a half across is a centimetre a texel, which is finer than the photon
 /// map's own gather radius and so is not the limit on anything.
 const CAUSTIC_RES: (u32, u32) = (128, 128);
+
+/// One receiver rectangle: a corner and its two edges, world metres.
+type Quad = ([f64; 3], [f64; 3], [f64; 3]);
+
+/// Where the caustic is gathered: the door's face, and a patch of sand in
+/// front of it wide enough to hold a focus thrown wide of the keyhole.
+///
+/// A free function and not a method, because two threads need it and only one
+/// of them has a [`RasterTier`]: the tier binds these rectangles as a texture,
+/// and [`rune_worker`] — which is where the photon map is actually traced —
+/// gathers onto them. Two lists of numbers would be a caustic drawn a
+/// centimetre off the stone it landed on.
+fn caustic_quads(scene: &CoveScene) -> [Quad; 2] {
+    let face = scene.cliff_face_y();
+    let door = (
+        [scene.door_x - scene.door_w / 2.0, face - 0.01, scene.door_sill()],
+        [scene.door_w, 0.0, 0.0],
+        [0.0, 0.0, scene.door_h],
+    );
+    let patch = scene.authored.parameter_or("caustic_patch_m", 8.0);
+    let sand = (
+        [
+            scene.door_x - patch / 2.0,
+            face - patch,
+            scene.sand_z_at(scene.door_x, face - patch) + 0.005,
+        ],
+        [patch, 0.0, 0.0],
+        // the sand is a plane at a grade, so the `v` edge rises with it
+        [0.0, patch, scene.beach_slope * patch],
+    );
+    [door, sand]
+}
+
+/// A photon map gathered onto both of them.
+fn gather_quads(map: &CausticMap, quads: &[Quad; 2]) -> Vec<raster::CausticQuad> {
+    quads
+        .iter()
+        .map(|(o, u, v)| raster::CausticQuad::gather(map, *o, *u, *v, CAUSTIC_RES))
+        .collect()
+}
 
 impl RasterTier {
     fn new(
@@ -1857,30 +2156,10 @@ impl RasterTier {
         parts.push((cove_render::Role::Ground, IDENTITY_ROWS, water));
         rs.sea = Some(sea);
 
-        // The two receivers the caustic is gathered onto: the door's face, and
-        // a patch of sand in front of it wide enough to hold a focus thrown
-        // wide of the keyhole.
-        let face = scene.cliff_face_y();
-        let door_quad = (
-            [
-                scene.door_x - scene.door_w / 2.0,
-                face - 0.01,
-                scene.door_sill(),
-            ],
-            [scene.door_w, 0.0, 0.0],
-            [0.0, 0.0, scene.door_h],
-        );
-        let patch = a.parameter_or("caustic_patch_m", 8.0);
-        let sand_quad = (
-            [
-                scene.door_x - patch / 2.0,
-                face - patch,
-                scene.sand_z_at(scene.door_x, face - patch) + 0.005,
-            ],
-            [patch, 0.0, 0.0],
-            // the sand is a plane at a grade, so the `v` edge rises with it
-            [0.0, patch, scene.beach_slope * patch],
-        );
+        // The two receivers the caustic is gathered onto. Their geometry is
+        // the level's, so it is written down once — [`caustic_quads`] — and
+        // the thread that gathers is not this one; see [`Photons`].
+        let [door_quad, sand_quad] = caustic_quads(scene);
         rs.caustics = vec![
             raster::CausticQuad::empty(CAUSTIC_RES),
             raster::CausticQuad::empty(CAUSTIC_RES),
@@ -1903,7 +2182,6 @@ impl RasterTier {
             glint_glow: scene.glint_glow,
             door_quad,
             sand_quad,
-            caustic_res: CAUSTIC_RES,
         })
     }
 
@@ -1982,12 +2260,23 @@ impl RasterTier {
     }
 
     /// Re-gather the photon map onto the two receivers.
+    ///
+    /// Sixteen thousand density estimates a receiver: what the *offline* path
+    /// pays once for a still. The window never calls this — see
+    /// [`Self::set_caustics`].
     fn gather(&mut self, map: &CausticMap) {
-        let quads = [self.door_quad, self.sand_quad];
-        self.scene.caustics = quads
-            .iter()
-            .map(|(o, u, v)| raster::CausticQuad::gather(map, *o, *u, *v, self.caustic_res))
-            .collect();
+        self.scene.caustics = gather_quads(map, &[self.door_quad, self.sand_quad]);
+    }
+
+    /// Take receivers somebody else gathered.
+    ///
+    /// What the window does: [`rune_worker`] gathers onto the same rectangles
+    /// off the frame path, so all a frame pays is the copy — two 128² floats,
+    /// a couple of hundred kilobytes, and only on a frame a new map arrived.
+    fn set_caustics(&mut self, quads: &[raster::CausticQuad]) {
+        if !quads.is_empty() {
+            self.scene.caustics = quads.to_vec();
+        }
     }
 
     fn draw(
@@ -2040,10 +2329,18 @@ const GLINT_TINT: [f32; 3] = [1.0, 0.93, 0.78];
 /// sharp. Standing, the tracer accumulates on the rig's exact camera at the
 /// budget's size and the blend fades it up: `(spp − 4) / 24`.
 ///
-/// **Nothing crosses the bus while the blend is zero.** A raster-only frame is
-/// handed over as the texture it was drawn into. Only once the reference has
-/// something to say is the frame read back — and by then nobody is moving, so
-/// the readback costs a frame rate nobody is spending.
+/// **Nothing crosses the bus at all.** A raster-only frame is handed over as
+/// the texture it was drawn into, and a settled one is that texture mixed with
+/// the reference by [`raster::Blend`] into another texture on the same device.
+/// The reference itself goes *up* the bus once a pass, at the budget's size,
+/// which is a few megabytes a few times a second and is not a frame's problem.
+///
+/// It used to be a readback: standing still, `frame::read_back` pulled a
+/// 1280×720 frame down, `settle::present` lerped a million pixels on this
+/// thread, and the viewport uploaded the answer again — five to eight
+/// milliseconds a frame, which took a window that walks at sixty down to fifty
+/// the moment the player stopped. The bytes path is still there and still
+/// tested; it is what `--shot --tier raster --settle` writes to a file.
 #[allow(clippy::too_many_arguments)]
 fn raster_worker(
     jobs: Receiver<Job>,
@@ -2057,13 +2354,15 @@ fn raster_worker(
     device: wgpu::Device,
     queue: wgpu::Queue,
     size: (u32, u32),
+    maps: Maps,
 ) {
     eprintln!("rune   evaluating the level…");
     let mut trace_size = budget.size();
     let player = Player::from_env();
     let field = sdf.clone();
+    let reference = maps.clone();
     let mut tracer = match Tracer::new(trace_size) {
-        Ok(t) => t.with_rig(sdf, player).with_projection(projection),
+        Ok(t) => t.with_rig(sdf, player).with_projection(projection).with_photons(maps),
         Err(e) => return eprintln!("rune: could not build the picture: {e}"),
     };
     let mut tier = match RasterTier::new(
@@ -2107,12 +2406,23 @@ fn raster_worker(
     let (want_tx, want_rx) = std::sync::mpsc::channel::<Trace>();
     let (got_tx, got_rx) = std::sync::mpsc::channel::<Traced>();
     if settle_on {
-        std::thread::spawn(move || settle_worker(want_rx, got_tx, budget, field, player, projection));
+        std::thread::spawn(move || {
+            settle_worker(want_rx, got_tx, budget, field, player, projection, reference)
+        });
     }
 
     let mut settle = if settle_on { raster::Settle::default() } else { raster::Settle::disabled() };
+    // The crossing, on the device. See [`raster::Blend`]: a standing frame is
+    // one full-screen pass over two textures rather than 3.7 MB down the bus,
+    // a million-pixel lerp and 3.7 MB back up.
+    let mut blender = raster::Blend::new(&device);
     let mut said_at = Instant::now();
     let mut frames = 0u32;
+    // How many new photon maps arrived since the last pace line. It is the
+    // one number that says the caustic is still live now that this thread does
+    // not trace it: `caustic_live_ms` of 100 should read as ten a second while
+    // the lens is moving and nothing at all while it is not.
+    let mut got_maps = 0u32;
     let mut raster_ms = 0.0f64;
     let mut prep_ms = 0.0f64;
     let mut last_view: Option<View> = None;
@@ -2121,7 +2431,6 @@ fn raster_worker(
     // the player has left — dropped, not blended.
     let mut generation = 0u64;
     let mut outstanding = false;
-    let mut reference: Option<(Vec<u8>, (u32, u32))> = None;
     // The meter's multiplier, as the reference last measured it. One until it
     // has: the level's authored exposure is its own answer for the picture it
     // opens on, which is what a walking player is looking at.
@@ -2154,16 +2463,23 @@ fn raster_worker(
         // blend a fade rather than a double exposure.
         let prepared = tracer.prepare(&job.frame, lit);
         if prepared.caustic_moved {
-            tier.gather(tracer.caustic_map());
+            // Not a gather: [`rune_worker`] did that off the frame path, and
+            // this is the copy of two 128² receivers that lands it on the
+            // door and the sand.
+            tier.set_caustics(tracer.caustic_quads());
+            got_maps += 1;
         }
         tier.place(tracer.cove(), &job.frame, &prepared.placement, lit);
-        // What the *pose* cost, before a triangle is drawn. On a walking
-        // frame this is nearly all of it and nearly all of that is the photon
-        // map: the lens moves with the hand, so `sync_caustics` retraces, and
-        // fifty thousand photons is tens of milliseconds. It is the level's
-        // cost and not the tier's — the trace tier pays exactly the same one
-        // out of the same `prepare` — so the pace line states the two halves
-        // separately rather than reporting one number that hides it.
+        // What the *pose* cost, before a triangle is drawn: the figure placed,
+        // the photon map taken, the rig sprung.
+        //
+        // This is the number the whole change is about, and the pace line
+        // states it apart from the draw for that reason. It used to be nearly
+        // the whole frame and nearly all of *it* was the photon map — the lens
+        // moves with the hand, so `sync_caustics` retraced, and fifty thousand
+        // photons is tens of milliseconds. Now the map arrives from
+        // [`rune_worker`] and this is arithmetic: a twentieth of a millisecond
+        // walking, against a draw of under two.
         let prep = lap.elapsed().as_secs_f64() * 1e3;
         prep_ms = if prep_ms > 0.0 { 0.7 * prep_ms + 0.3 * prep } else { prep };
 
@@ -2177,7 +2493,7 @@ fn raster_worker(
         if moved {
             settle.moved();
             generation += 1;
-            reference = None;
+            blender.forget();
         } else {
             settle.still(prepared.dt);
         }
@@ -2190,7 +2506,9 @@ fn raster_worker(
                 trace_size = done.size;
                 gain = done.exposure;
                 if !done.rgba.is_empty() {
-                    reference = Some((done.rgba, done.size));
+                    // Straight onto the device, once a pass, rather than into
+                    // a `Vec` a presented frame would then have to mix with.
+                    blender.set_reference(&device, &queue, &done.rgba, done.size);
                 }
             }
         }
@@ -2216,29 +2534,24 @@ fn raster_worker(
         raster_ms = if raster_ms > 0.0 { 0.7 * raster_ms + 0.3 * ms } else { ms };
 
         let blend = settle.blend();
-        let shot = if blend > 0.0 {
-            // **The bus is crossed only once the reference has something to
-            // say.** Below that the frame is handed over as the texture it
-            // was drawn into, and nothing is read back at all — which is the
-            // whole of a walking player's frame budget.
-            let img = kosm_view::frame::read_back(&device, &queue, &texture, size).into_raw();
-            let rgba = match &reference {
-                Some((bytes, tsize)) => raster::settle::present(&img, size, bytes, *tsize, blend),
-                // a blend above zero with nothing to blend cannot happen —
-                // the samples come with the picture — but a raw raster frame
-                // is the honest fallback and not a panic
-                None => img,
-            };
-            Shot { size, rgba, tex: None, mask: 0.0, mean_spp: settle.spp(), due: job.due }
-        } else {
-            Shot {
-                size,
-                rgba: Vec::new(),
-                tex: Some(texture),
-                mask: 0.0,
-                mean_spp: settle.spp(),
-                due: job.due,
-            }
+        // **Nothing crosses the bus, standing or walking.** A raster-only
+        // frame is handed over as the texture it was drawn into; a settled one
+        // is that texture and the reference mixed by [`raster::Blend`] into
+        // another texture on the same device. It used to be a readback, a
+        // million-pixel lerp and an upload — five to eight milliseconds, which
+        // is what took a window that walked at sixty down to fifty the moment
+        // the player stopped.
+        let shown = (blend > 0.0)
+            .then(|| blender.draw(&device, &queue, &texture, blend))
+            .flatten()
+            .unwrap_or(texture);
+        let shot = Shot {
+            size,
+            rgba: Vec::new(),
+            tex: Some(shown),
+            mask: 0.0,
+            mean_spp: settle.spp(),
+            due: job.due,
         };
 
         frames += 1;
@@ -2247,7 +2560,7 @@ fn raster_worker(
             said_at = Instant::now();
             eprintln!(
                 "rune   raster {}×{}: {:.1} fps, {:.1} ms drawing + {:.1} ms posing, blend \
-                 {:.2} at {:.1} spp ({}×{} traced) — {}",
+                 {:.2} at {:.1} spp ({}×{} traced), {:.1} caustics a second — {}",
                 size.0,
                 size.1,
                 frames as f64 / elapsed,
@@ -2257,9 +2570,11 @@ fn raster_worker(
                 settle.spp(),
                 trace_size.0,
                 trace_size.1,
+                got_maps as f64 / elapsed,
                 if moved { "moving" } else { "still" },
             );
             frames = 0;
+            got_maps = 0;
         }
         if out.send(shot).is_err() {
             return;
@@ -2305,6 +2620,7 @@ struct Traced {
 ///
 /// A new generation is a new pose: the history is thrown away rather than
 /// masked, for the reason [`Tracer::restart`] gives.
+#[allow(clippy::too_many_arguments)]
 fn settle_worker(
     want: Receiver<Trace>,
     out: Sender<Traced>,
@@ -2312,10 +2628,11 @@ fn settle_worker(
     sdf: Arc<kosm_scan::SdfGrid>,
     player: Player,
     projection: Option<Projection>,
+    maps: Maps,
 ) {
     let mut size = budget.size();
     let mut tracer = match Tracer::new(size) {
-        Ok(t) => t.with_rig(sdf, player).with_projection(projection),
+        Ok(t) => t.with_rig(sdf, player).with_projection(projection).with_photons(maps),
         Err(e) => return eprintln!("rune: the reference would not build: {e}"),
     };
     let mut generation = u64::MAX;
@@ -2884,6 +3201,9 @@ struct App {
     /// Which tier draws, and whether it settles into the reference.
     tier: Tier,
     settle: bool,
+    /// The live photon map, traced by the rune thread and read by whichever
+    /// render thread `init` starts. See [`Photons`].
+    maps: Maps,
     /// The window's own size in physical pixels, which is what the raster tier
     /// draws at — there is no ladder on that tier, because a forward pass at
     /// full size is milliseconds.
@@ -2894,6 +3214,12 @@ struct App {
     worst_ms: f64,
     dropped: u64,
     late: u64,
+    /// How many redraws since the last pace line put a *new* picture on the
+    /// glass, and how many there were. The first is the frame rate the player
+    /// actually sees, which is not the rate the render thread reports: a tier
+    /// drawing sixty a second into a window waking thirty times shows thirty.
+    shown: u64,
+    ticks: u64,
     gap: Duration,
     said_pace: Instant,
 }
@@ -2918,6 +3244,16 @@ impl App {
 
     /// Which frame the window is for: the moment the picture will be on the
     /// glass, which is now plus the latency it has measured.
+    ///
+    /// `late` counts the redraws that wanted a frame the simulation had not
+    /// made yet — the newest one it had was already a whole `gap` older than
+    /// the deadline. It is counted **per redraw** and the redraw rate is now a
+    /// knob ([`REDRAW`]) rather than the sixteen milliseconds it used to be,
+    /// so the pace line states it as a share of the redraws and not as a
+    /// number: a window waking twice as often as the simulation produces
+    /// frames finds one missing about half the time and is not, by that,
+    /// behind. `dropped` is the one to watch — a frame the window skipped
+    /// past because it never got round to asking for it.
     fn pace(&mut self, n: usize) {
         let deadline = Instant::now() + self.head_start();
         let want = match self.frames.iter().rposition(|f| f.due <= deadline) {
@@ -2966,18 +3302,19 @@ impl viewport::Scene for App {
         // never crosses the bus.
         let (device, queue) = (device.clone(), queue.clone());
         let (settle, size) = (self.settle, self.window_px);
+        let maps = self.maps.clone();
         match self.tier {
             Tier::Raster => {
                 std::thread::spawn(move || {
                     raster_worker(
                         jobs, shots, glow, budget, ready, sdf, projection, settle, device, queue,
-                        size,
+                        size, maps,
                     )
                 });
             }
             Tier::Trace => {
                 std::thread::spawn(move || {
-                    render_worker(jobs, shots, glow, budget, ready, sdf, projection, shutter)
+                    render_worker(jobs, shots, glow, budget, ready, sdf, projection, shutter, maps)
                 });
             }
         }
@@ -3028,6 +3365,13 @@ impl viewport::Scene for App {
             }
             self.frames.push(frame);
         }
+        // The frames behind the cursor are gone: nothing ever looks back, and
+        // at sixty a second a window that never trimmed would hold every
+        // snapshot the level ever took, arms and all.
+        if self.cursor > 256 {
+            self.frames.drain(..self.cursor);
+            self.cursor = 0;
+        }
         let n = self.frames.len();
         if n > 0 {
             self.pace(n);
@@ -3045,7 +3389,10 @@ impl viewport::Scene for App {
             });
         }
         self.lookahead.store(self.head_start().as_micros() as u64, Ordering::Relaxed);
-        if self.said_pace.elapsed().as_secs() >= 2 {
+        self.ticks += 1;
+        self.shown += u64::from(newest.is_some());
+        let since = self.said_pace.elapsed().as_secs_f64();
+        if since >= 2.0 {
             self.said_pace = Instant::now();
             let lead = self.frames.last().map_or(0.0, |f| {
                 let now = Instant::now();
@@ -3053,18 +3400,23 @@ impl viewport::Scene for App {
                     - now.saturating_duration_since(f.due).as_secs_f64() * 1e3
             });
             eprintln!(
-                "rune   pace: {:.0} ms presented latency (worst {:.0}), {:.0} ms head start, \
-                 the sim {:.0} ms ahead; {} dropped, {} late",
+                "rune   pace: {:.1} fps presented ({:.1} redraws), {:.0} ms presented latency \
+                 (worst {:.0}), {:.0} ms head start, the sim {:.0} ms ahead; {} dropped, \
+                 {:.0}% of redraws early",
+                self.shown as f64 / since,
+                self.ticks as f64 / since,
                 self.latency_ms,
                 self.worst_ms,
                 self.head_start().as_secs_f64() * 1e3,
                 lead,
                 self.dropped,
-                self.late,
+                100.0 * self.late as f64 / self.ticks.max(1) as f64,
             );
             self.dropped = 0;
             self.late = 0;
             self.worst_ms = 0.0;
+            self.shown = 0;
+            self.ticks = 0;
         }
         let key = self.frames.get(self.cursor).map(|f| f.frame.t);
         if key.is_some() && self.asked != key {
@@ -3176,6 +3528,24 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
 /// upscales the reference on its way over.
 const WINDOW: (u32, u32) = (1280, 720);
 
+/// How long the window waits between redraws.
+///
+/// The viewport's own default is sixteen milliseconds, which was written for
+/// the court — a tier whose passes are a tenth of a second, where the wait is
+/// free. It is not free here. The surface is `AutoVsync`, so a present blocks
+/// until the next vertical blank: sixteen milliseconds of waiting followed by
+/// a blit then misses the vblank it was aiming for and lands on the one after,
+/// which is *two* refresh periods a frame — thirty a second on a sixty hertz
+/// display, whatever the raster tier is capable of. Measured, before this was
+/// a knob: twenty-seven to thirty frames a second standing still with the
+/// raster drawing in two milliseconds.
+///
+/// Four milliseconds is short enough that the wait plus the blit fit inside
+/// one refresh period with room to spare, which leaves the pacing to the
+/// display — sixty on a sixty hertz panel, and a hundred and twenty on a
+/// hundred and twenty hertz one.
+const REDRAW: Duration = Duration::from_millis(4);
+
 /// The window itself: four threads and a viewport.
 ///
 /// `walk` seconds of held W at the start, for a run with nobody at the
@@ -3200,6 +3570,7 @@ pub fn window(
     let latest: Latest = Arc::new(Mutex::new(None));
     let gate = Arc::new(AtomicBool::new(false));
     let glow: Glow = Arc::new(Mutex::new(Lit::default()));
+    let maps: Maps = Arc::new(Mutex::new(Photons::default()));
 
     let scene = CoveScene::bundled()?;
     let photons = live_photons(&scene.authored);
@@ -3244,12 +3615,17 @@ pub fn window(
     }
     {
         let (latest, gate, glow) = (latest.clone(), gate.clone(), glow.clone());
-        std::thread::spawn(move || rune_worker(latest, gate, photons, glow));
+        let maps = maps.clone();
+        // Only the raster tier reads the map as a texture, so only the raster
+        // tier is worth gathering for.
+        let gather = tier == Tier::Raster;
+        std::thread::spawn(move || rune_worker(latest, gate, photons, glow, maps, gather));
     }
 
-    viewport::run(
+    viewport::run_at(
         "Kosm — the cove",
         WINDOW,
+        REDRAW,
         App {
             rx,
             shots: shot_rx,
@@ -3269,12 +3645,15 @@ pub fn window(
             shutter,
             tier,
             settle,
+            maps,
             window_px: WINDOW,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
             dropped: 0,
             late: 0,
+            shown: 0,
+            ticks: 0,
             gap: Duration::from_millis(33),
             said_pace: Instant::now(),
         },
@@ -3312,6 +3691,141 @@ mod tests {
     /// How many photons the tests score with. Well under the live budget: the
     /// checks below are "is it lit at all" and "is it dark", not a measurement.
     const TEST_PHOTONS: usize = 20_000;
+
+    /// **A walking frame poses without a photon trace.**
+    ///
+    /// The measurement that this change is about. [`Tracer::prepare`] is
+    /// everything a frame does before a triangle is drawn — place the figure,
+    /// bring the caustic up to date, spring the rig — and it used to *make*
+    /// the photon map whenever the lens had moved a centimetre, which walking
+    /// is every frame. Given a [`Maps`] it takes one instead, and what is left
+    /// is arithmetic.
+    ///
+    /// Ten milliseconds is a deliberately loose bound. The frame budget at
+    /// sixty is sixteen and a half, the raster tier's own draw is under two,
+    /// and this pass is measured at a twentieth of a millisecond — a bound of
+    /// ten fails the moment a photon trace comes back and passes on any
+    /// machine that is merely slow.
+    #[test]
+    fn a_walking_frame_poses_without_a_photon_trace() -> anyhow::Result<()> {
+        let scene = CoveScene::bundled()?;
+        let maps: Maps = Arc::new(Mutex::new(Photons::default()));
+        let mut tracer = Tracer::new((64, 36))?.with_photons(maps.clone());
+        let lit = Lit::default();
+        let at = |x: f64| {
+            snapshot_of(&Placement::standing(&scene, x, scene.spawn_y, 0.0), &scene)
+        };
+
+        // Two frames a stride apart — twenty centimetres, twenty times the
+        // rule's own centimetre — so the *offline* tracer would have retraced
+        // on the second of them.
+        let a = at(scene.spawn_x);
+        let b = at(scene.spawn_x + 0.2);
+        assert!(
+            caustic_moved(Some(&placement_of(&a)), &placement_of(&b)),
+            "the two poses are not far enough apart to be a measurement"
+        );
+        tracer.prepare(&a, lit);
+        let t0 = Instant::now();
+        let ready = tracer.prepare(&b, lit);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        assert!(!ready.caustic_moved, "a walking frame traced a photon map for itself");
+        assert!(tracer.caustic_map().is_empty(), "the tracer made a map nobody gave it");
+        assert!(ms < 10.0, "posing a walking frame took {ms:.1} ms");
+        println!("a walking frame poses in {ms:.3} ms");
+
+        // …and a map published into the slot arrives exactly once: the frame
+        // it lands on says so — which is what repaints the door in the mask
+        // and re-uploads the receiver textures — and no frame after it does.
+        *maps.lock().unwrap_or_else(|e| e.into_inner()) = Photons {
+            map: Arc::new(CausticMap::empty()),
+            quads: Arc::new(vec![raster::CausticQuad::empty((4, 4))]),
+            stamp: 1,
+        };
+        assert!(tracer.prepare(&b, lit).caustic_moved, "a published map never arrived");
+        assert_eq!(tracer.caustic_quads().len(), 1, "the receivers came with it");
+        assert!(!tracer.prepare(&b, lit).caustic_moved, "the same map arrived twice");
+        Ok(())
+    }
+
+    /// **The rate limit while walking, and the refresh when it stops.**
+    ///
+    /// [`Retrace`] is two clauses and the second one is the new half: a stale
+    /// map is retraced at most every `caustic_live_ms`. What this checks is
+    /// that the two together give the behaviour the level wants — about ten
+    /// maps a second while the lens is moving, and a map of the pose the
+    /// player *stopped* at within one limit plus a frame of them stopping.
+    ///
+    /// Driven on a synthetic clock, because the rule is a rule and not a
+    /// timing: `due` takes the moment it is asked about.
+    #[test]
+    fn the_caustic_is_rate_limited_walking_and_refreshed_when_the_lens_stops() -> anyhow::Result<()>
+    {
+        let scene = CoveScene::bundled()?;
+        let at = |x: f64| Placement::standing(&scene, x, -6.0, 0.0);
+        let every = Duration::from_millis(CAUSTIC_LIVE_MS as u64);
+        let frame = Duration::from_micros(16_667);
+        let mut r = Retrace::new(every);
+        let t0 = Instant::now();
+
+        // A second of walking at the level's own `walk_mps`: every frame moves
+        // the lens twenty times further than the pose rule's centimetre, so
+        // without the limit this would be sixty maps.
+        let speed = scene.authored.parameter_or("walk_mps", 1.4);
+        let mut traces = 0;
+        let mut walked = 0.0;
+        for k in 0..60u32 {
+            let now = t0 + frame * k;
+            walked += speed * frame.as_secs_f64();
+            let p = at(scene.spawn_x + walked);
+            if r.due(&p, now) {
+                r.traced(&p, now);
+                traces += 1;
+            }
+        }
+        assert!(
+            (8..=11).contains(&traces),
+            "a second of walking traced {traces} maps, not the ten {CAUSTIC_LIVE_MS:.0} ms buys"
+        );
+
+        // The player stops. The last map is of a pose up to a limit of walking
+        // ago, so it is still stale — and the next tick past the limit traces
+        // the pose they are actually standing at.
+        let stopped = at(scene.spawn_x + walked);
+        let t_stop = t0 + frame * 60;
+        let mut refreshed = None;
+        for k in 0..30u32 {
+            let now = t_stop + frame * k;
+            if r.due(&stopped, now) {
+                r.traced(&stopped, now);
+                refreshed = Some(now.saturating_duration_since(t_stop));
+                break;
+            }
+        }
+        let after = refreshed.expect("the map was never refreshed after the lens stopped");
+        assert!(
+            after <= every + frame,
+            "the map was refreshed {:.0} ms after the lens stopped, over the {:.0} ms limit \
+             and a frame",
+            after.as_secs_f64() * 1e3,
+            every.as_secs_f64() * 1e3
+        );
+
+        // And then nothing: a still lens is a map that would come back the
+        // same, and retracing it would throw the door's converged pixels away
+        // through the mask for nothing.
+        for k in 0..600u32 {
+            assert!(
+                !r.due(&stopped, t_stop + frame * (30 + k)),
+                "a still lens was retraced again"
+            );
+        }
+        println!(
+            "{traces} maps a second walking; refreshed {:.0} ms after stopping",
+            after.as_secs_f64() * 1e3
+        );
+        Ok(())
+    }
 
     /// **Test 6, the gate's clock.** A second above the threshold opens it;
     /// nine tenths of one does not; a moment below it starts the clock over.

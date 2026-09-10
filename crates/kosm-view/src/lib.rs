@@ -49,6 +49,16 @@ impl Viewer {
     pub fn run(title: &str, size: (u32, u32), scene: impl Scene) -> anyhow::Result<()> {
         viewport::run(title, size, scene)
     }
+
+    /// The same, at a chosen redraw cadence: see [`viewport::run_at`].
+    pub fn run_at(
+        title: &str,
+        size: (u32, u32),
+        tick: std::time::Duration,
+        scene: impl Scene,
+    ) -> anyhow::Result<()> {
+        viewport::run_at(title, size, tick, scene)
+    }
 }
 
 /// Warnings from wgpu and vcad, on stderr; anything quieter is noise.

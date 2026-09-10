@@ -65,8 +65,11 @@
 //! - [`water`] — the sea's knobs, as the shader's analytic surface.
 //! - [`pipeline`] — the wgpu resources and the two passes.
 //! - [`settle`] — the blend that turns this picture into the reference's when
-//!   nothing is moving.
+//!   nothing is moving, in bytes.
+//! - [`blend`] — the same mix on the device, so a standing frame crosses the
+//!   bus no more often than a walking one does.
 
+pub mod blend;
 pub mod material;
 pub mod pipeline;
 pub mod probes;
@@ -74,6 +77,7 @@ pub mod settle;
 pub mod shadow;
 pub mod water;
 
+pub use blend::Blend;
 pub use material::{GpuMaterial, band_to_rgb, library_gpu};
 pub use pipeline::{Frame, Raster};
 pub use probes::ProbeVolume;
