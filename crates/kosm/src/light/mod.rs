@@ -34,6 +34,14 @@ const BANDS: [(f64, [f64; 3]); 5] = [
     (0.650, [1.00, 0.05, 0.05]),
 ];
 
+/// Baked spectral irradiance: the light in a room, sampled on a grid.
+///
+/// The caustic above is *this* level's light, traced live because it moves.
+/// A room's other light does not — a fixed sun, a static sky, geometry that
+/// stands still — and [`probes`] is that half solved once, offline, so a
+/// raster tier can read it sixty times a second instead of re-solving it.
+pub mod probes;
+
 /// How many bands the spectrum is split into.
 pub const BANDS_LEN: usize = 5;
 

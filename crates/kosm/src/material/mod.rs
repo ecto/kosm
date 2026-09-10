@@ -62,12 +62,14 @@ use crate::audio;
 use crate::world::Param;
 
 mod datasheet;
+pub mod gpu;
 mod library;
 
 pub use datasheet::{
     BALL_RADIUS, Ball, Bounce, Datasheet, ball_world, bounce_curve, datasheet, ring_spectrum,
     settle,
 };
+pub use gpu::{GpuMaterial, band_to_rgb, bands_to_rgb, library_gpu};
 pub use library::{named, names};
 
 // ── spectra ───────────────────────────────────────────────────────────────
