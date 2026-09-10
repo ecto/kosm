@@ -2,9 +2,9 @@
 # Publish kosm's crates to crates.io, in dependency order.
 #
 # Everything upstream must be on crates.io first — cargo refuses to publish a
-# crate with a git dependency, and the root manifest's phyz/vcad/tang entries
-# are git revs until those repos ship. The preflight below checks the three
-# that gate everything else; see docs/publishing.md for the whole table.
+# crate with a git dependency. The root manifest's phyz/vcad/tang entries are
+# versions; the preflight below re-checks the three that gate everything else,
+# see docs/publishing.md.
 #
 #   scripts/publish.sh            # preflight, then publish
 #   scripts/publish.sh --dry-run  # add --dry-run to every cargo publish

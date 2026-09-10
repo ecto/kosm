@@ -251,15 +251,13 @@ four stages (build → run → observe → optimise-optional). Copy it.
 - **Render budget.** `Camera`'s `spp` is the cost. Four is a thumbnail,
   ninety-six is the marble's beauty frame and takes seconds per frame.
   A test or a template stays small.
-- **Externals.** phyz, vcad and tang are git revs in the workspace
+- **Externals.** phyz, vcad and tang are crates.io versions in the workspace
   `Cargo.toml` — a clean clone builds with no sibling checkouts. `.cargo/config.toml`
   (untracked; copy `.cargo/config.toml.example` and point it at your
   checkouts) patches those same sources back to local paths, so edits next
-  door still land in a kosm build; it overrides the manifest's patches, and
-  CI runs without it. `docs/publishing.md` says which of those revs is waiting
-  on which upstream release. `tang` is unified by a
-  `[patch.crates-io]` so `tang::Scalar` is one trait across the graph. Changing
-  any of it is a full rebuild.
+  door still land in a kosm build; CI runs without it. `docs/publishing.md`
+  has the versions. Every crate in the graph names the same published `tang`,
+  so `tang::Scalar` is one trait. Changing any of it is a full rebuild.
 - **One phyz.** There used to be a gap here: ipse-map pinned phyz twelve commits
   behind the rev kosm pins, cargo will not let a manifest `[patch]` pull a git URL
   onto itself, and a clean clone got two `Model` types. `crates/kosm-scan` is
@@ -269,8 +267,8 @@ four stages (build → run → observe → optimise-optional). Copy it.
 
 ## Cargo.lock and the local override
 
-The committed `Cargo.lock` is the clean-clone form: phyz and tang resolve
-from their git revs. With `.cargo/config.toml` present, cargo rewrites those
+The committed `Cargo.lock` is the clean-clone form: phyz, tang and vcad
+resolve from crates.io. With `.cargo/config.toml` present, cargo rewrites those
 entries to local paths on the first build. That churn is expected; do not
 commit a `Cargo.lock` whose phyz/tang sources are local paths. `git checkout
 -- Cargo.lock` before committing, or resolve once with the config moved aside.
