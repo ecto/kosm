@@ -1254,6 +1254,8 @@ fn snapshot_of(p: &Placement, scene: &CoveScene) -> Snapshot {
             Vec3::new(scene.door_x, scene.cliff_face_y(), scene.door_sill()),
         ),
         gate_open: false,
+        // A still is a pose, and nothing in it holds anything.
+        held: None,
     }
 }
 

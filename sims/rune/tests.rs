@@ -213,8 +213,8 @@ fn there_is_nowhere_in_the_cove_to_fall_off() -> anyhow::Result<()> {
 
     let (mut worst_drop, mut worst_drop_at) = (f64::NEG_INFINITY, 0usize);
     for k in 0..8 {
-        cove.facing = compass(k);
-        cove.tilt = 0.0;
+        cove.face(compass(k));
+        cove.set_tilt(0.0);
         cove.place(scene.spawn_x, scene.spawn_y, 0.0);
         let walk = being::Input::walking(1.0);
         for _ in 0..45_000 {
@@ -258,7 +258,7 @@ fn the_sea_stops_the_being_before_its_head_goes_under() -> anyhow::Result<()> {
     let (scene, mut cove) = standing()?;
     // Start on the dry sand a few metres up from the waterline, facing -y: the
     // spawn is twenty-odd metres away and this test is about the last five.
-    cove.facing = -std::f64::consts::FRAC_PI_2;
+    cove.face(-std::f64::consts::FRAC_PI_2);
     cove.place(scene.spawn_x, scene.waterline() + 4.0, 0.0);
 
     let walk = being::Input::walking(1.0);
@@ -317,13 +317,73 @@ fn the_sea_stops_the_being_before_its_head_goes_under() -> anyhow::Result<()> {
     // …and the sea is not a hole. Turn round and the same shore break that
     // stopped you carries you back up the beach: there is no dying in this
     // game, so there is nowhere in it you can walk to and not walk out of.
-    cove.facing = std::f64::consts::FRAC_PI_2;
+    cove.face(std::f64::consts::FRAC_PI_2);
     cove.run(20.0, &walk);
     assert!(
         cove.wading_depth() < 0.0,
         "twenty seconds of walking back and the being is still in {:.2} m of water",
         cove.wading_depth()
     );
+    Ok(())
+}
+
+/// **The hero stands too.** The same cove with `KOSM_RUNE_PLAYER=hero`: the
+/// figure of `sims/rune/hero` on every hinge its `Rig` declares, on the same
+/// baked field, held up by the same spring — and its boots, not a capsule, are
+/// what touch the sand.
+///
+/// It is not the default, and [`being::Player::from_env`] says why: the cove's
+/// rune is a caustic through a lens of glass and the figure is not one. What
+/// this test is for is that the *body* works — that the migration to
+/// [`kosm::player::Body`] gave the level a second body it can switch to on the
+/// day the lens is the thing in the hero's hand, and that the day it does the
+/// figure will already be standing.
+#[test]
+fn the_hero_stands_on_the_sand_and_walks_over_it() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    let mut cove = being::Cove::with_player(&scene, baked.sdf.clone(), being::Player::Hero)?;
+    assert_eq!(cove.player(), being::Player::Hero);
+    let start = cove.being_centre();
+
+    cove.hold_still(5.0);
+    let at = |c: &being::Cove| {
+        let p = c.being_centre();
+        (p.x - start.x).hypot(p.y - start.y)
+    };
+    let settled = at(&cove);
+    cove.hold_still(5.0);
+    let drift = at(&cove) - settled;
+    println!("hero settle {:.0} mm in the first five seconds, {:.1} mm in the next five", settled * 1e3, drift * 1e3);
+    println!(
+        "the hero weighs {:.1} kg, stands {:.1} mm off the spawn after five seconds, {:.2}° off vertical, on {} parts",
+        cove.mass(),
+        drift * 1e3,
+        cove.lean() / DEG,
+        cove.hero_parts().len()
+    );
+    // The first five seconds are the figure *settling*: the beach is a six
+    // per cent grade and the boots are 236 mm apart across it, so one lands
+    // before the other and the legs find a stance. What the second five
+    // seconds say is that the stance holds — a body whose joints were softer
+    // than `player::body::JOINT_SUPPORT` crept downhill at 25 mm/s for ever,
+    // and this is the number that caught it.
+    assert!(settled < 0.10, "the hero took {:.0} mm to settle on the sand", settled * 1e3);
+    assert!(drift < 0.005, "the hero crept {:.1} mm in the second five seconds of standing still", drift * 1e3);
+    assert!(cove.lean() < 5.0 * DEG, "the hero stood {:.2}° off vertical", cove.lean() / DEG);
+    assert!(cove.hero_parts().len() >= 13, "the hero has {} parts to draw", cove.hero_parts().len());
+    assert_eq!(cove.net_caught(), 0, "the net caught the hero standing still");
+
+    // and it walks, up the beach, at the speed the level asks for
+    cove.face(std::f64::consts::FRAC_PI_2);
+    cove.run(4.0, &being::Input::walking(1.0));
+    println!("four seconds of walking and the hero is doing {:.3} m/s (the level says {:.2})", cove.walking_speed(), scene.walk_mps);
+    assert!(
+        (cove.walking_speed() - scene.walk_mps).abs() < 0.2 * scene.walk_mps,
+        "the hero walks at {:.3} m/s, not the {:.2} the level asks for",
+        cove.walking_speed(),
+        scene.walk_mps
+    );
+    assert_eq!(cove.net_caught(), 0, "the net caught the hero walking");
     Ok(())
 }
 

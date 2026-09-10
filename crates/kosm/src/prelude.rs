@@ -34,6 +34,11 @@ pub use crate::world::{Light, Material, Param, World};
 // column on a `World`, and the two are different nouns.
 pub use crate::material::{self, Fluid, Material as Substance, Optics, Spectrum};
 
+// the player: a body on the ground, through a medium, and what drives it.
+// `player::Snapshot` and `player::Pose` keep their module in a name because a
+// sim has snapshots and poses of its own.
+pub use crate::player::{self, Body, BodySpec, Drive, Ground, Medium, Skeleton, Tool};
+
 // the build side: geometry in rust, and the colliders derived from it
 pub use crate::build::{Authored, Built, Params, build};
 pub use crate::colliders::{Derived as DerivedColliders, colliders_from_document};
