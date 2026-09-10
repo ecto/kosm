@@ -21,12 +21,28 @@
 //! N-BK7 with its Sellmeier pair, so the caustic it throws disperses by the
 //! same curve `light.rs` traces it with.
 //!
+//! **The substances are `kosm::material`'s.** Every name below resolves to one
+//! entry in that library — sand is `dry sand`, the cliff and the door are
+//! `granite`, the being is `N-BK7`, the automaton's limbs are `oak` under
+//! `lacquer` — and what this file adds is one override layer on top of it. The
+//! constants are the library's, the look is the level's, and there is no second
+//! table: the density the door swings with and the colour it is painted come
+//! out of the same entry.
+//!
 //! Colours are linear, not sRGB. The document's own `[material ...]`
 //! definition still wins over everything here, so a level can repaint itself
 //! without touching this file.
 
+use kosm::material::{self, Material as Substance};
 use kosm_render::pathtrace::Pbr;
 use vcad_ir::Document;
+
+/// The door's material name, and so its substance: dressed granite.
+///
+/// It is one word in three places — the body `scene.rs` builds, the root
+/// `render.rs` picks the door out of, and the arm [`cove`] paints — so it is
+/// spelled once here.
+pub const DOOR: &str = "granite";
 
 /// The PBR a name means in this document: the document's own definition
 /// first, then the cove's table, then vcad-render's library, then clay.
@@ -39,33 +55,75 @@ pub fn pbr(doc: &Document, name: &str) -> Pbr {
     })
 }
 
+/// The library entry each of the cove's names *is*.
+///
+/// The names in this file are the level's — "sand", "rock", "stone" — and every
+/// one of them resolves to a substance in `kosm::material`, so the beach the
+/// marble rolls on and the beach the tracer paints are one thing. There is no
+/// second table of densities here; [`cove`] takes what these hand back and
+/// changes only the look.
+fn substance(name: &str) -> Option<Substance> {
+    Some(match name {
+        "sand" => material::named("dry sand")?,
+        // The cliff, the boulders and the door are all one rock, cut three
+        // ways; what separates them in the picture is colour, below.
+        "rock" | "stone" | DOOR => material::named(DOOR)?,
+        "water" => material::named("sea water")?,
+        "porcelain" | "brass" => material::named(name)?,
+        // The hero's costume. Every one of these is an entry in the library
+        // in its own right — `sims/rune/hero/figure.rs` weighs the figure out
+        // of exactly these — so the colour the cove paints a sleeve and the
+        // density the sleeve swings with come out of one line.
+        "cloak" | "cream" | "skin" | "blush" | "ink" | "boot" | "leather" => material::named(name)?,
+        // Lacquered wood is not one substance and the library is right not to
+        // have a line for it: it is a coat over a substrate, and `coated` is
+        // the rule. Thirty microns of lacquer, which is thick enough not to
+        // iridesce, so nothing but the surface changes.
+        "lacquer" => material::named("oak")?.coated(&material::named("lacquer")?, 30e-6),
+        _ => return None,
+    })
+}
+
 /// The names the cove uses. One colour and one roughness each; that is the
 /// whole style.
+///
+/// **The substance is the library's and the look is the level's.** Each arm
+/// starts from [`substance`]'s `pbr()` and overrides exactly the fields the
+/// cove's art direction owns — the albedo, the roughness, the weak dielectric
+/// highlight. Nothing here restates a density or an index, and nothing here
+/// adds a lobe: a measured reflectance would be the wrong picture for a level
+/// whose whole look is flat saturated colour under a soft sky.
 fn cove(name: &str) -> Option<Pbr> {
-    // Flat: a diffuse lobe, a weak dielectric highlight, nothing layered.
-    let flat = |base: [f32; 3], roughness: f32| Pbr {
-        base_color: base,
-        roughness,
-        specular: 0.25,
-        ..Default::default()
+    // Flat: a diffuse lobe, a weak dielectric highlight, nothing layered — over
+    // whatever the library says the substance is.
+    let flat = |lib: &str, base: [f32; 3], roughness: f32| -> Option<Pbr> {
+        Some(Pbr { base_color: base, roughness, specular: 0.25, ..substance(lib)?.pbr() })
     };
     Some(match name {
         // Dry sand in low sun: warm, pale, and the brightest thing in the
         // picture that is not the sky, so the being reads dark against it.
-        "sand" => flat([0.85, 0.54, 0.22], 0.9),
+        "sand" => flat("sand", [0.85, 0.54, 0.22], 0.9)?,
         // The cliff and the boulders. Grey-blue, so the one big vertical mass
         // in the frame sits back from the sand instead of competing with it,
         // and so the sky's colour has something cool to land on.
-        "rock" => flat([0.13, 0.19, 0.33], 0.9),
+        "rock" => flat("rock", [0.13, 0.19, 0.33], 0.9)?,
         // The door: the same stone, cut and dressed. Darker and warmer than
         // the cliff it is set into — that difference is the whole reason the
         // door reads as a door from across the beach, before the aperture is
         // visible at all.
-        "stone" => flat([0.24, 0.20, 0.16], 0.85),
+        "stone" | DOOR => flat(DOOR, [0.24, 0.20, 0.16], 0.85)?,
         // The sea. Opaque on purpose (see the module note): a saturated teal
         // body colour under a smooth dielectric surface, so the swell is
         // legible as a field of sky reflections and the water is still teal
         // where it is not reflecting anything.
+        //
+        // This is the one arm that does *not* start from its substance, and it
+        // is the deliberate exception. `sea water`'s own `pbr()` is a
+        // transmissive dielectric, which is what sea water is and what this
+        // level cannot have: a transmission lobe on the ocean joins
+        // [`kosm_render::caustics::is_caustic_refractor`]'s aim and the rune's
+        // photons are spent on the water instead of on the being. So the sea is
+        // authored opaque, from `Pbr::default`, and says so.
         "water" => Pbr {
             base_color: [0.03, 0.30, 0.30],
             roughness: 0.10,
@@ -73,34 +131,104 @@ fn cove(name: &str) -> Option<Pbr> {
             ior: 1.333,
             ..Default::default()
         },
+        // ---- the automaton -------------------------------------------------
+        // The player is a made thing on an island of made things, and its
+        // three surfaces are the three a doll is actually made of. Same rule
+        // as the cove's: one colour and one roughness each, nothing layered,
+        // and the interest comes from the shapes and the light. Chosen against
+        // *both* backdrops it has to stand on — warm pale sand and a cool
+        // blue-grey cliff — which is what rules out a cool body colour: teal
+        // lacquer sits in front of that cliff and disappears into it.
+        //
+        // Porcelain: near-white with the warmth a glaze has, and smooth enough
+        // that the low sun leaves a soft sheen on the head rather than a flat
+        // chalk field. It is the brightest thing in the picture after the sand,
+        // so the head and the hands are where the eye goes.
+        // The library's porcelain is already this porcelain, albedo and
+        // roughness both, so the highlight is the only override left.
+        "porcelain" => Pbr { specular: 0.5, ..substance("porcelain")?.pbr() },
+        // Brass: the joints and the filigree. A real metal, so `metallic` is
+        // one and the base colour is F0 rather than an albedo; rough enough
+        // that the highlight is a smear along a ball and not a mirror.
+        // The library's brass is a conductor whose six F0 bands project to
+        // exactly the [0.72, 0.53, 0.22] this used to write down, at exactly
+        // this roughness — so here there is nothing left to override at all:
+        // the substance *is* the look.
+        "brass" => substance("brass")?.pbr(),
+        // Lacquered wood, deep vermilion. The complement of the cliff and
+        // darker than the sand, so the limbs read as a silhouette from across
+        // the beach and as a colour up close. Smooth, because lacquer is: the
+        // long soft highlight down a rod is the whole reason to lacquer it.
+        "lacquer" => Pbr { base_color: [0.34, 0.038, 0.028], roughness: 0.10, specular: 0.6, ..substance("lacquer")?.pbr() },
+        // ---- the hero --------------------------------------------------------
+        // The costume of `sims/rune/hero`, drawn in the cove's own light. The
+        // six library colours stand as they are — they were chosen against
+        // this sand and this cliff — and the only override is the cove's flat
+        // rule: a weak dielectric highlight and **no subsurface**, because the
+        // library's `skin` scatters, as skin does, and this look does not.
+        //
+        // These are the same numbers `hero/stage.rs::palette` paints its
+        // stills with, for the same reason and out of the same library; what
+        // this arm buys is that the *live* cove resolves them through the one
+        // path a cove surface is resolved through, so a document that repaints
+        // the cloak repaints the hero too.
+        "cloak" | "cream" | "skin" | "blush" | "ink" | "boot" => {
+            Pbr { specular: 0.25, subsurface: 0.0, ..substance(name)?.pbr() }
+        }
+        // The satchel and its strap: russet leather, the one warm accent on
+        // the figure and the mark that says which way it is facing.
+        "leather" => flat("leather", [0.30, 0.105, 0.045], 0.65)?,
         _ => return None,
     })
 }
 
-/// The being: a body of N-BK7, at the index the level authored.
+/// The glass the hero's lens is cut from: N-BK7, with the Sellmeier pair.
 ///
-/// `transmission: 1.0` with no `thin_walled` is precisely what the caustic
-/// pass looks for, so declaring the being's glass *is* declaring what the
-/// rune is thrown by. The Sellmeier pair is the datasheet's, not an Abbe
-/// approximation, because it is the same curve `light.rs` traces the score
-/// with — one glass, one dispersion, whichever code is asking.
-pub fn being(n_d: f64) -> Pbr {
+/// [`being`] is the *capsule's* glass and carries a metre of iron in the melt
+/// with it, which is right for a body a metre through and wrong for a wafer
+/// eleven millimetres thick — a tint authored for a metre of path is
+/// invisible in the lens and would only cost the caustic its neutrality. What
+/// is kept is the pair `kosm_render::caustics::is_caustic_refractor` looks
+/// for, `transmission: 1.0` and not thin-walled: declaring this **is**
+/// declaring what the photon pass is aimed at, and with the hero in the cove
+/// the lens is the only thing in the level that carries it.
+///
+/// The same glass `hero/stage.rs::glass` paints the doorstep stills with.
+pub fn lens_glass(n_d: f64) -> Pbr {
+    let glass = super::sim::GLASS.with_params(&[kosm::world::Param::new("N-BK7.n_d", n_d)]);
     Pbr {
         base_color: [1.0, 1.0, 1.0],
-        roughness: 0.02,
+        roughness: 0.0,
         transmission: 1.0,
-        ior: n_d as f32,
         specular: 1.0,
-        sellmeier: Some(kosm_render::spectrum::BK7_SELLMEIER),
+        ..glass.pbr()
+    }
+}
+
+/// The being: a body of N-BK7, at the index the level authored.
+///
+/// The substance is [`sim::GLASS`](super::sim::GLASS) — the library's N-BK7,
+/// the same entry the being's mass is weighed out of — with the level's `n_d`
+/// knob set on it through `with_params`, so a document that moves the index
+/// moves one number and the glass stays one glass. Everything the tracer needs
+/// then falls out of `pbr()`: `transmission: 1.0` with no `thin_walled`, which
+/// is precisely what the caustic pass looks for, and the datasheet's Sellmeier
+/// pair rather than an Abbe approximation, because it is the same curve
+/// `light.rs` traces the score with.
+pub fn being(n_d: f64) -> Pbr {
+    let glass = super::sim::GLASS.with_params(&[kosm::world::Param::new("N-BK7.n_d", n_d)]);
+    Pbr {
         // The iron in the melt: a metre of it transmits about this, the same
         // Beer-Lambert pair the court's backboard carries. On a twelve
         // millimetre board it is invisible and only the polished edge is
         // bottle-green; on a body seven hundred millimetres thick it is the
         // difference between a being you can see and a hole in the picture
-        // where the sand shows through unchanged.
+        // where the sand shows through unchanged. It is the cove's, not the
+        // datasheet's: N-BK7 as Schott sells it is water-clear over a metre,
+        // and a water-clear being is a hole in the picture.
         attenuation_color: [0.78, 0.92, 0.83],
         attenuation_distance: 1000.0,
-        ..Default::default()
+        ..glass.pbr()
     }
 }
 
@@ -213,6 +341,35 @@ mod tests {
         assert!(a.sellmeier.is_none() && !a.is_dispersive());
         assert_eq!((a.ior, a.transmission, a.roughness), (g.ior, g.transmission, g.roughness));
         assert_eq!(a.attenuation_color, g.attenuation_color);
+    }
+
+    /// **The look is the level's; the substance under it is the library's.**
+    /// Every name the cove paints resolves to one entry in `kosm::material`,
+    /// and the two the cove no longer overrides at all — porcelain and brass —
+    /// are the library's `pbr()` unchanged.
+    #[test]
+    fn every_cove_surface_is_one_substance_from_the_library() {
+        for (name, lib) in [
+            ("sand", "dry sand"),
+            ("rock", "granite"),
+            ("stone", "granite"),
+            (DOOR, "granite"),
+            ("water", "sea water"),
+            ("porcelain", "porcelain"),
+            ("brass", "brass"),
+            // a coat over a substrate, so its name says both
+            ("lacquer", "oak under lacquer"),
+        ] {
+            assert_eq!(substance(name).unwrap_or_else(|| panic!("{name} is not a substance")).name, lib);
+        }
+        // the door the picture paints and the door `being.rs` swings are the
+        // same granite, and nothing in this file writes its density down
+        assert_eq!(substance(DOOR).unwrap().density, material::named("granite").unwrap().density);
+        // and the level's `n_d` reaches the tracer through the library's N-BK7,
+        // which is where the Sellmeier pair comes from too
+        let g = being(1.6);
+        assert_eq!(g.ior, 1.6);
+        assert_eq!(g.sellmeier, material::named("N-BK7").unwrap().pbr().sellmeier);
     }
 
     /// The rim is always visible and always rises with the score, and it is

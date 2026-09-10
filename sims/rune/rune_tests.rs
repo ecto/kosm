@@ -18,6 +18,7 @@ use tang::Dual;
 
 use super::CoveScene;
 use super::hint::{self, Knobs};
+use super::being;
 use super::rune::{self, Piece, Pieces, Pose};
 use kosm::glass::Shape;
 
@@ -302,6 +303,17 @@ fn the_hint_matches_central_differences() {
 
 /// The dual's real part is the `f64` answer, which is the cheap half of
 /// "it is the same code".
+///
+/// **To the bit**, on both bodies. That is a stronger claim than it looks:
+/// `light.rs` aims its cone of rays on whatever scalar the caller brought,
+/// so the `Dual` pass builds the frame with `Dual` arithmetic — and a
+/// `Dual`'s division is a multiply by the divisor's reciprocal where an
+/// `f64`'s is a real divide. An ulp on the cone's axis is the initial
+/// condition of a walk that reflects up to eight times inside the glass,
+/// and that walk amplifies it until a grazing ray picks the other side of
+/// total internal reflection: sixty-odd rays in half a million changed their
+/// minds, and the score moved in its seventh digit. `trace_onto` shares one
+/// reciprocal instead, which is the same arithmetic on both scalars.
 #[test]
 fn the_dual_carries_the_score_it_differentiates() {
     let scene = reachable();
@@ -309,7 +321,19 @@ fn the_dual_carries_the_score_it_differentiates() {
     let plain = hint::score_of::<f64>(&scene, k, hint::RAYS);
     for i in 0..3 {
         let d: Dual<f64> = hint::score_dual(&scene, k.seed(i));
-        assert!((d.real - plain).abs() <= 1e-12 * plain.abs().max(1.0), "seed {i}: {} vs {plain}", d.real);
+        assert!(d.real == plain, "the capsule, seed {i}: {} vs {plain}", d.real);
+    }
+
+    // and the hero's lens, whose six knobs are the ones the hint is really
+    // taken in
+    let cove = CoveScene::bundled().unwrap();
+    let pose = rune::hero_doorstep(&cove, &rune::HeroPose::default());
+    let lens = hint::LensKnobs::of(&rune::hero_lens(&cove, &pose));
+    let plain = hint::score_lens_of::<f64>(&cove, lens, hint::RAYS);
+    println!("the lattice scores the held lens {plain:.6} at the staged doorstep");
+    for i in 0..6 {
+        let d = hint::score_hero_dual(&cove, lens.seed(i), hint::RAYS);
+        assert!(d.real == plain, "the lens, seed {i}: {} vs {plain}", d.real);
     }
 }
 
@@ -370,3 +394,399 @@ fn the_cove_solves() {
     let (pose, score) = rune::solve_and_record(&scene, 100_000, &out_dir()).unwrap();
     println!("solved ({:+.3}, {:+.3}) m at {:+.2}°: {:.5}", pose.x, pose.y, pose.tilt.to_degrees(), score.frac);
 }
+
+
+// ─── the hero ─────────────────────────────────────────────────────────────
+
+/// The hero's lens, as arithmetic and as a body.
+///
+/// [`rune::hero_lens`] is a two-link solve and a grip and takes microseconds;
+/// [`kosm::player::Body::held`] is where an arm with mass actually got to
+/// after a second of PD. The solve is written on the first and the game is
+/// played with the second, so they had better be the same lens — and this is
+/// where the claim is cashed, in centimetres and degrees rather than in a
+/// comment.
+///
+/// A plane and not the cove's baked field: the hero stands still at one
+/// point, and the sand there *is* a plane at that height. What is being
+/// measured is an arm, not a bake.
+#[test]
+fn the_heros_arithmetic_is_where_the_body_puts_the_lens() {
+    use kosm::player::{Air, Body, Drive, Plane, Tool};
+    let scene = CoveScene::bundled().unwrap();
+    let rig = &*being::HERO_RIG;
+    let cases = [
+        rune::hero_doorstep(&scene, &rune::HeroPose::default()),
+        rune::HeroPose { x: -2.0, y: 12.0, yaw: 1.1, aim_el: 0.55, aim_az: -0.62, cant: 0.9, },
+        rune::HeroPose { x: 3.0, y: 8.0, yaw: -0.4, aim_el: 0.95, aim_az: -0.35, cant: -0.5 },
+    ];
+    for pose in cases {
+        let want = rune::hero_lens_pose(&scene, &pose);
+        let mut body = Body::new(rig.spec.clone().with_dt(1e-3));
+        body.hold(Tool::new("lens").with_grip(being::lens_grip(pose.cant)));
+        let ground = Plane::at(scene.sand_z_at(pose.x, pose.y));
+        body.place(pose.x, pose.y, scene.sand_z_at(pose.x, pose.y), pose.yaw, 0.0);
+        let aim = rune::hero_aim(&scene, &pose);
+        body.run_for(3.0, &Drive { aim: Some(aim), ..Drive::STILL }, &ground, &Air);
+        let (got, _) = body.held().expect("the hero is holding the lens");
+
+        let miss = (got.pos - want.pos).norm();
+        // the angle between the two optical axes
+        let (ga, wa) = (got.rot.mul_vec(Vec3::new(0.0, 0.0, 1.0)), want.rot.mul_vec(Vec3::new(0.0, 0.0, 1.0)));
+        let turn = ga.dot(&wa).clamp(-1.0, 1.0).acos();
+        println!(
+            "hero at ({:+.2}, {:+.2}) holding {:+.1}° up, {:+.1}° canted: the arithmetic puts the glass at ({:+.3}, {:+.3}, {:+.3}) and the body puts it {:.1} mm away, {:.2}° off axis (the body leaned {:.2}°)",
+            pose.x, pose.y, pose.aim_el.to_degrees(), pose.cant.to_degrees(),
+            want.pos.x, want.pos.y, want.pos.z, miss * 1e3, turn.to_degrees(), body.lean().to_degrees(),
+        );
+        assert!(miss < 0.01, "the glass is {:.1} mm from where the arithmetic said", miss * 1e3);
+        assert!(turn.to_degrees() < 1.0, "the optical axis is {:.2}° off", turn.to_degrees());
+    }
+}
+
+/// The lens is one solid to both tracers, exactly as the capsule is.
+///
+/// `rune::Piece::Lens` answers the photon pass and `glass::Shape::Lens`
+/// answers the lattice and its duals. Two statements of the intersection of
+/// two spheres, and this is the test that says they are one piece of glass.
+#[test]
+fn the_lens_is_one_solid_to_both_tracers() {
+    let scene = CoveScene::bundled().unwrap();
+    let pose = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let held = rune::hero_lens(&scene, &pose);
+    let (r, a, h) = rune::lens_numbers_m();
+    let u = held.axis.normalize();
+    let piece = Pieces(vec![rune::lens_piece(&held)]);
+    let solid: Shape<f64> = hint::lens_shape(
+        tang::Vec3::new(held.centre.x, held.centre.y, held.centre.z),
+        tang::Vec3::new(held.axis.x, held.axis.y, held.axis.z),
+    );
+    let tv = |v: Vec3| tang::Vec3::new(v.x, v.y, v.z);
+    // the two sphere centres agree
+    match &solid {
+        Shape::Lens { c1, c2, r1, r2 } => {
+            let want = (held.centre - u * a, held.centre + u * a);
+            assert!((c1 - &tv(want.0)).norm() < 1e-12 && (c2 - &tv(want.1)).norm() < 1e-12);
+            assert!((r1 - r).abs() < 1e-12 && (r2 - r).abs() < 1e-12);
+        }
+        _ => panic!("lens_shape did not make a lens"),
+    }
+    // and every ray sees the same surface: down the axis, across the rim, and
+    // one that misses beside it
+    let side = u.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
+    for d in [u, -u, side, (u + side * 0.6).normalize(), Vec3::new(0.31, 0.87, -0.38).normalize()] {
+        for off in [0.0, 0.5 * h, 0.92 * h, 1.4 * h] {
+            let o = held.centre + side.cross(&d).normalize() * off - d * 3.0;
+            let ray = Ray::new(Point3::from_vec(o), d);
+            let mine = Geometry::intersect(&piece, &ray, 0, 1e-7, f64::INFINITY);
+            match (solid.enter(tv(o), tv(d)), mine) {
+                (Some((t, n)), Some(hit)) => {
+                    assert!((t - hit.t).abs() < 1e-9, "entry {t} vs {}", hit.t);
+                    let hn = hit.normal.into_inner();
+                    assert!((n - tv(hn)).norm() < 1e-9, "entry normal {n:?} vs {hn:?}");
+                }
+                (None, None) => {}
+                (x, y) => panic!("the two tracers disagree at offset {off}: {} vs {}", x.is_some(), y.is_some()),
+            }
+        }
+        // from inside, the exit is the nearest of the two spheres' far roots
+        let o = held.centre;
+        let ray = Ray::new(Point3::from_vec(o), d);
+        let mut all = Vec::new();
+        Geometry::intersect_all(&piece, &ray, 0, &mut all);
+        let far = all.iter().map(|hit| hit.t).fold(f64::NEG_INFINITY, f64::max);
+        let (t, n) = solid.exit(tv(o), tv(d)).expect("a ray from inside leaves");
+        assert!((t - far).abs() < 1e-9, "exit {t} vs {far}");
+        // The normal belongs to one of the two caps, and which one is not
+        // always a question with an answer. A ray leaving the centre *across*
+        // the axis exits on the **rim**, where the caps meet: the two
+        // spheres' far roots are the same number to the bit, and an edge does
+        // not have a normal to be right about. So what is checked is that
+        // both tracers are on the *surface* — each one's normal is the
+        // outward normal of one of the two spheres at the point they agree
+        // on — and not that they picked the same cap out of a tie.
+        let at = held.centre + d * far;
+        let caps = [(at - (held.centre - u * a)) / r, (at - (held.centre + u * a)) / r];
+        let on_surface = |v: Vec3| caps.iter().any(|c| (v - c).norm() < 1e-9);
+        assert!(on_surface(Vec3::new(n.x, n.y, n.z)), "the lattice's exit normal {n:?} is on neither cap");
+        let seen = all.iter().find(|hit| (hit.t - far).abs() < 1e-9).expect("the photon tracer found no face");
+        assert!(on_surface(seen.normal.into_inner()), "the photon tracer's exit normal is on neither cap");
+    }
+    // the thing is the right size: the rim is `h` across and the glass is
+    // `2(r − a)` thick, which is `hero/kit.rs`'s own arithmetic
+    let up = u.cross(&side).normalize();
+    for (dir, want) in [(side, h), (up, h), (u, r - a)] {
+        let (t, _) = solid.exit(tv(held.centre), tv(dir)).unwrap();
+        assert!((t - want).abs() < 1e-9, "the glass is {t} along {dir:?}, not {want}");
+    }
+}
+
+/// **The hero's hint.** `∂frac/∂(x, y, yaw, aim_el, aim_az, cant)` against
+/// central differences of the same lattice score.
+///
+/// [`hint::gradient_hero`] is six exact dual passes in the *lens's* six knobs
+/// chained onto twelve differences of the arm's arithmetic; this differences
+/// the whole composition instead. What is being checked is therefore the
+/// chain rule and the duals, against a sampling of the same integral.
+///
+/// **It is tight, and the capsule's is not**, and the difference is the
+/// aperture. A lens is a thin disc that spends its life being turned, so its
+/// silhouette sweeps across the lattice and rays step in and out of it a
+/// whole ray at a time — a step a `Dual` cannot see, a step a difference
+/// sees all of, and a step that does not get smaller when rays are added
+/// because there are proportionally more of them. Two things fixed it, and
+/// both are in `crates/kosm`:
+///
+/// * `glass::Shape::rim_weight` feathers the outer
+///   `glass::RIM_FEATHER` of the aperture with a smoothstep, so the
+///   integrand reaches the silhouette at zero with a zero slope and the sum
+///   is C¹ in every knob. The hint therefore scores a lens whose outer 5 %
+///   is a graded filter and `rune.rs`'s photon pass scores the hard one;
+///   [`the_hint_agrees_with_the_photons`] is where that gap is measured.
+/// * `light::trace_onto` snaps its accumulation grid to the cell lattice the
+///   keyhole itself sits on, so the grid can only ever move by a whole cell
+///   — a relabelling, which changes no score — instead of sliding under a
+///   keyhole that is not sliding with it.
+///
+/// What the six knobs read at 200² rays a band and a step of 2 cm and
+/// 1.15°: `x` 0.4 %, `y` 0.2 %, `yaw` 0.13 %, `aim_el` 0.07 %, `aim_az`
+/// 0.01 %, `cant` 0.17 %. The two that are still noise — `x` and `y` — are
+/// the two whose derivative is a thousandth of the others': the beam is
+/// smaller than the keyhole at the doorstep, so walking a centimetre either
+/// way is free and the score is flat in them by design.
+#[test]
+fn the_heros_hint_matches_central_differences() {
+    let scene = CoveScene::bundled().unwrap();
+    let seed = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let rays = 200 * 200;
+    let h = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02];
+    let dual = hint::gradient_hero(&scene, &seed, rays);
+    let mut fd = [0.0; 6];
+    let at = |p: &rune::HeroPose| hint::score_lens_of(&scene, hint::LensKnobs::of(&rune::hero_lens(&scene, p)), rays);
+    for k in 0..6 {
+        let (mut lo, mut hi) = (seed, seed);
+        *lo.knob(k) -= h[k];
+        *hi.knob(k) += h[k];
+        fd[k] = (at(&hi) - at(&lo)) / (2.0 * h[k]);
+    }
+    let scale = fd.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    for k in 0..6 {
+        println!(
+            "  knob {k}: dual {:+10.5}   differences {:+10.5}   {:+6.2}%",
+            dual[k],
+            fd[k],
+            100.0 * (dual[k] - fd[k]) / fd[k].abs().max(1e-12)
+        );
+    }
+    for k in 0..6 {
+        assert!(
+            (dual[k] - fd[k]).abs() < 0.02 * fd[k].abs() + 2e-4 * scale,
+            "knob {k}: dual {} vs central differences {}",
+            dual[k],
+            fd[k]
+        );
+    }
+    // and the two knobs the design says should dominate do
+    assert!(scale > 0.0, "the score does not move at all");
+    assert!(dual[3].abs() > dual[4].abs(), "the lift moves the score less than the swing does");
+}
+
+/// The lens's beam centre is analytic, and it is where the light lands.
+///
+/// A thin lens images a parallel bundle wherever its own undeviated chief ray
+/// crosses the plane, so [`hint::beam_centre_hero`] is a division rather than
+/// a fan of rays. This says the lattice tracer agrees: at the staged pose the
+/// chief ray is on the keyhole and so is the light.
+#[test]
+fn the_heros_beam_lands_where_the_chief_ray_says() {
+    let scene = CoveScene::bundled().unwrap();
+    let seed = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let [u, v] = hint::beam_centre_hero(&scene, &seed).expect("the beam reaches the face");
+    let c = hint::caustic_of_lens(&scene, &rune::hero_lens(&scene, &seed), hint::RAYS);
+    let ([cu, cv], w) = hint::centroid(&c).expect("the lattice caught something");
+    println!(
+        "the chief ray lands ({u:+.4}, {v:+.4}) m from the keyhole; the lattice's centroid is ({cu:+.4}, {cv:+.4}) m, carrying {w:.4} W"
+    );
+    assert!(u.hypot(v) < 0.01, "the staged chief ray misses the keyhole by {:.1} mm", u.hypot(v) * 1e3);
+    assert!(
+        (cu - u).hypot(cv - v) < 0.05,
+        "the chief ray and the light disagree by {:.0} mm",
+        (cu - u).hypot(cv - v) * 1e3
+    );
+}
+
+/// **What the soft rim costs.** The lattice's feathered aperture against the
+/// hard disc [`rune::lens_projected_area`] states and the photon pass shines
+/// on.
+///
+/// `glass::Shape::rim_weight` grades the outer `glass::RIM_FEATHER` of the
+/// lens so the hint's sum is C¹ in the knobs that turn it, and the price is
+/// that the hint scores slightly less glass than there is. Two things are in
+/// the gap and they pull the same way:
+///
+/// * the feather itself. The graded band is `1 − 0.95² ≈ 9.8 %` of the
+///   aperture's area and a smoothstep passes half of it on average, so about
+///   **4.9 %**. This is a *constant* — the feather is in normalised radius,
+///   so the fraction does not move when the glass is turned — which is why it
+///   cancels out of [`hint::score_lens_of`]'s ratio and shows up only here.
+/// * the analytic area's own approximation: `π h² cos θ` plus a rectangular
+///   knife edge is a flat disc's silhouette, and a biconvex lens is not flat.
+///
+/// Measured here: **7.2 %** of the hard aperture at the staged doorstep and
+/// **5.0 %** with the wrist turned a further 45°. The 4.9 % is the feather
+/// and does not move; the rest is the formula, and it does — which is the
+/// whole argument for [`hint::score_lens_of`] dividing one lattice sum by
+/// another rather than by an analytic area. An analytic denominator would
+/// have put that two per cent of cant-dependence straight into `∂frac/∂cant`
+/// as a bias no amount of rays could wash out.
+#[test]
+fn the_feathered_rim_costs_a_twentieth_of_the_glass() {
+    let scene = CoveScene::bundled().unwrap();
+    let pose = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let held = rune::hero_lens(&scene, &pose);
+    let k = hint::LensKnobs::of(&held);
+    let hard = hint::lens_incident::<f64>(&scene, k) * kosm::light::BANDS_LEN as f64;
+    let soft = hint::caustic_of_lens(&scene, &held, hint::RAYS).caught;
+    let kept = soft / hard;
+    println!(
+        "the hard aperture subtends {hard:.6e} sr of lamp, the feathered lattice {soft:.6e}: the rim and the formula spend {:.2}% of the glass",
+        100.0 * (1.0 - kept)
+    );
+    assert!((0.90..=0.96).contains(&kept), "the feathered lattice keeps {kept:.4} of the hard aperture, not about 0.93");
+
+    // the feather is a constant of the glass; the formula is not. Turn the
+    // wrist and the gap closes, which is the two per cent of cant-dependence
+    // an analytic denominator would have handed the gradient as a bias.
+    let turned = rune::HeroPose { cant: pose.cant + std::f64::consts::FRAC_PI_4, ..pose };
+    let held = rune::hero_lens(&scene, &turned);
+    let k = hint::LensKnobs::of(&held);
+    let also = hint::caustic_of_lens(&scene, &held, hint::RAYS).caught / (hint::lens_incident::<f64>(&scene, k) * kosm::light::BANDS_LEN as f64);
+    println!("canted a further 45°, the feathered lattice keeps {also:.4} against {kept:.4}");
+    assert!((0.93..=0.97).contains(&also), "canted, the lattice keeps {also:.4}, not the feather's own 0.95");
+    assert!(also > kept, "the projected-area formula is supposed to be worst edge-on");
+}
+
+/// **The live gate.** At the solved hero pose the score the *game* reads —
+/// the glass in a stepped body's hand, with the body's own head and trunk in
+/// the light — clears `open_frac`.
+///
+/// Not the arithmetic's score: [`being::Cove::rune_score`] is what the rune
+/// thread calls every frame, off a body that has been placed and let settle.
+/// The offline solve is only worth anything if the thing the player walks
+/// scores the same, and this is where the two meet.
+#[test]
+fn the_hero_at_the_solved_pose_opens_the_door() -> anyhow::Result<()> {
+    let (scene, cove) = super::tests::hero_cove()?;
+    let mut cove = cove;
+    let solved = rune::HeroPose::solution(&scene);
+    assert!(solved.is_solved(), "scene.rs has no hero solution; run `kosm run rune`");
+    cove.place_hero(&solved);
+    cove.hold_still(2.0);
+
+    let read = cove.hero_pose();
+    let arithmetic = rune::score_hero(&scene, &solved, PHOTONS).frac;
+    let live = cove.rune_score(&scene, PHOTONS);
+    println!(
+        "solved ({:+.3}, {:+.3}) at {:+.1}°, holding {:+.1}° up and {:+.1}° canted; the body settled at ({:+.3}, {:+.3}) at {:+.1}° leaning {:.2}°\n\
+         the arithmetic scores {arithmetic:.5}, the live body {live:.5}, open_frac {:.3}",
+        solved.x, solved.y, solved.yaw.to_degrees(), solved.aim_el.to_degrees(), solved.cant.to_degrees(),
+        read.x, read.y, read.yaw.to_degrees(), cove.lean().to_degrees(), scene.open_frac,
+    );
+    assert!(live >= scene.open_frac, "the live score is {live:.5}, under open_frac {:.3}", scene.open_frac);
+    Ok(())
+}
+
+/// **The glint.** From the spawn, the hint points up the beach at the door.
+///
+/// The bare score out there is exactly zero — the beam lands a hundred metres
+/// along the cliff — so what is being read is the guided objective, which is
+/// the one the solvability sweep climbed from every spawn.
+#[test]
+fn the_heros_glint_points_at_the_door() {
+    let scene = CoveScene::bundled().unwrap();
+    let door = scene.door_frame().origin;
+    let from = rune::HeroPose { x: scene.spawn_x, y: scene.spawn_y, ..Default::default() }.facing(door);
+    assert!(
+        hint::score_lens_of(&scene, hint::LensKnobs::of(&rune::hero_lens(&scene, &from)), hint::SWEEP_RAYS) == 0.0,
+        "the bare score is flat at the spawn, which is the problem the glint solves"
+    );
+    let g = hint::guided_gradient_hero(&scene, &from, hint::SWEEP_RAYS).expect("the beam lands somewhere");
+    let n = g[0].hypot(g[1]);
+    let (ux, uy) = (g[0] / n, g[1] / n);
+    let (dx, dy) = (door.x - from.x, door.y - from.y);
+    let toward = (ux * dx + uy * dy) / dx.hypot(dy);
+    println!(
+        "at the spawn ({:+.1}, {:+.1}) the glint steps ({ux:+.3}, {uy:+.3}); the door is ({:+.3}, {:+.3}) away, {:.0}% of the step is toward it",
+        from.x, from.y, dx / dx.hypot(dy), dy / dx.hypot(dy), 100.0 * toward
+    );
+    assert!(uy > 0.0, "the glint points away from the beach: {g:?}");
+    assert!(toward > 0.5, "only {:.0}% of the glint's step is toward the door", 100.0 * toward);
+
+    // and the game's own version of it agrees. `game.rs` has a *body* and not
+    // a pose, so it differentiates the objective in the two directions the
+    // glass moves when its owner walks ([`hint::guided_walk`]) rather than in
+    // the hero's knobs. Walking translates the lens rigidly, so the two are
+    // the same arrow.
+    let lens = rune::hero_lens(&scene, &from);
+    let w = hint::guided_walk(&scene, &lens, hint::SWEEP_RAYS).expect("the beam lands somewhere");
+    let wn = w[0].hypot(w[1]);
+    let agree = (w[0] * ux + w[1] * uy) / wn;
+    println!("walking the lens instead steps ({:+.3}, {:+.3}): {:.0}% the same arrow", w[0] / wn, w[1] / wn, 100.0 * agree);
+    assert!(agree > 0.9, "the lens's own glint and the hero's disagree by {:.0}°", agree.acos().to_degrees());
+}
+
+/// **Test 4 for the hero**, and the one the design says a cove has to pass
+/// before it ships: from every spawn in a 6×6 grid, the guided ascent walks
+/// the hero to a pose over `open_frac`.
+#[test]
+#[ignore = "a minute of tracing; `kosm run rune` runs the same sweep and reports it"]
+fn the_cove_is_solvable_by_the_hero() {
+    let scene = CoveScene::bundled().unwrap();
+    let climbs = hint::solvable_hero(&scene, 6, 200, &out_dir().join("cove/solvable-hero.txt")).unwrap();
+    let solved = climbs.iter().filter(|c| c.solved).count();
+    assert_eq!(solved, climbs.len(), "{} of {} spawns reached open_frac", solved, climbs.len());
+}
+
+/// The **lens's own** six knobs, dual against differences, at three lattice
+/// densities and three step sizes.
+///
+/// A probe and not a gate: [`the_heros_hint_matches_central_differences`] is
+/// the gate, and it reads the composition. This one reads the expensive half
+/// on its own, which is where an aperture that stopped being C¹ would show up
+/// first — as a disagreement that does *not* fall when rays are added, and
+/// that gets worse as the step shrinks. It reads under a tenth of a per cent
+/// in all fifty-four cells; before `glass::Shape::rim_weight` and
+/// `light.rs`'s snapped grid it read up to 26 %.
+#[test]
+#[ignore = "a probe"]
+fn probe_lens_gradient() {
+    let scene = CoveScene::bundled().unwrap();
+    let seed = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let k = hint::LensKnobs::of(&rune::hero_lens(&scene, &seed));
+    for side in [200usize, 400, 800] {
+        let rays = side * side;
+        println!("=== {side}² rays a band ===");
+        for i in 0..6 {
+            let d = hint::score_hero_dual(&scene, k.seed(i), rays).dual;
+            for h in [1e-4, 1e-3, 1e-2] {
+                let (mut lo, mut hi) = (k, k);
+                let bump = |kk: &mut hint::LensKnobs<f64>, s: f64| match i {
+                    0 => kk.centre.x += s,
+                    1 => kk.centre.y += s,
+                    2 => kk.centre.z += s,
+                    3 => kk.axis.x += s,
+                    4 => kk.axis.y += s,
+                    _ => kk.axis.z += s,
+                };
+                bump(&mut lo, -h);
+                bump(&mut hi, h);
+                let fd = (hint::score_lens_of(&scene, hi, rays) - hint::score_lens_of(&scene, lo, rays)) / (2.0 * h);
+                println!(
+                    "  lens knob {i}  h {h:.0e}:  dual {d:+10.5}   fd {fd:+10.5}   {:+6.2}%",
+                    100.0 * (d - fd) / fd.abs().max(1e-12)
+                );
+            }
+        }
+    }
+}
+

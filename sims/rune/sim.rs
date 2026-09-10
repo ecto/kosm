@@ -14,32 +14,87 @@
 //!
 //! Metres, z up.
 
+use std::sync::LazyLock;
+
 use kosm_scan::SdfGrid;
-use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, solve_contacts_warm};
+use phyz_contact::{ContactCache, ContactMaterial, ContactSolverConfig, assemble, find_ground_contacts_model, solve_contacts_warm};
 use phyz_math::{GRAVITY, Vec3};
 use phyz_model::{Model, State};
 use phyz_rigid::{aba, forward_kinematics, integrate_configuration, rotate_free_joint_velocities, strip_free_joint_coriolis};
 
 use super::CoveScene;
 use kosm::garage::marble_model;
+use kosm::material::{self, Material as Substance};
 
 /// Free-joint q is [wx, wy, wz, x, y, z]; the rolled body is joint 0.
 const POS: usize = 3;
 
-/// Wet sand under glass. The cove has no friction knob: the beach is not a
-/// tuned surface, it is the one the marble check is stated on.
+/// Sand under glass, as the *level* authors it.
+///
+/// This is the one number in the cove that is not the library's, and it is an
+/// override on purpose. `kosm::material`'s `dry sand` is μ = 0.55 and
+/// [`Substance::wet`] takes it to 0.6875 — either would hold a marble on a 0.06
+/// grade, where rolling without slip only asks for `(2/7)·tan θ ≈ 0.017`. But
+/// [`roll_on_beach`] is *stated* as the closed form for a sphere that rolls
+/// without slipping, and what it is measuring is the baked field, not the sand:
+/// a check whose answer moves when the friction moves is a check of the wrong
+/// thing. 0.8 is margin wide enough that no step of the discrete contact solve
+/// can slip, so the speed the marble reaches is the field's answer alone.
+///
+/// The ground body still carries the library's `dry sand`
+/// (`scene.rs`'s `ground.material("sand")`, which
+/// [`kosm::build::BuiltBody::substance`] resolves), and everything else about
+/// the beach — its density, its stiffness, its colour — comes from there.
 pub const SAND_FRICTION: f64 = 0.8;
 
-/// N-BK7, kg/m³: the being and the test marble are the same glass.
-pub const GLASS_DENSITY: f64 = 2510.0;
+/// The cove's glass: `N-BK7`, out of `kosm::material`.
+///
+/// The being and the test marble are the same substance, and it is the same
+/// entry that hands [`materials::being`](super::materials::being) the index and
+/// the Sellmeier pair the caustic is traced with — one glass, whichever code is
+/// asking. Its density was written here as a `2510.0` of its own; it is the
+/// library's number now.
+pub static GLASS: LazyLock<Substance> = LazyLock::new(|| material::named("N-BK7").expect("N-BK7 is in kosm's material library"));
 
 /// One contact step against a baked map: `Simulator::step_with_contacts` with
 /// the plane swapped for the field, normals as the field reports them.
 pub fn step_on_sdf(model: &Model, state: &mut State, sdf: &SdfGrid, material: &ContactMaterial, cache: &mut ContactCache) {
+    step_on_sdf_over(model, state, sdf, material, cache, None);
+}
+
+/// The same step with a plane under the map: the net.
+///
+/// [`kosm_scan::find_terrain_contacts_model`] skips any candidate whose sample
+/// point is outside the sampled volume, because beyond the map there is no
+/// floor ([`kosm_scan::sdf`]) — which is the honest reading of a scan and is
+/// exactly wrong for a *level*, where walking off the edge means falling for
+/// ever. `net` is a horizontal plane at that z, produced by phyz's own ground
+/// contacts, and it is consulted only when the field has nothing to say: it is
+/// the floor under the level, not a feature of it. The cove is closed by rock
+/// on all four sides, so `sims/rune/tests.rs` walks the being at the edges for
+/// three quarters of a minute in every direction and counts how often this
+/// fires, and the count it asserts is zero.
+///
+/// Returns whether the net carried the step.
+pub fn step_on_sdf_over(
+    model: &Model,
+    state: &mut State,
+    sdf: &SdfGrid,
+    material: &ContactMaterial,
+    cache: &mut ContactCache,
+    net: Option<f64>,
+) -> bool {
     let dt = model.dt;
     let (xforms, _) = forward_kinematics(model, state);
     state.body_xform = xforms;
-    let contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let mut contacts = kosm_scan::find_terrain_contacts_model(model, state, sdf, material.margin);
+    let mut caught = false;
+    if contacts.is_empty() {
+        if let Some(z) = net {
+            contacts = find_ground_contacts_model(model, state, z, material.margin);
+            caught = !contacts.is_empty();
+        }
+    }
     // In the frame the contacts were assembled in: a free joint's body-frame
     // turn is taken out here and put back, exactly, after the solve (phyz).
     let mut qdd = aba(model, state);
@@ -61,6 +116,7 @@ pub fn step_on_sdf(model: &Model, state: &mut State, sdf: &SdfGrid, material: &C
     let v = state.v.clone();
     integrate_configuration(model, state.q.as_mut_slice(), v.as_slice(), dt);
     state.time += dt;
+    caught
 }
 
 /// What the marble did on the beach.
@@ -132,7 +188,7 @@ pub fn resting_centre(scene: &CoveScene, x: f64, y: f64, r: f64) -> Vec3 {
 /// there the sand runs into the sea and the plane's answer no longer holds.
 pub fn roll_on_beach(scene: &CoveScene, sdf: &SdfGrid, r: f64, x0: f64, y0: f64, t_end: f64, guard: f64) -> anyhow::Result<BeachRoll> {
     let dt = 1e-3;
-    let mass = GLASS_DENSITY * 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
+    let mass = GLASS.density * 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
     let mut model = marble_model(r, mass);
     model.dt = dt;
     let material = ContactMaterial { friction: SAND_FRICTION, restitution: 0.0, ..Default::default() };

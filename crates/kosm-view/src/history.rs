@@ -27,6 +27,20 @@
 //! Because depth is a ray distance, unprojecting is exact and cheap:
 //! `p = eye + normalize(dir(px, py)) * depth`. No matrix inverse anywhere.
 //!
+//! ## and because it is a ray distance, the projection is a choice
+//!
+//! Every step of the reprojection below goes through exactly two functions —
+//! [`View::ray_dir`], which turns a pixel into a direction, and
+//! [`View::project`], which turns a world point back into a pixel — and
+//! nothing else in this module knows how a camera maps a screen. So a second
+//! map is a second arm on each of those and no change at all to the
+//! reprojection, the mask, the plan or the resolve. `kosm_render`'s
+//! [`Projection::Equidistant`] is that second map, and it is why the fisheye
+//! is no longer offline-only: an `f·θ` frame reprojects through an `f·θ`
+//! inverse and lands on the pixel it came from. A depth that was a view-space
+//! `z`, or a projection that was a matrix, would both have had to be
+//! rewritten instead.
+//!
 //! ## both tiers bring them
 //!
 //! They did not always. The GPU tier used to hand over colour alone — the
@@ -58,6 +72,7 @@
 //! stretches between bounces are for.
 
 use crate::temporal::TemporalHistory;
+use kosm_render::pathtrace::Projection;
 use vcad_kernel_math::{Point3, Vec3};
 use vcad_kernel_raytrace::pathtrace::{self, Film, PathTraceOptions};
 
@@ -101,22 +116,95 @@ pub use crate::temporal::{Pose, View};
 
 impl View {
     /// The unit direction through a pixel's centre.
+    ///
+    /// The screen coordinates are the tracer's own — `2·(px + 0.5)/w − 1` and
+    /// `1 − 2·(py + 0.5)/h`, which is `kosm_render`'s integrator with the
+    /// jitter at the pixel centre — so the two generators can be compared ray
+    /// for ray. See [`View::dir`] for the maps themselves.
     pub fn ray_dir(&self, px: u32, py: u32) -> Vec3 {
         let sx = 2.0 * ((px as f64 + 0.5) / self.width as f64) - 1.0;
         let sy = 1.0 - 2.0 * ((py as f64 + 0.5) / self.height as f64);
-        (self.forward + self.right * (sx * self.half_w) + self.up * (sy * self.half_h)).normalize()
+        self.dir(sx, sy)
+    }
+
+    /// The unit direction through normalised screen coordinates in `[-1, 1]`,
+    /// under this view's own map. The inverse of [`View::project`].
+    ///
+    /// This is `kosm_render::Camera::ray` with the aperture taken out (a
+    /// history reprojects from a pinhole whatever the lens is doing) and the
+    /// `half_fov` folded into [`View`]'s half-extents rather than multiplied
+    /// at the end.
+    pub fn dir(&self, sx: f64, sy: f64) -> Vec3 {
+        match self.projection {
+            // Unmoved: the expression this function was before there was a
+            // second map, so every rectilinear picture is the one it was.
+            Projection::Rectilinear => {
+                (self.forward + self.right * (sx * self.half_w) + self.up * (sy * self.half_h))
+                    .normalize()
+            }
+            // `r = f·θ`. The half-extents are radians here, so `(u, v)` *is*
+            // the angle off the axis, resolved into its magnitude and its
+            // azimuth around the optical axis.
+            Projection::Equidistant => {
+                let (u, v) = (sx * self.half_w, sy * self.half_h);
+                let theta = (u * u + v * v).sqrt();
+                if !(theta > 0.0) {
+                    return self.forward;
+                }
+                // Past half a turn the map folds back on itself; the tracer
+                // clamps and so does this, so the two agree even there.
+                let (st, ct) = theta.min(std::f64::consts::PI).sin_cos();
+                (self.forward * ct + (self.right * (u / theta) + self.up * (v / theta)) * st)
+                    .normalize()
+            }
+        }
     }
 
     /// Where a world point lands, in pixel coordinates (a pixel centre is at
-    /// the integer). `None` if it is at or behind the eye plane.
+    /// the integer).
+    ///
+    /// `None` when the point has no image: at the eye, or — under the pinhole
+    /// only — at or behind the eye plane. The fisheye has no such plane, which
+    /// is the whole of why it is a different map: a point ninety degrees off
+    /// the axis is a point this camera can see, and the answer is a screen
+    /// radius, not a division by a depth that has gone to zero. A point past
+    /// the edge of the frame still comes back, with `|sx|` or `|sy|` over one;
+    /// every caller here bounds-checks the pixel it gets.
     pub fn project(&self, p: Point3) -> Option<(f64, f64)> {
         let v = p - self.eye;
         let z = v.dot(&self.forward);
-        if z <= 1e-6 {
-            return None;
-        }
-        let sx = v.dot(&self.right) / (z * self.half_w);
-        let sy = v.dot(&self.up) / (z * self.half_h);
+        let (sx, sy) = match self.projection {
+            Projection::Rectilinear => {
+                if z <= 1e-6 {
+                    return None;
+                }
+                (
+                    v.dot(&self.right) / (z * self.half_w),
+                    v.dot(&self.up) / (z * self.half_h),
+                )
+            }
+            Projection::Equidistant => {
+                let (x, y) = (v.dot(&self.right), v.dot(&self.up));
+                let r = x.hypot(y);
+                // `atan2` takes the angle past ninety degrees without a
+                // singularity, which is the half of the sphere a pinhole
+                // cannot describe at all.
+                let theta = r.atan2(z);
+                if r <= 0.0 {
+                    // On the axis, or exactly behind: the first is the centre
+                    // of the frame and the second has no azimuth to give.
+                    if z <= 0.0 {
+                        return None;
+                    }
+                    (0.0, 0.0)
+                } else {
+                    (
+                        theta * (x / r) / self.half_w,
+                        theta * (y / r) / self.half_h,
+                    )
+                }
+            }
+        };
         Some((
             (sx + 1.0) * 0.5 * self.width as f64 - 0.5,
             (1.0 - sy) * 0.5 * self.height as f64 - 0.5,
@@ -126,6 +214,12 @@ impl View {
     /// The screen rectangle a world sphere covers, dilated. `None` when it
     /// falls off the screen entirely; `Some` covering everything when the
     /// sphere contains or straddles the eye, where there is no rectangle.
+    ///
+    /// The two early outs read the forward depth rather than the map, and
+    /// they are right for both of these: a sphere entirely behind the eye
+    /// plane is off a frame of any field of view under 180°, and one
+    /// straddling it has no rectangle under either map. A fisheye wider than
+    /// that would need the first of them rewritten as an angle.
     fn sphere_rect(&self, centre: Point3, radius: f64) -> Option<Rect> {
         let v = centre - self.eye;
         let z = v.dot(&self.forward);
@@ -141,8 +235,15 @@ impl View {
         }
         let (cx, cy) = self.project(centre)?;
         // Angular half-size at the near-most point of the sphere, which is
-        // conservative for the whole of it.
-        let r_px = radius / ((z - radius) * self.half_h) * 0.5 * self.height as f64;
+        // conservative for the whole of it — expressed, either way, as the
+        // screen radius the map gives that angle. The pinhole's `half_h` is a
+        // tangent and the tangent is already in hand; the fisheye's is
+        // radians, so the angle itself is what is divided by it.
+        let r_px = match self.projection {
+            Projection::Rectilinear => radius / ((z - radius) * self.half_h),
+            Projection::Equidistant => (radius / (z - radius)).atan() / self.half_h,
+        } * 0.5
+            * self.height as f64;
         Rect::around(cx, cy, r_px, self.width, self.height)
     }
 }
@@ -218,17 +319,23 @@ impl Plan {
     /// The pixels the plan asks for, as a share of the screen. Rectangles may
     /// overlap, so this is an upper bound — which is the safe side for a
     /// caller deciding whether a patch is still cheaper than the frame.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// It is also what [`crate::budget::Budget`] is told a pass repainted, so
+    /// it is no longer a test-only convenience.
     pub fn coverage(&self, size: (u32, u32)) -> f32 {
         let n = (size.0 as f32) * (size.1 as f32);
         if self.full || n <= 0.0 {
             return 1.0;
         }
+        // `fold` from a positive zero rather than `sum`, whose identity for a
+        // float is *negative* zero — which every pace line in the workspace
+        // has been faithfully printing as "-0% repainted" on a still frame.
+        // `clamp` does not fix it either: `-0.0 < 0.0` is false.
         let px: f32 = self
             .rects
             .iter()
             .map(|r| (r[2] as f32) * (r[3] as f32))
-            .sum();
+            .fold(0.0, |a, b| a + b);
         (px / n).min(1.0)
     }
 
@@ -1244,6 +1351,7 @@ impl TemporalHistory for History {
                     half_h: 1.0,
                     width: film.width,
                     height: film.height,
+                    projection: Projection::Rectilinear,
                 }),
                 self.poses.clone(),
             ),
@@ -1278,6 +1386,377 @@ mod tests {
             Vec3::new(0.0, 0.0, 1.0),
             45.0,
         )
+    }
+
+    // ---- the two maps, against the tracer's own rays --------------------
+
+    /// A quad of half-size `half` on the plane through `at` with normal `n`,
+    /// as a [`TriMesh`]. Big enough that every ray in the cone lands on it.
+    fn quad(at: Point3, n: Vec3, half: f64) -> kosm_render::TriMesh {
+        let n = n.normalize();
+        // Any basis of the plane will do; a quad has no parameterisation
+        // anything here reads.
+        let hint = if n.z.abs() < 0.9 {
+            Vec3::new(0.0, 0.0, 1.0)
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        };
+        let t = n.cross(hint).normalize();
+        let b = n.cross(t).normalize();
+        let p = |a: f64, c: f64| at + t * (a * half) + b * (c * half);
+        kosm_render::TriMesh::new(
+            vec![p(-1.0, -1.0), p(1.0, -1.0), p(1.0, 1.0), p(-1.0, 1.0)],
+            Vec::new(),
+            &[0, 1, 2, 0, 2, 3],
+        )
+    }
+
+    /// One plane, rendered: the distance from the eye along each pixel's
+    /// primary ray. Zero where the ray missed.
+    fn plane_depth(
+        cam: &pathtrace::Camera,
+        at: Point3,
+        n: Vec3,
+        w: u32,
+        h: u32,
+        seed: u64,
+    ) -> Vec<f32> {
+        let scene = kosm_render::pathtrace::Scene::<kosm_render::TriMesh> {
+            objects: vec![kosm_render::pathtrace::Object::new(
+                std::sync::Arc::new(kosm_render::Bvh::build(quad(at, n, 4.0e5))),
+                kosm_render::pathtrace::Pbr::default(),
+            )],
+            lights: Vec::new(),
+            env: kosm_render::pathtrace::Environment::default(),
+            sun: None,
+            ground: None,
+            splats: None,
+        };
+        let opts = PathTraceOptions {
+            spp: 1,
+            seed,
+            denoise: false,
+            ..Default::default()
+        };
+        kosm_render::pathtrace::render(&scene, cam, w, h, &opts).depth
+    }
+
+    /// The direction the tracer actually fired through every pixel, solved
+    /// out of three renders.
+    ///
+    /// `Film::depth` is the distance along the primary ray to the first hit,
+    /// so a plane through `p0` with normal `n` gives one linear equation in
+    /// the unknown direction: `d·n = (p0 − eye)·n / depth`. Three planes
+    /// through the same point, with independent normals, give three — and
+    /// the solve is the tracer's own ray, jitter and all. The jitter is the
+    /// *same* in all three, because a pixel's sampler is seeded from the seed
+    /// and the pixel and knows nothing about the camera, so the three
+    /// equations describe one ray rather than three neighbouring ones.
+    ///
+    /// This is the only handle on `Camera::ray` from outside the crate — it
+    /// is `pub(crate)` — and it is a better test than calling it would be:
+    /// what has to agree is not the function but the picture it makes.
+    fn traced_dirs(cam: &pathtrace::Camera, p0: Point3, w: u32, h: u32) -> Vec<Option<Vec3>> {
+        // Three normals that span, all facing back towards a camera looking
+        // along +y, and none of them so edge-on that a depth loses its
+        // precision at the corner of the frame.
+        let ns = [
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(-0.5, -1.0, 0.0),
+            Vec3::new(0.0, -1.0, -0.5),
+        ];
+        let depths: Vec<Vec<f32>> = ns
+            .iter()
+            .map(|n| plane_depth(cam, p0, *n, w, h, 0x51de_face))
+            .collect();
+        let ns: Vec<Vec3> = ns.iter().map(|n| n.normalize()).collect();
+        let cs: Vec<f64> = ns.iter().map(|n| (p0 - cam.eye).dot(n)).collect();
+        let det3 = |m: [[f64; 3]; 3]| {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        };
+        let rows = [
+            [ns[0].x, ns[0].y, ns[0].z],
+            [ns[1].x, ns[1].y, ns[1].z],
+            [ns[2].x, ns[2].y, ns[2].z],
+        ];
+        let d = det3(rows);
+        assert!(d.abs() > 1e-6, "the three planes have to span");
+        (0..(w as usize) * (h as usize))
+            .map(|i| {
+                let b: Vec<f64> = (0..3)
+                    .map(|k| cs[k] / depths[k][i].max(f32::MIN_POSITIVE) as f64)
+                    .collect();
+                if depths.iter().any(|dep| dep[i] <= 0.0) {
+                    return None;
+                }
+                // Cramer, which is exact enough for a 3×3 whose rows are unit
+                // vectors and whose determinant has just been checked.
+                let sub = |col: usize| {
+                    let mut m = rows;
+                    for r in 0..3 {
+                        m[r][col] = b[r];
+                    }
+                    det3(m) / d
+                };
+                Some(Vec3::new(sub(0), sub(1), sub(2)).normalize())
+            })
+            .collect()
+    }
+
+    /// Both maps, ray for ray, against what the tracer fired.
+    ///
+    /// The agreement that matters is not that `View` and `Camera` compute the
+    /// same expression — they do not, one folds the half field of view into
+    /// its extents — but that a pixel means the same direction to both. A
+    /// history whose `ray_dir` disagreed with the generator by a pixel would
+    /// smear its own past by a pixel every pass.
+    ///
+    /// The tolerance is a pixel and a half of angle, because the tracer's ray
+    /// is jittered inside its pixel and this one is through its centre. The
+    /// second half of the test is what gives the first half teeth: the *other*
+    /// map is out by far more than that.
+    #[test]
+    fn both_projections_agree_with_the_tracers_own_primary_rays() {
+        let (w, h) = (96u32, 64u32);
+        let eye = Point3::new(0.0, 0.0, 0.0);
+        let cam = pathtrace::Camera::look_at(
+            eye,
+            Point3::new(0.0, 1000.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            100.0,
+        );
+        let p0 = Point3::new(0.0, 1000.0, 0.0);
+
+        for projection in [Projection::Rectilinear, Projection::Equidistant] {
+            let cam = cam.with_projection(projection);
+            let view = View::of(&cam, w, h);
+            let other = View {
+                projection: match projection {
+                    Projection::Rectilinear => Projection::Equidistant,
+                    Projection::Equidistant => Projection::Rectilinear,
+                },
+                ..View::of(
+                    &cam.with_projection(match projection {
+                        Projection::Rectilinear => Projection::Equidistant,
+                        Projection::Equidistant => Projection::Rectilinear,
+                    }),
+                    w,
+                    h,
+                )
+            };
+            let fired = traced_dirs(&cam, p0, w, h);
+
+            // A pixel of angle, vertically, under this map. The half-extent is
+            // a tangent or an angle depending on the map, so it is measured
+            // rather than read off.
+            let px_rad = {
+                let a = view.ray_dir(w / 2, h / 2);
+                let b = view.ray_dir(w / 2, h / 2 + 1);
+                a.dot(&b).clamp(-1.0, 1.0).acos()
+            };
+            let tol = 1.5 * px_rad;
+
+            let mut worst = 0.0f64;
+            let mut worst_other = 0.0f64;
+            let mut tested = 0;
+            for py in 0..h {
+                for px in 0..w {
+                    let Some(d) = fired[(py * w + px) as usize] else {
+                        continue;
+                    };
+                    tested += 1;
+                    let off = |v: &View| {
+                        v.ray_dir(px, py).dot(&d).clamp(-1.0, 1.0).acos()
+                    };
+                    worst = worst.max(off(&view));
+                    worst_other = worst_other.max(off(&other));
+                }
+            }
+            assert!(
+                tested > (w * h) as usize / 2,
+                "{projection:?}: only {tested} pixels landed on all three planes"
+            );
+            assert!(
+                worst < tol,
+                "{projection:?}: worst disagreement {:.5} rad, over {:.5} rad ({:.2} pixels)",
+                worst,
+                tol,
+                worst / px_rad
+            );
+            // The other map is out by five times the tolerance the right one
+            // passes at — a quarter of a radian, fourteen degrees of picture.
+            // Without this the first assertion could be passed by a `ray_dir`
+            // that was merely *a* plausible map.
+            assert!(
+                worst_other > 5.0 * tol,
+                "{projection:?}: the wrong map was only {:.5} rad out against {:.5} — \
+                 this test has no teeth",
+                worst_other,
+                worst
+            );
+        }
+    }
+
+    /// A view records the map it was built under, and carries it across a
+    /// size step. Cheap, and it is the thing every arm below rests on.
+    #[test]
+    fn a_view_carries_its_projection() {
+        let cam = camera(Point3::new(0.0, -3000.0, 0.0));
+        let flat = View::of(&cam, W, H);
+        let fish = View::of(&cam.with_projection(Projection::Equidistant), W, H);
+        assert_eq!(flat.projection, Projection::Rectilinear);
+        assert_eq!(fish.projection, Projection::Equidistant);
+        assert_ne!(flat, fish, "two maps are two views, whatever else matches");
+        assert_eq!(fish.at_size(W * 2, H * 2).projection, Projection::Equidistant);
+        // The pinhole keeps its tangent and the fisheye takes radians.
+        assert!((flat.half_h - 22.5f64.to_radians().tan()).abs() < 1e-15);
+        assert!((fish.half_h - 22.5f64.to_radians()).abs() < 1e-15);
+    }
+
+    /// The fisheye reprojects to the right pixels.
+    ///
+    /// A real scene, really rendered: a converged picture under an `f·θ`
+    /// camera, a fifteen-degree turn, and one pass at the new camera. What
+    /// the history hands back afterwards has to look like a picture *taken*
+    /// at the new camera — so it is compared against one, converged from
+    /// black over the same number of passes.
+    ///
+    /// The wall is a checkerboard on purpose. A smooth scene would pass this
+    /// test with the reprojection deleted: two low-contrast pictures of the
+    /// same wall from cameras fifteen degrees apart are already nearly the
+    /// same bytes, and the comparison would be measuring nothing. High
+    /// spatial frequency is what makes "the right pixel" and "a pixel nearby"
+    /// two different answers.
+    ///
+    /// Only the pixels the history says it *carried* are compared, which is
+    /// the claim under test; the strip that swung in from the edge holds one
+    /// pass of raw samples and is noise, not evidence. And the comparison is
+    /// against the same pixels of the picture it came *from*: what says the
+    /// samples went to the right place is that they moved most of the way to
+    /// the new camera's picture. Under a fisheye a pure yaw moves a pixel by
+    /// an amount that depends on where in the frame it is, so a pinhole
+    /// inverse — the map this `View` had until it learned there were two —
+    /// fails exactly here.
+    #[test]
+    fn a_fisheye_reprojects_a_turn_onto_the_right_pixels() {
+        let (w, h) = (96u32, 72u32);
+        let eye = Point3::new(0.0, -2500.0, 400.0);
+        let look = |yaw_deg: f64| {
+            let (s, c) = yaw_deg.to_radians().sin_cos();
+            pathtrace::Camera::look_at(
+                eye,
+                eye + Vec3::new(s * 2500.0, c * 2500.0, -400.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                100.0,
+            )
+            .with_projection(Projection::Equidistant)
+        };
+        // A checkerboard wall, and one panel of it pulled forward so the
+        // frame has depth in it as well as contrast.
+        let cell = 900.0;
+        let mut objects = Vec::new();
+        for i in -4i32..=4 {
+            for j in -3i32..=3 {
+                let near = i == 1 && j == 0;
+                let at = Point3::new(
+                    i as f64 * 2.0 * cell,
+                    if near { -600.0 } else { 2400.0 },
+                    400.0 + j as f64 * 2.0 * cell,
+                );
+                let albedo = if (i + j).rem_euclid(2) == 0 {
+                    [0.92, 0.90, 0.85]
+                } else {
+                    [0.04, 0.05, 0.07]
+                };
+                objects.push(kosm_render::pathtrace::Object::new(
+                    std::sync::Arc::new(kosm_render::Bvh::build(quad(
+                        at,
+                        Vec3::new(0.0, -1.0, 0.0),
+                        if near { cell * 0.5 } else { cell },
+                    ))),
+                    kosm_render::pathtrace::Pbr::plastic(albedo, 0.6, 0.0),
+                ));
+            }
+        }
+        let scene = kosm_render::pathtrace::Scene::<kosm_render::TriMesh> {
+            objects,
+            lights: Vec::new(),
+            env: kosm_render::pathtrace::Environment::default(),
+            sun: None,
+            ground: None,
+            splats: None,
+        };
+        // Low spp, as a live pass is: four samples and sixteen passes, which
+        // is a picture that has converged enough to compare and nowhere near
+        // enough to hide a misplaced sample.
+        let pass = |cam: &pathtrace::Camera, k: u64| {
+            let opts = PathTraceOptions {
+                spp: 4,
+                seed: 0xf1_5eed ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                denoise: false,
+                ..Default::default()
+            };
+            kosm_render::pathtrace::render(&scene, cam, w, h, &opts)
+        };
+        // The resolve is the raw accumulated mean: the filter is a different
+        // question and would only blur the one being asked here.
+        let plain = PathTraceOptions { denoise: false, ..Default::default() };
+        let converge = |cam: &pathtrace::Camera, n: u64| {
+            let view = View::of(cam, w, h);
+            let mut hist = History::new((w, h));
+            for k in 0..n {
+                hist.merge(&pass(cam, k), &view, &[], &[], None);
+            }
+            hist
+        };
+
+        let (a, b) = (look(0.0), look(15.0));
+        let mut hist = converge(&a, 16);
+        let stale = hist.resolve(1.0, &plain);
+        let held: Vec<u32> = hist.count.clone();
+
+        let vb = View::of(&b, w, h);
+        hist.merge(&pass(&b, 99), &vb, &[], &[], None);
+        let kept: Vec<bool> = hist
+            .count
+            .iter()
+            .zip(&held)
+            .map(|(&now, &was)| now > was && was > 0)
+            .collect();
+        let carried = kept.iter().filter(|&&k| k).count();
+        assert!(
+            carried as f64 > 0.5 * (w * h) as f64,
+            "a fifteen-degree turn should carry most of the frame, carried {carried} of {}",
+            w * h
+        );
+
+        let want = converge(&b, 16).resolve(1.0, &plain);
+        let got = hist.resolve(1.0, &plain);
+        // Mean channel difference over the carried pixels alone.
+        let over = |x: &[u8], y: &[u8]| {
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for (i, _) in kept.iter().enumerate().filter(|&(_, &k)| k) {
+                for c in 0..3 {
+                    sum += (x[i * 4 + c] as f64 - y[i * 4 + c] as f64).abs();
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let reprojected = over(&got, &want);
+        let unmoved = over(&stale, &want);
+        assert!(
+            reprojected < 0.35 * unmoved,
+            "the reprojection should land on the new camera's picture: \
+             {reprojected:.2} of 255 against {unmoved:.2} for the picture it came from"
+        );
+        assert!(
+            reprojected < 16.0,
+            "reprojected pixels are {reprojected:.2} of 255 from a picture taken there"
+        );
     }
 
     /// A film whose every pixel hits the plane `y = 0`, facing the camera —

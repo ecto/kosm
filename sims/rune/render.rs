@@ -121,11 +121,22 @@ pub type Picture = pathtrace::Scene<CoveGeom>;
 /// way of getting one. A solved pose, a hand-placed pose and a live snapshot
 /// all arrive here as the same three numbers, which is what lets the offline
 /// frame exist before the being can walk.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Placement {
     /// The being's centre in world metres, and its body → world rotation.
     /// The body's axes are right, facing, up.
     pub being: (PVec3, Mat3),
+    /// The hero's solids, placed — every part of the figure and the glass in
+    /// its hand, at the transforms one snapshot of the simulation puts them
+    /// at. [`None`] is the capsule, which is what the offline still and the
+    /// solvability sweep are written against.
+    ///
+    /// The solids themselves are [`Scene`]'s and are built once; what changes
+    /// per frame is the fourth field of each of these, so a walking hero costs
+    /// one 4×4 a part and not one tessellation. An `Arc<[_]>` rather than a
+    /// `Vec`, because a `Placement` is cloned per pass and compared against
+    /// the pose the caustic map was traced at.
+    pub hero: Option<Arc<[HeroPart]>>,
     /// How far the door has swung, radians. Zero is shut; positive opens it
     /// out of the cliff into the cove.
     pub door_angle: f64,
@@ -167,10 +178,22 @@ impl Placement {
         let lean_facing = facing * c + up * s;
         Self {
             being: (centre, columns(right, lean_facing, lean_up)),
+            hero: None,
             door_angle: 0.0,
             score: 0.0,
             glint: None,
         }
+    }
+
+    /// The same pose, with the hero's solids placed on it.
+    pub fn with_hero(mut self, hero: Option<Arc<[HeroPart]>>) -> Self {
+        self.hero = hero;
+        self
+    }
+
+    /// Whether this placement draws the figure rather than the capsule.
+    pub fn is_hero(&self) -> bool {
+        self.hero.as_ref().is_some_and(|h| !h.is_empty())
     }
 
     /// The same pose, with the rune's score on it.
@@ -190,6 +213,103 @@ impl Placement {
         let r = self.being.1;
         PVec3::new(r[(0, 1)], r[(1, 1)], r[(2, 1)])
     }
+}
+
+// ---- the hero -------------------------------------------------------------
+
+/// One of the hero's solids, placed for one frame.
+///
+/// The name is `sims/rune/hero/figure.rs`'s body name — `hood`, `boot_r`,
+/// `strap` — or `lens` and `lens_ring` for the glass in the hand. It is
+/// carried because a part that is drawn in the wrong place is a bug you can
+/// only see, and a name in a test is how you see it in a number instead.
+#[derive(Clone)]
+pub struct HeroPart {
+    pub name: String,
+    pub bvh: Arc<Bvh<CoveGeom>>,
+    pub to_world: Transform,
+    pub pbr: Pbr,
+}
+
+// A BVH has no `Debug` and would be no use as one; what a reader of a
+// `Placement` wants to know about a part is its name and where it ended up.
+impl std::fmt::Debug for HeroPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = self.to_world.matrix.c3;
+        f.debug_struct("HeroPart").field("name", &self.name).field("at", &[c.x, c.y, c.z]).finish()
+    }
+}
+
+/// One of the hero's solids as it was **authored**: which of the body's links
+/// carries it, and where it sits in that link's own frame.
+///
+/// This is the whole of "build once, re-place per frame". `figure()` is
+/// evaluated exactly once, at [`Scene::new`], and every primitive its bodies
+/// are a union of gets one BVH; what a walking hero costs after that is one
+/// 4×4 per primitive per frame.
+struct HeroSolid {
+    name: String,
+    bvh: Arc<Bvh<CoveGeom>>,
+    pbr: Pbr,
+    /// Which link of `kosm::player::BodySpec::hero` this rides on: an index
+    /// into `Snapshot::parts`, which is in the spec's link order.
+    link: usize,
+    /// Primitive → the link's own frame, in **hero-local millimetres**.
+    local: Transform,
+}
+
+/// Hero-local millimetres as the body's own frame: `+y` forward becomes `+x`,
+/// `+x` right becomes `−y`, `z` is `z`.
+///
+/// The rotation half of [`kosm::player::body::hero_local`], without its
+/// millimetres — because the picture is assembled in millimetres and the
+/// thousand cancels. That cancellation is the only reason this matrix and not
+/// that function is what the placement uses; they are the same map.
+fn hero_axes() -> Mat3 {
+    Mat3::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+}
+
+/// How far outside link `i`'s own flesh a body-local point is, metres.
+///
+/// The **signed** distance to the nearest lump, so a part that overlaps two
+/// links goes to the one it is deepest inside rather than to the one whose
+/// pivot happens to be nearer. That distinction is not academic: the cloak's
+/// skirt cone has its centroid 117 mm from the pelvis ball's centre and 87 mm
+/// from the chest's, so a nearest-centre rule would hang the skirt off the
+/// torso and swing it when the hero leaned.
+fn lump_depth(link: &kosm::player::Link, q: PVec3) -> f64 {
+    link.lumps
+        .iter()
+        .map(|l| {
+            let d = l.to - l.from;
+            let t = if d.norm_squared() > 1e-18 { ((q - l.from).dot(&d) / d.norm_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            (q - (l.from + d * t)).norm() - l.radius
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// A solid of the hero's, traced with **smoothed** vertex normals.
+///
+/// [`geometry_of`] is the cove's and shades a boolean's tessellation flat,
+/// which is right for a cliff cut out of a slab and wrong for a hood: the
+/// figure's cowl is a union of spheres and a torus and a hood with facets on
+/// it is a hood nobody believes. `hero/stage.rs::smooth_normals` is the rule
+/// the hero's own stills are drawn with — welded by position, creased at 46°
+/// — so the live figure and the doorstep plate shade the same way.
+fn hero_geometry(solid: &Solid) -> CoveGeom {
+    if let Some(brep) = solid.as_brep() {
+        let brep = Arc::new(brep.clone());
+        let faces = brep.topology.faces.iter().map(|(id, _)| id).collect();
+        return CoveGeom::Brep(BrepGeom::BRep { brep, faces });
+    }
+    let mut mesh = solid.to_mesh(0);
+    vcad_kernel::vcad_kernel_tessellate::render_bake_default(&mut mesh);
+    let n = mesh.vertices.len() / 3;
+    let positions: Vec<Point3> = (0..n)
+        .map(|i| Point3::new(mesh.vertices[i * 3] as f64, mesh.vertices[i * 3 + 1] as f64, mesh.vertices[i * 3 + 2] as f64))
+        .collect();
+    let normals = super::hero::stage::smooth_normals(&positions, &mesh.indices);
+    CoveGeom::Brep(BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices)))
 }
 
 /// A body → world rotation from its three axes, as columns.
@@ -234,6 +354,13 @@ pub struct Scene {
     glint_glow: f64,
     /// The being, centred on the origin with its axis along +z.
     being: Placed,
+    /// The hero's costume, built once, each part in the frame of the link
+    /// that carries it. Empty when the level could not evaluate the figure.
+    hero: Vec<HeroSolid>,
+    /// The glass in the hand and the ring around it, in the lens's own frame:
+    /// centred on the origin with the optical axis along +z, which is what
+    /// `hero/kit.rs` cuts them in.
+    held: Vec<HeroSolid>,
     env: Environment,
     sun: Sun,
     ground: Option<Ground>,
@@ -251,6 +378,11 @@ pub struct Scene {
     /// `sqrt(gather_photons / photons)`, so the offline frame is bit-identical
     /// and the walking picture has a caustic instead of sparkle.
     gather_photons: f64,
+    /// Solids a caller has put in the cove that the cove knows nothing about.
+    /// See [`Scene::push_part`]. Empty for `kosm run rune`.
+    extras: Vec<Placed>,
+    /// Whether the being is drawn at all. See [`Scene::set_being_visible`].
+    show_being: bool,
     /// Whether the *camera's* being disperses. The caustic pass's always does.
     ///
     /// See [`materials::being_achromatic`]: at one sample a pixel a pass the
@@ -280,8 +412,8 @@ impl Scene {
                     .clone();
                 let Some(local) = bvh.bounds() else { continue };
                 let to_world = placement(&inst.to_world);
-                if root.material == "door" || root.material == "stone" {
-                    door.push(Placed { bvh, pbr: materials::pbr(doc, "stone"), to_world });
+                if root.material == "door" || root.material == materials::DOOR {
+                    door.push(Placed { bvh, pbr: materials::pbr(doc, materials::DOOR), to_world });
                 } else {
                     // one root, three surfaces; see `ground_material`
                     let name = ground_material(&transform_aabb(&local, &to_world), scene);
@@ -350,6 +482,16 @@ impl Scene {
             material: materials::pbr(doc, "water"),
             shadow_catcher: false,
         });
+        // The figure, evaluated once. A level that cannot build it says so and
+        // carries on with the capsule rather than failing to open a window.
+        let (hero, held) = match hero_solids(doc, scene) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("cove   the hero could not be built ({e}); the capsule stands in");
+                (Vec::new(), Vec::new())
+            }
+        };
+
         Ok(Self {
             statics,
             door,
@@ -360,6 +502,8 @@ impl Scene {
             glint,
             glint_glow: scene.glint_glow,
             being,
+            hero,
+            held,
             env,
             sun,
             ground,
@@ -370,6 +514,8 @@ impl Scene {
             // rune is actually read at, so it is the scale to gather at.
             gather: a.parameter_or("caustic_radius_mm", scene.aperture_r * PER_M / 2.0),
             gather_photons: a.parameter_or("caustic_radius_photons", 600_000.0).max(1.0),
+            extras: Vec::new(),
+            show_being: true,
             body_dispersion: true,
         })
     }
@@ -385,11 +531,124 @@ impl Scene {
         self.body_dispersion = on;
     }
 
+    /// Draw one more thing in every picture this scene makes: a BVH over this
+    /// picture's geometry, a material, and an object → world placement in
+    /// millimetres.
+    ///
+    /// Additive and orthogonal to everything above it — the cove itself never
+    /// calls this. A character, a prop, a second refractor: anything a caller
+    /// holds as a placed BVH can be put in the cove's own light without the
+    /// cove having to know what it is. A `pbr` that transmits joins the caustic
+    /// pass's aim for nothing, because [`kosm_render::caustics`] looks at the
+    /// picture's materials and at nothing else — so a lens pushed in here
+    /// throws a rune exactly the way the being does.
+    ///
+    /// [`geometry_of`] turns a placed vcad solid into the geometry this wants;
+    /// [`mesh_geometry`] does the same for a caller that has tessellated
+    /// something itself.
+    pub fn push_object(&mut self, bvh: Arc<Bvh<CoveGeom>>, pbr: Pbr, to_world: Transform) {
+        self.extras.push(Placed { bvh, pbr, to_world });
+    }
+
+    /// Whether the being is in the picture. On by default, which is the cove.
+    ///
+    /// A still of something *else* standing in this cove wants the level, the
+    /// light and the door and not the capsule — and, because the being is a
+    /// dielectric, leaving it in would also spend half the rune's photons on a
+    /// body that is not in shot.
+    pub fn set_being_visible(&mut self, on: bool) {
+        self.show_being = on;
+    }
+
+    /// The gather radius the caustic is read at, millimetres.
+    ///
+    /// The authored default is half the keyhole, which is the scale a being's
+    /// broad, aberrated focus is read at. A refractor that focuses tighter than
+    /// that — a figured lens rather than a body — wants a smaller disc or the
+    /// estimate averages its own spot away.
+    pub fn set_gather(&mut self, radius_mm: f64) {
+        self.gather = radius_mm.max(1e-6);
+        self.gather_photons = self.photons.max(1) as f64;
+    }
+
+    /// How many photons the rune is traced with. Zero is off.
+    pub fn set_photons(&mut self, photons: usize) {
+        self.photons = photons;
+    }
+
     /// The gather radius a map of `photons` photons is asked for, in
     /// millimetres. See [`Self::gather_photons`].
     fn gather_for(&self, photons: usize) -> f64 {
         let widen = (self.gather_photons / (photons.max(1) as f64)).sqrt();
         self.gather * widen.clamp(1.0, MAX_WIDENING)
+    }
+
+    /// The hero's solids at one snapshot of the body: every costume part on
+    /// the link that carries it, and the glass wherever the arm actually got
+    /// it to.
+    ///
+    /// The whole per-frame cost of drawing a figure. A part authored at
+    /// `p_mm` in the hero's own millimetres, on a link whose pivot is `pivot`
+    /// (body-local metres) and whose frame the simulation has put at
+    /// `(pos, R)` (world metres, `R` body → world), is drawn at
+    ///
+    /// ```text
+    /// world_mm = R · P · p_mm + 1000 · (pos − R · pivot)
+    /// ```
+    ///
+    /// where `P` is [`hero_axes`]. The thousand that turns hero-millimetres
+    /// into body-metres and the thousand that turns world-metres back into
+    /// the picture's millimetres cancel in the linear part and survive only
+    /// in the translation, which is why this is one 4×4 and not two.
+    pub fn hero_at(
+        &self,
+        parts: &[kosm::player::Part],
+        pivots: &[PVec3],
+        held: Option<kosm::player::Pose>,
+    ) -> Option<Arc<[HeroPart]>> {
+        if self.hero.is_empty() || parts.is_empty() {
+            return None;
+        }
+        let axes = hero_axes();
+        let mut out: Vec<HeroPart> = Vec::with_capacity(self.hero.len() + self.held.len());
+        for solid in &self.hero {
+            let (Some(part), Some(pivot)) = (parts.get(solid.link), pivots.get(solid.link)) else { continue };
+            let (pos, r) = (part.pose.pos, part.pose.rot);
+            let t = (pos - r.mul_vec(*pivot)) * PER_M;
+            let frame = rigid(&r.mul_mat(&axes), t.x, t.y, t.z);
+            out.push(HeroPart {
+                name: solid.name.clone(),
+                bvh: solid.bvh.clone(),
+                pbr: solid.pbr,
+                to_world: Transform::from_matrix(frame.matrix * solid.local.matrix),
+            });
+        }
+        // The glass is not on a link. It is where `Body::held` says it is,
+        // which is not where the arm was asked to put it, because an arm has
+        // mass — and that is the pose the scorer reads too.
+        if let Some(pose) = held {
+            let c = pose.pos * PER_M;
+            let frame = rigid(&pose.rot, c.x, c.y, c.z);
+            for solid in &self.held {
+                out.push(HeroPart {
+                    name: solid.name.clone(),
+                    bvh: solid.bvh.clone(),
+                    pbr: solid.pbr,
+                    to_world: Transform::from_matrix(frame.matrix * solid.local.matrix),
+                });
+            }
+        }
+        (!out.is_empty()).then(|| out.into())
+    }
+
+    /// The link pivots the hero's placement needs, body-local metres. Built
+    /// once by the caller and handed to [`Scene::hero_at`] each frame.
+    pub fn hero_pivots() -> Vec<PVec3> {
+        kosm::player::BodySpec::hero(&super::being::hero_skeleton(&super::hero::figure::Rig::DEFAULT))
+            .links
+            .iter()
+            .map(|l| l.pivot)
+            .collect()
     }
 
     /// The picture at one pose: the static half, the being where it stands,
@@ -429,9 +688,22 @@ impl Scene {
                 Transform::translation(g.x, g.y, g.z),
             ));
         }
-        let (centre, rot) = p.being;
-        let c = centre * PER_M;
-        objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
+        objects.extend(self.extras.iter().map(Placed::object));
+        // The body: the figure when there is one, and the capsule when there
+        // is not. Never both — the capsule is the hero's *optical* proxy and
+        // a figure standing inside a lens the size of itself is worse than
+        // either half of that sentence.
+        if let Some(hero) = p.hero.as_ref().filter(|h| !h.is_empty()) {
+            if self.show_being {
+                for part in hero.iter() {
+                    objects.push(Object::placed(part.bvh.clone(), part.pbr, part.to_world.clone()));
+                }
+            }
+        } else if self.show_being {
+            let (centre, rot) = p.being;
+            let c = centre * PER_M;
+            objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
+        }
         Picture {
             objects,
             lights: Vec::new(),
@@ -489,17 +761,118 @@ impl Scene {
     }
 }
 
+/// The hero's solids: the costume on its links, and the glass in its hand.
+///
+/// Evaluated once. Every body of `hero/figure.rs` is walked into the placed
+/// primitives its union is made of, each distinct solid gets one BVH, and
+/// each primitive is assigned to **the link whose flesh it is deepest
+/// inside** ([`lump_depth`]) — so a bone drawn between the hip and the knee
+/// rides the thigh, the shin below it rides the shin, and the cowl rides the
+/// neck. Nothing here is a table of names: the assignment is geometric,
+/// because the pivots the figure is drawn from and the pivots the body is
+/// built from are the same `Rig::pivots()`.
+///
+/// The lens and its ring come back separately: they hang off
+/// [`kosm::player::Body::held`], which is where the arm actually got the
+/// glass to rather than where it was asked to put it.
+fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Vec<HeroSolid>, Vec<HeroSolid>)> {
+    use super::hero::{figure, kit};
+    use kosm::build::Params;
+
+    // The same rig the body is built from — `being::hero_skeleton(Rig::DEFAULT)`
+    // — so a part's rest pose and its link's pivot are the same number.
+    let built = figure::figure(&Params::default())?;
+    let spec = kosm::player::BodySpec::hero(&super::being::hero_skeleton(&figure::Rig::DEFAULT));
+
+    let mut prims = Prims::default();
+    let mut bvhs: HashMap<usize, Arc<Bvh<CoveGeom>>> = HashMap::new();
+    let mut parts = Vec::new();
+    for body in &built.bodies {
+        let pbr = materials::pbr(&built.document, &body.material);
+        for inst in instances::instances(&built.document, body.root, &mut prims)? {
+            let bvh = bvhs
+                .entry(Arc::as_ptr(&inst.solid) as usize)
+                .or_insert_with(|| Arc::new(Bvh::build(hero_geometry(&inst.solid))))
+                .clone();
+            let Some(local) = bvh.bounds() else { continue };
+            let to_world = placement(&inst.to_world);
+            // where this primitive sits in the body's own frame, metres
+            let box_mm = transform_aabb(&local, &to_world);
+            let mid = Point3::new(
+                0.5 * (box_mm.min.x + box_mm.max.x),
+                0.5 * (box_mm.min.y + box_mm.max.y),
+                0.5 * (box_mm.min.z + box_mm.max.z),
+            );
+            let q = kosm::player::body::hero_local(mid.x, mid.y, mid.z);
+            let link = (0..spec.links.len())
+                .min_by(|&a, &b| {
+                    lump_depth(&spec.links[a], q)
+                        .partial_cmp(&lump_depth(&spec.links[b], q))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            parts.push(HeroSolid { name: body.name.clone(), bvh, pbr, link, local: to_world });
+        }
+    }
+    anyhow::ensure!(!parts.is_empty(), "the hero evaluated to no solid");
+
+    // The glass. `lens_mesh` is exact spherical caps with analytic normals,
+    // which is the same trade the being's capsule makes and for the same
+    // reason: the boolean is two spheres two and a half metres across meeting
+    // in a disc a hundred and ten millimetres wide.
+    let a = &scene.authored;
+    let lens = Arc::new(Bvh::build(mesh_geometry(kit::lens_mesh(
+        a.parameter_or("lens_segments", 96.0).max(8.0) as usize,
+        a.parameter_or("lens_rings", 24.0).max(2.0) as usize,
+    ))));
+    let mut held = vec![HeroSolid {
+        name: "lens".into(),
+        bvh: lens,
+        pbr: materials::lens_glass(scene.n_d),
+        link: 0,
+        local: Transform::identity(),
+    }];
+    // …and its brass ring, out of the same `Built` the doorstep stills use.
+    // Decoration, and it earns the line: a rimless disc of glass in a fist is
+    // a hole in the picture, and the ring is what says the hero is holding
+    // something rather than standing behind it.
+    if let Ok(hardware) = kit::hardware(&Params::default()) {
+        for body in &hardware.bodies {
+            let pbr = materials::pbr(doc, &body.material);
+            for inst in instances::instances(&hardware.document, body.root, &mut prims)? {
+                let bvh = Arc::new(Bvh::build(hero_geometry(&inst.solid)));
+                held.push(HeroSolid {
+                    name: body.name.clone(),
+                    bvh,
+                    pbr,
+                    link: 0,
+                    local: placement(&inst.to_world),
+                });
+            }
+        }
+    }
+    Ok((parts, held))
+}
+
 /// Which of the cove's surfaces one primitive of the `ground` root is.
 ///
-/// The document unions the beach, the cliff and the boulders into one solid
-/// because the bake wants one inside; the picture wants three colours out of
-/// it. The instance walk hands back the primitives that union was made of, so
-/// the split is geometric and is stated here once: the beach is the only one
-/// of them whose footprint is the cove itself, and everything standing on it
-/// — the cliff along +y, the boulders, the sea stack — is rock. Millimetres,
-/// because these are world bounds of a vcad solid.
+/// The document unions the beach, the cliff, the boulders, the headlands and
+/// the reef into one solid because the bake wants one inside; the picture wants
+/// two colours out of it. The instance walk hands back the primitives that
+/// union was made of, so the split is geometric and is stated here once: the
+/// sand — beach and seabed, which are one slab — is the only primitive that
+/// covers the cove in *both* directions, and everything standing on it is rock.
+///
+/// Both halves of that test are load-bearing now that the slab runs on past the
+/// waterline. The headlands are cut like the beach and so are just as long in y
+/// as it is; what separates them is that they are five metres wide in x, not
+/// forty. The cliff is the mirror image — the width, not the length. So the
+/// rule is the conjunction, and a primitive has to be the whole floor to be
+/// sand. Millimetres, because these are world bounds of a vcad solid.
 fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
-    if world.max.y - world.min.y > 0.5 * scene.cove * PER_M { "sand" } else { "rock" }
+    let half = 0.5 * scene.cove * PER_M;
+    let (w, l) = (world.max.x - world.min.x, world.max.y - world.min.y);
+    if w > half && l > half { "sand" } else { "rock" }
 }
 
 /// The level's daylight: a low afternoon sun and the sky it hangs in.
@@ -510,7 +883,7 @@ fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
 /// flat and bright. The defaults put roughly as much irradiance on the sand
 /// from the sky as from the sun at this elevation, which leaves a shadow that
 /// is soft, blue, and unmistakably there.
-fn daylight(scene: &CoveScene) -> (Environment, Sun) {
+pub fn daylight(scene: &CoveScene) -> (Environment, Sun) {
     let a = &scene.authored;
     let sky = a.parameter_or("sky_intensity", 0.42) as f32;
     let env = Environment::Gradient(GradientEnv {
@@ -653,7 +1026,18 @@ fn annulus_mesh(centre: Point3, r_in: f64, r_out: f64, segments: usize) -> TriMe
 /// The geometry a solid is traced as: its analytic BRep if it has one, its
 /// tessellation if a boolean took the BRep away — the same fallback the court
 /// takes, and the same one `vcad-render --photoreal` takes.
-fn geometry_of(solid: &Solid) -> CoveGeom {
+/// A caller's own triangles, as this picture's geometry.
+///
+/// The way in for a shape the kernel will not hand over as a *trimmed* B-rep —
+/// the being's capsule is one, and so is a lens cut as the intersection of two
+/// spheres. Give the mesh exact analytic normals and the shading is exact even
+/// where the silhouette is a polygon, which is the same trade [`capsule_mesh`]
+/// makes.
+pub fn mesh_geometry(mesh: TriMesh) -> CoveGeom {
+    CoveGeom::Brep(BrepGeom::Mesh(mesh))
+}
+
+pub fn geometry_of(solid: &Solid) -> CoveGeom {
     if let Some(brep) = solid.as_brep() {
         let brep = Arc::new(brep.clone());
         let faces = brep.topology.faces.iter().map(|(id, _)| id).collect();
@@ -757,12 +1141,18 @@ pub fn camera(scene: &CoveScene, p: &Placement) -> Camera {
     let t = ((reach - (face - centre.y)) / reach).clamp(0.0, 1.0);
     let mix = |lo: f64, hi: f64| lo + (hi - lo) * t;
 
-    // and the one thing that is not negotiable: the eye stays out of the rock.
+    // and the two things that are not negotiable: the eye stays out of the rock,
+    // and it stays out of the sea. Wading, the being's centre drops toward the
+    // waterline and the far framing's `cam_up_mm` drops with it; a metre of
+    // that and the eye would be under the swell, looking at the inside of an
+    // opaque teal surface. So the eye is floored a hand's breadth above the
+    // flat waterline — the being in the water is seen from over it.
     let clear = (face - scene.being_r) * PER_M - a.parameter_or("cam_face_clear_mm", 500.0);
+    let afloat = (scene.sea_z * PER_M) + a.parameter_or("cam_sea_clear_mm", 400.0);
     let eye = Point3::new(
         a.parameter_or("cam_x_mm", mix(far_eye[0], near_eye[0])),
         a.parameter_or("cam_y_mm", mix(far_eye[1], near_eye[1]).min(clear)),
-        a.parameter_or("cam_z_mm", mix(far_eye[2], near_eye[2])),
+        a.parameter_or("cam_z_mm", mix(far_eye[2], near_eye[2]).max(afloat)),
     );
     // The *aim* turns to the keyhole faster than the eye walks round to it.
     // Both on the same `t` and the last twenty per cent of the blend leaves the
@@ -811,6 +1201,22 @@ pub fn frame(
     spp: usize,
 ) -> anyhow::Result<image::RgbaImage> {
     let mut picture = Scene::new(scene)?;
+    frame_in(&mut picture, scene, placement, size, spp)
+}
+
+/// The same, on a [`Scene`] the caller has already built.
+///
+/// `sims/rune/mod.rs`'s still needs one: to draw the hero at a solved
+/// [`super::rune::HeroPose`] it has to ask [`Scene::hero_at`] where the
+/// costume goes, and that is a method on a built scene. One statement of the
+/// render, two ways in.
+pub fn frame_in(
+    picture: &mut Scene,
+    scene: &CoveScene,
+    placement: &Placement,
+    size: (u32, u32),
+    spp: usize,
+) -> anyhow::Result<image::RgbaImage> {
     let rune = picture.caustic_map(placement);
     let at = picture.at(placement);
     let cam = camera(scene, placement);
@@ -871,6 +1277,53 @@ mod tests {
         // to be, which is what keeps `kosm run rune` spectral.
         assert!(picture.being.pbr.is_dispersive());
         assert!(!materials::achromatic(picture.being.pbr).is_dispersive());
+    }
+
+    /// One primitive of the `ground` root is the floor and every other one is
+    /// rock. The rule is a footprint test (see [`ground_material`]) and the
+    /// footprints moved when the cove was closed: the sand slab now runs
+    /// fourteen metres past the waterline, and the headlands cut out of the
+    /// same plane are exactly as long as it is. So the check is that there is
+    /// still precisely *one* sand — the beach and its seabed — and that the
+    /// cliff, the boulders, the headlands and the reef are all rock.
+    #[test]
+    fn the_ground_is_one_beach_and_the_rest_of_it_is_rock() -> anyhow::Result<()> {
+        let scene = CoveScene::bundled()?;
+        let picture = Scene::new(&scene)?;
+        let sand = materials::pbr(&scene.authored.document, "sand").base_color;
+        let rock = materials::pbr(&scene.authored.document, "rock").base_color;
+        // the sea is in `statics` too, and it is neither
+        let water = materials::pbr(&scene.authored.document, "water").base_color;
+        let (mut sands, mut rocks) = (0, 0);
+        for p in &picture.statics {
+            match p.pbr.base_color {
+                c if c == sand => sands += 1,
+                c if c == rock => rocks += 1,
+                c if c == water => {}
+                c => panic!("the ground grew a surface that is neither sand nor rock: {c:?}"),
+            }
+        }
+        assert_eq!(sands, 1, "the beach and its seabed are one slab, so exactly one primitive is sand");
+        // three boulders, a sea stack, the cliff, six headland steps and the reef
+        assert!(rocks >= 10, "only {rocks} of the cove's primitives came out as rock");
+        Ok(())
+    }
+
+    /// The picture never dips under the sea. Wading, the being's centre falls
+    /// toward the waterline and the far framing's eye falls with it; the floor
+    /// is what keeps the camera over the water looking down at a being in it
+    /// rather than inside an opaque teal surface looking at nothing.
+    #[test]
+    fn the_eye_stays_over_the_water() {
+        let scene = CoveScene::bundled().expect("the bundled cove");
+        let floor = (scene.sea_z + scene.authored.parameter_or("cam_sea_clear_mm", 400.0) * MM) * PER_M;
+        // out along the seabed, until the being is under
+        for k in 0..20 {
+            let y = scene.waterline() - scene.seabed * k as f64 / 19.0;
+            let p = Placement::standing(&scene, 0.0, y, 0.0);
+            let cam = camera(&scene, &p);
+            assert!(cam.eye.z >= floor - 1e-9, "wading at y = {y:+.1} m the eye is at {:.0} mm, under the waterline's floor at {floor:.0}", cam.eye.z);
+        }
     }
 
     #[test]

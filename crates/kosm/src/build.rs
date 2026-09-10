@@ -44,6 +44,7 @@ use phyz_model::{Geometry, ModelBuilder};
 use vcad_ir::{CsgOp, Document, Node, NodeId, SceneEntry};
 
 use crate::colliders::{Derived, colliders_from_document};
+use crate::material::Material as Substance;
 use crate::scene::MM;
 use crate::world::{Material, Param, World};
 
@@ -140,6 +141,11 @@ pub struct Built {
 pub struct BuiltBody {
     pub name: String,
     pub material: String,
+    /// The substance this body was authored with, when it was authored by
+    /// value through [`Body::substance`] rather than by name. [`Self::substance`]
+    /// is what a caller should ask; this is where the answer is kept when the
+    /// author had one that the library does not.
+    pub authored_substance: Option<Substance>,
     /// `None` for a static body.
     pub mass: Option<f64>,
     /// Where a dynamic body starts, metres. Static bodies are at the origin
@@ -149,6 +155,32 @@ pub struct BuiltBody {
     pub root: NodeId,
     /// Colliders derived from that root, in metres.
     pub colliders: Derived,
+}
+
+impl BuiltBody {
+    /// This body's substance: the one it was authored with, or the library's
+    /// entry for its material name.
+    ///
+    /// The `no-collide` marker is stripped first, so a roof authored as
+    /// `"no-collide galvanized"` still answers "galvanized". A name the
+    /// library does not know gives `None` — no fallback substance, because
+    /// guessing a density is worse than admitting there isn't one.
+    ///
+    /// ```
+    /// use kosm::prelude::*;
+    /// let built = build(&Params::default(), |b| {
+    ///     b.body("hoop").material("brass").cylinder(10.0, 4.0);
+    /// })?;
+    /// let brass = built.bodies[0].substance().expect("brass is in the library");
+    /// assert_eq!(brass.name, "brass");
+    /// assert!(brass.contact().friction > 0.0);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn substance(&self) -> Option<Substance> {
+        self.authored_substance
+            .clone()
+            .or_else(|| crate::material::named(crate::materials::split(&self.material).1))
+    }
 }
 
 type Closure = Arc<dyn Fn(&Builder) + Send + Sync>;
@@ -251,6 +283,7 @@ fn finish(inner: Inner, recipe: Recipe) -> anyhow::Result<Built> {
         built_bodies.push(BuiltBody {
             name: body.name.clone(),
             material: body.material.clone(),
+            authored_substance: body.substance.clone(),
             mass: body.mass,
             origin: [body.origin[0] * MM, body.origin[1] * MM, body.origin[2] * MM],
             root: body.root,
@@ -311,10 +344,24 @@ fn world_of(bodies: &[BuiltBody], params: &[Param]) -> World {
     }
     let materials = bodies
         .iter()
-        .map(|b| Material {
-            name: b.material.clone(),
-            albedo: crate::materials::colour(crate::materials::split(&b.material).1),
-            ..Material::default()
+        .map(|b| {
+            // The authored substance first: a body given a `Material` by value
+            // carries constants the library may not have, and its albedo is
+            // the one the author meant.
+            let s = b.substance();
+            Material {
+                name: b.material.clone(),
+                albedo: s
+                    .as_ref()
+                    .map(|s| s.colour())
+                    .unwrap_or_else(|| crate::materials::colour(crate::materials::split(&b.material).1)),
+                roughness: s.as_ref().map(|s| s.roughness).unwrap_or(0.5),
+                metallic: s
+                    .as_ref()
+                    .map(|s| matches!(s.optics, crate::material::Optics::Conductor) as u8 as f64)
+                    .unwrap_or(0.0),
+                ..Material::default()
+            }
         })
         .collect();
     let mut world = World::from_phyz(model, state).with_params(params.to_vec());
@@ -348,6 +395,7 @@ fn inertia_of(body: &BuiltBody, m: f64) -> SpatialInertia {
 struct BodyDef {
     name: String,
     material: String,
+    substance: Option<Substance>,
     mass: Option<f64>,
     origin: [f64; 3],
     root: NodeId,
@@ -471,6 +519,7 @@ impl Builder {
         inner.bodies.push(BodyDef {
             name: name.to_owned(),
             material: "clay".into(),
+            substance: None,
             mass: None,
             origin: [0.0; 3],
             root,
@@ -687,6 +736,33 @@ impl Body {
     /// the `no-collide` prefix still means what it meant.
     pub fn material(&self, name: &str) -> &Self {
         self.inner.borrow_mut().bodies[self.index].material = name.to_owned();
+        self
+    }
+
+    /// The material, by value: a [`Substance`] rather than a name.
+    ///
+    /// The body takes the substance's own name, so the document, the colour
+    /// path and the `no-collide` rule all behave exactly as if
+    /// [`Body::material`] had been called with it — and
+    /// [`BuiltBody::substance`] hands the constants back afterwards, so a sim
+    /// can ask this body for its `contact()` or its `modal()` without a
+    /// second table.
+    ///
+    /// ```
+    /// use kosm::prelude::*;
+    /// let bronze = material::named("bell bronze").expect("bell bronze");
+    /// let built = build(&Params::default(), move |b| {
+    ///     b.body("bell").substance(&bronze).sphere(30.0).dynamic(1.0);
+    /// })?;
+    /// let m = built.bodies[0].substance().expect("authored by value");
+    /// assert_eq!(m.name, "bell bronze");
+    /// assert!(m.loss < 1e-3, "a bell is a low loss factor");
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn substance(&self, substance: &Substance) -> &Self {
+        let mut inner = self.inner.borrow_mut();
+        inner.bodies[self.index].material = substance.name.clone();
+        inner.bodies[self.index].substance = Some(substance.clone());
         self
     }
 

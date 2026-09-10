@@ -1,92 +1,278 @@
 //! The being and the door: the two things in the cove that move.
 //!
-//! The being is a capsule of glass on one phyz free joint — the marble of
-//! [`super::sim`] grown up — standing on the baked field through the same SDF
-//! contact path ([`sim::step_on_sdf`]). It has no legs and no limbs. What
-//! holds it up is a *spring*, not a constraint: a torque on the free joint
-//! proportional to the angle between its own axis and the axis the player has
-//! commanded, with damping. Shove it and it tips; let go and it comes back.
-//! That is the whole difference between a weeble and a ragdoll, and it is one
-//! torque.
+//! The being is [`kosm::player::Body`] now, and this file is what is left of
+//! it that is the *cove's*: where it spawns, what the sea is made of, and the
+//! door.
 //!
-//! The door is a slab of stone on a revolute joint at its own vertical edge,
-//! hinged into the cliff, with a soft limit at [`DOOR_LIMIT`] and a spring
-//! that drives it open only while the gate is set. It is a body with mass: it
-//! swings, it does not teleport. Step 4 sets the gate from the rune's score;
-//! here it is set by hand.
+//! What moved out, and where it went:
+//!
+//! - the upright spring, derived from the body's own inertia about its feet →
+//!   [`kosm::player::body`];
+//! - the walk, which was a bang-bang force capped at `walk_mps` and is now a
+//!   velocity controller with a rise and a stop time and a lean into both →
+//!   the same;
+//! - buoyancy, form drag against the shore break, and the spin the water takes
+//!   out of a shove → [`kosm::player::Water`], the same integral and the same
+//!   numbers;
+//! - the SDF contact step with the net under it → [`kosm::player::Netted`]
+//!   over [`kosm::player::SdfGround`], which is `sim::step_on_sdf_over` with
+//!   the count kept in the ground rather than in the level.
+//!
+//! What stayed: the door, a slab of stone on a revolute joint at its own
+//! vertical edge, hinged into the cliff, with a soft limit at [`DOOR_LIMIT`]
+//! and a spring that drives it open only while the gate is set. It is a body
+//! with mass: it swings, it does not teleport. It has no contacts — it stands
+//! inside a recess that is *in* the baked field, and a collidable door would
+//! be born penetrating its own doorway — so it steps over
+//! [`kosm::player::Nowhere`], which is the same integrator with nothing under
+//! it.
+//!
+//! **The being has legs.** [`Player::Hero`] builds the figure of
+//! `sims/rune/hero/figure.rs` out of its own `Rig::pivots()`, with the
+//! costume's substances for the masses and the boots for the contacts;
+//! [`Player::Capsule`] is the glass capsule the level was written against,
+//! and is still what `being_r_mm` and `being_h_mm` describe. `KOSM_RUNE_PLAYER`
+//! picks, and the hero is the default now.
+//!
+//! **And the hero holds the lens.** [`Cove::with_player`] puts
+//! `hero/kit.rs`'s two-and-a-half-metre crown glass in its right hand, the
+//! arm's own PD carries it to [`LENS_AIM`] — up and out, the way somebody
+//! sighting through a lens holds one — and [`Cove::held_lens`] hands back
+//! where it *actually got to*, which is not where it was asked to be because
+//! an arm has mass. That pose is what `rune::score_lens` traces the live gate
+//! through and what the picture draws the glass at, so the number and the
+//! image are the same piece of glass. [`Cove::being_pose`]'s capsule proxy
+//! survives for the capsule body and for the hint's gradient, which is still
+//! written on the capsule's two knobs.
 //!
 //! Everything the dynamics needs from the player arrives as [`Input`], and
-//! everything the picture needs comes back as [`Snapshot`], the way the
-//! court's does.
+//! everything the picture needs comes back as [`Snapshot`].
 //!
 //! Metres, radians, seconds; z up.
 
 use std::f64::consts::PI;
+use std::sync::{Arc, LazyLock};
 
+use kosm::player::body::TILT_MAX as PLAYER_TILT_MAX;
+use kosm::player::ground::step_on;
+use kosm::player::{Body, BodySpec, Drive, Netted, Nowhere, Part, Pose, SdfGround, Skeleton, Tool, Water};
 use kosm_scan::SdfGrid;
 use phyz_contact::{ContactCache, ContactMaterial};
-use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3, quat_exp};
+use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
 use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
 use super::CoveScene;
-use super::sim::{self, Beach, GLASS_DENSITY};
+use super::hero::figure::Rig;
+use super::sim::{Beach, GLASS};
+use kosm::material::{self, Material as Substance};
 
-/// The being is body 0, on the free joint the whole model starts with.
+/// The being is body 0 of its own model, on the free joint it starts with.
 pub const BEING: usize = 0;
-/// The free joint's DOF order is angular first: `q = [w(3), pos(3)]` and
-/// `v = [angular(3), linear(3)]`, both in the *body* frame for the velocity.
-const ANG: usize = 0;
-const POS: usize = 3;
 
 /// How far the player may lean the being, radians. Ten degrees is the design's
 /// "a few degrees about its own horizontal axis": enough to walk the caustic
-/// across the door, not enough to fall over.
-pub const TILT_MAX: f64 = 10.0 * PI / 180.0;
+/// across the door, not enough to fall over. `kosm::player` owns the number
+/// now; this is the cove's name for it.
+pub const TILT_MAX: f64 = PLAYER_TILT_MAX;
 
-/// How fast the upright spring brings the being back, rad/s.
+/// Glass on wet sand, and the cove's own number rather than the library's.
 ///
-/// The being is an inverted pendulum about its feet, so the spring has to buy
-/// back gravity before it buys any stiffness of its own — see
-/// [`Being::upright_gains`]. Asking for a critically damped `ω_n` here, the
-/// free response to a shove is `θ(t) = θ₀ (1 + ω_n t) e^{−ω_n t}`: it never
-/// crosses zero (so it does not oscillate, and there is nothing to tune away)
-/// and it is inside a twentieth of the shove by `ω_n t ≈ 4.7`. At 6 rad/s that
-/// is 0.8 s from 20° to under 1°, which is the "about a second" the design
-/// asks for and is slow enough to *see*.
-pub const UPRIGHT_OMEGA: f64 = 6.0;
-
-/// The walking force, as an acceleration: `F = WALK_GAIN · m · direction`.
-///
-/// It has to beat the sand before it moves the being at all — the being is
-/// driven by a force at its centre of mass, not by feet that grip, so nothing
-/// happens until the force passes `μ m g`. With [`BEING_FRICTION`] that floor
-/// is 3.4 m/s², and what is left over is the acceleration the player feels:
-/// 0.4 s from a standstill to `walk_mps`.
-pub const WALK_GAIN: f64 = 6.0;
-
-/// Glass on wet sand.
-///
-/// Deliberately far below [`sim::SAND_FRICTION`], which is what the *marble*
-/// rolls on: a rolling sphere needs grip and a sliding being needs to slide.
-/// The being's own material wins for its terrain contacts — a contact against
-/// the ground combines with nothing — so the two coexist in one scene.
+/// Deliberately far below [`super::sim::SAND_FRICTION`], which is what the
+/// *marble* rolls on: a rolling sphere needs grip and a walking being needs to
+/// slide. Neither is `kosm::material`'s sand, because neither is a
+/// measurement — they are the two ends the level wants a body to sit at.
 pub const BEING_FRICTION: f64 = 0.35;
 
-/// How long the being takes to stop once the player lets go, seconds. The
-/// damping is `−m v_h / τ`; the sand takes over below what friction can hold.
-pub const STOP_TAU: f64 = 0.15;
+/// The sea: `sea water` out of `kosm::material`, 1025 kg/m³.
+///
+/// Glass ([`GLASS`]) is two and a half times as dense, so a being in the sea
+/// gets lighter and keeps its feet: it never floats off the bed, and there is
+/// nothing to swim.
+pub static SEA: LazyLock<Substance> = LazyLock::new(|| material::named("sea water").expect("sea water is in kosm's material library"));
 
-/// Stone, kg/m³.
-pub const STONE_DENSITY: f64 = 2500.0;
+/// The drag coefficient of a bluff body in water. A capsule broadside is about
+/// a cylinder, which is about one.
+pub const WATER_DRAG_CD: f64 = 1.0;
+
+/// How much of the upright spring's own damping the water adds when the being
+/// is fully under, as a fraction. A quarter is "a little".
+pub const WATER_SPIN_DAMP: f64 = 0.25;
 
 /// How far the door swings before the recess stops it, radians.
 pub const DOOR_LIMIT: f64 = 100.0 * PI / 180.0;
 
 /// How fast the door swings, rad/s: critically damped at the limit, so the
 /// angle rises monotonically and settles on it instead of slamming into it.
-/// At 3 rad/s the swing is 1.6 s of the 3 s the rune holds it open for.
 pub const DOOR_OMEGA: f64 = 3.0;
+
+/// Which body the player is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Player {
+    /// The glass capsule the level was written against: `being_r_mm` by
+    /// `being_h_mm`, one free joint, and the whole body is the lens.
+    Capsule,
+    /// The adventurer of `sims/rune/hero`, on every hinge its `Rig` declares.
+    Hero,
+}
+
+impl Player {
+    /// What `KOSM_RUNE_PLAYER` says, or the default.
+    ///
+    /// Default **hero**, and that is now a statement about the optics as much
+    /// as about the body. The day this comment was written the other way
+    /// round has arrived: the lens is the thing in the hero's hand
+    /// ([`Cove::held_lens`]), the live gate scores the caustic *that* throws
+    /// ([`super::rune::score_lens`]), and the figure is drawn from its own
+    /// solids at the transforms the simulation puts them at. A capsule of
+    /// glass with no legs is the level's old body and its old optics, and
+    /// `KOSM_RUNE_PLAYER=capsule` is still every one of `rune_tests.rs`'s
+    /// numbers — the focal length, the solvable band, the recorded solution —
+    /// because the offline solve and the solvability sweep are on the
+    /// capsule's own `rune::Pose` and have not moved.
+    pub fn from_env() -> Self {
+        match std::env::var("KOSM_RUNE_PLAYER").ok().as_deref() {
+            Some("capsule") => Player::Capsule,
+            _ => Player::Hero,
+        }
+    }
+}
+
+impl Default for Player {
+    fn default() -> Self {
+        Player::Hero
+    }
+}
+
+/// The hero's rig as [`kosm::player`]'s plain-data skeleton.
+///
+/// `figure.rs` is hero-local **millimetres** with `+y` forward; the player's
+/// frame is metres with `+x` forward. [`kosm::player::body::hero_local`] is
+/// that one line, and `Rig::pivots()` is where every joint comes from — so
+/// there is still exactly one statement of where the hero's knees are.
+pub fn hero_skeleton(rig: &Rig) -> Skeleton {
+    let p = rig.pivots();
+    let at = |v: [f64; 3]| kosm::player::body::hero_local(v[0], v[1], v[2]);
+    let density = |name: &str| material::named(name).map(|m| m.density).unwrap_or(1000.0);
+    Skeleton {
+        torso: at(p.torso),
+        neck: at(p.neck),
+        chest: at([0.0, rig.pelvis_y, rig.chest_z]),
+        head: at([0.0, 0.0, rig.head_z]),
+        skirt: at([0.0, rig.pelvis_y, rig.skirt_z]),
+        hip: [at(p.hip[0]), at(p.hip[1])],
+        knee: [at(p.knee[0]), at(p.knee[1])],
+        ankle: [at(p.ankle[0]), at(p.ankle[1])],
+        shoulder: [at(p.shoulder[0]), at(p.shoulder[1])],
+        elbow: [at(p.elbow[0]), at(p.elbow[1])],
+        hand: [at(p.hand[0]), at(p.hand[1])],
+        leg_r: rig.leg_r / 1000.0,
+        boot_r: rig.boot_r / 1000.0,
+        arm_r: rig.arm_r / 1000.0,
+        hand_r: rig.hand_r / 1000.0,
+        chest_r: rig.chest_r / 1000.0,
+        head_r: rig.head_r / 1000.0,
+        skirt_r: rig.skirt_r / 1000.0,
+        leg_density: density("cream"),
+        boot_density: density("boot"),
+        arm_density: density("cloak"),
+        torso_density: density("cloak"),
+        head_density: density("skin"),
+        // What the figure weighs as a body, rather than what a bag of
+        // overlapping solid balls adds up to. See `Rig::mass_kg`.
+        mass_kg: (rig.mass_kg > 0.0).then_some(rig.mass_kg),
+        capsule: None,
+    }
+}
+
+/// Where the hero's hand is asked to go, in the **body's own frame**: a
+/// bearing at the shoulder, up and out to the hero's right.
+///
+/// `LENS_AIM_EL` is the lift and `LENS_AIM_AZ` the swing, which is negative
+/// because the body's `+y` is its *left*. They are `hero/mod.rs`'s doorstep
+/// numbers — 46° up and 28° out — read into the player's frame (`+x` forward,
+/// `+y` left, `+z` up) rather than the figure's, and they are what puts the
+/// glass clear of a 456 mm head on a 1113 mm frame.
+///
+/// Two angles and not a vector, because they are *knobs* now:
+/// [`super::rune::HeroPose`] solves over them, and a solved elevation is what
+/// decides how far off the door the hero has to stand. Where the hero has to
+/// stand is [`super::rune::solve_hero`]'s question and not this constant's.
+pub const LENS_AIM_EL: f64 = 46.0 * PI / 180.0;
+pub const LENS_AIM_AZ: f64 = -28.0 * PI / 180.0;
+
+/// How much of the arm's straight reach the aim asks for.
+pub const LENS_REACH: f64 = 0.97;
+
+/// The hand's target in the body's own frame, from the shoulder, for a lift
+/// and a swing.
+pub fn lens_aim_dir(el: f64, az: f64) -> Vec3 {
+    let (se, ce) = el.sin_cos();
+    let (sa, ca) = az.sin_cos();
+    Vec3::new(ce * ca, ce * sa, se)
+}
+
+/// Where the glass sits relative to the fist that is holding its rim, with
+/// `cant` radians of wrist on top.
+///
+/// A hand on a rim holds the lens a semi-diameter away in the lens's own
+/// plane, and the optical axis runs across it. So the grip puts the centre of
+/// the glass `LENS_D/2` up-and-outboard of the hand and turns the lens's own
+/// `+z` — which is the optical axis `hero/kit.rs` cuts it about — onto the
+/// body's forward. `hero/mod.rs::GRIP_HINT` is the same offset in the
+/// figure's frame.
+///
+/// `cant` is a **turn of the wrist**: the whole grip, glass and offset
+/// together, rotated about the hand's own `+z`. It swings the optical axis
+/// off the forearm's line without moving the fist, which is the one thing a
+/// person holding a lens by its rim can do that neither walking nor raising
+/// the arm does. It costs `cos θ` of the sun the glass collects and buys
+/// nothing in *where* the caustic lands — a thin lens images a parallel
+/// bundle wherever its undeviated chief ray crosses the focal plane, and a
+/// cant moves that ray not at all — so what it is really worth is the shape
+/// of the patch, and the solve is what says how much of it to spend.
+/// `hero/mod.rs::LENS_CANT_DEG` is the same turn taken about the world's
+/// vertical, for the stills' framing.
+pub fn lens_grip(cant: f64) -> Pose {
+    let hint = Vec3::new(0.15, -0.55, 0.82).normalize();
+    let radius = 0.5 * super::hero::kit::LENS_D / 1000.0;
+    // the lens's own axes in the hand's frame, as columns: +z forward,
+    // +x to the body's left, +y up
+    let rot = Mat3::new(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    let roll = Mat3::rotation_z(cant);
+    Pose::new(roll.mul_vec(hint * radius), roll.mul_mat(&rot))
+}
+
+/// The hero's rig, built once: the spec every link and lump of the figure
+/// comes out of, and how far the root sits above the sand under it.
+///
+/// A `BodySpec` is a tree of inertias and is not free to build, and
+/// [`super::rune::solve_hero`] asks for the hero's arm arithmetic tens of
+/// thousands of times without a body anywhere near it. Nothing in here
+/// depends on where the hero is standing, so there is one.
+pub struct HeroRig {
+    pub spec: BodySpec,
+    /// How far up its own axis the root sits from the ground under its feet.
+    pub foot_drop: f64,
+}
+
+pub static HERO_RIG: LazyLock<HeroRig> = LazyLock::new(|| {
+    let spec = BodySpec::hero(&hero_skeleton(&Rig::DEFAULT));
+    let foot_drop = Body::new(spec.clone()).consts().foot_drop;
+    HeroRig { spec, foot_drop }
+});
+
+/// The door's substance, read off the door body the level built.
+fn door_substance(scene: &CoveScene) -> anyhow::Result<Substance> {
+    scene
+        .authored
+        .bodies
+        .iter()
+        .find(|b| b.name == "door")
+        .ok_or_else(|| anyhow::anyhow!("the cove has no `door` body to take a substance from"))?
+        .substance()
+        .ok_or_else(|| anyhow::anyhow!("the door's material is not in kosm's material library"))
+}
 
 /// What the player is asking for on one step.
 ///
@@ -108,25 +294,32 @@ impl Input {
     pub fn walking(forward: f64) -> Self {
         Self { forward, ..Self::STILL }
     }
+
+    /// As the controller's own drive.
+    pub fn drive(&self) -> Drive {
+        Drive {
+            forward: self.forward,
+            strafe: self.strafe,
+            run: false,
+            yaw_delta: self.yaw_delta,
+            lean_delta: self.tilt_delta,
+            aim: None,
+        }
+    }
 }
 
 /// The cove at one instant, as the picture wants it.
-///
-/// Shaped like `court::render::Snapshot`: poses and velocities, nothing that
-/// needs the simulation to still be alive. The renderer places the being's
-/// capsule and the door's slab from this and nothing else.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     /// The simulation's own clock, seconds.
     pub t: f64,
     /// The solver's step, seconds.
     pub dt: f64,
     /// The being's centre and its **world → body** rotation, phyz's convention
-    /// (so `rot.transpose()` is the way out to world).
+    /// (so `rot.transpose()` is the way out to world). This is the *capsule
+    /// proxy*: what the optics still trace through.
     pub being: (Vec3, Mat3),
-    /// The being's linear and angular velocity in **world** axes, m/s and
-    /// rad/s. phyz keeps the free joint's in body axes; the picture wants the
-    /// world's.
+    /// The being's linear and angular velocity in **world** axes.
     pub being_vel: (Vec3, Vec3),
     /// Where the being is looking and how far it is leaning, radians.
     pub facing: f64,
@@ -136,83 +329,25 @@ pub struct Snapshot {
     /// The door's body frame — at the hinge, `rot` world → body.
     pub door: SpatialTransform,
     pub gate_open: bool,
+    /// Where the held lens is, if the hero is holding one.
+    pub held: Option<Pose>,
+    /// Every link of the figure, placed — [`None`] for the capsule, which has
+    /// only the one.
+    pub parts: Option<Arc<Vec<Part>>>,
 }
 
-/// The being's numbers, resolved once from the scene.
-#[derive(Clone, Copy, Debug)]
-struct Being {
-    r: f64,
-    /// Half the distance between the cap centres: the capsule's `length / 2`.
-    half: f64,
-    mass: f64,
-    /// Mass and inertia about the capsule's centre, which is its centre of
-    /// mass: the model wants it, and so does the spring.
-    inertia: SpatialInertia,
-    /// The upright spring and its damping, N·m/rad and N·m·s/rad.
-    k: f64,
-    c: f64,
-    walk_mps: f64,
-}
+// `Snapshot` was `Copy` and is not any more, and the `Arc` is why it is still
+// cheap. `game.rs` sends one down a channel to the render thread every frame
+// and keeps the last one behind a mutex; the *parts* are what the render
+// thread places the figure from, so they have to travel with it, and the only
+// two ways to do that are to allocate a `Vec` per frame on the simulation
+// thread or to refcount one. The body builds the `Vec` once per snapshot
+// either way; this way nothing after that copies it.
 
-impl Being {
-    /// The capsule's mass and inertia about its centre, from the glass alone:
-    /// a cylinder of length `2·half` and two hemispherical caps.
-    fn new(r: f64, height: f64, walk_mps: f64) -> Self {
-        let half = (height - 2.0 * r) / 2.0;
-        let (m_cyl, m_cap) = (GLASS_DENSITY * PI * r * r * 2.0 * half, GLASS_DENSITY * 2.0 / 3.0 * PI * r * r * r);
-        let mass = m_cyl + 2.0 * m_cap;
-        // Transverse inertia about the capsule's centre. The cylinder is the
-        // textbook `m(3r² + L²)/12`; a cap is a hemisphere whose own centre of
-        // mass sits `3r/8` past the cap centre, so shifting its `2/5 m r²`
-        // (which is about the *sphere's* centre) out to the capsule's centre
-        // through its own centre of mass leaves `m(2r²/5 + L²/4 + 3Lr/8)`.
-        let l = 2.0 * half;
-        let i_t = m_cyl * (3.0 * r * r + l * l) / 12.0 + 2.0 * m_cap * (0.4 * r * r + l * l / 4.0 + 3.0 * l * r / 8.0);
-        // About its own axis the capsule is a cylinder plus two hemispheres
-        // and nothing has to be shifted: the axis passes through both.
-        let i_a = 0.5 * m_cyl * r * r + 2.0 * 0.4 * m_cap * r * r;
-        let inertia = SpatialInertia::new(mass, Vec3::zeros(), Mat3::from_diagonal(&Vec3::new(i_t, i_t, i_a)));
-        let (k, c) = Self::upright_gains(mass, i_t, height);
-        Self { r, half, mass, inertia, k, c, walk_mps }
-    }
-
-    /// The upright spring's stiffness and damping, from the being's own
-    /// numbers rather than from tuning.
-    ///
-    /// Standing, the being is an inverted pendulum about its feet: inertia
-    /// `I_p = I_transverse + m (h/2)²` about that pivot, and gravity is a
-    /// *negative* spring of `m g h/2` about it, because a body tipped past
-    /// vertical keeps going. So the spring has to pay gravity back before it
-    /// buys any stiffness of its own, and a critically damped recovery at
-    /// [`UPRIGHT_OMEGA`] is
-    ///
-    /// ```text
-    /// k = I_p ω_n² + m g h/2      c = 2 I_p ω_n
-    /// ```
-    ///
-    /// For the authored being (350 mm by 1.4 m of N-BK7, 1127 kg) that is
-    /// 33.6 kN·m/rad and 8.6 kN·m·s/rad. The far side of the trade is that a
-    /// stiffer spring stands straighter on a slope: the ground's reaction acts
-    /// under the *foot*, which on a beach of grade `s` is `r·s` uphill of the
-    /// centre, so the being settles a hair downhill of vertical at
-    /// `m g (L/2) s / (k − m g L/2)` — 0.4° here, and inversely proportional to
-    /// `k`. Standing at that angle instead of straight up costs the centre
-    /// 5 mm, which is what the standing test's centimetre of drift is spent on.
-    fn upright_gains(mass: f64, i_transverse: f64, height: f64) -> (f64, f64) {
-        let i_pivot = i_transverse + mass * (height / 2.0).powi(2);
-        let k = i_pivot * UPRIGHT_OMEGA * UPRIGHT_OMEGA + mass * GRAVITY * height / 2.0;
-        let c = 2.0 * i_pivot * UPRIGHT_OMEGA;
-        (k, c)
-    }
-}
-
-/// The door's numbers and where in the state its one DOF lives.
+/// The door's numbers and where in its own little state its one DOF lives.
 #[derive(Clone, Copy, Debug)]
 struct Door {
     body: usize,
-    /// The hinge angle's index into `q`, and its rate's into `v`. A revolute
-    /// joint has one of each and they are the same number here, but they are
-    /// two different vectors and are kept apart.
     q: usize,
     v: usize,
     /// The drive toward open, N·m/rad and N·m·s/rad.
@@ -222,96 +357,126 @@ struct Door {
 
 /// The cove, stepping: the being, the door, the field they stand on.
 pub struct Cove {
-    pub model: Model,
-    pub state: State,
-    /// The baked field the being's feet read. Owned, because a `Cove` is what
-    /// the window hands to its simulation thread.
-    pub sdf: SdfGrid,
-    /// Where the being is looking: yaw about z, radians, zero along +x.
-    pub facing: f64,
-    /// The lean the player is *asking* for, radians, positive forward along
-    /// the facing. Where the body actually is is another question, and the
-    /// answer is [`Cove::being_axis`].
-    pub tilt: f64,
-    beach: Beach,
-    being: Being,
+    /// The being.
+    pub body: Body,
+    /// The baked field with the level's net under it.
+    ground: Netted<SdfGround>,
+    /// The sea.
+    sea: Water,
+    /// The door's own model: one fixed hinge and one slab, no contacts.
+    door_model: Model,
+    door_state: State,
+    door_cache: ContactCache,
+    door_material: ContactMaterial,
     door: Door,
-    material: ContactMaterial,
-    cache: ContactCache,
+    beach: Beach,
+    /// The waterline, the shore break and the net's floor, kept for the
+    /// readings the level's tests take.
+    sea_z: f64,
+    floor: f64,
+    /// The capsule the optics see: radius and height, metres.
+    capsule: (f64, f64),
+    which: Player,
     gate: bool,
+    /// Where the hand is asked to put the glass, world metres. `None` lets
+    /// the arm hang, which is the capsule's whole story and is also what a
+    /// hero that has put the lens away would be.
+    aim: Option<Vec3>,
+    /// How the hero is holding the lens: the arm's lift and swing at the
+    /// shoulder, and the turn of the wrist. Three of
+    /// [`super::rune::HeroPose`]'s six knobs, live.
+    hold: (f64, f64, f64),
 }
 
 impl Cove {
-    /// Build the cove's bodies on a baked field: the being at the scene's
-    /// spawn, standing on the sand, and the door closed in the cliff.
+    /// Build the cove's bodies on a baked field, with whatever body
+    /// `KOSM_RUNE_PLAYER` asks for.
     pub fn new(scene: &CoveScene, sdf: SdfGrid) -> anyhow::Result<Self> {
-        let being = Being::new(scene.being_r, scene.being_h, scene.walk_mps);
-        anyhow::ensure!(being.half > 0.0, "the being's capsule has no cylinder between its caps");
+        Self::with_player(scene, sdf, Player::from_env())
+    }
 
-        // The door hangs from its +x edge, at the middle of its thickness, on
-        // the sand: that way a positive hinge angle swings its face out of the
-        // cliff and into the cove, which is the way a door opens.
+    /// The same, saying which body.
+    pub fn with_player(scene: &CoveScene, sdf: SdfGrid, which: Player) -> anyhow::Result<Self> {
+        anyhow::ensure!(scene.being_h > 2.0 * scene.being_r, "the being's capsule has no cylinder between its caps");
+        let capsule = (scene.being_r, scene.being_h);
+        let spec = match which {
+            Player::Capsule => BodySpec::capsule(scene.being_r, scene.being_h, GLASS.density),
+            Player::Hero => BodySpec::hero(&hero_skeleton(&Rig::DEFAULT)).with_capsule(Some(capsule)),
+        }
+        .with_friction(BEING_FRICTION)
+        .with_speeds(scene.walk_mps, 2.6)
+        .with_dt(1e-3);
+        let mut body = Body::new(spec);
+        // The glass goes in the hand at build time, because the level is
+        // about the glass: from here on `Body::held` is where the refractor
+        // is and `being_pose` is only a proxy.
+        if which == Player::Hero {
+            body.hold(Tool::new("lens").with_grip(lens_grip(0.0)));
+        }
+
+        // ---- the door ------------------------------------------------------
+        // It hangs from its +x edge, at the middle of its thickness, on the
+        // sand: a positive hinge angle swings its face out of the cliff and
+        // into the cove, which is the way a door opens.
         let (w, h, t) = (scene.door_w, scene.door_h, scene.door_t);
         let hinge = Vec3::new(scene.door_x + w / 2.0, scene.cliff_face_y() + t / 2.0, scene.door_sill());
-        let door_mass = STONE_DENSITY * w * h * t;
+        let stone = door_substance(scene)?;
+        let door_mass = stone.density * w * h * t;
         let door_com = Vec3::new(-w / 2.0, 0.0, h / 2.0);
         let slab = |a: f64, b: f64| door_mass * (a * a + b * b) / 12.0;
         let door_inertia = SpatialInertia::new(door_mass, door_com, Mat3::from_diagonal(&Vec3::new(slab(t, h), slab(w, h), slab(w, t))));
-
-        let mut model = ModelBuilder::new()
+        let mut door_model = ModelBuilder::new()
             .gravity(Vec3::new(0.0, 0.0, -GRAVITY))
             .dt(1e-3)
-            .add_free_body("being", -1, SpatialTransform::identity(), being.inertia)
             .add_fixed_body("hinge", -1, SpatialTransform::new(Mat3::identity(), hinge), SpatialInertia::new(1.0, Vec3::zeros(), Mat3::identity() * 0.01))
-            .add_revolute_body("door", 1, SpatialTransform::identity(), door_inertia)
+            .add_revolute_body("door", 0, SpatialTransform::identity(), door_inertia)
             .build();
-
-        model.bodies[BEING].geometry = Some(Geometry::Capsule { radius: being.r, length: 2.0 * being.half });
-        model.bodies[BEING].material = Some(ContactMaterial { friction: BEING_FRICTION, restitution: 0.0, ..Default::default() });
-        // The slab is the picture's, not the solver's. The door stands inside
-        // the cliff's recess, and the cliff is *in* the baked field, so a
-        // collidable door would be born penetrating the walls of its own
-        // doorway and would spend the level being pushed out of them. Nothing
-        // in this slice touches the door but the sun.
-        model.bodies[2].visuals = vec![GeomInstance::new(Geometry::Box { half_extents: Vec3::new(w / 2.0, t / 2.0, h / 2.0) }, SpatialTransform::new(Mat3::identity(), door_com))];
-
-        let door_joint = model.bodies[2].joint_idx;
+        door_model.bodies[1].visuals = vec![GeomInstance::new(Geometry::Box { half_extents: Vec3::new(w / 2.0, t / 2.0, h / 2.0) }, SpatialTransform::new(Mat3::identity(), door_com))];
+        let door_joint = door_model.bodies[1].joint_idx;
         // Rotating a slab about its own edge: the centre's `m(w² + t²)/12`
         // carried out to the hinge, half a width away.
         let i_hinge = slab(w, t) + door_mass * (w / 2.0).powi(2);
         {
-            let joint = &mut model.joints[door_joint];
+            let joint = &mut door_model.joints[door_joint];
             joint.limits = Some([0.0, DOOR_LIMIT]);
-            // The default limit is written for a unit inertia; a two-tonne
-            // slab would walk straight through it. Thirty radians a second is
-            // a hard stop that is still a hundred steps of the solver's 1 ms.
             joint.limit_stiffness = i_hinge * 30.0 * 30.0;
             joint.limit_damping = 2.0 * i_hinge * 30.0;
         }
         let door = Door {
-            body: 2,
-            q: model.q_offsets[door_joint],
-            v: model.v_offsets[door_joint],
+            body: 1,
+            q: door_model.q_offsets[door_joint],
+            v: door_model.v_offsets[door_joint],
             k: i_hinge * DOOR_OMEGA * DOOR_OMEGA,
             c: 2.0 * i_hinge * DOOR_OMEGA,
         };
+        let door_material = ContactMaterial::default();
 
-        let material = ContactMaterial { friction: sim::SAND_FRICTION, restitution: 0.0, ..Default::default() };
         let mut cove = Self {
-            state: model.default_state(),
-            model,
-            sdf,
-            facing: 0.0,
-            tilt: 0.0,
-            beach: Beach::of(scene),
-            being,
+            body,
+            ground: Netted::new(SdfGround(sdf), scene.floor()),
+            sea: Water { surface_z: scene.sea_z, density: SEA.fluid().density, current: Vec3::new(0.0, scene.surf, 0.0), drag_cd: WATER_DRAG_CD, spin_damp: WATER_SPIN_DAMP },
+            door_state: door_model.default_state(),
+            door_cache: ContactCache::new(door_material.margin.max(1e-3)),
+            door_material,
+            door_model,
             door,
-            cache: ContactCache::new(material.margin.max(1e-3)),
-            material,
+            beach: Beach::of(scene),
+            sea_z: scene.sea_z,
+            floor: scene.floor(),
+            capsule,
+            which,
             gate: false,
+            aim: None,
+            hold: (LENS_AIM_EL, LENS_AIM_AZ, 0.0),
         };
+        cove.hold_lens_up();
         cove.place(scene.spawn_x, scene.spawn_y, 0.0);
         Ok(cove)
+    }
+
+    /// Which body this cove is walking.
+    pub fn player(&self) -> Player {
+        self.which
     }
 
     /// Stand the being on the sand at `(x, y)`, leaning `lean` radians forward
@@ -321,87 +486,36 @@ impl Cove {
     /// [`Cove::tilt`], where the player has asked it to be: a shove is exactly
     /// the difference between the two, and this is how a test administers one.
     pub fn place(&mut self, x: f64, y: f64, lean: f64) {
-        let (axis, w) = self.leaned(lean);
-        let centre = self.beach.resting_centre(x, y, self.being.r) + axis * self.being.half;
-        for (i, v) in [w.x, w.y, w.z, centre.x, centre.y, centre.z].into_iter().enumerate() {
-            self.state.q[i] = v;
-        }
-        for i in 0..6 {
-            self.state.v[i] = 0.0;
-        }
+        let facing = self.body.facing();
+        self.body.place(x, y, self.beach.z_at(x, y), facing, lean);
+        self.hold_lens_up();
     }
 
-    /// The body axis and the free joint's exponential coordinates for a lean
-    /// of `lean` radians forward along the current facing.
-    ///
-    /// Leaning forward turns `ẑ` toward the facing, which is a rotation about
-    /// `ẑ × facing` — the being's *left*, as it must be for a nod.
-    fn leaned(&self, lean: f64) -> (Vec3, Vec3) {
-        let axis_of_rotation = Vec3::z().cross(self.facing_dir());
-        let w = axis_of_rotation * lean;
-        (quat_exp(&w).to_matrix().mul_vec(Vec3::z()), w)
+    /// Point the being. `tests.rs`'s compass, and the window's mouse.
+    pub fn face(&mut self, facing: f64) {
+        let (p, lean) = (self.body.footing(), 0.0);
+        self.body.place(p.x, p.y, self.beach.z_at(p.x, p.y), facing, lean);
+        self.hold_lens_up();
     }
 
-    /// One step of the solver: the player's intent, then the contact step.
-    ///
-    /// The intent is three torques and a force, written into `state.ctrl`,
-    /// which a model with no actuators reads as generalized forces per DOF.
-    /// The free joint's motion subspace is the identity *in the body frame*,
-    /// so its six entries are a torque about the being's own axes and a force
-    /// at its own centre, and everything the player asks for in world axes is
-    /// rotated into the body's before it is written. Gravity is the model's.
+    /// Set the lean the player is asking for, radians.
+    pub fn set_tilt(&mut self, tilt: f64) {
+        self.body.set_tilt(tilt);
+    }
+
+    /// One step: the being through its controllers, then the door.
     pub fn step(&mut self, input: &Input) {
-        self.facing = wrap(self.facing + input.yaw_delta);
-        self.tilt = (self.tilt + input.tilt_delta).clamp(-TILT_MAX, TILT_MAX);
-
-        let r_bw = self.body_to_world();
-        let axis = r_bw.mul_vec(Vec3::z());
-        let (facing_dir, right) = (self.facing_dir(), self.right_dir());
-        let omega = r_bw.mul_vec(self.angular_velocity_body());
-        let velocity = r_bw.mul_vec(self.linear_velocity_body());
-
-        // The upright spring. The error is the rotation that takes the being's
-        // own axis onto the commanded one — world z leaned by `tilt` — as a
-        // rotation vector, so it stays honest at 20° where a small-angle
-        // cross product does not. Damping is on the whole angular velocity,
-        // which also keeps the capsule from spinning about its own axis: a
-        // symmetric capsule has no yaw of its own, and the being's heading is
-        // `facing`, a number, not a body rotation.
-        let target = (Vec3::z() * self.tilt.cos() + facing_dir * self.tilt.sin()).normalize();
-        let cross = axis.cross(target);
-        let sin = cross.norm();
-        let error = if sin > 1e-12 { cross * (sin.atan2(axis.dot(target)) / sin) } else { Vec3::zeros() };
-        let torque = error * self.being.k - omega * self.being.c;
-
-        // Walking: a horizontal force at the centre of mass, cut off once the
-        // being is already going that fast in that direction, and a mild pull
-        // toward standstill when the player is asking for nothing.
-        let commanded = facing_dir * input.forward + right * input.strafe;
-        let n = commanded.norm();
-        let force = if n > 1e-9 {
-            // A held W and a held D are two full pushes, and unclamped they
-            // would walk √2 faster along the diagonal than along either one.
-            let unit = commanded / n;
-            let along = Vec3::new(velocity.x, velocity.y, 0.0).dot(unit);
-            let drive = if n > 1.0 { unit } else { commanded };
-            if along < self.being.walk_mps { drive * (WALK_GAIN * self.being.mass) } else { Vec3::zeros() }
-        } else {
-            Vec3::new(velocity.x, velocity.y, 0.0) * (-self.being.mass / STOP_TAU)
-        };
-
-        let (torque, force) = (r_bw.transpose().mul_vec(torque), r_bw.transpose().mul_vec(force));
-        for (i, v) in [torque.x, torque.y, torque.z, force.x, force.y, force.z].into_iter().enumerate() {
-            self.state.ctrl[i] = v;
-        }
+        self.hold_lens_up();
+        let drive = Drive { aim: self.aim, ..input.drive() };
+        self.body.step(&drive, &self.ground, &self.sea, 1e-3);
 
         // The door: a damper always, so a door let go of stops rather than
         // coasting on a frictionless hinge, and the spring toward open only
         // while the gate is set.
-        let (angle, rate) = (self.state.q[self.door.q], self.state.v[self.door.v]);
+        let (angle, rate) = (self.door_state.q[self.door.q], self.door_state.v[self.door.v]);
         let drive = if self.gate { self.door.k * (DOOR_LIMIT - angle) } else { 0.0 };
-        self.state.ctrl[self.door.v] = drive - self.door.c * rate;
-
-        sim::step_on_sdf(&self.model, &mut self.state, &self.sdf, &self.material, &mut self.cache);
+        self.door_state.ctrl[self.door.v] = drive - self.door.c * rate;
+        step_on(&self.door_model, &mut self.door_state, &Nowhere, &self.door_material, &mut self.door_cache);
     }
 
     /// Step for `seconds` with nobody at the controls.
@@ -411,8 +525,122 @@ impl Cove {
 
     /// Step for `seconds` with the same input held down.
     pub fn run(&mut self, seconds: f64, input: &Input) {
-        for _ in 0..(seconds / self.model.dt).round().max(0.0) as usize {
+        for _ in 0..(seconds / self.dt()).round().max(0.0) as usize {
             self.step(input);
+        }
+    }
+
+    /// Where the hand is asked to go, world metres, or `None`.
+    ///
+    /// Set by [`Cove::hold_lens_up`] at every step, so it moves with the
+    /// body. What comes back out of [`Cove::held_lens`] is where the arm
+    /// actually got to, which trails this by however much an arm's own PD
+    /// trails a target it is chasing.
+    pub fn aim(&self) -> Option<Vec3> {
+        self.aim
+    }
+
+    /// Hold the lens up: the aim, in the body's own frame, at the lift and
+    /// swing [`Cove::set_hold`] last asked for.
+    ///
+    /// **Recomputed every step**, and that is not an optimisation to be
+    /// undone later — it is the difference between a pose and a tug of war.
+    /// [`kosm::player::Drive::aim`] is a *world* point, so an aim set once at
+    /// the spawn is a point the hero walks away from: the arm reaches after
+    /// it, the reach torques the body, the body leans, the lean starts a
+    /// walk, and the walk moves the shoulder further from the point. The
+    /// first run of this walked a hero that had let go of W across four
+    /// metres of beach at a metre and a half a second and never stopped. An
+    /// aim in the body's own frame is a hero holding a lens up; an aim in the
+    /// world's is a hero holding on to one.
+    ///
+    /// [`Body::orientation`] rather than [`Body::snapshot`] because this runs
+    /// at the solver's kilohertz: one quaternion, not thirteen frames of
+    /// forward kinematics.
+    pub fn hold_lens_up(&mut self) {
+        if self.which != Player::Hero {
+            return;
+        }
+        let Some(arm) = self.body.spec().arm else { return };
+        let links = &self.body.spec().links;
+        let shoulder = links[arm.shoulder].pivot;
+        let out = LENS_REACH * (arm.upper + arm.lower);
+        let local = shoulder + lens_aim_dir(self.hold.0, self.hold.1) * out - links[0].pivot;
+        self.aim = Some(self.body.root() + self.body.orientation().mul_vec(local));
+    }
+
+    /// How the hero is holding the lens: the arm's lift and swing at the
+    /// shoulder and the turn of the wrist, radians.
+    pub fn hold(&self) -> (f64, f64, f64) {
+        self.hold
+    }
+
+    /// Ask for a different hold. The wrist re-grips at once — the glass is
+    /// bolted to the fist and turning it is not a thing an arm has to reach
+    /// for — and the arm starts for the new aim on the next step.
+    pub fn set_hold(&mut self, aim_el: f64, aim_az: f64, cant: f64) {
+        self.hold = (aim_el, aim_az, cant);
+        if self.which == Player::Hero {
+            self.body.hold(Tool::new("lens").with_grip(lens_grip(cant)));
+        }
+        self.hold_lens_up();
+    }
+
+    /// Stand the hero at a [`super::rune::HeroPose`], holding the lens the
+    /// way that pose says, at rest.
+    ///
+    /// The arithmetic of `rune::hero_lens` says where the glass *will* be;
+    /// this is how a body is put where that arithmetic was talking about. The
+    /// two are not the same to the millimetre and are not meant to be — an
+    /// arm has mass and a body standing with one arm up leans a little into
+    /// it — and `rune_tests` says how far apart they are.
+    pub fn place_hero(&mut self, pose: &super::rune::HeroPose) {
+        self.set_hold(pose.aim_el, pose.aim_az, pose.cant);
+        self.body.place(pose.x, pose.y, self.beach.z_at(pose.x, pose.y), pose.yaw, 0.0);
+        self.hold_lens_up();
+    }
+
+    /// Where the hero is standing and how it is holding the glass, read back
+    /// off the body. The inverse of [`Cove::place_hero`], and what the live
+    /// hint differentiates at.
+    pub fn hero_pose(&self) -> super::rune::HeroPose {
+        let p = self.body.footing();
+        let (aim_el, aim_az, cant) = self.hold;
+        super::rune::HeroPose { x: p.x, y: p.y, yaw: self.body.facing(), aim_el, aim_az, cant }
+    }
+
+    /// The hero's trunk, as the opaque solids the rune's little scene needs.
+    ///
+    /// A lens 220 mm across held beside a head 456 mm across is a lens its
+    /// owner can stand in front of, and the day the caustic pass found the
+    /// refractor *inside the skull* every one of its photons hit hair before
+    /// it hit glass. The score has to know.
+    pub fn shadows(&self) -> Vec<super::rune::Piece> {
+        match self.which {
+            Player::Capsule => Vec::new(),
+            Player::Hero => super::rune::occluders(self.body.spec(), &self.body.snapshot().parts),
+        }
+    }
+
+    /// The rune, live, on whichever body this cove is walking.
+    ///
+    /// The hero is scored on the glass in its hand with its own head and
+    /// trunk in the way ([`super::rune::score_lens_at`]); the capsule is
+    /// scored on itself, which is every number the offline solve and the
+    /// solvability sweep were measured with.
+    pub fn rune_score(&self, scene: &CoveScene, photons: usize) -> f64 {
+        match self.lens() {
+            Some(lens) => super::rune::score_lens_at(scene, &lens, &self.shadows(), photons).frac,
+            None => {
+                let (centre, world_to_body) = self.being_pose();
+                let axis = world_to_body.transpose().mul_vec(Vec3::z());
+                let pose = super::rune::Pose {
+                    x: centre.x,
+                    y: centre.y,
+                    tilt: (-axis.y).atan2(axis.z),
+                };
+                super::rune::score(scene, &pose, photons).frac
+            }
         }
     }
 
@@ -427,114 +655,160 @@ impl Cove {
 
     /// The hinge angle, radians: 0 closed, [`DOOR_LIMIT`] wide open.
     pub fn door_angle(&self) -> f64 {
-        self.state.q[self.door.q]
+        self.door_state.q[self.door.q]
     }
 
     /// The door's body frame in the world: at the hinge, `rot` world → body.
     pub fn door_transform(&self) -> SpatialTransform {
-        forward_kinematics(&self.model, &self.state).0[self.door.body]
+        forward_kinematics(&self.door_model, &self.door_state).0[self.door.body]
     }
 
-    /// The being's centre and its world → body rotation.
+    /// The being's centre and its world → body rotation — the **capsule
+    /// proxy**, which is what the rune is traced through.
     pub fn being_pose(&self) -> (Vec3, Mat3) {
-        (self.being_centre(), self.body_to_world().transpose())
+        let (centre, r_bw) = self.body.capsule_pose().unwrap_or_else(|| (self.body.root(), Mat3::identity()));
+        (centre, r_bw.transpose())
     }
 
     pub fn being_centre(&self) -> Vec3 {
-        Vec3::new(self.state.q[POS], self.state.q[POS + 1], self.state.q[POS + 2])
+        self.being_pose().0
     }
 
     /// The being's own axis, from foot to head, in world.
     pub fn being_axis(&self) -> Vec3 {
-        self.body_to_world().mul_vec(Vec3::z())
+        self.body.axis()
     }
 
-    /// How far the being is off the vertical, radians. What a shove leaves
-    /// behind and what the upright spring spends itself on.
+    /// How far the being is off the vertical, radians.
     pub fn lean(&self) -> f64 {
-        self.being_axis().dot(Vec3::z()).clamp(-1.0, 1.0).acos()
+        self.body.lean()
     }
 
     /// The being's velocity in world axes, m/s.
     pub fn being_velocity(&self) -> Vec3 {
-        self.body_to_world().mul_vec(self.linear_velocity_body())
+        self.body.centre_velocity()
     }
 
     /// Its horizontal speed, m/s: what `walk_mps` caps.
     pub fn walking_speed(&self) -> f64 {
-        let v = self.being_velocity();
-        v.x.hypot(v.y)
+        self.body.speed()
+    }
+
+    /// Where the being is looking, radians, zero along `+x`.
+    pub fn facing(&self) -> f64 {
+        self.body.facing()
+    }
+
+    /// The lean the player is asking for, radians.
+    pub fn tilt(&self) -> f64 {
+        self.body.tilt()
     }
 
     /// Where the being's centre rests standing at `(x, y)` with no lean.
     pub fn resting_centre(&self, x: f64, y: f64) -> Vec3 {
-        self.beach.resting_centre(x, y, self.being.r) + Vec3::z() * self.being.half
+        Vec3::new(x, y, self.beach.z_at(x, y) + self.capsule.1 / 2.0)
+    }
+
+    /// How much of the being is under water, 0 on dry sand and 1 with its head
+    /// gone.
+    pub fn submerged(&self) -> f64 {
+        let (r, h) = self.capsule;
+        let half = (h - 2.0 * r) / 2.0;
+        let rise = self.being_axis().z.abs() * half;
+        let depth = (self.sea_z - (self.being_centre().z - rise - r)).clamp(0.0, 2.0 * (rise + r));
+        kosm::player::medium::wetted(r, 2.0 * rise, depth).0 / kosm::player::medium::capsule_volume(r, 2.0 * half)
+    }
+
+    /// How deep the water is where the being is standing, metres: the
+    /// waterline less the sand under its feet. Negative on dry sand.
+    pub fn wading_depth(&self) -> f64 {
+        let p = self.being_centre();
+        self.sea_z - self.beach.z_at(p.x, p.y)
+    }
+
+    /// How many steps the net under the level has carried. Zero, on a cove
+    /// that is closed.
+    pub fn net_caught(&self) -> usize {
+        self.ground.caught()
+    }
+
+    /// The floor the net sits at, metres.
+    pub fn net_floor(&self) -> f64 {
+        self.floor
     }
 
     pub fn time(&self) -> f64 {
-        self.state.time
+        self.body.time()
     }
 
     pub fn dt(&self) -> f64 {
-        self.model.dt
+        self.body.dt()
     }
 
     pub fn mass(&self) -> f64 {
-        self.being.mass
+        self.body.mass()
     }
 
-    /// The upright spring, N·m/rad and N·m·s/rad. Reported, not tuned: see
-    /// [`Being::upright_gains`].
+    /// The upright spring, N·m/rad and N·m·s/rad. Reported, not tuned.
     pub fn upright_spring(&self) -> (f64, f64) {
-        (self.being.k, self.being.c)
+        self.body.upright_spring()
     }
 
     /// Where the being is looking, as a unit vector on the sand's plane.
     pub fn facing_dir(&self) -> Vec3 {
-        let (s, c) = self.facing.sin_cos();
-        Vec3::new(c, s, 0.0)
+        self.body.facing_dir()
     }
 
     /// The being's right: `facing × ẑ`, so `strafe = 1` walks to its right.
     pub fn right_dir(&self) -> Vec3 {
-        self.facing_dir().cross(Vec3::z())
+        self.body.right_dir()
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        let r_bw = self.body_to_world();
-        Snapshot {
-            t: self.state.time,
-            dt: self.model.dt,
-            being: (self.being_centre(), r_bw.transpose()),
-            being_vel: (r_bw.mul_vec(self.linear_velocity_body()), r_bw.mul_vec(self.angular_velocity_body())),
-            facing: self.facing,
-            tilt: self.tilt,
-            door_angle: self.door_angle(),
-            door: self.door_transform(),
-            gate_open: self.gate,
+    /// Where the held lens is, if the hero is holding one.
+    ///
+    /// Not where the arm was *asked* to put it — [`Cove::aim`] is that — but
+    /// where it actually got to, because an arm has mass. This is the pose
+    /// [`super::rune::score_lens`] traces the live gate through and the pose
+    /// `render.rs` draws the glass at, so the number and the picture are the
+    /// same piece of glass at the same moment.
+    ///
+    /// The lens's own frame: `+z` is the optical axis, which is what
+    /// `hero/kit.rs` cuts it about.
+    pub fn held_lens(&self) -> Option<Pose> {
+        self.body.held().map(|(pose, _)| pose)
+    }
+
+    /// The held lens as the scorer's refractor: its centre and its optical
+    /// axis, world metres.
+    pub fn lens(&self) -> Option<super::rune::Held> {
+        let pose = self.held_lens()?;
+        Some(super::rune::Held { centre: pose.pos, axis: pose.rot.mul_vec(Vec3::z()) })
+    }
+
+    /// The hero's parts, placed, for the renderer. Empty for the capsule.
+    pub fn hero_parts(&self) -> Vec<Part> {
+        match self.which {
+            Player::Capsule => Vec::new(),
+            Player::Hero => self.body.snapshot().parts,
         }
     }
 
-    /// The being's body → world rotation, straight from the free joint's
-    /// exponential coordinates. (`forward_kinematics` would say the same thing
-    /// for a root body; this is the half of it that is wanted every step.)
-    fn body_to_world(&self) -> Mat3 {
-        quat_exp(&Vec3::new(self.state.q[ANG], self.state.q[ANG + 1], self.state.q[ANG + 2])).to_matrix()
+    pub fn snapshot(&self) -> Snapshot {
+        let (centre, world_to_body) = self.being_pose();
+        let v = self.body.velocity();
+        let snap = self.body.snapshot();
+        Snapshot {
+            t: self.time(),
+            dt: self.dt(),
+            being: (centre, world_to_body),
+            being_vel: (v, snap.root_vel.1),
+            facing: snap.facing,
+            tilt: snap.tilt,
+            door_angle: self.door_angle(),
+            door: self.door_transform(),
+            gate_open: self.gate,
+            held: snap.held,
+            parts: (self.which == Player::Hero).then(|| Arc::new(snap.parts)),
+        }
     }
-
-    fn angular_velocity_body(&self) -> Vec3 {
-        Vec3::new(self.state.v[ANG], self.state.v[ANG + 1], self.state.v[ANG + 2])
-    }
-
-    fn linear_velocity_body(&self) -> Vec3 {
-        Vec3::new(self.state.v[POS], self.state.v[POS + 1], self.state.v[POS + 2])
-    }
-}
-
-/// Wrap an angle into `(-π, π]`, so a facing that has been spun a hundred
-/// times reads the same as one that has not.
-fn wrap(a: f64) -> f64 {
-    let two = 2.0 * PI;
-    let r = a - two * ((a + PI) / two).floor();
-    if r <= -PI { r + two } else { r }
 }

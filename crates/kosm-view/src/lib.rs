@@ -6,12 +6,21 @@
 //! tiers accumulate into, behind one trait; [`history`] is the CPU tier's
 //! implementation of it — reprojection, a geometric mask, an à-trous filter,
 //! a firefly cap — for a sim with no GPU tracer to hand a scene to;
-//! [`frame`] the camera and the readback both the window and a still share,
-//! and [`ride`] the recorded-rollout player.
+//! [`budget`] chooses how big a picture the next pass may be, from what the
+//! last one cost and whether anything moved; [`frame`] the camera and the
+//! readback both the window and a still share, and [`ride`] the
+//! recorded-rollout player.
+//!
+//! [`View`] carries a [`Projection`], so the map a camera draws with is part
+//! of what a history reprojects through rather than an assumption baked into
+//! it. `kosm_render`'s equidistant fisheye is therefore a live camera and not
+//! an offline one: an `f·θ` frame is carried across a moved eye by the `f·θ`
+//! inverse and converges exactly as a pinhole frame does.
 //!
 //! Nothing here names a sim. `sims/court/game.rs` and `sims/pool/game.rs` are
 //! the per-sim viewer modes and live with their sims.
 
+pub mod budget;
 pub mod frame;
 pub mod history;
 pub mod temporal;
@@ -20,8 +29,9 @@ pub mod viewport;
 #[cfg(feature = "ride")]
 pub mod ride;
 
+pub use budget::Budget;
 pub use frame::{Camera, read_back};
-pub use temporal::{Pose, TemporalHistory, View};
+pub use temporal::{Pose, Projection, TemporalHistory, View};
 pub use viewport::{Event, Image, Key, Scene};
 
 /// The window, driven by a sim's [`Scene`].

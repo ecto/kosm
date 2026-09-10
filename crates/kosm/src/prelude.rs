@@ -29,6 +29,15 @@ pub use crate::snapshot::{assert_close, assert_image_close};
 pub use crate::step::{Action, PhyzStep, Policy, Step, Trajectory, Zero, rollout, step_batch};
 pub use crate::task::{Invariant, Task, check_invariants};
 pub use crate::world::{Light, Material, Param, World};
+// substances: one `Material` per stuff, every facet derived from its
+// constants. Spelled `Substance` here because `Material` above is the render
+// column on a `World`, and the two are different nouns.
+pub use crate::material::{self, Fluid, Material as Substance, Optics, Spectrum};
+
+// the player: a body on the ground, through a medium, and what drives it.
+// `player::Snapshot` and `player::Pose` keep their module in a name because a
+// sim has snapshots and poses of its own.
+pub use crate::player::{self, Body, BodySpec, Drive, Ground, Medium, Skeleton, Tool};
 
 // the build side: geometry in rust, and the colliders derived from it
 pub use crate::build::{Authored, Built, Params, build};
