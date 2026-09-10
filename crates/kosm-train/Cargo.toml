@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Loops that produce policies: PPO, behaviour cloning, CEM, MAP-Elites"
-keywords = ["reinforcement-learning", "ppo", "cem", "map-elites", "policy"]
+keywords = ["rl", "ppo", "cem", "map-elites", "policy"]
 categories = ["simulation", "science"]
 exclude = ["out/"]
 
