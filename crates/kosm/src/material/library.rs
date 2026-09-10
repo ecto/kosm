@@ -13,6 +13,10 @@
 //! is marked as an estimate, while the mechanics beside them are the real
 //! substance's. That is what lets the court, the skatepark and the cove render
 //! the same colours after this change and still ask a `rim` for its density.
+//! The cove's costume — `cloak`, `cream`, `skin`, `blush`, `ink`, `boot` — is
+//! there on the same terms, so `sims/rune/hero` can build a figure whose every
+//! part answers `substance()` and a later `kosm::player` can hang phyz joints
+//! on it without writing a second table of densities.
 //!
 //! ```
 //! use kosm::material;
@@ -114,6 +118,13 @@ const NAMES: &[&str] = &[
     "window",
     "paint",
     "key",
+    // the cove's costume
+    "cloak",
+    "cream",
+    "skin",
+    "blush",
+    "ink",
+    "boot",
 ];
 
 // ── sources ───────────────────────────────────────────────────────────────
@@ -869,6 +880,96 @@ fn build(key: &str) -> Option<Material> {
             .rub(0.55, 0.45)
             .look([0.55, 0.20, 0.18], 0.25)
             .cite(measured(WOOD), estimated("paint on a lacquered maple floor"), estimated(LOOK))
+            .done(),
+
+        // ── the cove's costume ────────────────────────────────────────────
+        //
+        // Rune's adventurer, part by part. Same rule as the court's names
+        // above: each is a *place on the figure*, and each carries the
+        // mechanics of the substance it is actually cut from — so `cloak` is
+        // wool felt with a dye on it, `cream` is linen, `boot` is leather
+        // that has been blacked and waxed — while the colour is the one
+        // `sims/rune/hero/stage.rs` paints it, chosen against the sand, the
+        // cliff and the door.
+        //
+        // The reason they are here rather than in the sim is
+        // `Body::substance`: a hero whose parts resolve to substances is a
+        // hero `kosm::player` can hang phyz joints on without a second
+        // table — the cloak's 300 kg/m³ and the boot's μ = 0.6 come from
+        // this file and nowhere else.
+        "cloak" => B::new("cloak")
+            .mech(300.0, 1.0e6, 0.30, 0.50)
+            .rub(0.7, 0.05)
+            .look([0.055, 0.42, 0.47], 0.75)
+            .stiffness(1.0e3)
+            .cite(
+                measured("Beranek, Noise and Vibration Control: pressed wool felt"),
+                estimated("opaque"),
+                estimated("dyed a saturated cyan-teal: the one hue the cove does not already own"),
+            )
+            .done(),
+        "cream" => B::new("cream")
+            .mech(400.0, 3.0e9, 0.30, 0.08)
+            .rub(0.5, 0.1)
+            .look([0.93, 0.90, 0.78], 0.7)
+            .stiffness(2.0e3)
+            .cite(
+                estimated("woven flax, effective: fibre modulus over a cloth's own density"),
+                estimated("opaque"),
+                estimated("bleached linen: the brightest thing on the figure, so the collar reads at 20 m"),
+            )
+            .done(),
+        // Soft tissue, not a solid: the modulus is the dermis's, which is six
+        // orders under bone and is why a finger deforms and a knuckle does
+        // not. The scattering pair is the reason skin is not just a colour.
+        "skin" => B::new("skin")
+            .mech(1050.0, 0.5e6, 0.45, 0.30)
+            .rub(0.6, 0.2)
+            .look([0.88, 0.63, 0.47], 0.55)
+            .sss(Subsurface::organic_mm(0.5, 2.6, 0.8))
+            .stiffness(1.5e3)
+            .cite(
+                measured(&format!("{CRC} (soft tissue density); dermis modulus from Ashby's elastomer range")),
+                measured("Jensen et al., A Practical Model for Subsurface Light Transport (2001), table 1: skin"),
+                estimated("a warm mid tan, held twice as bright as the cove's stone and half as saturated as its sand"),
+            )
+            .done(),
+        // The cheek tint. Skin under a rose wash, so the mechanics are skin's
+        // to the digit and only the albedo moves.
+        "blush" => B::new("blush")
+            .mech(1050.0, 0.5e6, 0.45, 0.30)
+            .rub(0.6, 0.2)
+            .look([0.92, 0.46, 0.42], 0.55)
+            .sss(Subsurface::organic_mm(0.5, 2.6, 0.8))
+            .stiffness(1.5e3)
+            .cite(
+                measured(&format!("{CRC} (soft tissue density); dermis modulus from Ashby's elastomer range")),
+                measured("Jensen et al. (2001), table 1: skin"),
+                estimated("a rose wash over the same skin, flat enough to stay a Mii's cheek and not a shadow"),
+            )
+            .done(),
+        // Lamp black bound in a film: the darkest thing the figure has, and
+        // the only one whose whole job is to be a hole.
+        "ink" => B::new("ink")
+            .mech(1800.0, 2.0e9, 0.35, 0.05)
+            .rub(0.4, 0.1)
+            .look([0.015, 0.015, 0.02], 0.5)
+            .cite(
+                measured(&format!("{CRC} (carbon black, bound)")),
+                estimated("opaque: a 1.5 % albedo is what a lamp-black film measures"),
+                estimated("a dot eye, and nothing in the picture darker"),
+            )
+            .done(),
+        "boot" | "waxed leather" => B::new("boot")
+            .mech(900.0, 0.5e9, 0.40, 0.10)
+            .rub(0.6, 0.3)
+            .look([0.055, 0.06, 0.075], 0.55)
+            .stiffness(5.0e3)
+            .cite(
+                measured("Ashby, Materials and Design: vegetable-tanned leather"),
+                estimated("opaque"),
+                estimated("blacked and waxed, and cool rather than warm so the feet plant the figure"),
+            )
             .done(),
 
         _ => None,

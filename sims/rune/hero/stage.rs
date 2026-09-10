@@ -7,11 +7,18 @@
 //!
 //! So the geometry is small and local and the *light is copied*. Every number
 //! under "the daylight" below is `sims/rune/render.rs`'s `daylight` and
-//! `sims/rune/scene.rs`'s `sun_az_deg`/`sun_el_deg`, and every colour under
-//! [`palette`] is `sims/rune/materials.rs`'s. They are copied rather than
-//! called because `render.rs` and `materials.rs` belong to the cove and the
-//! cove is a forty-metre bake; a character stage that had to build one to
-//! borrow a colour would not be a character stage.
+//! `sims/rune/scene.rs`'s `sun_az_deg`/`sun_el_deg`, and the cove's four
+//! colours under [`palette`] are `sims/rune/materials.rs`'s. They are copied
+//! rather than called because `render.rs` and `materials.rs` belong to the
+//! cove and the cove is a forty-metre bake; a character stage that had to
+//! build one to borrow a colour would not be a character stage.
+//!
+//! The **substances** are not copied. Every arm of [`palette`] starts from
+//! `kosm::material`'s `pbr()` for the name and overrides only what the art
+//! direction owns, exactly as `sims/rune/materials.rs` does — and the hero's
+//! own costume is in that library too, so the colour a body is *authored*
+//! with (`Body::substance`) and the colour this file paints it are one
+//! number, checked by a test at the foot of the file.
 //!
 //! **The frame.** Millimetres, z up, and the origin is the *door's sill* —
 //! the point on the sand at the middle of the shut door's face. So:
@@ -202,26 +209,46 @@ pub const EXPOSURE: f64 = 0.7;
 /// The cove's four are copied from `sims/rune/materials.rs`; the rest are the
 /// hero's own and are chosen against those four. Linear colours, never sRGB.
 ///
-/// The rule the cove states and this keeps: one colour and one roughness
-/// each, no clearcoat, no sheen, no subsurface. The picture's interest is the
-/// shapes, the sun and the glass.
+/// **The substance is the library's and the look is the level's** — the rule
+/// `sims/rune/materials.rs` states, kept here. Every arm below starts from
+/// `kosm::material`'s `pbr()` for the name and overrides exactly the fields
+/// the art direction owns: the albedo, the roughness, the weak dielectric
+/// highlight. Nothing here restates a density and nothing here adds a lobe.
+///
+/// The costume names — `cloak`, `cream`, `skin`, `blush`, `ink`, `boot` — are
+/// entries in the library in their own right, so the colour below and the
+/// colour a `Body::substance` was authored with are the same number; the test
+/// at the foot of this file is what keeps them that way. The two the hero
+/// *re*-colours are `leather` and `brass`, whose library entries are a
+/// general leather and a general brass and whose place in this picture is a
+/// russet satchel and a warm buckle.
+///
+/// One colour and one roughness each, no clearcoat, no sheen, and **no
+/// subsurface**: the library's `skin` scatters, as skin does, and this look
+/// does not. The picture's interest is the shapes, the sun and the glass.
 pub fn palette(name: &str) -> Pbr {
-    let flat = |base: [f32; 3], roughness: f32| Pbr {
+    let lib = |name: &str| {
+        kosm::material::named(name).unwrap_or_else(|| panic!("`{name}` is not in kosm::material")).pbr()
+    };
+    // A flat surface over whatever the library says the substance is: a
+    // diffuse lobe, a weak dielectric highlight, nothing layered, no walk.
+    let flat = |substance: &str, base: [f32; 3], roughness: f32| Pbr {
         base_color: base,
         roughness,
         specular: 0.25,
-        ..Default::default()
+        subsurface: 0.0,
+        ..lib(substance)
     };
     match name {
         // ---- the cove's, copied ------------------------------------------
-        "sand" => flat([0.85, 0.54, 0.22], 0.9),
-        "rock" => flat([0.13, 0.19, 0.33], 0.9),
-        "stone" => flat([0.24, 0.20, 0.16], 0.85),
+        "sand" => flat("dry sand", [0.85, 0.54, 0.22], 0.9),
+        "rock" => flat("granite", [0.13, 0.19, 0.33], 0.9),
+        "stone" => flat("granite", [0.24, 0.20, 0.16], 0.85),
 
         // ---- the door's furniture ----------------------------------------
         // The keyhole is a hole: darker than any stone, so it reads as depth
         // and not as a coin stuck to the door.
-        "keyhole" => flat([0.03, 0.025, 0.02], 0.9),
+        "keyhole" => flat("granite", [0.03, 0.025, 0.02], 0.9),
         // The rim glows. `materials::rim(glow_floor = 0.8, gain, score = 0)`
         // is the keyhole nobody has solved yet — findable, not loud — and
         // that is the state every one of these stills is in.
@@ -241,35 +268,43 @@ pub fn palette(name: &str) -> Pbr {
         // one hue nothing else in the cove owns — the sea is far darker and
         // greener — with the value sitting squarely between the sand above it
         // and the stone behind it.
-        "cloak" => flat([0.055, 0.42, 0.47], 0.75),
-        // The hood's inside and the collar: cream, the brightest thing on the
-        // figure, ringing the face so the eye goes to the head.
-        "cream" => flat([0.86, 0.83, 0.73], 0.7),
-        // Skin: warm tan, a shade the sand cannot swallow because the sand is
-        // twice as bright.
-        "skin" => flat([0.72, 0.44, 0.28], 0.6),
-        // Dot eyes. Nothing else on the face at all.
-        "ink" => flat([0.015, 0.015, 0.02], 0.5),
-        // Boots and belt: dark slate, cool, so the feet plant the figure
-        // instead of glowing at the bottom of it.
-        "boot" => flat([0.055, 0.06, 0.075], 0.55),
-        // The satchel: russet leather, the one warm accent, on the hip where
-        // it breaks the cloak's silhouette.
-        "leather" => flat([0.30, 0.105, 0.045], 0.65),
+        //
+        // These six are the library's own numbers, unchanged. They are here
+        // as arms rather than as a fall-through so that the one file an
+        // agent reads to change the costume is still this one.
+        "cloak" | "cream" | "skin" | "blush" | "ink" | "boot" => {
+            Pbr { specular: 0.25, subsurface: 0.0, ..lib(name) }
+        }
+        // The satchel and its strap: russet leather, the one warm accent, on
+        // the side that tells the hero's left from its right.
+        "leather" => flat("leather", [0.30, 0.105, 0.045], 0.65),
         // Brass buckle and the lens's ring: warm metal, rough enough that the
         // low sun leaves a smear and not a star.
-        "brass" => Pbr { base_color: [0.72, 0.53, 0.22], metallic: 1.0, roughness: 0.28, ..Default::default() },
+        "brass" => Pbr { roughness: 0.28, ..lib("brass") },
 
         // ---- the kit --------------------------------------------------------
-        // The mirror: polished, and barely rough at all. A real metal, so the
-        // base colour is F0 rather than an albedo.
-        "silver" => Pbr { base_color: [0.95, 0.96, 0.97], metallic: 1.0, roughness: 0.02, ..Default::default() },
-        // The glass the lens and the prism are made of: N-BK7 with its
-        // Sellmeier pair, which is what makes both of them throw a caustic
-        // that disperses — and what makes `caustics::is_caustic_refractor`
-        // find them and spend the photon budget on them and nothing else.
+        // The mirror. A real metal, so the base colour is F0 rather than an
+        // albedo — and **rougher than the library's fresh silver**, which is
+        // 0.02 and is what a mirror is on the day it is silvered.
+        //
+        // The satin is for the picture and it is honest: a hand mirror carried
+        // in a satchel on a beach is satin, not a laser flat. It is also the
+        // difference between a patch and a speckle. A 0.02 lobe is a
+        // hundredth of a degree wide, so the only camera path that ever
+        // reaches the sun through it is one that hits the sun's own disc
+        // exactly, and the door lights up in single pixels; at 0.08 the lobe
+        // is a few degrees, next-event estimation at the mirror connects to
+        // the sun on nearly every bounce that gets there, and what lands is a
+        // soft-edged patch half a metre across.
+        "silver" => Pbr { roughness: 0.05, ..lib("silver") },
+        // The glass the lens is made of: N-BK7 with its Sellmeier pair, which
+        // is what makes it throw a caustic that disperses — and what makes
+        // `caustics::is_caustic_refractor` find it and spend the photon
+        // budget on it and nothing else.
         "glass" => glass(),
-        _ => flat([0.55, 0.55, 0.55], 0.8),
+        // The prism's is not the same glass. See `kit::PRISM_GLASS`.
+        "flint" => flint(),
+        _ => flat("clay", [0.55, 0.55, 0.55], 0.8),
     }
 }
 
@@ -290,6 +325,26 @@ pub fn glass() -> Pbr {
         sellmeier: Some(kosm_render::spectrum::BK7_SELLMEIER),
         ..Default::default()
     }
+}
+
+/// Lead crystal: the prism's glass, and **not** the lens's.
+///
+/// The library's `lead crystal` is `n_d = 1.60` at an Abbe number of 33,
+/// against N-BK7's 1.5168 at 64. The index barely matters; the Abbe number is
+/// everything, because it *is* the dispersion — a flint splits the visible
+/// band 2.4 times as wide as a crown does, and 2.4× is the difference between
+/// a spectrum that needs eleven metres of beach to separate and one that
+/// needs four. See [`super::kit::PRISM_GLASS`] for the arithmetic and
+/// [`super::tools`] for the measurement.
+///
+/// No Sellmeier pair, and that is not a shortcut: the renderer reconstructs a
+/// one-term Cauchy from `ior` and `abbe`
+/// ([`kosm_render::spectrum::cauchy_index`]) whenever a glass does not carry
+/// coefficients, and the library has an Abbe number for lead crystal and no
+/// coefficients. One degree of freedom, honestly used.
+pub fn flint() -> Pbr {
+    let lead = kosm::material::named("lead crystal").expect("lead crystal is in the library");
+    Pbr { base_color: [1.0, 1.0, 1.0], roughness: 0.0, specular: 1.0, ..lead.pbr() }
 }
 
 // ---- assembling a picture --------------------------------------------------
@@ -523,6 +578,40 @@ pub fn options(spp: usize, seed: u64) -> PathTraceOptions {
     }
 }
 
+/// The same, for a frame whose subject is a **rare path**.
+///
+/// Two of the integrator's defaults are exactly wrong for the mirror in
+/// `tools.png`, and both took a render apiece to find.
+///
+/// - `adaptive: true` makes `spp` a ceiling and lets a pixel stop once its
+///   own variance says it has settled. A patch of sun bounced off a 250 mm
+///   disc reaches a pixel on the shaded door through a diffuse bounce that
+///   finds the mirror about one sample in forty — so the pixel looks smooth,
+///   dark and converged for the first thirty-nine, stops, and the patch never
+///   arrives. Raising the budget from 256 to 1024 changed the render *time*
+///   by nothing at all, which is the tell.
+/// - `firefly_clamp: Some(12.0)` truncates any indirect estimate past twelve
+///   radiance units. A one-in-forty path carries forty times the mean by
+///   construction, so the few samples that did find the mirror were shaved to
+///   a twelfth of what they were worth. The relative clamp does the same job
+///   against the pixel's own running mean, which is what a spike-hunting
+///   frame wants: fireflies still die, a genuinely bright pixel does not.
+///
+/// Everything else is [`options`]'s.
+pub fn options_rare(spp: usize, seed: u64) -> PathTraceOptions {
+    PathTraceOptions {
+        adaptive: false,
+        firefly_clamp: None,
+        firefly_clamp_relative: Some(24.0),
+        // …and two more à-trous passes, because what the rare path leaves
+        // behind after all that is not noise in the ordinary sense but a
+        // mottle at the scale of a few pixels, which is exactly what a wider
+        // edge-aware footprint is for.
+        denoise_iters: 7,
+        ..options(spp, seed)
+    }
+}
+
 /// Tonemap a film to an image, at the cove's exposure.
 pub fn to_image(film: &Film) -> image::RgbaImage {
     let px = film.to_srgb8(EXPOSURE as f32, false);
@@ -562,9 +651,39 @@ mod tests {
         // the rim is a light and nothing the caustic pass will aim at
         let rim = palette("rim");
         assert!(rim.emissive[0] > 0.0 && rim.transmission == 0.0);
-        // and the glass is exactly what it will aim at
+        // and the glass is exactly what it will aim at — both of them
         let g = palette("glass");
         assert!(g.transmission > 0.0 && !g.thin_walled && g.sellmeier.is_some());
+        let f = palette("flint");
+        assert!(f.transmission > 0.0 && !f.thin_walled, "the prism has to be a refractor");
+        assert!(f.sellmeier.is_none() && f.abbe > 0.0, "the flint disperses off its Abbe number");
+        assert!(f.abbe < g.abbe.max(64.17), "the flint has to split wider than the crown");
         Ok(())
+    }
+
+    /// The costume is the library's, to the bit.
+    ///
+    /// The hero's parts are authored with `Body::substance`, so the name a
+    /// body carries is a library name and the colour this file paints it has
+    /// to be the colour that entry holds — otherwise a figure would answer
+    /// one thing when asked what it is made of and look like another. The
+    /// six below are the cove's costume; `leather` and `brass` are excluded
+    /// on purpose, because those two the level does re-colour.
+    #[test]
+    fn the_costume_this_file_paints_is_the_costume_the_library_holds() {
+        for name in ["cloak", "cream", "skin", "blush", "ink", "boot"] {
+            let m = kosm::material::named(name).unwrap_or_else(|| panic!("`{name}` left the library"));
+            let p = palette(name);
+            assert_eq!(p.base_color, m.pbr().base_color, "`{name}` is two colours");
+            assert_eq!(p.roughness, m.roughness as f32, "`{name}` is two roughnesses");
+            // flat, whatever the substance does: skin scatters and this look
+            // does not
+            assert_eq!(p.subsurface, 0.0, "`{name}` brought a subsurface walk with it");
+            assert_eq!(p.transmission, 0.0, "`{name}` is not a window");
+            assert!(m.density > 0.0, "`{name}` has no density to hand a rig");
+        }
+        // and the two that are re-coloured really are re-coloured, so that
+        // the exclusion above is a statement and not an oversight
+        assert_ne!(palette("leather").base_color, kosm::material::named("leather").unwrap().pbr().base_color);
     }
 }

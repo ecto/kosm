@@ -42,21 +42,32 @@
 //!
 //! # The prism
 //!
-//! Equilateral, 150 mm on a side, 200 mm long. At apex `A = 60°` the minimum
-//! deviation is
+//! Equilateral, 150 mm on a side, 200 mm long, and **lead crystal, not
+//! N-BK7**. At apex `A = 60°` the minimum deviation is
 //!
 //! ```text
-//! δ = 2 asin(n sin(A/2)) − A = 38.6°  at n_d
+//! δ = 2 asin(n sin(A/2)) − A
 //! ```
 //!
-//! and the same formula at the ends of the visible band — n = 1.5308 at
-//! 400 nm, n = 1.5131 at 700 nm, both off the Sellmeier pair the glass
-//! carries — spreads that by **1.6°**. Sixteen milliradians is a hand's
-//! breadth of colour at two metres and nothing at all at twenty
-//! centimetres, which is the whole reason [`aim`] exists: the prism is
-//! turned about the sunbeam until what comes out of it *grazes* the sand and
-//! the spectrum is thrown the length of the frame instead of dropped at its
-//! feet.
+//! and the same formula at the ends of the visible band is the spectrum's
+//! whole width. The glass is the only lever on it that matters:
+//!
+//! | glass | n_d | V | δ at n_d | 400–700 nm spread |
+//! |-------|-----|---|----------|-------------------|
+//! | N-BK7 | 1.5168 | 64 | 38.6° | 1.6° |
+//! | lead crystal | 1.600 | 33 | 46.3° | 3.9° |
+//!
+//! A spectrum through a slit of width `w` thrown `D` is `w + D·Δ` long and
+//! `w/(w + D·Δ)` as bright as bare sun, and both of those are fixed by `Δ`
+//! alone. At N-BK7's 1.6° a **300 mm** band needs eleven metres of beach; at
+//! lead crystal's 3.9° it needs four, and four metres fits in a frame. So the
+//! adventurer's prism is flint and the lens is crown — which is what an
+//! optician would do anyway, because a prism is for splitting and a lens is
+//! for focusing and low dispersion is a *virtue* in the second job.
+//!
+//! [`aim`] is what turns it: the exit of a prism at minimum deviation lies on
+//! a cone about the incoming sunbeam whatever the prism's own orientation is,
+//! so "throw the spectrum at that stone" is a one-dimensional search.
 //!
 //! # The mirror
 //!
@@ -80,6 +91,11 @@ pub const LENS_F: f64 = 2500.0;
 /// The prism: an equilateral triangle this far on a side, this long.
 pub const PRISM_SIDE: f64 = 150.0;
 pub const PRISM_LEN: f64 = 200.0;
+/// What it is cut from. `kosm::material`'s entry, and the name
+/// [`super::stage::palette`] answers with [`super::stage::flint`].
+pub const PRISM_GLASS: &str = "lead crystal";
+/// How wide the slit in the prism's stop is. See [`hardware`].
+pub const PRISM_SLIT: f64 = 60.0;
 /// The mirror, across, and how thick the disc is.
 pub const MIRROR_D: f64 = 250.0;
 pub const MIRROR_T: f64 = 14.0;
@@ -151,6 +167,58 @@ pub fn index_at(lambda_nm: f64) -> f64 {
     (1.0 + (0..3).map(|i| b[i] * l2 / (l2 - c[i])).sum::<f64>()).sqrt()
 }
 
+/// The prism's glass at a wavelength.
+///
+/// Lead crystal has an Abbe number in the library and no Sellmeier pair, so
+/// this is [`kosm_render::spectrum::cauchy_index`] — which is *exactly* what
+/// the renderer falls back to for a dispersive material without coefficients
+/// (`cpu::material::Material::index_at`). Same function, same two numbers:
+/// the band this file predicts and the band the photons draw are one band.
+pub fn prism_index_at(lambda_nm: f64) -> f64 {
+    let (n_d, abbe) = prism_glass();
+    kosm_render::spectrum::cauchy_index(n_d, abbe, lambda_nm / 1000.0)
+}
+
+/// The prism glass's `(n_d, V)`, from the library, so this file has no
+/// optical constant of its own to drift.
+pub fn prism_glass() -> (f64, f64) {
+    let m = kosm::material::named(PRISM_GLASS).expect("the prism's glass is in the library");
+    let p = m.pbr();
+    (p.ior as f64, p.abbe as f64)
+}
+
+/// The prism's deviation at the d line, and how wide it spreads the visible
+/// band. Radians, and the two numbers the whole staging of `tools.png` turns
+/// on.
+pub fn prism_deviation() -> (f64, f64) {
+    let (n_d, _) = prism_glass();
+    let (blue, red) = (prism_index_at(400.0), prism_index_at(700.0));
+    (min_deviation(n_d), min_deviation(blue) - min_deviation(red))
+}
+
+/// How long the band is on a screen `throw` away whose normal makes an angle
+/// with the beam of `cos_incidence`, from a slit of width `slit`.
+///
+/// `slit + throw · (Δ + sun)` square to the beam, stretched by the screen's
+/// tilt. The sun's own half-degree is in there because at four metres it is
+/// 37 mm and the slit is 60: leaving it out would predict a band a fifth
+/// crisper than the one the tracer draws.
+pub fn band_length(slit: f64, throw: f64, cos_incidence: f64) -> f64 {
+    let (_, spread) = prism_deviation();
+    (slit + throw * (spread + SUN_ANGULAR_DIAMETER)) / cos_incidence.abs().max(1e-3)
+}
+
+/// How bright that band is against bare sun: a slit passes a slit's worth of
+/// light and the spread only ever dilutes it.
+pub fn band_brightness(slit: f64, throw: f64) -> f64 {
+    let (_, spread) = prism_deviation();
+    slit / (slit + throw * (spread + SUN_ANGULAR_DIAMETER))
+}
+
+/// The sun's angular diameter, radians. The floor under every caustic in
+/// this file: no slit image and no lens focus is ever sharper than this.
+pub const SUN_ANGULAR_DIAMETER: f64 = 0.0093;
+
 // ---- aiming ----------------------------------------------------------------
 
 /// Where a ray leaving `from` along `dir` meets the beach.
@@ -164,6 +232,20 @@ pub fn land_on_sand(from: Point3, dir: Vec3) -> Option<Point3> {
         return None;
     }
     let t = (stage::SLOPE * from.y - from.z) / denom;
+    (t > 0.0).then(|| from + dir * t)
+}
+
+/// The same for any plane: where a ray leaving `from` along `dir` meets the
+/// plane through `on` with normal `n`.
+///
+/// `tools.png` throws all three tools at one standing stone rather than at
+/// the sand, so this is the function [`aim_at_plane`] bisects on.
+pub fn land_on_plane(from: Point3, dir: Vec3, on: Point3, n: Vec3) -> Option<Point3> {
+    let denom = dir.dot(n);
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let t = (on - from).dot(n) / denom;
     (t > 0.0).then(|| from + dir * t)
 }
 
@@ -230,7 +312,25 @@ pub fn descend(from: Point3, azimuth: f64, throw: f64) -> Option<Vec3> {
     Some(Vec3::new(ca * cb, sa * cb, -sb).normalize())
 }
 
+/// Where a tool has to stand for its beam to land on `target`.
+///
+/// The inverse of [`aim`], and the one that stages a picture. `aim` asks
+/// "given where the prism is, which way can it throw?" — a bisection, because
+/// the beach is a plane and the cone is not. This asks "given where the light
+/// has to land, where does the prism go?", which is not a search at all: pick
+/// a spin, take the exit direction off the cone, and step back along it.
+///
+/// So a still that wants three marks of light on one stone chooses the three
+/// marks first and lets the tools fall where they must. That is the whole
+/// difference between `tools.png` as it was — three tools placed on the sand
+/// and their light wherever it went — and as it is.
+pub fn place_for(target: Point3, axis: Vec3, half_angle: f64, spin: f64, throw: f64) -> (Point3, Vec3) {
+    let out = on_cone(axis, half_angle, spin);
+    (target - out * throw, out)
+}
+
 /// The prism's placement, from the beam that goes in and the beam that comes
+/// out./// The prism's placement, from the beam that goes in and the beam that comes
 /// out.
 ///
 /// At minimum deviation the ray *inside* the glass runs square to the apex
@@ -418,25 +518,35 @@ pub fn hardware(params: &Params) -> anyhow::Result<Built> {
         // leaving a slit between them. It is not decoration and it is not a
         // cheat — it is the reason the spectrum exists.
         //
-        // A prism spreads the visible band by 1.6°, and a beam as wide as the
-        // prism's own face has to travel `150 mm / tan 1.6° ≈ 5.4 m` before
-        // red has walked clear of violet. Under 5.4 m what lands is a white
-        // patch with coloured edges, which is what a prism on a table
-        // actually looks like and is not what anybody means by a spectrum.
-        // Narrow the beam to a slit and the same 1.6° separates it in
-        // proportion: at `slit` millimetres it takes `slit / tan 1.6°`, which
-        // for 26 mm is 900 mm — a stone's throw across the sand. Every optics
-        // bench in the world has this stone on it.
+        // A beam as wide as the prism's own face has to travel
+        // `150 mm / tan 3.9° ≈ 2.2 m` before red has walked clear of violet,
+        // and what lands short of that is a white patch with coloured edges —
+        // which is what a prism on a table actually looks like and is not
+        // what anybody means by a spectrum. Narrow the beam to a slit and the
+        // same 3.9° separates it in proportion. Every optics bench in the
+        // world has this stone on it.
+        //
+        // **How wide the slit is, is the whole trade.** A band is
+        // `slit + throw·Δ` long and `slit/(slit + throw·Δ)` as bright as bare
+        // sun — so a narrow slit buys resolution and pays for it in light, at
+        // exactly one for one, and there is no third option. Sixty
+        // millimetres at a four-metre throw is a 380 mm band at 0.16 of full
+        // sun, which against a stone in shade is about twice its surround.
+        // Twenty-six, the last pass's number, would be 0.07 and invisible.
         // It is *turned to face the beam*, which is not a nicety either: the
         // light crosses the prism's own frame at δ/2 = 19° to it, so a slit
         // cut square through 90 mm of stone is a tunnel 31 mm off-axis and a
         // 26 mm slit through it passes precisely nothing. Square to the beam,
         // the same stone passes the slit's full width.
-        let slit = b.param("prism_slit_mm", 26.0);
-        let half = 0.5 * min_deviation(N_D).to_degrees();
+        let slit = b.param("prism_slit_mm", PRISM_SLIT);
+        let half = 0.5 * prism_deviation().0.to_degrees();
         let (sh, ch) = (-half).to_radians().sin_cos();
+        // The stop is the cliff's own rock rather than the door's stone: a
+        // brown block on a brown slab in front of a brown door is a prism
+        // nobody can find in the frame, and the cove's rock is a cool
+        // blue-grey that reads against every one of them.
         let stop = b.body("stop");
-        stop.material("stone");
+        stop.material("rock");
         for side in [-1.0, 1.0] {
             // along the beam, and across it
             let off = side * (0.5 * slit + 78.0);
@@ -446,6 +556,21 @@ pub fn hardware(params: &Params) -> anyhow::Result<Built> {
                 b.boxed(80.0, 156.0, 1.25 * PRISM_LEN)
                     .rotate_z(-half)
                     .at(-1.05 * PRISM_SIDE * ux + off * vx, -1.05 * PRISM_SIDE * uy + off * vy, 0.0),
+            );
+            // …and a cap over each end of the slit, so the slit is *shorter*
+            // than the prism it feeds. Without these the top and bottom 25 mm
+            // of the slit see past the glass entirely and lay a bar of
+            // undeviated sun three metres from the spectrum — invisible at a
+            // 250 mm throw, which is why the last pass never saw it, and the
+            // brightest thing in the frame at four.
+            stop.add(
+                b.boxed(80.0, slit + 40.0, 90.0)
+                    .rotate_z(-half)
+                    .at(
+                        -1.05 * PRISM_SIDE * ux,
+                        -1.05 * PRISM_SIDE * uy,
+                        side * (0.47 * PRISM_LEN + 45.0),
+                    ),
             );
         }
 
@@ -509,17 +634,37 @@ mod tests {
         assert!((80.0..100.0).contains(&p), "the doorstep patch is {p} mm");
     }
 
-    /// The prism's deviation and its dispersion, off the same Sellmeier pair
-    /// the renderer refracts with.
+    /// The prism is flint, it deviates by forty-seven degrees, and it spreads
+    /// the band nearly four — two and a half times what the lens's crown
+    /// would, which is the only reason a 300 mm rainbow fits on this beach.
     #[test]
-    fn the_prism_deviates_by_thirty_nine_degrees_and_spreads_by_one_and_a_half() {
-        let d = min_deviation(N_D).to_degrees();
-        assert!((d - 38.6).abs() < 0.2, "δ = {d}°");
-        let (blue, red) = (index_at(400.0), index_at(700.0));
+    fn the_prism_is_flint_and_splits_two_and_a_half_times_as_wide_as_the_lens() {
+        let (n_d, abbe) = prism_glass();
+        assert!((n_d - 1.60).abs() < 1e-6, "the prism's glass is n_d = {n_d}");
+        assert!((abbe - 33.0).abs() < 1e-6, "and V = {abbe}");
+        let (delta, spread) = prism_deviation();
+        assert!((delta.to_degrees() - 46.3).abs() < 0.3, "δ = {}°", delta.to_degrees());
+        let (blue, red) = (prism_index_at(400.0), prism_index_at(700.0));
         assert!(blue > red, "glass is more bending to the blue: {blue} vs {red}");
-        assert!((index_at(587.6) - N_D).abs() < 2e-3, "the d line is n_d");
-        let spread = dispersion(blue, red).to_degrees();
-        assert!((1.2..2.2).contains(&spread), "the spectrum spreads {spread}°");
+        assert!((prism_index_at(587.56) - n_d).abs() < 1e-9, "the d line is n_d");
+        assert!((3.4..4.4).contains(&spread.to_degrees()), "the spectrum spreads {}°", spread.to_degrees());
+        // and it really is wider than the lens's crown, which is the claim
+        let crown = dispersion(index_at(400.0), index_at(700.0));
+        assert!(spread > 2.2 * crown, "flint {spread} vs crown {crown}");
+
+        // The staging trade, in the two functions that state it: a band gets
+        // longer and dimmer together and there is no third option.
+        let short = band_length(PRISM_SLIT, 1000.0, 1.0);
+        let long = band_length(PRISM_SLIT, 4000.0, 1.0);
+        assert!(long > 2.5 * short, "{short} → {long}");
+        assert!(band_brightness(PRISM_SLIT, 4000.0) < band_brightness(PRISM_SLIT, 1000.0));
+        assert!((band_length(PRISM_SLIT, 4000.0, 1.0) * band_brightness(PRISM_SLIT, 4000.0) - PRISM_SLIT).abs() < 1e-9);
+        // the number `tools.png` is staged on: a 300–450 mm band at a four
+        // metre throw, at a sixth of bare sun
+        assert!((300.0..460.0).contains(&long), "the band is {long} mm");
+        let bright = band_brightness(PRISM_SLIT, 4000.0);
+        assert!((0.12..0.22).contains(&bright), "the band is {bright} of bare sun");
+
         // eight triangles, none degenerate, and every one of them wound so
         // that its normal points *out* of the glass
         let m = prism_mesh();
@@ -548,6 +693,25 @@ mod tests {
         assert!(((hit - from).norm() - 1400.0).abs() < 1.0, "it landed {} away", (hit - from).norm());
         // …and on the sand, not through it
         assert!((hit.z - stage::sand_z(hit.y)).abs() < 1e-6);
+    }
+
+    /// And staging is the *inverse* of aiming: pick where the light lands,
+    /// and the tool's place falls out with no search at all.
+    #[test]
+    fn a_tool_stands_where_the_mark_it_has_to_make_puts_it() {
+        let target = Point3::new(1200.0, -900.0, 700.0);
+        let axis = stage::sun_ray();
+        let (delta, _) = prism_deviation();
+        let (prism, out) = place_for(target, axis, delta, 1.35, 4000.0);
+        assert!(((target - prism).norm() - 4000.0).abs() < 1e-9, "the throw is not the throw");
+        assert!(((prism + out * 4000.0) - target).norm() < 1e-9, "the beam misses its own target");
+        // the exit is on the cone: that is what makes this a *prism's* beam
+        // and not a wish
+        assert!((axis.normalize().dot(out).acos() - delta).abs() < 1e-9);
+        // and a plane through the target catches it where it was told to
+        let n = Vec3::new(-axis.x, -axis.y, 0.0).normalize();
+        let hit = land_on_plane(prism, out, target, n).expect("it meets the stone");
+        assert!((hit - target).norm() < 1e-6, "it landed {:.3} mm off", (hit - target).norm());
     }
 
     /// The prism's frame really does turn the beam it was built for, and the
