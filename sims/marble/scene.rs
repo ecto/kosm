@@ -160,14 +160,21 @@ fn cup_hollow(b: &Builder, k: Knobs) -> Shape {
     let [cup_x, cup_r, cup_wall, cup_h] = k.cup;
     let cup_big = cup_r + cup_wall;
 
-    let tube = b
-        .cylinder(cup_big, cup_h)
-        .at(cup_x, 0.0, 0.0)
-        .difference(b.cylinder(cup_r, 1.1 * cup_h).at(cup_x, 0.0, 0.0));
+
+    // Mouth first, then the bore. The two cuts commute — same solid either way
+    // — but vcad 0.10's Difference does not: with the bore taken first, the
+    // outer difference against the mouth box silently does nothing (the tube's
+    // −x wall survives to x = 65 mm, and the collider decomposition then fills
+    // the mouth and falls back to a solid hull). Cutting the mouth off the
+    // plain cylinder first avoids the difference-of-a-difference that trips it.
     let mouth = b
         .boxed(1.4444 * cup_big, 1.6630 * cup_big, 1.2 * cup_h)
         .at(cup_x - 1.2778 * cup_big, 0.0, 0.5 * cup_h);
-    tube.difference(mouth).named("cup")
+    b.cylinder(cup_big, cup_h)
+        .at(cup_x, 0.0, 0.0)
+        .difference(mouth)
+        .difference(b.cylinder(cup_r, 1.1 * cup_h).at(cup_x, 0.0, 0.0))
+        .named("cup")
 }
 
 #[cfg(test)]
