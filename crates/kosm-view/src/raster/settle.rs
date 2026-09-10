@@ -128,10 +128,21 @@ impl std::fmt::Display for SettleReport {
 /// One presented frame: the raster's bytes, the reference's, and the blend.
 ///
 /// Both are already sRGB-encoded, and the mix is done **there** rather than in
-/// linear light on purpose: the two tiers tonemap with the same ACES curve and
-/// the same sRGB transfer, so a pixel that agrees agrees at every blend and a
-/// pixel that does not fades between two displayable values. Mixing in linear
-/// and re-encoding would be one more place for the two to disagree.
+/// linear light on purpose: the two tiers put their radiance through the same
+/// film — `kosm_render::post::Post`, as a shader on one tier and as Rust on
+/// the other, so the same haze, the same exposure, the same `cos⁴`, the same
+/// bloom and the same ACES curve — and so a pixel that agrees agrees at every
+/// blend and a pixel that does not fades between two displayable values.
+/// Mixing in linear and re-encoding would be one more place for the two to
+/// disagree.
+///
+/// **That is also why the film runs before the blend and not after it.** A
+/// bloom is a neighbourhood operator and a vignette is a function of where the
+/// pixel is, so neither depends on which tier drew it; applying one chain to
+/// each tier's own radiance and then mixing is the same picture as mixing and
+/// then applying it, wherever the two tiers agree — and where they do not, the
+/// whole point of the blend is that it fades between two finished frames
+/// rather than between two half-finished ones.
 ///
 /// `traced` may be smaller than `raster` — the tracer runs at the budget's
 /// size and the raster at the window's — in which case it is sampled with

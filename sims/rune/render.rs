@@ -909,22 +909,117 @@ fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
 pub fn daylight(scene: &CoveScene) -> (Environment, Sun) {
     let a = &scene.authored;
     let sky = a.parameter_or("sky_intensity", 0.42) as f32;
-    let env = Environment::Gradient(GradientEnv {
-        zenith: [0.14, 0.30, 0.62],
-        horizon: [0.38, 0.58, 0.85],
-        // what a downward ray outside the cove finds: the sand it came off
-        ground: [0.42, 0.36, 0.24],
-        intensity: sky,
-    });
     let irr = a.parameter_or("sun_irradiance", 6.2) as f32;
     let d = scene.sun_dir();
+    let radius = a.parameter_or("sun_angular_radius", 0.02);
     let sun = Sun::new(
         Vec3::new(d.x, d.y, d.z),
-        a.parameter_or("sun_angular_radius", 0.02),
+        radius,
         // low afternoon light: warm, and warmer the lower it is
         [irr, 0.77 * irr, 0.46 * irr],
     );
+    let env = if !sky_is_model(a) {
+        // `sky = 0`: the two-colour gradient the level hung under before
+        // there was a model. Kept so a picture can be taken both ways and the
+        // difference looked at rather than argued about.
+        Environment::Gradient(GradientEnv {
+            zenith: [0.14, 0.30, 0.62],
+            horizon: [0.38, 0.58, 0.85],
+            // what a downward ray outside the cove finds: the sand it came off
+            ground: [0.42, 0.36, 0.24],
+            intensity: sky,
+        })
+    } else {
+        Environment::Sky(sky_env(scene))
+    };
     (env, sun)
+}
+
+/// Whether the level hangs under the analytic sky or the old gradient.
+///
+/// The level's `sky` knob says, and `--sky gradient` overrides it. A process
+/// global and not a parameter because a `CoveScene` is built from
+/// `Params::default()` at a dozen call sites, none of which is handed a flag,
+/// and threading one through all of them to answer a comparison question
+/// would be a worse change than this is.
+static SKY_MODEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `--sky gradient` / `--sky preetham`, once, before anything is drawn.
+pub fn set_sky_model(on: bool) {
+    SKY_MODEL.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn sky_is_model(a: &kosm::build::Built) -> bool {
+    match SKY_MODEL.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => a.parameter_or("sky", 1.0) >= 0.5,
+    }
+}
+
+/// The gradient's own mean radiance over the upper hemisphere, at
+/// `sky_intensity = 1`.
+///
+/// [`SkyEnv`] is normalised to *its* mean radiance, so multiplying the knob by
+/// this is what makes `sky = 0` and `sky = 1` the same exposure — the two look
+/// different, which is the point, but the meter does not have to chase a stop
+/// between them and neither does the level author.
+const GRADIENT_FILL: f32 = 0.389;
+
+/// The cove's clear sky, as the model both tiers read.
+///
+/// Preetham, at the level's own sun. `sky_turbidity` is the haze — two and a
+/// half is a clean afternoon over water, four is the same beach with the wind
+/// off the land — and `ground_albedo` scales the sand's own colour, which is
+/// what a ray leaving the cove downward actually finds.
+pub fn sky_env(scene: &CoveScene) -> kosm_render::env::SkyEnv {
+    let a = &scene.authored;
+    let d = scene.sun_dir();
+    let g = a.parameter_or("ground_albedo", 1.0) as f32;
+    kosm_render::env::SkyEnv::new(
+        Vec3::new(d.x, d.y, d.z),
+        a.parameter_or("sky_turbidity", 2.5) as f32,
+        [0.42 * g, 0.36 * g, 0.24 * g],
+        a.parameter_or("sky_intensity", 0.42) as f32 * GRADIENT_FILL,
+        a.parameter_or("sun_angular_radius", 0.02) as f32,
+    )
+}
+
+/// The haze, as both tiers apply it.
+///
+/// `air_density` is the extinction at sea level per metre and `air_scale_m`
+/// the height it falls by `e` over. The default is deliberately gentle: over a
+/// forty-metre cove the far headland reads a shade hazier than the sand
+/// underfoot and nothing else changes, which is what aerial perspective looks
+/// like at this scale. It is a **participating-medium approximation** that
+/// the reference tracer does not trace — `kosm_render::post` says so at
+/// length — and it is applied identically on both tiers so the settle blend
+/// has nothing to fade between.
+pub fn air(scene: &CoveScene) -> kosm_render::post::Aerial {
+    let a = &scene.authored;
+    kosm_render::post::Aerial {
+        density: a.parameter_or("air_density", 0.0045) as f32,
+        scale_h: a.parameter_or("air_scale_m", 60.0) as f32,
+    }
+}
+
+/// The film both tiers put the light through: exposure, the lens's `cos⁴`,
+/// bloom, ACES, sRGB. `exposure` is the level's number already multiplied by
+/// whatever the meter measured.
+pub fn post(scene: &CoveScene, exposure: f32) -> kosm_render::post::Post {
+    let a = &scene.authored;
+    kosm_render::post::Post {
+        exposure,
+        vignette: a.parameter_or("vignette", 0.35) as f32,
+        bloom_threshold: a.parameter_or("bloom_threshold", 1.05) as f32,
+        bloom_strength: a.parameter_or("bloom", 0.10) as f32,
+        bloom_radius_px: a.parameter_or("bloom_radius_px", 7.0) as f32,
+        aerial: air(scene),
+        sky: sky_is_model(a).then(|| sky_env(scene)),
+        // The cove is traced in vcad's millimetres; the haze is stated per
+        // metre. `PER_M` is the one place the two units meet.
+        units_per_metre: PER_M as f32,
+    }
 }
 
 /// The sea: a lattice of heights at `sea_z`, from the waterline out to sea.
@@ -1210,9 +1305,27 @@ pub fn options(scene: &CoveScene, spp: usize, seed: u64) -> PathTraceOptions {
     }
 }
 
-/// Tonemap a film to an image.
+/// Tonemap a film to an image, with no camera to hang the lens terms on.
+///
+/// The haze and the vignette both need the rig — one wants the eye's height
+/// and the pixel's own view ray, the other the field of view — so a caller
+/// with only a film gets the exposure and the tonemap, which is what this
+/// always did. [`to_image_through`] is the one the cove's stills take.
 pub fn to_image(film: &Film, exposure: f64) -> image::RgbaImage {
     let px = film.to_srgb8(exposure as f32, false);
+    image::RgbaImage::from_raw(film.width, film.height, px).expect("film is width × height × 4")
+}
+
+/// The same, through the level's own film: haze, exposure, `cos⁴`, bloom,
+/// ACES, sRGB — the chain `kosm-view`'s raster tier applies in a shader, so a
+/// still taken on either tier is the same picture.
+pub fn to_image_through(
+    film: &Film,
+    scene: &CoveScene,
+    cam: &Camera,
+    exposure: f64,
+) -> image::RgbaImage {
+    let px = post(scene, exposure as f32).apply(film, cam, false);
     image::RgbaImage::from_raw(film.width, film.height, px).expect("film is width × height × 4")
 }
 
@@ -1245,7 +1358,7 @@ pub fn frame_in(
     let cam = camera(scene, placement);
     let opts = options(scene, spp, STILL_SEED);
     let film = pathtrace::render_with_caustics(&at, &cam, size.0, size.1, &opts, Some(&rune));
-    Ok(to_image(&film, scene.authored.parameter_or("exposure", 0.7)))
+    Ok(to_image_through(&film, scene, &cam, scene.authored.parameter_or("exposure", 0.7)))
 }
 
 /// The most [`Scene::gather_for`] may widen the authored gather radius.

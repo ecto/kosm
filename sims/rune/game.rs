@@ -1565,7 +1565,10 @@ impl Tracer {
         // one the window saw.
         let e = meter.follow(&self.film.rgb, dt);
         let rgba = if present {
-            self.history.resolve(self.exposure * e as f32, &options(&self.scene, seed, true))
+            // The same chain the raster tier's post pass applies, on the same
+            // radiance: `cove_render::post` is the one statement of it.
+            let film = cove_render::post(&self.scene, self.exposure * e as f32);
+            self.history.resolve_through(&film, &cam, &options(&self.scene, seed, true))
         } else {
             Vec::new()
         };
@@ -1934,6 +1937,22 @@ pub enum Tier {
 
 /// `--tier raster|trace`. The default is the raster, and it falls back to the
 /// tracer, loudly, when the level asks for something the raster cannot draw.
+/// `--sky gradient|preetham`, over the level's own `sky` knob.
+///
+/// The gradient is kept because the sky is a *look* change and the only
+/// honest way to argue about one is to take the same photograph both ways.
+/// It reaches `cove_render` as a process global; see
+/// [`cove_render::set_sky_model`] for why it is not a parameter.
+fn sky_flag(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    match args.value("sky") {
+        None => {}
+        Some(v) if v == "gradient" => cove_render::set_sky_model(false),
+        Some(v) if v == "preetham" || v == "sky" => cove_render::set_sky_model(true),
+        Some(other) => anyhow::bail!("--sky {other}: gradient or preetham"),
+    }
+    Ok(())
+}
+
 fn tier_flag(args: &kosm_cli::Args) -> anyhow::Result<Tier> {
     match args.value("tier") {
         None => Ok(Tier::Raster),
@@ -1986,9 +2005,6 @@ fn cove_probes(scene: &CoveScene, out: &Path) -> raster::ProbeVolume {
 fn sky_only_probes(scene: &CoveScene) -> raster::ProbeVolume {
     use kosm_render::pathtrace::Environment;
     let (env, _) = cove_render::daylight(scene);
-    let Environment::Gradient(g) = env else {
-        return raster::probes::uniform([0.0; 3], 1.0, [2, 2, 2], 0.2);
-    };
     let (lo, hi) = scene.volume();
     let spacing = 4.0;
     let dims = [
@@ -1996,20 +2012,30 @@ fn sky_only_probes(scene: &CoveScene) -> raster::ProbeVolume {
         (((hi.y - lo.y) / spacing).ceil() as u32 + 1).max(2),
         (((hi.z - lo.z) / spacing).ceil() as u32 + 1).max(2),
     ];
+    // The level's own environment, whichever it is, projected onto SH — so
+    // the fallback is the sky the tracer would have used and not a guess at
+    // it. `Spectrum::rgb`'s spread puts each primary over the two bands it
+    // owns, which `band_to_rgb` inverts exactly.
     raster::probes::from_radiance([lo.x, lo.y, lo.z], spacing, dims, 512, |_, d| {
-        // `GradientEnv`: the ground colour below the horizon, and horizon to
-        // zenith above it — the same lookup the tracer's environment does.
-        let rgb = if d[2] < 0.0 {
-            g.ground
-        } else {
-            let t = d[2] as f32;
-            [
-                g.horizon[0] + (g.zenith[0] - g.horizon[0]) * t,
-                g.horizon[1] + (g.zenith[1] - g.horizon[1]) * t,
-                g.horizon[2] + (g.zenith[2] - g.horizon[2]) * t,
-            ]
+        let dir = kosm_render::math::Vec3::new(d[0], d[1], d[2]);
+        let c = match &env {
+            Environment::Sky(sky) => sky.radiance(dir),
+            Environment::Gradient(g) => {
+                // the ground colour below the horizon, horizon to zenith above
+                let rgb = if d[2] < 0.0 {
+                    g.ground
+                } else {
+                    let t = d[2] as f32;
+                    [
+                        g.horizon[0] + (g.zenith[0] - g.horizon[0]) * t,
+                        g.horizon[1] + (g.zenith[1] - g.horizon[1]) * t,
+                        g.horizon[2] + (g.zenith[2] - g.horizon[2]) * t,
+                    ]
+                };
+                [rgb[0] * g.intensity, rgb[1] * g.intensity, rgb[2] * g.intensity]
+            }
+            _ => [0.2, 0.2, 0.2],
         };
-        let c = [rgb[0] * g.intensity, rgb[1] * g.intensity, rgb[2] * g.intensity];
         [c[2], c[2], c[1], c[1], c[0], c[0]]
     })
 }
@@ -2107,6 +2133,22 @@ impl RasterTier {
         let (lo, hi) = scene.volume();
         rs.bounds = ([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
         rs.exposure = a.parameter_or("exposure", 0.7) as f32;
+        // **The light is the level's, not the tier's.** Every one of these is
+        // the same value `cove_render::post` hands the path tracer, so the
+        // settle blend fades one picture into another picture of the same sky,
+        // in the same haze, through the same lens. `units_per_metre` is the one
+        // field of that film this tier does not take: it works in metres, and
+        // the shader's haze is already metric.
+        let film = cove_render::post(scene, rs.exposure);
+        rs.sky = film.sky;
+        rs.air = film.aerial;
+        rs.vignette = film.vignette;
+        rs.bloom_threshold = film.bloom_threshold;
+        rs.bloom_strength = film.bloom_strength;
+        rs.bloom_radius_px = film.bloom_radius_px;
+        rs.ao_radius_m = a.parameter_or("ao_radius_m", 0.3) as f32;
+        rs.ao_strength = a.parameter_or("ao_strength", 1.0) as f32;
+
 
         // One material per surface the level names, through
         // `materials::gpu` — which *is* `materials::pbr` laid over the
@@ -3472,6 +3514,14 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 ///   reprojects through it, so a walking player under an `f·θ` camera
 ///   converges exactly as a pinhole one does. The still and the window take
 ///   the same flag, so a `--shot` is a picture of what the window shows.
+/// - `--sky gradient|preetham` (over the level's `sky` knob, the model by
+///   default) is which sky the cove hangs under. Preetham's is warm at the
+///   horizon, blue at the zenith and bright around the sun; the gradient is
+///   the two-colour lerp the level had before, kept so the same photograph
+///   can be taken both ways. The knobs are `sky_turbidity` (2.5),
+///   `sky_intensity` and `ground_albedo`; the haze over it is `air_density`
+///   and `air_scale_m`, and the film is `vignette`, `bloom`,
+///   `bloom_threshold` and `bloom_radius_px`.
 /// - `--shutter on|off` (over the level's `cam_shutter`, on by default) folds
 ///   [`Rig::shutter_passes`] passes into one presented frame while the eye is
 ///   moving. The frame rate drops and the passes integrate the motion between
@@ -3497,6 +3547,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let walk: u32 = num("walk").unwrap_or(0);
     let projection = projection_flag(args)?;
     let tier = tier_flag(args)?;
+    sky_flag(args)?;
     let settle = !args.flag("no-settle");
     if let Some(path) = args.value("shot") {
         return match tier {

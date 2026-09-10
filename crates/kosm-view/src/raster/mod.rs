@@ -16,14 +16,34 @@
 //!
 //! ```text
 //! shadow pass   2048² depth along the sun, orthographic over the level
+//! depth prepass the camera's own depth, geometry only
+//! ao pass       half-res hemisphere occlusion off it, two bilateral blurs
+//! sky pass      Preetham's clear sky, and the sun's disc, into linear HDR
 //! scene pass    per fragment:
-//!                 direct   = sun irradiance × (Lambert + GGX) × PCF shadow
+//!                 direct   = sun irradiance × (Lambert + GGX) × PCSS shadow
 //!                          + the caustic quads' irradiance where they land
-//!                 indirect = probes.sample(sun, p, n)            [6 bands]
+//!                 indirect = probes.sample(sun, p, n) × ao       [6 bands]
 //!                 colour   = band_to_rgb(albedo × (direct + indirect))
 //!                          + emission + the instance's own glow
-//!               ACES, sRGB, out
+//!                 air      = mix(colour, sky(view), 1 − e^{−τ})
+//! post pass     exposure, cos⁴ vignette, bloom, ACES, sRGB, out
 //! ```
+//!
+//! ## the light is the level's, and both tiers read the same struct
+//!
+//! [`Scene::sky`] is `kosm_render::env::SkyEnv` itself, [`Scene::air`] is
+//! `kosm_render::post::Aerial`, and the vignette, the bloom and the tonemap
+//! are `kosm_render::post::Post` — the same values the path tracer resolves
+//! its own frame through. That is not tidiness: the settle blend fades one
+//! frame into the other in code space, so a sky, a haze or a tonemap that
+//! differed by a per cent would show as the picture shifting under a standing
+//! player. The WGSL ports live in `shaders/scene.wgsl` and `shaders/post.wgsl`
+//! and a GPU test holds each to its Rust original.
+//!
+//! Every one of those is **off** in [`Scene::new`]. A level asks for a sky, a
+//! haze, an occlusion, a vignette and a bloom or it gets the picture this tier
+//! drew before any of them existed — which is what keeps the datasheet ball's
+//! parity numbers measuring the shading and not the art direction.
 //!
 //! **The volume it is handed must not carry the sun's direct term.** The
 //! shader computes `E · max(0, n·s)` itself, per pixel, against the shadow
@@ -63,7 +83,7 @@
 //! - [`material`] — [`material::GpuMaterial`] and `library_gpu()`, ditto.
 //! - [`shadow`] — the sun's orthographic frustum over a bounding box.
 //! - [`water`] — the sea's knobs, as the shader's analytic surface.
-//! - [`pipeline`] — the wgpu resources and the two passes.
+//! - [`pipeline`] — the wgpu resources and the eight passes.
 //! - [`settle`] — the blend that turns this picture into the reference's when
 //!   nothing is moving, in bytes.
 //! - [`blend`] — the same mix on the device, so a standing frame crosses the
@@ -463,6 +483,31 @@ pub struct Scene {
     pub bounds: ([f64; 3], [f64; 3]),
     /// The authored exposure, before the meter's multiplier.
     pub exposure: f32,
+    /// The analytic sky the level hangs under, if it has one.
+    ///
+    /// [`None`] is what this tier did before there was a sky model: every
+    /// direction lookup falls back to the probe volume's own low-frequency
+    /// read and the background is the horizon's colour. The datasheet ball is
+    /// still drawn that way, which is what keeps its parity numbers pinned to
+    /// the studio rig they were measured under.
+    ///
+    /// It is [`kosm_render::env::SkyEnv`] itself and not a copy of its
+    /// fields: the tracer holds the same value, so the two tiers cannot drift
+    /// apart about what the sky is.
+    pub sky: Option<kosm_render::env::SkyEnv>,
+    /// The haze. `density` zero — the default — is no aerial perspective.
+    pub air: kosm_render::post::Aerial,
+    /// The world radius the screen-space occlusion looks for geometry in,
+    /// metres, and how much of what it finds is applied.
+    pub ao_radius_m: f32,
+    pub ao_strength: f32,
+    /// How much of the lens's `cos⁴` falloff the post pass applies, 0 to 1.
+    pub vignette: f32,
+    /// The bloom: the exposed luminance a pixel has to pass to bleed, what
+    /// fraction of the blur comes back, and its σ in full-size pixels.
+    pub bloom_threshold: f32,
+    pub bloom_strength: f32,
+    pub bloom_radius_px: f32,
 }
 
 impl Scene {
@@ -487,6 +532,17 @@ impl Scene {
                 caustics: Vec::new(),
                 bounds,
                 exposure: 0.7,
+                // Everything a level has to ask for is off here, so a scene
+                // built without a word about light draws exactly what this
+                // tier drew before any of it existed.
+                sky: None,
+                air: kosm_render::post::Aerial::default(),
+                ao_radius_m: 0.3,
+                ao_strength: 0.0,
+                vignette: 0.0,
+                bloom_threshold: 1.0,
+                bloom_strength: 0.0,
+                bloom_radius_px: 6.0,
             },
             by_name,
         )

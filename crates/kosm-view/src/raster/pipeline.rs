@@ -50,7 +50,50 @@ struct Uniforms {
     caustic_v: [[f32; 4]; 2],
     caustic_flags: [f32; 4],
     band_to_rgb: [[f32; 4]; 6],
+    inv_view_proj: [f32; 16],
+    sky_a: [f32; 4],
+    sky_ground: [f32; 4],
+    air: [f32; 4],
+    screen: [f32; 4],
+    shadow_m: [f32; 4],
 }
+
+/// What the ambient-occlusion pass and its two blurs read. See
+/// `shaders/ao.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct AoUniforms {
+    view_proj: [f32; 16],
+    inv_view_proj: [f32; 16],
+    size: [f32; 4],
+    knobs: [f32; 4],
+    eye: [f32; 4],
+}
+
+/// What the bloom's three passes and the resolve read. See
+/// `shaders/post.wgsl`; [`kosm_render::post::Post`] is the same chain in Rust.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct PostUniforms {
+    lens: [f32; 4],
+    bloom: [f32; 4],
+    size: [f32; 4],
+}
+
+/// The linear HDR the scene pass writes and the post pass reads.
+///
+/// `Rgba16Float` and not `Rgba8Unorm`: the whole point of moving the tonemap
+/// into its own pass is that the bloom threshold and the vignette act on
+/// *radiance*, and a sunlit rim at forty times the exposure does not fit in a
+/// byte. Half a float carries three decimal digits over sixty stops, which is
+/// more than a one-sample-per-pixel reference has.
+const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// How much the ambient occlusion and the bloom are shrunk before they are
+/// computed. Both are low frequencies by construction — an integral over a
+/// hemisphere and a wide blur — and both cost their resolution squared.
+const AO_SHRINK: u32 = 2;
+const BLOOM_SHRINK: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -138,25 +181,84 @@ struct MeshGpu {
 }
 
 /// The tier's GPU resources.
+///
+/// # The pass chain
+///
+/// ```text
+/// shadow    2048² depth along the sun, orthographic over the level
+/// prepass   camera depth, geometry only — no fragment stage at all
+/// ao        half-res occlusion off that depth, then two bilateral blurs
+/// sky       a full-screen Preetham lookup, and the sun's disc, into HDR
+/// scene     the shading, over the prepass's depth, into the same HDR
+/// bright    quarter-res threshold of the exposed, vignetted HDR
+/// blur ×2   a separable Gaussian over it
+/// resolve   exposure, vignette, bloom, ACES, sRGB → the byte the window shows
+/// ```
+///
+/// The prepass earns its keep twice: it is what the occlusion is computed
+/// from, and it turns the scene pass's depth test into `LessEqual` with no
+/// writes, so the expensive fragment shader runs once per visible pixel
+/// instead of once per drawn triangle over it.
 pub struct Raster {
     pipeline: wgpu::RenderPipeline,
+    prepass_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
+    ao_pipeline: wgpu::RenderPipeline,
+    ao_blur_pipeline: wgpu::RenderPipeline,
+    bright_pipeline: wgpu::RenderPipeline,
+    bloom_blur_pipeline: wgpu::RenderPipeline,
+    resolve_pipeline: wgpu::RenderPipeline,
+
     uniforms: wgpu::Buffer,
     shadow_uniforms: wgpu::Buffer,
+    /// The occlusion pass and its two blurs, one buffer each: the three differ
+    /// only in the blur's step, and a single buffer rewritten between them
+    /// would not work — every `write_buffer` of a submission lands before any
+    /// of its passes run.
+    ao_uniforms: [wgpu::Buffer; 3],
+    /// Likewise for the bright pass, the two blurs and the resolve.
+    post_uniforms: [wgpu::Buffer; 4],
     materials: wgpu::Buffer,
     probes: wgpu::Buffer,
     probe_inside: wgpu::Buffer,
-    bind: wgpu::BindGroup,
+
+    layout: wgpu::BindGroupLayout,
+    bind: Option<wgpu::BindGroup>,
     shadow_bind: wgpu::BindGroup,
+    ao_layout: wgpu::BindGroupLayout,
+    /// Three bind groups over two ping-ponged occlusion buffers, so no pass
+    /// ever has the texture it writes bound for reading.
+    ao_binds: Vec<wgpu::BindGroup>,
+    post_layout: wgpu::BindGroupLayout,
+    post_binds: Vec<wgpu::BindGroup>,
     blit_layout: wgpu::BindGroupLayout,
     blit_bind: Option<wgpu::BindGroup>,
+
+    compare_sampler: wgpu::Sampler,
+    linear_sampler: wgpu::Sampler,
     blit_sampler: wgpu::Sampler,
     shadow_map: wgpu::TextureView,
     caustic_tex: wgpu::Texture,
     caustic_res: (u32, u32),
     meshes: Vec<MeshGpu>,
-    colour: Option<(Arc<wgpu::Texture>, wgpu::TextureView, wgpu::TextureView, u32, u32)>,
+    targets: Option<Targets>,
+}
+
+/// Everything whose size is the frame's.
+struct Targets {
+    size: (u32, u32),
+    /// The byte the window shows, and what `read_back` and the settle blend
+    /// take: `Rgba8Unorm` holding already-sRGB bytes.
+    colour: Arc<wgpu::Texture>,
+    colour_view: wgpu::TextureView,
+    hdr: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    ao: [wgpu::TextureView; 2],
+    bloom: [wgpu::TextureView; 2],
+    ao_size: (u32, u32),
+    bloom_size: (u32, u32),
 }
 
 impl Raster {
@@ -188,19 +290,40 @@ impl Raster {
             label: Some("raster shadow"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shadow.wgsl").into()),
         });
+        let ao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("raster ao"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ao.wgsl").into()),
+        });
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("raster post"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/post.wgsl").into()),
+        });
 
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raster uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let shadow_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raster shadow uniforms"),
-            size: std::mem::size_of::<ShadowUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let uniform_buffer = |label, size| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let uniforms = uniform_buffer("raster uniforms", std::mem::size_of::<Uniforms>() as u64);
+        let shadow_uniforms =
+            uniform_buffer("raster shadow uniforms", std::mem::size_of::<ShadowUniforms>() as u64);
+        let ao_size = std::mem::size_of::<AoUniforms>() as u64;
+        let ao_uniforms = [
+            uniform_buffer("raster ao", ao_size),
+            uniform_buffer("raster ao blur x", ao_size),
+            uniform_buffer("raster ao blur y", ao_size),
+        ];
+        let post_size = std::mem::size_of::<PostUniforms>() as u64;
+        let post_uniforms = [
+            uniform_buffer("raster bright", post_size),
+            uniform_buffer("raster bloom blur x", post_size),
+            uniform_buffer("raster bloom blur y", post_size),
+            uniform_buffer("raster resolve", post_size),
+        ];
+
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raster materials"),
             contents: bytemuck::cast_slice(&scene.materials),
@@ -235,11 +358,7 @@ impl Raster {
 
         // The caustic receivers: one array layer per rectangle, always two, so
         // a frame with no map binds the same pipeline as a frame with one.
-        let caustic_res = scene
-            .caustics
-            .first()
-            .map(|q| q.res)
-            .unwrap_or((4, 4));
+        let caustic_res = scene.caustics.first().map(|q| q.res).unwrap_or((4, 4));
         let caustic_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("raster caustics"),
             size: wgpu::Extent3d {
@@ -266,16 +385,7 @@ impl Raster {
                 uniform_entry(0),
                 storage_entry(1),
                 storage_entry(2),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                depth_texture_entry(3),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -292,16 +402,13 @@ impl Raster {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                filtering_sampler_entry(6),
                 storage_entry(7),
+                float_texture_entry(8),
+                filtering_sampler_entry(9),
             ],
         });
-        let compare = device.create_sampler(&wgpu::SamplerDescriptor {
+        let compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("raster shadow sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -310,38 +417,21 @@ impl Raster {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("raster caustic sampler"),
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("raster linear sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("raster"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: materials.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: probes.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&shadow_map),
-                },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&compare) },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(
-                        &caustic_tex.create_view(&wgpu::TextureViewDescriptor {
-                            dimension: Some(wgpu::TextureViewDimension::D2Array),
-                            ..Default::default()
-                        }),
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&linear) },
-                wgpu::BindGroupEntry { binding: 7, resource: probe_inside.as_entire_binding() },
-            ],
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("raster depth sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
 
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -352,6 +442,20 @@ impl Raster {
             label: Some("raster shadow"),
             layout: &shadow_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: shadow_uniforms.as_entire_binding() }],
+        });
+
+        let ao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raster ao"),
+            entries: &[uniform_entry(0), depth_texture_entry(1), float_texture_entry(2)],
+        });
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raster post"),
+            entries: &[
+                uniform_entry(0),
+                float_texture_entry(1),
+                float_texture_entry(2),
+                filtering_sampler_entry(3),
+            ],
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
@@ -380,6 +484,35 @@ impl Raster {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+        let depth_state = |write: bool, compare: wgpu::CompareFunction| {
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(write),
+                depth_compare: Some(compare),
+                stencil: Default::default(),
+                bias: Default::default(),
+            })
+        };
+        // **The prepass and the scene pass must agree to the bit.** Same
+        // vertex entry, same matrices, same swell — so `LessEqual` accepts
+        // exactly the fragments the prepass kept, and nothing z-fights with
+        // its own depth.
+        let prepass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("raster prepass"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: depth_state(true, wgpu::CompareFunction::Less),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raster"),
             layout: Some(&pl),
@@ -393,7 +526,7 @@ impl Raster {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: HDR,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -403,13 +536,35 @@ impl Raster {
             // this and the cove's are no better — so nothing is culled and
             // the fragment stage flips a normal that faces away.
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
+            depth_stencil: depth_state(false, wgpu::CompareFunction::LessEqual),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("raster sky"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_sky"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_sky"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
             }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
@@ -431,72 +586,86 @@ impl Raster {
             },
             fragment: None,
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
+            depth_stencil: depth_state(true, wgpu::CompareFunction::Less),
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
         });
 
+        let full_screen_vs = |label: &str,
+                              module: &wgpu::ShaderModule,
+                              bgl: &wgpu::BindGroupLayout,
+                              vs: &str,
+                              entry: &str,
+                              format: wgpu::TextureFormat| {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let full_screen = |label: &str,
+                           module: &wgpu::ShaderModule,
+                           bgl: &wgpu::BindGroupLayout,
+                           entry: &str,
+                           format: wgpu::TextureFormat| {
+            full_screen_vs(label, module, bgl, "vs", entry, format)
+        };
+        let ao_pipeline = full_screen("raster ao", &ao_shader, &ao_layout, "fs_ao", AO_FORMAT);
+        let ao_blur_pipeline =
+            full_screen("raster ao blur", &ao_shader, &ao_layout, "fs_blur", AO_FORMAT);
+        let bright_pipeline =
+            full_screen("raster bright", &post_shader, &post_layout, "fs_bright", HDR);
+        let bloom_blur_pipeline =
+            full_screen("raster bloom blur", &post_shader, &post_layout, "fs_blur", HDR);
+        let resolve_pipeline = full_screen(
+            "raster resolve",
+            &post_shader,
+            &post_layout,
+            "fs_resolve",
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raster blit"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+            entries: &[float_texture_entry(0), filtering_sampler_entry(1)],
         });
-        let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("raster blit"),
-            bind_group_layouts: &[Some(&blit_layout)],
-            immediate_size: 0,
-        });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("raster blit"),
-            layout: Some(&blit_pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_blit"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_blit"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let blit_pipeline = full_screen_vs(
+            "raster blit",
+            &shader,
+            &blit_layout,
+            "vs_blit",
+            "fs_blit",
+            target_format,
+        );
 
         let mut meshes = Vec::with_capacity(scene.meshes.len());
         for mesh in &scene.meshes {
@@ -523,23 +692,39 @@ impl Raster {
 
         let mut me = Self {
             pipeline,
+            prepass_pipeline,
+            sky_pipeline,
             shadow_pipeline,
             blit_pipeline,
+            ao_pipeline,
+            ao_blur_pipeline,
+            bright_pipeline,
+            bloom_blur_pipeline,
+            resolve_pipeline,
             uniforms,
             shadow_uniforms,
+            ao_uniforms,
+            post_uniforms,
             materials,
             probes,
             probe_inside,
-            bind,
+            layout,
+            bind: None,
             shadow_bind,
+            ao_layout,
+            ao_binds: Vec::new(),
+            post_layout,
+            post_binds: Vec::new(),
             blit_layout,
             blit_bind: None,
-            blit_sampler: linear,
+            compare_sampler,
+            linear_sampler,
+            blit_sampler: nearest_sampler,
             shadow_map,
             caustic_tex,
             caustic_res,
             meshes,
-            colour: None,
+            targets: None,
         };
         me.upload_caustics(queue, &scene.caustics);
         Ok(me)
@@ -622,14 +807,154 @@ impl Raster {
             bytemuck::bytes_of(&ShadowUniforms { sun_view_proj: fr.view_proj }),
         );
 
+        let vp = view_proj(&frame.camera, w as f32 / h as f32);
+        let inv = invert4(&vp);
+        self.write_uniforms(queue, scene, frame, (w, h), &vp, &inv, &fr);
+
+        // the instances, grown where a mesh has more copies than it had
+        let mut counts = Vec::with_capacity(self.meshes.len());
+        for (g, mesh) in self.meshes.iter_mut().zip(scene.meshes.iter()) {
+            let n = mesh.instances.len() as u32;
+            if n > g.cap {
+                g.inst = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("raster instances"),
+                    size: (n as usize * std::mem::size_of::<Instance>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                g.cap = n;
+            }
+            if n > 0 {
+                queue.write_buffer(&g.inst, 0, bytemuck::cast_slice(&mesh.instances));
+            }
+            counts.push(n);
+        }
+
+        let t = self.targets.as_ref().expect("target");
+        let out = t.colour.clone();
+        let bind = self.bind.as_ref().expect("bind group");
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("raster"),
+        });
+
+        // ── the sun's own depth ────────────────────────────────────────────
+        {
+            let mut pass = depth_pass(&mut enc, "raster shadow", &self.shadow_map);
+            pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, &self.shadow_bind, &[]);
+            draw_meshes(&mut pass, &self.meshes, &counts);
+        }
+        // ── the camera's, so the occlusion has something to read and the
+        //    shading runs once a pixel ──────────────────────────────────────
+        {
+            let mut pass = depth_pass(&mut enc, "raster prepass", &t.depth);
+            pass.set_pipeline(&self.prepass_pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            draw_meshes(&mut pass, &self.meshes, &counts);
+        }
+        // ── the occlusion, and two bilateral blurs over it ─────────────────
+        if scene.ao_strength > 0.0 && self.ao_binds.len() == 3 {
+            for (i, (pipeline, target)) in [
+                (&self.ao_pipeline, 0usize),
+                (&self.ao_blur_pipeline, 1),
+                (&self.ao_blur_pipeline, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut pass = colour_pass(&mut enc, "raster ao", &t.ao[target]);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.ao_binds[i], &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
+        // ── the sky, then the shading over it ──────────────────────────────
+        {
+            let mut pass = colour_pass(&mut enc, "raster sky", &t.hdr);
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("raster scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.hdr,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // the sky pass already painted what a ray that hits
+                        // nothing shows, so this loads rather than clears
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            draw_meshes(&mut pass, &self.meshes, &counts);
+        }
+        // ── the film ───────────────────────────────────────────────────────
+        if scene.bloom_strength > 0.0 && self.post_binds.len() == 4 {
+            for (i, (pipeline, target)) in [
+                (&self.bright_pipeline, 0usize),
+                (&self.bloom_blur_pipeline, 1),
+                (&self.bloom_blur_pipeline, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut pass = colour_pass(&mut enc, "raster bloom", &t.bloom[target]);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.post_binds[i], &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
+        {
+            let mut pass = colour_pass(&mut enc, "raster resolve", &t.colour_view);
+            pass.set_pipeline(&self.resolve_pipeline);
+            pass.set_bind_group(0, &self.post_binds[3], &[]);
+            pass.draw(0..4, 0..1);
+        }
+        queue.submit([enc.finish()]);
+        out
+    }
+
+    /// Every uniform block the chain reads, written for this frame.
+    #[allow(clippy::too_many_arguments)]
+    fn write_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        frame: &Frame,
+        size: (u32, u32),
+        vp: &[f32; 16],
+        inv: &[f32; 16],
+        fr: &super::shadow::Frustum,
+    ) {
+        let (w, h) = size;
         let d = scene.sun.direction;
         let irr = scene.sun.irradiance;
         let po = scene.probes.origin;
         let dims = scene.probes.dims;
         let m = super::band_to_rgb();
         let sea = scene.sea.unwrap_or(super::Sea::cove(0.0, 0.0, 0.0, 1.0));
+        let half_h = (frame.camera.fov_deg.to_radians() * 0.5).tan() as f32;
+        let half_w = half_h * w as f32 / h as f32;
+        let sky = scene.sky;
         let u = Uniforms {
-            view_proj: view_proj(&frame.camera, w as f32 / h as f32),
+            view_proj: *vp,
             sun_view_proj: fr.view_proj,
             eye: [
                 frame.camera.eye.x as f32,
@@ -684,110 +1009,81 @@ impl Raster {
                 [m[4][0], m[4][1], m[4][2], 0.0],
                 [m[5][0], m[5][1], m[5][2], 0.0],
             ],
+            inv_view_proj: *inv,
+            sky_a: sky.map_or([2.5, 1.0, 0.0, 0.02], |s| {
+                [s.turbidity, s.scale, s.intensity, s.sun_radius]
+            }),
+            sky_ground: sky.map_or([0.0; 4], |s| {
+                [s.ground_albedo[0], s.ground_albedo[1], s.ground_albedo[2], 1.0]
+            }),
+            air: [
+                if sky.is_some() { scene.air.density } else { 0.0 },
+                scene.air.scale_h,
+                scene.ao_radius_m,
+                scene.ao_strength,
+            ],
+            screen: [w as f32, h as f32, half_w, half_h],
+            shadow_m: [
+                fr.texel_m * SHADOW as f32,
+                fr.depth_m,
+                (scene.sun.angular_radius as f32).tan(),
+                fr.texel_m,
+            ],
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
-        // the instances, grown where a mesh has more copies than it had
-        let mut counts = Vec::with_capacity(self.meshes.len());
-        for (g, mesh) in self.meshes.iter_mut().zip(scene.meshes.iter()) {
-            let n = mesh.instances.len() as u32;
-            if n > g.cap {
-                g.inst = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("raster instances"),
-                    size: (n as usize * std::mem::size_of::<Instance>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                g.cap = n;
-            }
-            if n > 0 {
-                queue.write_buffer(&g.inst, 0, bytemuck::cast_slice(&mesh.instances));
-            }
-            counts.push(n);
+        let Some(t) = self.targets.as_ref() else { return };
+        let ao = AoUniforms {
+            view_proj: *vp,
+            inv_view_proj: *inv,
+            size: [t.ao_size.0 as f32, t.ao_size.1 as f32, w as f32, h as f32],
+            knobs: [scene.ao_radius_m, 0.02, 0.0, 0.0],
+            eye: [
+                frame.camera.eye.x as f32,
+                frame.camera.eye.y as f32,
+                frame.camera.eye.z as f32,
+                0.0,
+            ],
+        };
+        for (i, step) in [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]].into_iter().enumerate() {
+            let mut u = ao;
+            u.knobs[2] = step[0];
+            u.knobs[3] = step[1];
+            queue.write_buffer(&self.ao_uniforms[i], 0, bytemuck::bytes_of(&u));
         }
 
-        let (tex, cv, dv, _, _) = self.colour.as_ref().expect("target");
-        let out = tex.clone();
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("raster"),
-        });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("raster shadow"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_map,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.shadow_bind, &[]);
-            for (g, n) in self.meshes.iter().zip(counts.iter().copied()) {
-                if n == 0 || g.n == 0 {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, g.vb.slice(..));
-                pass.set_vertex_buffer(1, g.inst.slice(..));
-                pass.draw(0..g.n, 0..n);
-            }
+        let lens = [frame.exposure, scene.vignette, half_w, half_h];
+        let sigma = scene.bloom_radius_px / BLOOM_SHRINK as f32;
+        let full = [w as f32, h as f32, 0.0, 0.0];
+        let quarter = |step: [f32; 2]| {
+            [t.bloom_size.0 as f32, t.bloom_size.1 as f32, step[0], step[1]]
+        };
+        let blocks = [
+            PostUniforms { lens, bloom: [scene.bloom_threshold, 0.0, sigma, 0.0], size: full },
+            PostUniforms {
+                lens,
+                bloom: [scene.bloom_threshold, 0.0, sigma, 0.0],
+                size: quarter([1.0, 0.0]),
+            },
+            PostUniforms {
+                lens,
+                bloom: [scene.bloom_threshold, 0.0, sigma, 0.0],
+                size: quarter([0.0, 1.0]),
+            },
+            PostUniforms {
+                lens,
+                bloom: [scene.bloom_threshold, scene.bloom_strength, sigma, 0.0],
+                size: full,
+            },
+        ];
+        for (buffer, block) in self.post_uniforms.iter().zip(blocks.iter()) {
+            queue.write_buffer(buffer, 0, bytemuck::bytes_of(block));
         }
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("raster scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: cv,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // The sky, already sRGB-encoded: the clear is what a
-                        // ray that hits nothing shows, and on this tier that
-                        // is the level's horizon colour rather than black.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.62,
-                            g: 0.76,
-                            b: 0.92,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: dv,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind, &[]);
-            for (g, n) in self.meshes.iter().zip(counts.iter().copied()) {
-                if n == 0 || g.n == 0 {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, g.vb.slice(..));
-                pass.set_vertex_buffer(1, g.inst.slice(..));
-                pass.draw(0..g.n, 0..n);
-            }
-        }
-        queue.submit([enc.finish()]);
-        out
     }
 
     /// The colour target, for a caller that wants to read it back.
     pub fn texture(&self) -> Option<Arc<wgpu::Texture>> {
-        self.colour.as_ref().map(|(t, ..)| t.clone())
+        self.targets.as_ref().map(|t| t.colour.clone())
     }
 
     /// Paint the last drawn frame into an existing render pass — the egui
@@ -801,11 +1097,25 @@ impl Raster {
     }
 
     fn ensure_target(&mut self, device: &wgpu::Device, w: u32, h: u32) {
-        if let Some((_, _, _, cw, ch)) = &self.colour {
-            if *cw == w && *ch == h {
-                return;
-            }
+        if self.targets.as_ref().map(|t| t.size) == Some((w, h)) {
+            return;
         }
+        let ao_size = ((w / AO_SHRINK).max(1), (h / AO_SHRINK).max(1));
+        let bloom_size = ((w / BLOOM_SHRINK).max(1), (h / BLOOM_SHRINK).max(1));
+        let attach = |label: &str, size: (u32, u32), format, extra| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | extra,
+                view_formats: &[],
+            })
+        };
         let colour = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("raster colour"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -819,35 +1129,311 @@ impl Raster {
             // the viewport blits an already-sRGB image through an sRGB view
             view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
         });
-        let depth = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("raster depth"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let cv = colour.create_view(&wgpu::TextureViewDescriptor {
+        let hdr = attach("raster hdr", (w, h), HDR, wgpu::TextureUsages::empty());
+        // **The depth is stored, not discarded.** The occlusion pass reads it
+        // as a texture between the prepass and the shading, which is the whole
+        // reason there is a prepass.
+        let depth = attach(
+            "raster depth",
+            (w, h),
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::empty(),
+        );
+        let ao_a = attach("raster ao a", ao_size, AO_FORMAT, wgpu::TextureUsages::empty());
+        let ao_b = attach("raster ao b", ao_size, AO_FORMAT, wgpu::TextureUsages::empty());
+        let bloom_a = attach("raster bloom a", bloom_size, HDR, wgpu::TextureUsages::empty());
+        let bloom_b = attach("raster bloom b", bloom_size, HDR, wgpu::TextureUsages::empty());
+
+        let colour_view = colour.create_view(&wgpu::TextureViewDescriptor {
             format: Some(wgpu::TextureFormat::Rgba8Unorm),
             ..Default::default()
         });
-        let dv = depth.create_view(&Default::default());
+        let hdr_view = hdr.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let ao_views = [ao_a.create_view(&Default::default()), ao_b.create_view(&Default::default())];
+        let bloom_views =
+            [bloom_a.create_view(&Default::default()), bloom_b.create_view(&Default::default())];
+
+        // The scene's own bind group carries the occlusion, so it is remade
+        // whenever the frame changes size.
+        self.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raster"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.materials.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.probes.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow_map),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.compare_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.caustic_tex.create_view(&wgpu::TextureViewDescriptor {
+                            dimension: Some(wgpu::TextureViewDimension::D2Array),
+                            ..Default::default()
+                        }),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+                wgpu::BindGroupEntry { binding: 7, resource: self.probe_inside.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&ao_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+            ],
+        }));
+
+        // **No pass reads the texture it writes.** The occlusion goes into
+        // `a` while `b` is bound, the first blur into `b` while `a` is bound,
+        // the second back into `a`.
+        let ao_bind = |i: usize, read: usize| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raster ao"),
+                layout: &self.ao_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ao_uniforms[i].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&ao_views[read]),
+                    },
+                ],
+            })
+        };
+        self.ao_binds = vec![ao_bind(0, 1), ao_bind(1, 0), ao_bind(2, 1)];
+
+        let post_bind = |i: usize, bloom: usize| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raster post"),
+                layout: &self.post_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.post_uniforms[i].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&hdr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&bloom_views[bloom]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                    },
+                ],
+            })
+        };
+        self.post_binds = vec![post_bind(0, 1), post_bind(1, 0), post_bind(2, 1), post_bind(3, 0)];
+
         self.blit_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raster blit"),
             layout: &self.blit_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cv) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&colour_view),
+                },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
                 },
             ],
         }));
-        self.colour = Some((Arc::new(colour), cv, dv, w, h));
+
+        self.targets = Some(Targets {
+            size: (w, h),
+            colour: Arc::new(colour),
+            colour_view,
+            hdr: hdr_view,
+            depth: depth_view,
+            ao: ao_views,
+            bloom: bloom_views,
+            ao_size,
+            bloom_size,
+        });
     }
 }
+
+/// The occlusion's own format. One channel, eight bits: an ambient term is a
+/// number between nought and one that a bilateral blur has already smoothed,
+/// and a code of it is a thousandth of a stop.
+const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// A depth-only pass over a view, clearing it.
+fn depth_pass<'a>(
+    enc: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    view: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// A colour-only pass over a view, cleared to black. Every full-screen pass in
+/// the chain writes every pixel, so the clear is a formality that keeps a
+/// tile-based GPU from loading the old contents first.
+fn colour_pass<'a>(
+    enc: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    view: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// Every mesh with an instance, into whichever pass is open.
+fn draw_meshes(pass: &mut wgpu::RenderPass<'_>, meshes: &[MeshGpu], counts: &[u32]) {
+    for (g, n) in meshes.iter().zip(counts.iter().copied()) {
+        if n == 0 || g.n == 0 {
+            continue;
+        }
+        pass.set_vertex_buffer(0, g.vb.slice(..));
+        pass.set_vertex_buffer(1, g.inst.slice(..));
+        pass.draw(0..g.n, 0..n);
+    }
+}
+
+/// The inverse of a column-major 4×4, by cofactors.
+///
+/// The sky pass needs it to turn a clip-space corner back into a world
+/// direction, and the occlusion pass to turn a depth texel back into the point
+/// behind it. Both must be the inverse of *this frame's* matrix and not of a
+/// look-at rebuilt from the eye: the rig can roll, and a reconstruction would
+/// quietly level the horizon under the geometry drawn over it.
+pub fn invert4(m: &[f32; 16]) -> [f32; 16] {
+    let a = |c: usize, r: usize| m[c * 4 + r] as f64;
+    let mut inv = [0.0f64; 16];
+    let s0 = a(0, 0) * a(1, 1) - a(1, 0) * a(0, 1);
+    let s1 = a(0, 0) * a(1, 2) - a(1, 0) * a(0, 2);
+    let s2 = a(0, 0) * a(1, 3) - a(1, 0) * a(0, 3);
+    let s3 = a(0, 1) * a(1, 2) - a(1, 1) * a(0, 2);
+    let s4 = a(0, 1) * a(1, 3) - a(1, 1) * a(0, 3);
+    let s5 = a(0, 2) * a(1, 3) - a(1, 2) * a(0, 3);
+    let c5 = a(2, 2) * a(3, 3) - a(3, 2) * a(2, 3);
+    let c4 = a(2, 1) * a(3, 3) - a(3, 1) * a(2, 3);
+    let c3 = a(2, 1) * a(3, 2) - a(3, 1) * a(2, 2);
+    let c2 = a(2, 0) * a(3, 3) - a(3, 0) * a(2, 3);
+    let c1 = a(2, 0) * a(3, 2) - a(3, 0) * a(2, 2);
+    let c0 = a(2, 0) * a(3, 1) - a(3, 0) * a(2, 1);
+    let det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    if det.abs() < 1e-20 {
+        return super::IDENTITY;
+    }
+    let d = 1.0 / det;
+    inv[0] = (a(1, 1) * c5 - a(1, 2) * c4 + a(1, 3) * c3) * d;
+    inv[1] = (-a(0, 1) * c5 + a(0, 2) * c4 - a(0, 3) * c3) * d;
+    inv[2] = (a(3, 1) * s5 - a(3, 2) * s4 + a(3, 3) * s3) * d;
+    inv[3] = (-a(2, 1) * s5 + a(2, 2) * s4 - a(2, 3) * s3) * d;
+    inv[4] = (-a(1, 0) * c5 + a(1, 2) * c2 - a(1, 3) * c1) * d;
+    inv[5] = (a(0, 0) * c5 - a(0, 2) * c2 + a(0, 3) * c1) * d;
+    inv[6] = (-a(3, 0) * s5 + a(3, 2) * s2 - a(3, 3) * s1) * d;
+    inv[7] = (a(2, 0) * s5 - a(2, 2) * s2 + a(2, 3) * s1) * d;
+    inv[8] = (a(1, 0) * c4 - a(1, 1) * c2 + a(1, 3) * c0) * d;
+    inv[9] = (-a(0, 0) * c4 + a(0, 1) * c2 - a(0, 3) * c0) * d;
+    inv[10] = (a(3, 0) * s4 - a(3, 1) * s2 + a(3, 3) * s0) * d;
+    inv[11] = (-a(2, 0) * s4 + a(2, 1) * s2 - a(2, 3) * s0) * d;
+    inv[12] = (-a(1, 0) * c3 + a(1, 1) * c1 - a(1, 2) * c0) * d;
+    inv[13] = (a(0, 0) * c3 - a(0, 1) * c1 + a(0, 2) * c0) * d;
+    inv[14] = (-a(3, 0) * s3 + a(3, 1) * s1 - a(3, 2) * s0) * d;
+    inv[15] = (a(2, 0) * s3 - a(2, 1) * s1 + a(2, 2) * s0) * d;
+    // **The accessor and the layout cancel, and the result is copied
+    // straight through.** `a(i, j)` reads element `(j, i)` of a column-major
+    // matrix, so the cofactors above are those of `Mᵀ` and `inv` holds
+    // `(Mᵀ)⁻¹ = (M⁻¹)ᵀ` in the row-major order the classic listing writes.
+    // A row-major `(M⁻¹)ᵀ` and a column-major `M⁻¹` are the same sixteen
+    // floats in the same order — transposing here once *more* was the bug
+    // that drew the sky with a diagonal horizon.
+    let mut out = [0.0f32; 16];
+    for k in 0..16 {
+        out[k] = inv[k] as f32;
+    }
+    out
+}
+
+fn depth_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn float_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn filtering_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
 
 fn quad_vec4(quads: &[CausticQuad], f: impl Fn(&CausticQuad) -> [f64; 3]) -> [[f32; 4]; 2] {
     let mut out = [[0.0f32; 4]; 2];
@@ -970,7 +1556,11 @@ mod tests {
     /// sixteen-byte boundary and 528 bytes all told.
     #[test]
     fn the_uniform_block_is_the_shaders() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 528);
+        // 528 was the block before the sky, the air and the film's own pass;
+        // the six additions are a 4×4 and five `vec4`s.
+        assert_eq!(std::mem::size_of::<Uniforms>(), 528 + 64 + 5 * 16);
+        assert_eq!(std::mem::size_of::<AoUniforms>() % 16, 0);
+        assert_eq!(std::mem::size_of::<PostUniforms>(), 48);
         assert_eq!(std::mem::size_of::<Uniforms>() % 16, 0);
         assert_eq!(std::mem::size_of::<Instance>(), 96);
         assert_eq!(std::mem::size_of::<super::super::GpuMaterial>(), 112);
@@ -994,6 +1584,61 @@ mod tests {
             assert!(
                 (back - x).abs() <= 1e-3 * x.abs().max(1e-3),
                 "{x} came back {back}"
+            );
+        }
+    }
+
+    /// **The inverse is the inverse, in the layout the caller handed over.**
+    ///
+    /// The sky pass turns a clip-space corner back into a world direction with
+    /// it and the occlusion pass turns a depth texel back into a point, so an
+    /// inverse that came back transposed is a picture drawn under a different
+    /// camera from the geometry over it — which is exactly what it looked
+    /// like: a horizon at forty degrees behind a level beach.
+    #[test]
+    fn the_inverse_undoes_the_projection() {
+        let cam = kosm_render::Camera::look_at(
+            Point3::new(2.0, -3.0, 1.5),
+            Point3::new(0.0, 0.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            50.0,
+        );
+        let m = view_proj(&cam, 16.0 / 9.0);
+        let inv = invert4(&m);
+        // M⁻¹ M is the identity, to a float's precision
+        for c in 0..4 {
+            for r in 0..4 {
+                let mut s = 0.0f32;
+                for k in 0..4 {
+                    s += inv[k * 4 + r] * m[c * 4 + k];
+                }
+                let want = if c == r { 1.0 } else { 0.0 };
+                assert!((s - want).abs() < 1e-4, "({r},{c}) is {s}, not {want}");
+            }
+        }
+        // and the round trip a sky pixel takes: a clip corner back to a world
+        // direction, and that direction forward again to the same corner
+        for ndc in [[0.0f32, 0.0], [0.7, -0.4], [-1.0, 1.0]] {
+            let un = |z: f32| {
+                let mut o = [0.0f32; 4];
+                for r in 0..4 {
+                    o[r] = inv[r] * ndc[0] + inv[4 + r] * ndc[1] + inv[8 + r] * z + inv[12 + r];
+                }
+                [o[0] / o[3], o[1] / o[3], o[2] / o[3]]
+            };
+            let (a, b) = (un(0.0), un(1.0));
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let p = [a[0] + d[0] * 0.05, a[1] + d[1] * 0.05, a[2] + d[2] * 0.05];
+            let mut clip = [0.0f32; 4];
+            for r in 0..4 {
+                clip[r] = m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r];
+            }
+            assert!(
+                (clip[0] / clip[3] - ndc[0]).abs() < 1e-3
+                    && (clip[1] / clip[3] - ndc[1]).abs() < 1e-3,
+                "{ndc:?} came back ({}, {})",
+                clip[0] / clip[3],
+                clip[1] / clip[3]
             );
         }
     }

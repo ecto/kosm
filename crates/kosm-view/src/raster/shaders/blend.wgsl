@@ -3,9 +3,10 @@
 // `settle::present` is this in bytes; this is the same mix without the
 // readback. Both textures are bound as **non-sRGB** views of already-sRGB
 // bytes, so the interpolation happens in code space exactly as the CPU
-// version's does — the two tiers tonemap with the same ACES curve and the same
-// transfer, so a pixel that agrees agrees at every blend, and mixing in linear
-// and re-encoding would be one more place for them to disagree.
+// version's does — both frames have already been through the level's own film,
+// which `kosm_render::post::Post` states once and both tiers apply, so a pixel
+// that agrees agrees at every blend, and mixing in linear and re-encoding would
+// be one more place for them to disagree.
 //
 // The reference is smaller than the raster (the tracer runs at the budget's
 // size and the raster at the window's), and the sampler is linear with
