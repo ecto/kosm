@@ -69,6 +69,16 @@ scripts/publish.sh --dry-run   # preflight + cargo publish --dry-run
 scripts/publish.sh
 ```
 
+A dry run cannot check the whole chain. `cargo publish` packages each crate
+against the live index, so a crate whose workspace upstream this run has not
+really published yet fails with `no matching package named <x> found` — today
+that is `kosm-train`, waiting on `kosm`. The script reports those as deferred
+and still exits 0; a real run never hits it, because by then the upstream is on
+the index. Anything else is a real failure and stops the run.
+
+The script also needs `${CRATES[@]}` indexed without a negative subscript:
+macOS ships bash 3.2, which has none.
+
 ## After ecto/vcad#867 (done)
 
 vcad #867 is what let `kosm-render` leave 0.1.x. It merged, vcad 0.10.0 shipped
