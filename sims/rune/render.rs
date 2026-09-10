@@ -309,7 +309,7 @@ fn hero_geometry(solid: &Solid) -> CoveGeom {
         .map(|i| Point3::new(mesh.vertices[i * 3] as f64, mesh.vertices[i * 3 + 1] as f64, mesh.vertices[i * 3 + 2] as f64))
         .collect();
     let normals = super::hero::stage::smooth_normals(&positions, &mesh.indices);
-    CoveGeom::Brep(BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices)))
+    CoveGeom::Brep(mesh_geom(TriMesh::new(positions, normals, &mesh.indices)))
 }
 
 /// A body → world rotation from its three axes, as columns.
@@ -433,7 +433,7 @@ impl Scene {
         });
 
         let being = Placed {
-            bvh: Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(capsule_mesh(
+            bvh: Arc::new(Bvh::build(CoveGeom::Brep(mesh_geom(capsule_mesh(
                 scene.being_r * PER_M,
                 scene.being_h * PER_M,
                 a.parameter_or("being_segments", 96.0).max(8.0) as usize,
@@ -454,7 +454,7 @@ impl Scene {
         // it. It is built in the door's *shut* world frame, exactly as the
         // door's own parts are, so the one hinge transform carries both and the
         // rim can never drift off the stone it is cut into.
-        let rim = Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(annulus_mesh(
+        let rim = Arc::new(Bvh::build(CoveGeom::Brep(mesh_geom(annulus_mesh(
             Point3::new(
                 scene.door_x * PER_M,
                 (scene.cliff_face_y() - RIM_PROUD_MM * MM) * PER_M,
@@ -466,7 +466,7 @@ impl Scene {
         )))));
         // A capsule whose height is two radii is the sphere, exactly.
         let glint_r = scene.glint_r * PER_M;
-        let glint = Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(capsule_mesh(
+        let glint = Arc::new(Bvh::build(CoveGeom::Brep(mesh_geom(capsule_mesh(
             glint_r,
             2.0 * glint_r,
             a.parameter_or("glint_segments", 32.0).max(8.0) as usize,
@@ -1034,7 +1034,15 @@ fn annulus_mesh(centre: Point3, r_in: f64, r_out: f64, segments: usize) -> TriMe
 /// where the silhouette is a polygon, which is the same trade [`capsule_mesh`]
 /// makes.
 pub fn mesh_geometry(mesh: TriMesh) -> CoveGeom {
-    CoveGeom::Brep(BrepGeom::Mesh(mesh))
+    CoveGeom::Brep(mesh_geom(mesh))
+}
+
+/// `BrepGeom::Mesh`, whose `normals` field is a second copy of what the
+/// `TriMesh` holds — taken back off the mesh so the two can never disagree
+/// about which normals survived construction.
+fn mesh_geom(mesh: TriMesh) -> BrepGeom {
+    let normals = mesh.normals().to_vec();
+    BrepGeom::Mesh { mesh, normals }
 }
 
 pub fn geometry_of(solid: &Solid) -> CoveGeom {
@@ -1054,7 +1062,7 @@ pub fn geometry_of(solid: &Solid) -> CoveGeom {
     } else {
         Vec::new()
     };
-    CoveGeom::Brep(BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices)))
+    CoveGeom::Brep(mesh_geom(TriMesh::new(positions, normals, &mesh.indices)))
 }
 
 /// vcad's placement, as the tracer's. The two are the same 4×4 under
