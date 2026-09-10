@@ -24,16 +24,50 @@
 use kosm_render::gpu::History;
 use vcad_kernel_raytrace::pathtrace::{self, Film};
 
+/// How a camera maps the screen onto directions, re-exported so a caller can
+/// name [`View`]'s own field without reaching past this crate for it. It is
+/// `kosm_render`'s: there is one answer to what a pixel means, and the
+/// renderer owns it.
+pub use kosm_render::pathtrace::Projection;
+
 /// A pose that moved by less than this, in millimetres, did not move.
 const MOVED_MM: f64 = 1.0;
 
 /// …nor did one whose rotation matrix changed by less than this per element.
 const TURNED: f64 = 1e-4;
 
-/// A pinhole view: where the eye is, the screen basis, and the tangent
-/// half-extents of the frustum. Built from `pathtrace::Camera` and a size,
-/// which is exactly what `Camera::ray` uses, so pixel centres agree to the
-/// float.
+/// A view: where the eye is, the screen basis, the half-extents of the frame
+/// and the map those half-extents are measured in. Built from
+/// `pathtrace::Camera` and a size, which is exactly what `Camera::ray` uses,
+/// so pixel centres agree to the float.
+///
+/// ## the half-extents are in the projection's own units
+///
+/// This used to be a pinhole frustum and nothing else: `half_h` was
+/// `tan(fov/2)`, `half_w` that times the aspect, and
+/// [`crate::history`]'s `project` divided by the forward depth. That is the
+/// `r = f·tan θ` map written out, and it is the reason
+/// [`Projection::Equidistant`] was offline-only — a fisheye frame handed to a
+/// history that reprojects through a pinhole smears its own past across the
+/// frame.
+///
+/// So the half-extents are now stated in whatever unit the map measures
+/// screen radius in — **a tangent for the pinhole, radians for the fisheye** —
+/// and both maps read them the same way. Screen coordinates `(sx, sy)` in
+/// `[-1, 1]`:
+///
+/// - [`Projection::Rectilinear`]: the direction is
+///   `forward + right·(sx·half_w) + up·(sy·half_h)`, with `half_h =
+///   tan(fov/2)`. Unmoved, to the bit.
+/// - [`Projection::Equidistant`]: `(u, v) = (sx·half_w, sy·half_h)` are the
+///   *angle* offsets, `θ = |(u, v)|` is the angle from the forward axis and
+///   `(u, v)/θ` its azimuth, with `half_h = fov/2` in radians. That is
+///   `r = f·θ` with `f = 1`, which is `kosm_render`'s generator with the
+///   `half_fov` folded into the extents rather than multiplied at the end.
+///
+/// Both agree at the vertical edge of the frame, because
+/// `kosm_render::Projection` says they must: `sy = 1` is `fov/2` off the axis
+/// under either. What differs is everything between.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct View {
     pub eye: vcad_kernel_math::Point3,
@@ -44,11 +78,24 @@ pub struct View {
     pub half_h: f64,
     pub width: u32,
     pub height: u32,
+    /// How `(sx, sy)` becomes a direction — and how a direction becomes
+    /// `(sx, sy)` again. Part of the identity of a view: a camera that
+    /// changed its map moved every pixel, whatever else stayed still.
+    pub projection: Projection,
 }
 
 impl View {
     pub fn of(cam: &pathtrace::Camera, width: u32, height: u32) -> Self {
-        let half_h = (cam.fov_deg.to_radians() * 0.5).tan();
+        let half = cam.fov_deg.to_radians() * 0.5;
+        let half_h = match cam.projection {
+            // `tan(fov/2)`: the expression this was before the map was a
+            // choice, so every rectilinear view is the one it always was.
+            Projection::Rectilinear => half.tan(),
+            // Radians. `tan` is not merely wrong here, it is unbounded — a
+            // 180° fisheye is a perfectly good camera and `tan(90°)` is not a
+            // number a history can compare.
+            Projection::Equidistant => half,
+        };
         Self {
             eye: cam.eye,
             forward: cam.forward,
@@ -58,10 +105,15 @@ impl View {
             half_h,
             width,
             height,
+            projection: cam.projection,
         }
     }
 
-    /// The same eye and the same frustum, sampled at a different raster size.
+    /// The same eye and the same frame, sampled at a different raster size.
+    ///
+    /// The vertical extent is the map's and does not depend on the raster;
+    /// only the horizontal one, which is the vertical times the aspect. True
+    /// of both maps, which is what lets this stay one line.
     pub fn at_size(&self, width: u32, height: u32) -> Self {
         Self {
             half_w: self.half_h * (width as f64 / height as f64),

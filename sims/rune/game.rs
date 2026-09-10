@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 
 use kosm_render::caustics::CausticMap;
 use kosm_render::math::{Point3, Vec3 as RVec3};
-use kosm_render::pathtrace::{self, Camera, Film, PathTraceOptions};
+use kosm_render::pathtrace::{self, Camera, Film, PathTraceOptions, Projection};
 use super::being::{Cove, Input, Player, Snapshot};
 use super::render::{self as cove_render, PER_M, Placement};
 use super::{CoveScene, bake, hint, rune};
@@ -138,6 +138,24 @@ const TILT_PER_UNIT: f64 = 0.0010;
 /// the door's converged pixels away for it.
 const CAUSTIC_MOVED_M: f64 = 0.01;
 const CAUSTIC_LEANED_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
+
+/// The most presented latency the shutter is allowed to buy, in
+/// milliseconds.
+///
+/// The shutter spends *passes* — a frame is not put on the glass until the
+/// history has folded [`Rig::shutter_passes`] of them — and a pass on this
+/// tier is tens of milliseconds, so an open shutter is latency as directly as
+/// it is blur. A running player who has to wait a fifth of a second to see a
+/// turn is a player who oversteers, and no amount of integrated motion is
+/// worth that. So the fold is capped at whatever fits here, measured against
+/// what a pass is actually costing right now — which is the honest place for
+/// the cap, because the same four passes are 60 ms at a quarter size and 400
+/// at the pretty rung.
+///
+/// A hundred and twenty milliseconds is about three passes of a walking-size
+/// frame on this machine, and it is under the ~150 ms where a mouse turn
+/// starts to feel like it is being negotiated rather than made.
+const SHUTTER_LATENCY_MS: f64 = 120.0;
 
 /// How long the score has to hold above `open_frac`, in simulated seconds.
 const HOLD: f64 = 1.0;
@@ -864,6 +882,45 @@ fn live_photons(a: &kosm::build::Built) -> usize {
     a.parameter_or("caustic_photons_live", 50_000.0).max(0.0) as usize
 }
 
+/// The camera's map, as the *level* says it: `cam_projection`, zero for the
+/// pinhole and anything else for the `f·θ` fisheye.
+///
+/// A number because every resolved knob is a number — the level's knobs are
+/// [`kosm::world::Param`]s and a `Param` holds an `f64`. `--projection` is
+/// the same choice written in words, because nobody types a projection as a
+/// float, and it wins when it is given.
+fn projection_knob(a: &kosm::build::Built) -> Projection {
+    if a.parameter_or("cam_projection", 0.0) > 0.5 {
+        Projection::Equidistant
+    } else {
+        Projection::Rectilinear
+    }
+}
+
+/// `--projection rectilinear|equidistant`. `None` leaves the level's own
+/// `cam_projection` alone.
+fn projection_flag(args: &kosm_cli::Args) -> anyhow::Result<Option<Projection>> {
+    match args.value("projection") {
+        None => Ok(None),
+        Some("rectilinear" | "pinhole" | "flat") => Ok(Some(Projection::Rectilinear)),
+        Some("equidistant" | "fisheye") => Ok(Some(Projection::Equidistant)),
+        Some(other) => {
+            anyhow::bail!("--projection {other}: rectilinear or equidistant")
+        }
+    }
+}
+
+/// `--shutter off|on`. `None` leaves the level's own `cam_shutter` alone,
+/// which is one — open — unless the level says otherwise.
+fn shutter_flag(args: &kosm_cli::Args) -> anyhow::Result<Option<bool>> {
+    match args.value("shutter") {
+        None => Ok(None),
+        Some("off" | "0" | "no") => Ok(Some(false)),
+        Some("on" | "1" | "yes") => Ok(Some(true)),
+        Some(other) => anyhow::bail!("--shutter {other}: on or off"),
+    }
+}
+
 /// One pass of the picture, and the state that carries between passes.
 ///
 /// Split out of the worker so `--shot` runs the same code the window does. A
@@ -904,6 +961,15 @@ struct Tracer {
     meter: Option<Meter>,
     /// The link pivots the hero's parts are placed from. Built once.
     pivots: Vec<phyz_math::Vec3>,
+    /// How this camera maps the screen. Read off the level's
+    /// `cam_projection`, overridable with `--projection`.
+    ///
+    /// It is a property of the *tracer* and not of one pass because it is
+    /// part of the identity of a [`View`]: the history reprojects through it,
+    /// and a map that changed between two passes would be a camera that moved
+    /// every pixel. The still and the window take it the same way, so a
+    /// `--shot` is a picture of what the window would show.
+    projection: Projection,
 }
 
 impl Tracer {
@@ -922,6 +988,7 @@ impl Tracer {
         // this can land.
         set_knob(&mut scene.authored, "caustic_photons", photons as f64);
         let exposure = scene.authored.parameter_or("exposure", 0.7) as f32;
+        let projection = projection_knob(&scene.authored);
         let t0 = Instant::now();
         let mut picture = cove_render::Scene::new(&scene)?;
         // The live body is achromatic. A dispersive surface draws one hero
@@ -975,7 +1042,16 @@ impl Tracer {
             rig_t: None,
             meter: None,
             pivots: cove_render::Scene::hero_pivots(),
+            projection,
         })
+    }
+
+    /// The map the command line asked for, over the one the level names.
+    fn with_projection(mut self, p: Option<Projection>) -> Self {
+        if let Some(p) = p {
+            self.projection = p;
+        }
+        self
     }
 
     /// Give this tracer the follow camera. What the window does and the still
@@ -1052,7 +1128,13 @@ impl Tracer {
     /// retraces pays for it inside its own milliseconds, and a pass that does
     /// not shows the last map, which is what "keep showing the last map while
     /// walking" is.
-    fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit) -> Passed {
+    /// `present` is the shutter: `true` resolves the picture for the glass,
+    /// `false` folds this pass into the history and stops there. A resolve is
+    /// the à-trous filter and a tonemap over the whole frame — a fixed
+    /// seventy to ninety milliseconds — so a shutter that resolved every pass
+    /// it folded would be paying for pictures nobody is ever shown, and would
+    /// cost more frame rate than the fold saves.
+    fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit, present: bool) -> Passed {
         // A size step is a new grid, not a new picture: the history is
         // resampled onto it, keeping the mean, the counts and the guides. That
         // is what lets [`Budget`] change the size while the picture is
@@ -1118,8 +1200,15 @@ impl Tracer {
         // hundred thousand of them is not, and the meter's own second of lag
         // is what is left to smooth.
         let meter = self.meter.get_or_insert_with(|| Meter::calibrated(&self.film.rgb).bounded(0.5, 2.0));
+        // The meter runs on every pass, presented or not: it is measuring the
+        // *light*, and a pass the shutter swallowed carried as much of it as
+        // one the window saw.
         let e = meter.follow(&self.film.rgb, dt);
-        let rgba = self.history.resolve(self.exposure * e as f32, &options(&self.scene, seed, true));
+        let rgba = if present {
+            self.history.resolve(self.exposure * e as f32, &options(&self.scene, seed, true))
+        } else {
+            Vec::new()
+        };
         Passed {
             rgba,
             mask: self.history.mask_fraction(),
@@ -1141,10 +1230,15 @@ impl Tracer {
     ///
     /// The still's is [`cove_render::camera`], unchanged.
     fn camera(&mut self, frame: &Snapshot, placement: &Placement, dt: f64) -> Camera {
-        let Some(rig) = self.rig.as_ref() else {
-            return quantised(&cove_render::camera(&self.scene, placement));
+        // The map is the tracer's, not the rig's: a `Rig` places an eye and
+        // chooses a field of view, and how that field is drawn onto a raster
+        // is the renderer's question. Applied at the one point both cameras
+        // come through, so the still and the window cannot disagree about it.
+        let cam = match self.rig.as_ref() {
+            None => quantised(&cove_render::camera(&self.scene, placement)),
+            Some(rig) => rig.follow(&subject_of(frame), dt),
         };
-        rig.follow(&subject_of(frame), dt)
+        cam.with_projection(self.projection)
     }
 }
 
@@ -1185,12 +1279,10 @@ struct Passed {
     exposure: f64,
     /// How many passes of the history the rig's shutter is open for.
     ///
-    /// **Read and reported, not yet spent.** Consuming it means integrating
-    /// that many passes into one presented frame, and this tier presents
-    /// every pass it takes — there is no frame/pass distinction here to spend
-    /// it on, and lowering [`Budget`]'s target instead would be a different
-    /// knob wearing the shutter's name. It is on the pace line so the number
-    /// is visible while the loop that would use it is written.
+    /// [`render_worker`] spends it: it folds this many passes into the
+    /// history before resolving one of them to the window, so a walking
+    /// player sees fewer frames and each of them integrates the motion
+    /// between. One — a still eye — is the loop this tier always ran.
     shutter: u32,
 }
 
@@ -1210,17 +1302,35 @@ fn render_worker(
     mut budget: Budget,
     ready: Arc<AtomicBool>,
     sdf: Arc<kosm_scan::SdfGrid>,
+    projection: Option<Projection>,
+    shutter: Option<bool>,
 ) {
     eprintln!("rune   evaluating the level…");
     let mut size = budget.size();
     let mut tracer = match Tracer::new(size) {
-        Ok(t) => t.with_rig(sdf, Player::from_env()),
+        Ok(t) => t.with_rig(sdf, Player::from_env()).with_projection(projection),
         Err(e) => return eprintln!("rune: could not build the picture: {e}"),
     };
+    // The flag over the level's own `cam_shutter`, resolved here because this
+    // is the first place both are in hand.
+    let shutter_on =
+        shutter.unwrap_or_else(|| tracer.scene.authored.parameter_or("cam_shutter", 1.0) > 0.5);
     // The level is up. `--walk` waits on this: a scripted walk that started
     // during the minute the level takes to evaluate would be over before the
     // first pass, and the measurement it exists for would be of nothing.
     ready.store(true, Ordering::Release);
+    eprintln!(
+        "rune   the camera is {}, the shutter is {}",
+        match tracer.projection {
+            Projection::Rectilinear => "rectilinear",
+            Projection::Equidistant => "an equidistant fisheye",
+        },
+        if shutter_on {
+            "open while the eye moves"
+        } else {
+            "--shutter off: one pass a frame"
+        }
+    );
     eprintln!(
         "rune   the cpu path tracer, {}",
         if budget.is_on() {
@@ -1235,6 +1345,22 @@ fn render_worker(
     let mut current: Option<Job> = None;
     let mut said_at = Instant::now();
     let mut since_said = 0u32;
+    // The shutter, as the loop keeps it. `want` is how many passes this frame
+    // is folding — decided when the frame starts and held, so a shutter that
+    // closes mid-fold does not strand the passes already spent — and `folded`
+    // is how many have gone in.
+    //
+    // The two costs are kept apart on purpose. A pass that is *not* presented
+    // skips the resolve, and the resolve is the à-trous filter over the whole
+    // frame: a fixed seventy to ninety milliseconds that does not scale with
+    // the picture. So a folded pass and a presented one are not the same
+    // measurement, and averaging them together is what a frame's latency must
+    // not be estimated from. It is `(want − 1)·fold + frame`.
+    let mut folded = 0u32;
+    let mut want = 1u32;
+    let mut fold_ms = 0.0f64;
+    let mut frame_ms = 0.0f64;
+    let mut capped = 0u64;
     loop {
         let mut latest = None;
         loop {
@@ -1257,10 +1383,33 @@ fn render_worker(
         if size.0 == 0 || size.1 == 0 {
             continue;
         }
+        // Every sub-pass of an open shutter takes the *newest* frame it can
+        // see, which is what makes the fold a motion blur rather than the
+        // same instant traced several times: the history integrates the
+        // world moving under it, and the picture that comes out has the
+        // motion of the whole exposure in it.
         let lap = Instant::now();
         let lit = *glow.lock().unwrap_or_else(|e| e.into_inner());
-        let done = tracer.pass(&job.frame, size, lit);
+        let present = folded + 1 >= want;
+        let done = tracer.pass(&job.frame, size, lit, present);
         let ms = lap.elapsed().as_secs_f64() * 1e3;
+        let ewma = |was: f64, now: f64| if was > 0.0 { 0.7 * was + 0.3 * now } else { now };
+        folded += 1;
+        if !present {
+            fold_ms = ewma(fold_ms, ms);
+            // Mid-exposure the size is *held*. The budget is a policy over
+            // what a pass costs, and a pass that skipped its resolve did not
+            // cost what a pass costs — feeding it one teaches the cost model
+            // a number seventy milliseconds too cheap, and the model answers
+            // with a size whose presented pass takes a quarter of a second.
+            // Measured, before this was true: the ladder climbed to 240×135
+            // while walking and every frame took 253 ms. So the budget is
+            // told about presented passes only, one measurement a frame, and
+            // the size steps once a frame with it.
+            since_said += 1;
+            continue;
+        }
+        frame_ms = ewma(frame_ms, ms);
         let shot = Shot {
             size,
             rgba: done.rgba,
@@ -1268,6 +1417,25 @@ fn render_worker(
             mean_spp: done.mean_spp,
             due: job.due,
         };
+        let spent = folded;
+        folded = 0;
+        // What the *next* frame's shutter is, decided now that this one is
+        // out: how far open the rig has it, capped at the number of passes
+        // [`SHUTTER_LATENCY_MS`] will pay for. A frame of `n` passes is
+        // `(n − 1)` folded ones and one presented, so that is what is solved
+        // for — using the presented pass's own cost for both until a folded
+        // one has been timed.
+        let asked = if shutter_on { done.shutter.max(1) } else { 1 };
+        let fold = if fold_ms > 0.0 { fold_ms } else { frame_ms };
+        let affordable = if fold > 0.0 {
+            (1 + ((SHUTTER_LATENCY_MS - frame_ms).max(0.0) / fold).floor() as u32).max(1)
+        } else {
+            asked
+        };
+        want = asked.min(affordable);
+        if want < asked {
+            capped += 1;
+        }
         since_said += 1;
         // The pace line, once a second: the size and the scale the policy
         // chose, what the pass it chose them from actually cost, and how many
@@ -1278,7 +1446,7 @@ fn render_worker(
             eprintln!(
                 "rune   cpu {}×{} (×{:.2}{}) at 1 spp: {:.0} ms a pass, {:.1} passes a second, \
                  {:.0}% repainted ({:.0}% masked), {:.1} samples a pixel, ×{:.2} exposure, \
-                 {} shutter — {}",
+                 shutter {}/{}{} ({:.1} frames a second) — {}",
                 shot.size.0,
                 shot.size.1,
                 budget.scale(),
@@ -1289,9 +1457,25 @@ fn render_worker(
                 100.0 * shot.mask,
                 shot.mean_spp,
                 done.exposure,
+                spent,
                 done.shutter,
+                if capped > 0 { "*" } else { "" },
+                since_said as f64 / elapsed / spent.max(1) as f64,
                 if budget.is_still() { "still" } else { "walking" },
             );
+            if capped > 0 {
+                eprintln!(
+                    "rune   the shutter was capped on {capped} frame(s): {:.0} ms to fold \
+                     a pass and {:.0} ms to present one, against a {:.0} ms latency ceiling",
+                    // What the cap actually divided by: until a folded pass
+                    // has been timed — and a shutter capped shut never folds
+                    // one — that is the presented pass's own cost.
+                    if fold_ms > 0.0 { fold_ms } else { frame_ms },
+                    frame_ms,
+                    SHUTTER_LATENCY_MS
+                );
+                capped = 0;
+            }
             since_said = 0;
         }
         // Measured, then chosen: the next size is a fact about the pass that
@@ -1321,7 +1505,13 @@ fn render_worker(
 /// of zero is the old behaviour to the byte: nothing moves, the budget sees a
 /// still frame from its first pass, and the size never leaves the ladder's
 /// still end.
-pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow::Result<()> {
+pub fn still(
+    path: &Path,
+    passes: u32,
+    walk: u32,
+    mut budget: Budget,
+    projection: Option<Projection>,
+) -> anyhow::Result<()> {
     let scene = CoveScene::bundled()?;
     let solution = rune::Pose::solution(&scene);
     // `KOSM_RUNE_SPAWN=1` stands the being where the player finds it even on a
@@ -1445,9 +1635,12 @@ pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow:
     // keyhole ends up behind the hood. The rig's [`Interest`] is on the
     // aperture and its arm is on the same field the boots stand on, so it
     // frames the door from over the hero's shoulder wherever the hero is.
-    let mut tracer = Tracer::new(at)?;
+    let mut tracer = Tracer::new(at)?.with_projection(projection);
     if let Some(sdf) = field {
         tracer = tracer.with_rig(sdf, which);
+    }
+    if tracer.projection != Projection::Rectilinear {
+        eprintln!("rune   the still is an equidistant fisheye");
     }
     let t0 = Instant::now();
     let mut rgba = Vec::new();
@@ -1458,21 +1651,29 @@ pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow:
         let moving = k < walk;
         let held = if moving { walked(k) } else { walked(walk.saturating_sub(1)) };
         let lap = Instant::now();
-        let done = tracer.pass(&held, at, lit);
+        let done = tracer.pass(&held, at, lit, true);
         let ms = lap.elapsed().as_secs_f64() * 1e3;
         shot = at;
         if (at.0 as u64) * (at.1 as u64) < (smallest.0 as u64) * (smallest.1 as u64) {
             smallest = at;
         }
         if walk > 0 {
+            // `repainted` is on this line and not only on the window's,
+            // because it is the number that says whether the history is
+            // *converging*: a picture whose plan keeps asking for the whole
+            // frame is a picture starting over every pass, and under a map
+            // this history had never reprojected through that is exactly the
+            // failure to watch for. Headless, it is the only way to see it.
             eprintln!(
-                "rune   pass {k}: {}×{} (×{:.2}) — {} at {:.0} ms, {:.1} samples a pixel",
+                "rune   pass {k}: {}×{} (×{:.2}) — {} at {:.0} ms, {:.1} samples a pixel, \
+                 {:.0}% repainted",
                 at.0,
                 at.1,
                 budget.scale(),
                 if moving { "walking" } else { "standing" },
                 ms,
-                done.mean_spp
+                done.mean_spp,
+                100.0 * done.repainted
             );
         }
         rgba = done.rgba;
@@ -1579,6 +1780,10 @@ struct App {
     /// The baked field, handed to the render thread with everything else it
     /// is started with: the camera's arm keeps the eye out of it.
     sdf: Arc<kosm_scan::SdfGrid>,
+    /// The camera's map and whether the shutter is spent, both handed to the
+    /// render thread with everything else it is started with.
+    projection: Option<Projection>,
+    shutter: Option<bool>,
 
     lookahead: Lookahead,
     latency_ms: f64,
@@ -1651,7 +1856,10 @@ impl viewport::Scene for App {
         let budget = self.budget.clone();
         let ready = self.ready.clone();
         let sdf = self.sdf.clone();
-        std::thread::spawn(move || render_worker(jobs, shots, glow, budget, ready, sdf));
+        let (projection, shutter) = (self.projection, self.shutter);
+        std::thread::spawn(move || {
+            render_worker(jobs, shots, glow, budget, ready, sdf, projection, shutter)
+        });
     }
 
     fn event(&mut self, event: viewport::Event) {
@@ -1777,6 +1985,21 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 ///   from the start, so a headless run walks and then stops without a hand on
 ///   the keyboard; in a `--shot` it steps the being for the first `N` passes
 ///   and stands for the rest, which is the picture of the climb back.
+///
+/// And the camera's own two:
+///
+/// - `--projection rectilinear|equidistant` is how the screen is mapped onto
+///   directions, over the level's `cam_projection`. The fisheye is live now,
+///   not offline-only: `kosm_view::View` carries the map and the history
+///   reprojects through it, so a walking player under an `f·θ` camera
+///   converges exactly as a pinhole one does. The still and the window take
+///   the same flag, so a `--shot` is a picture of what the window shows.
+/// - `--shutter on|off` (over the level's `cam_shutter`, on by default) folds
+///   [`Rig::shutter_passes`] passes into one presented frame while the eye is
+///   moving. The frame rate drops and the passes integrate the motion between
+///   them, which is what a shutter is; standing still it is one pass a frame
+///   and nothing changes. Capped at [`SHUTTER_LATENCY_MS`] of passes, because
+///   a shutter is latency as directly as it is blur.
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let num = |name: &str| args.value(name).and_then(|v| v.parse().ok());
     let ms = |name: &str| args.value(name).and_then(|v| v.parse::<f64>().ok());
@@ -1794,8 +2017,9 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         )
     };
     let walk: u32 = num("walk").unwrap_or(0);
+    let projection = projection_flag(args)?;
     if let Some(path) = args.value("shot") {
-        return still(Path::new(path), num("passes").unwrap_or(64), walk, budget);
+        return still(Path::new(path), num("passes").unwrap_or(64), walk, budget, projection);
     }
     // `--cpu` is the court's flag for "do not hand the render thread a
     // device", and this tier never does; it is accepted and says so rather
@@ -1804,7 +2028,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         eprintln!("rune   --cpu: this tier is the CPU integrator either way");
     }
     let frames: usize = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0);
-    window(frames, budget, walk)
+    window(frames, budget, walk, projection, shutter_flag(args)?)
 }
 
 /// The window itself: four threads and a viewport.
@@ -1813,7 +2037,13 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
 /// keyboard: it is how the pass rate while walking is measured, and it is
 /// exactly the same held direction a key press sets, so the simulation cannot
 /// tell the difference.
-pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
+pub fn window(
+    frames: usize,
+    budget: Budget,
+    walk: u32,
+    projection: Option<Projection>,
+    shutter: Option<bool>,
+) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
@@ -1887,6 +2117,8 @@ pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
             budget,
             ready,
             sdf,
+            projection,
+            shutter,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
