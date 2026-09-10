@@ -1,10 +1,12 @@
 //! Glass solids the camera can see through and the lamp can shine through.
 //!
-//! Two shapes: a sphere, and a convex polyhedron given as half-spaces (a cube,
-//! a square pyramid, anything convex). Both answer the two questions light
-//! transport asks: where does a ray from outside enter, with what normal; and
-//! where does a ray from inside leave, with what normal. Everything is generic
-//! over `tang::Scalar`, so the same code runs on `Dual` for derivatives.
+//! Four shapes: a sphere, a convex polyhedron given as half-spaces (a cube, a
+//! square pyramid, anything convex), a capsule, and a lens — the intersection
+//! of two spheres. Every one of them answers the two questions light transport
+//! asks: where does a ray from outside enter, with what normal; and where does
+//! a ray from inside leave, with what normal. Everything is generic over
+//! `tang::Scalar`, so the same code runs on `Dual` for derivatives — which is
+//! how `sims/rune`'s hint differentiates the caustic the hero's lens throws.
 //!
 //! The camera path (`shade_through`) is real: Fresnel splits the ray into a
 //! reflected and a refracted share at each face, the refracted ray travels
@@ -14,11 +16,39 @@
 
 use tang::{Scalar, Vec3};
 
+/// How much of an aperture's radius [`Shape::rim_weight`] feathers, as a
+/// fraction of it. Five per cent: wide enough that a lattice at a few hundred
+/// rays a side puts several rays in the graded band, narrow enough that the
+/// glass loses about a twentieth of its area to it. See there.
+pub const RIM_FEATHER: f64 = 0.05;
+
 #[derive(Clone)]
 pub enum Shape<S: Scalar> {
     Sphere { centre: Vec3<S>, r: S },
     /// Convex polyhedron: outward unit normals and offsets, `n·p ≤ d` inside.
     Convex { planes: Vec<(Vec3<S>, S)>, centre: Vec3<S>, bound_r: S },
+    /// The segment `a`→`b` swept by radius `r`: a cylinder between two caps.
+    /// The cove's being is one of these, and a capsule is the marble grown a
+    /// waist — with `a == b` it answers exactly what `Sphere` answers.
+    Capsule { a: Vec3<S>, b: Vec3<S>, r: S },
+    /// The **intersection of two spheres**: a biconvex lens, and the one in
+    /// the hero's hand.
+    ///
+    /// `c1`/`r1` and `c2`/`r2` are the two spheres, and the glass is what is
+    /// inside both. Its rim is the circle where the two surfaces cross, and
+    /// each of its two caps belongs to the sphere on the *far* side of that
+    /// rim — which is what makes them bulge apart. `hero/kit.rs::lens_mesh`
+    /// tessellates the same two caps the same way round.
+    ///
+    /// One variant and not two spheres in a list, for the reason
+    /// `sims/rune/rune.rs` gives for the capsule: a dielectric must never
+    /// meet an interface that is not on its surface, and two overlapping
+    /// spheres would hand it four. An intersection of convex bodies is
+    /// convex, so a ray meets this one in a single interval — the entry is
+    /// the *later* of the two spheres' entries and the exit the *earlier* of
+    /// their exits, with the normal at each end belonging to whichever sphere
+    /// was crossed there. Two roots or none; never four.
+    Lens { c1: Vec3<S>, c2: Vec3<S>, r1: S, r2: S },
 }
 
 #[derive(Clone)]
@@ -65,6 +95,28 @@ impl<S: Scalar> Shape<S> {
         match self {
             Shape::Sphere { centre, r } => (*centre, *r),
             Shape::Convex { centre, bound_r, .. } => (*centre, *bound_r),
+            Shape::Capsule { a, b, r } => ((*a + *b) * S::HALF, (*b - *a).norm() * S::HALF + *r),
+            // Centred on the rim, and tight: the glass lies inside the
+            // cylinder of the rim's own radius capped by the two caps'
+            // sagittae, so `√(h² + bulge²)` holds it and is barely more than
+            // the semi-diameter. A bounding sphere is what the lattice tracer
+            // aims its cone at, so a loose one is rays spent on nothing.
+            Shape::Lens { c1, c2, r1, r2 } => {
+                let sep = (*c2 - *c1).norm();
+                if sep.to_f64() <= 1e-12 {
+                    let r = if r1.to_f64() < r2.to_f64() { *r1 } else { *r2 };
+                    return (*c1, r);
+                }
+                // reciprocals and not divisions, here and everywhere else the
+                // lens is arithmetic on `S`: see [`Shape::rim_weight`]
+                let u = (*c2 - *c1) * sep.recip();
+                // where the two surfaces cross, along the line of centres
+                let a = (sep * sep + *r1 * *r1 - *r2 * *r2) * (S::TWO * sep).recip();
+                let h2 = (*r1 * *r1 - a * a).max(S::ZERO);
+                let (s1, s2) = (*r1 - a, *r2 - (sep - a));
+                let bulge = if s1.to_f64() > s2.to_f64() { s1 } else { s2 };
+                (*c1 + u * a, (h2 + bulge * bulge).sqrt())
+            }
         }
     }
 
@@ -105,6 +157,17 @@ impl<S: Scalar> Shape<S> {
                 }
                 (t_in > S::from_f64(1e-7) && t_in < t_out).then_some((t_in, n_in))
             }
+            Shape::Capsule { a, b, r } => capsule_hit(*a, *b, *r, o, d, true),
+            Shape::Lens { c1, c2, r1, r2 } => {
+                let (Some((a0, a1)), Some((b0, b1))) = (sphere_span(*c1, *r1, o, d), sphere_span(*c2, *r2, o, d)) else {
+                    return None;
+                };
+                // the sphere entered last owns the entry; the one left first
+                // owns the far end of the interval
+                let (t, centre, r) = if a0.to_f64() > b0.to_f64() { (a0, *c1, *r1) } else { (b0, *c2, *r2) };
+                let leave = if a1.to_f64() < b1.to_f64() { a1 } else { b1 };
+                (t > S::from_f64(1e-7) && t < leave).then(|| (t, (o + d * t - centre) * r.recip()))
+            }
         }
     }
 
@@ -132,8 +195,189 @@ impl<S: Scalar> Shape<S> {
                 }
                 best
             }
+            Shape::Capsule { a, b, r } => capsule_hit(*a, *b, *r, o, d, false),
+            // The nearer of the two spheres' far roots, with the clamped
+            // discriminant `Sphere::exit` uses: a ray that starts inside
+            // always leaves, and a photon that has grazed its way to the rim
+            // must not be told otherwise by a rounding error.
+            Shape::Lens { c1, c2, r1, r2 } => {
+                let leave = |centre: Vec3<S>, r: S| {
+                    let oc = o - centre;
+                    let b = oc.dot(&d);
+                    let disc = (b * b - (oc.norm_sq() - r * r)).max(S::ZERO);
+                    let t = -b + disc.sqrt();
+                    (t, (o + d * t - centre) * r.recip())
+                };
+                let (t1, n1) = leave(*c1, *r1);
+                let (t2, n2) = leave(*c2, *r2);
+                Some(if t1.to_f64() < t2.to_f64() { (t1, n1) } else { (t2, n2) })
+            }
         }
     }
+
+    /// How much of a ray entering at `p` the solid actually passes: one over
+    /// nearly all of it, falling smoothly to zero at the rim.
+    ///
+    /// **A feathered aperture, and it is there for the derivative.** A
+    /// lattice tracer fires a fixed grid of rays and asks each whether it
+    /// meets the glass; the answer is a *step*, so as a knob turns the solid
+    /// and its silhouette shrinks, rays leave the sum one whole ray at a
+    /// time. A `Dual` sees none of that — its lattice does not move — and a
+    /// central difference sees all of it, so the two disagree by however much
+    /// energy the rim rays were carrying. Adding rays does not help: the step
+    /// gets smaller and there are proportionally more of them.
+    ///
+    /// Weighting each ray by a smoothstep over the last [`RIM_FEATHER`] of
+    /// the aperture radius makes the integrand go to zero *continuously* at
+    /// the silhouette, with a zero slope there — so the sum is C¹ in the
+    /// knobs and the dual is differentiating the function the difference
+    /// measures. What it costs is that the glass has a soft edge: the hint
+    /// scores a lens whose outer 5 % is a graded neutral filter, and
+    /// `sims/rune/rune.rs`'s photon pass scores the hard one.
+    ///
+    /// Only [`Shape::Lens`] has an aperture in this sense. A sphere or a
+    /// capsule is a *solid* the light goes through the middle of, its
+    /// silhouette is what its own curvature makes it, and its rim rays are
+    /// grazing rays that Fresnel has already all but extinguished — so those
+    /// answer one everywhere and nothing changes for them.
+    pub fn rim_weight(&self, p: Vec3<S>) -> S {
+        let Shape::Lens { c1, c2, r1, r2 } = self else {
+            return S::ONE;
+        };
+        let sep = (*c2 - *c1).norm();
+        if sep.to_f64() <= 1e-12 {
+            return S::ONE;
+        }
+        let u = (*c2 - *c1) * sep.recip();
+        // the rim: where the two spheres cross, `a` along the line of
+        // centres from `c1` and `h` out from it
+        let a = (sep * sep + *r1 * *r1 - *r2 * *r2) * (S::TWO * sep).recip();
+        let h2 = (*r1 * *r1 - a * a).max(S::ZERO);
+        if h2.to_f64() <= 0.0 {
+            return S::ONE;
+        }
+        let rel = p - (*c1 + u * a);
+        let radial2 = (rel.norm_sq() - rel.dot(&u) * rel.dot(&u)).max(S::ZERO);
+        // `s` is the ray's radial distance as a fraction of the aperture's;
+        // squared throughout, so there is no `sqrt` at zero to differentiate
+        let s = (radial2 * h2.recip()).min(S::ONE);
+        let edge = S::from_f64((1.0 - RIM_FEATHER) * (1.0 - RIM_FEATHER));
+        if s.to_f64() <= edge.to_f64() {
+            return S::ONE;
+        }
+        let t = (S::ONE - s) * (S::ONE - edge).recip();
+        t * t * (S::from_f64(3.0) - S::TWO * t)
+    }
+
+    /// The same solid read in another frame: the one whose origin is
+    /// `origin` and whose axes are `u`, `v`, `w`, so a point `p` becomes
+    /// `(u·(p−o), v·(p−o), w·(p−o))`.
+    ///
+    /// The frame has to be orthonormal — this is a rigid move, not a
+    /// deformation, and a plane's offset is only carried by `d − n·o`
+    /// because the normal keeps its length. It is what lets the caustic
+    /// trace put any receiving plane where its plate code expects one.
+    pub fn to_frame(&self, origin: Vec3<S>, u: Vec3<S>, v: Vec3<S>, w: Vec3<S>) -> Self {
+        let pt = |p: Vec3<S>| {
+            let q = p - origin;
+            Vec3::new(u.dot(&q), v.dot(&q), w.dot(&q))
+        };
+        let dir = |n: Vec3<S>| Vec3::new(u.dot(&n), v.dot(&n), w.dot(&n));
+        match self {
+            Shape::Sphere { centre, r } => Shape::Sphere { centre: pt(*centre), r: *r },
+            Shape::Convex { planes, centre, bound_r } => Shape::Convex {
+                planes: planes.iter().map(|(n, d)| (dir(*n), *d - n.dot(&origin))).collect(),
+                centre: pt(*centre),
+                bound_r: *bound_r,
+            },
+            Shape::Capsule { a, b, r } => Shape::Capsule { a: pt(*a), b: pt(*b), r: *r },
+            Shape::Lens { c1, c2, r1, r2 } => Shape::Lens { c1: pt(*c1), c2: pt(*c2), r1: *r1, r2: *r2 },
+        }
+    }
+}
+
+/// Where the ray `o + t d` crosses a sphere, both roots and in order, or
+/// `None` when it misses. The one piece of arithmetic [`Shape::Lens`] is
+/// made of.
+fn sphere_span<S: Scalar>(centre: Vec3<S>, r: S, o: Vec3<S>, d: Vec3<S>) -> Option<(S, S)> {
+    let oc = o - centre;
+    let b = oc.dot(&d);
+    let disc = b * b - (oc.norm_sq() - r * r);
+    (disc >= S::ZERO).then(|| {
+        let s = disc.sqrt();
+        (-b - s, -b + s)
+    })
+}
+
+/// The ray `o + t d` against the capsule `a`→`b` of radius `r`: the nearest
+/// entry when `near`, the farthest exit otherwise, with the outward normal.
+///
+/// A capsule is three pieces — the cylinder between the cap planes and the
+/// two end spheres — and each piece owns the part of the surface the other
+/// two do not: a cylinder root only counts while its axial parameter lies in
+/// `[0, 1]`, and a cap's root only counts beyond that cap's plane. The body
+/// is convex, so once the candidates are filtered the entry is the smallest
+/// and the exit the largest, with no ordering left to reason about.
+///
+/// A segment of zero length is a sphere, and it is answered as one so that
+/// the two variants cannot drift on the degenerate case.
+fn capsule_hit<S: Scalar>(a: Vec3<S>, b: Vec3<S>, r: S, o: Vec3<S>, d: Vec3<S>, near: bool) -> Option<(S, Vec3<S>)> {
+    let ba = b - a;
+    let baba = ba.dot(&ba);
+    if baba <= S::from_f64(1e-24) {
+        let sphere = Shape::Sphere { centre: a, r };
+        return if near { sphere.enter(o, d) } else { sphere.exit(o, d) };
+    }
+    let eps = S::from_f64(1e-7);
+    let m = o - a;
+    let bard = ba.dot(&d);
+    let baoc = ba.dot(&m);
+    let mut best: Option<(S, Vec3<S>)> = None;
+    let mut take = |t: S, n: Vec3<S>| {
+        if near && t <= eps {
+            return;
+        }
+        let better = best.as_ref().is_none_or(|(bt, _)| if near { t < *bt } else { t > *bt });
+        if better {
+            best = Some((t, n));
+        }
+    };
+
+    // the cylinder body, in the axial parametrisation that keeps `baba` out
+    // of the square roots; `k2` is `|ba|² sin²θ` and vanishes on a ray
+    // parallel to the axis, which then only ever meets the caps
+    let k2 = baba - bard * bard;
+    if k2 > S::from_f64(1e-18) {
+        let k1 = baba * m.dot(&d) - baoc * bard;
+        let k0 = baba * m.dot(&m) - baoc * baoc - r * r * baba;
+        let h = k1 * k1 - k2 * k0;
+        if h >= S::ZERO {
+            let hs = h.sqrt();
+            let t = if near { (-k1 - hs) / k2 } else { (-k1 + hs) / k2 };
+            let y = baoc + t * bard;
+            if y > S::ZERO && y < baba {
+                take(t, (m + d * t - ba * (y / baba)) / r);
+            }
+        }
+    }
+
+    // the caps: a sphere's root counts only on its own side of the cap plane,
+    // which is where that sphere is the capsule's surface
+    for (centre, beyond_a) in [(a, true), (b, false)] {
+        let oc = o - centre;
+        let bq = oc.dot(&d);
+        let disc = bq * bq - (oc.norm_sq() - r * r);
+        if disc < S::ZERO {
+            continue;
+        }
+        let ds = disc.sqrt();
+        let t = if near { -bq - ds } else { -bq + ds };
+        let y = baoc + t * bard;
+        if (beyond_a && y <= S::ZERO) || (!beyond_a && y >= baba) {
+            take(t, (oc + d * t) / r);
+        }
+    }
+    best
 }
 
 // Snell, Fresnel and the mirror are `kosm-render`'s now: they are laws at an
@@ -186,5 +430,187 @@ pub fn to_dual(shape: &Shape<f64>) -> Shape<tang::Dual<f64>> {
             centre: v(*centre),
             bound_r: Dual::constant(*bound_r),
         },
+        Shape::Capsule { a, b, r } => Shape::Capsule { a: v(*a), b: v(*b), r: Dual::constant(*r) },
+        Shape::Lens { c1, c2, r1, r2 } => {
+            Shape::Lens { c1: v(*c1), c2: v(*c2), r1: Dual::constant(*r1), r2: Dual::constant(*r2) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tang::Dual;
+
+    const A: Vec3<f64> = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    const B: Vec3<f64> = Vec3 { x: 0.0, y: 0.0, z: 1.0 };
+    const R: f64 = 0.35;
+
+    /// Distance to the capsule's surface, the independent statement of the
+    /// same solid: a hit is a zero of this, and the normal is its gradient.
+    fn sdf(p: Vec3<f64>, a: Vec3<f64>, b: Vec3<f64>, r: f64) -> f64 {
+        let (ba, pa) = (b - a, p - a);
+        let h = if ba.norm_sq() > 0.0 { (pa.dot(&ba) / ba.norm_sq()).clamp(0.0, 1.0) } else { 0.0 };
+        (pa - ba * h).norm() - r
+    }
+
+    fn grad(p: Vec3<f64>, a: Vec3<f64>, b: Vec3<f64>, r: f64) -> Vec3<f64> {
+        let h = 1e-6;
+        let d = |e: Vec3<f64>| (sdf(p + e * h, a, b, r) - sdf(p - e * h, a, b, r)) / (2.0 * h);
+        Vec3::new(d(Vec3::x()), d(Vec3::y()), d(Vec3::z())).normalize()
+    }
+
+    #[test]
+    fn the_capsule_is_a_cylinder_between_two_spheres() {
+        let cap = Shape::Capsule { a: A, b: B, r: R };
+        let d = Vec3::new(-1.0, 0.0, 0.0);
+        // through the body, through the lower cap, through the upper cap
+        for (h, x) in [(0.5, R), (-0.2, (R * R - 0.04f64).sqrt()), (1.25, (R * R - 0.0625f64).sqrt())] {
+            let o = Vec3::new(5.0, 0.0, h);
+            let (t, n) = cap.enter(o, d).expect("the ray meets the capsule");
+            assert!((t - (5.0 - x)).abs() < 1e-12, "entry at height {h}: {t} vs {}", 5.0 - x);
+            let p = o + d * t;
+            assert!(sdf(p, A, B, R).abs() < 1e-12, "the entry point is on the surface");
+            let g = grad(p, A, B, R);
+            assert!((n - g).norm() < 1e-6, "normal at height {h}: {n:?} vs {g:?}");
+        }
+        // and misses when it passes outside the swept radius
+        assert!(cap.enter(Vec3::new(5.0, 0.0, 1.4), d).is_none());
+    }
+
+    #[test]
+    fn the_capsule_exits_at_the_far_surface() {
+        let cap = Shape::Capsule { a: A, b: B, r: R };
+        // sideways out of the cylinder, straight up through the top cap, and
+        // a slanted ray that leaves through the cap it did not start under
+        let cases = [
+            (Vec3::new(0.0, 0.0, 0.5), Vec3::new(-1.0, 0.0, 0.0), 0.35),
+            (Vec3::new(0.0, 0.0, 0.9), Vec3::new(0.0, 0.0, 1.0), 0.45),
+            (Vec3::new(0.0, 0.0, 0.2), Vec3::new(0.0, 0.0, -1.0), 0.55),
+        ];
+        for (o, dir, want) in cases {
+            let (t, n) = cap.exit(o, dir).expect("a ray from inside leaves");
+            assert!((t - want).abs() < 1e-12, "exit from {o:?} along {dir:?}: {t} vs {want}");
+            let p = o + dir * t;
+            assert!(sdf(p, A, B, R).abs() < 1e-12);
+            assert!((n - grad(p, A, B, R)).norm() < 1e-6, "exit normal {n:?}");
+        }
+        // a slant with no closed form: the exit is on the surface, and just
+        // past it is outside
+        let (o, dir) = (Vec3::new(0.0, 0.0, 0.9), Vec3::new(1.0, 0.0, 1.0).normalize());
+        let (t, n) = cap.exit(o, dir).unwrap();
+        assert!(sdf(o + dir * t, A, B, R).abs() < 1e-12);
+        assert!(sdf(o + dir * (t + 1e-6), A, B, R) > 0.0);
+        assert!(sdf(o + dir * (t - 1e-6), A, B, R) < 0.0);
+        assert!((n - grad(o + dir * t, A, B, R)).norm() < 1e-6);
+    }
+
+    #[test]
+    fn a_capsule_of_no_length_is_the_sphere() {
+        let c = Vec3::new(0.1, -0.2, 0.4);
+        let (cap, sph) = (Shape::Capsule { a: c, b: c, r: 0.3 }, Shape::Sphere { centre: c, r: 0.3 });
+        for dir in [Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.3, 0.6, -0.9).normalize(), Vec3::new(0.0, 1.0, 0.0)] {
+            let o = c - dir * 2.0;
+            match (cap.enter(o, dir), sph.enter(o, dir)) {
+                (Some((tc, nc)), Some((ts, ns))) => {
+                    assert!((tc - ts).abs() < 1e-15 && (nc - ns).norm() < 1e-15);
+                }
+                (a, b) => panic!("entry disagrees: {:?} vs {:?}", a.is_some(), b.is_some()),
+            }
+            let (tc, nc) = cap.exit(c, dir).unwrap();
+            let (ts, ns) = sph.exit(c, dir).unwrap();
+            assert!((tc - ts).abs() < 1e-15 && (nc - ns).norm() < 1e-15);
+        }
+        let (bc, bs) = (cap.bounds(), sph.bounds());
+        assert!((bc.1 - bs.1).abs() < 1e-15 && (bc.0 - bs.0).norm() < 1e-15);
+    }
+
+    /// The lens's entry and exit differentiate in the *axis* it is turned
+    /// about, which is the derivative the hero's hint is made of.
+    ///
+    /// A rotation and not a translation, because a translation is the easy
+    /// half: what a canted lens does to a ray is to move the surface it is
+    /// crossed at, and the sphere that surface belongs to is two and a half
+    /// metres away from the glass. Seeded on the axis, differenced on the
+    /// same rotation.
+    #[test]
+    fn the_lens_differentiates_in_the_axis_it_is_turned_about() {
+        // a symmetric biconvex lens, `hero/kit.rs`'s numbers in metres
+        let (r, half, semi) = (2.584, 2.5817, 0.110);
+        let centre = Vec3::new(0.0, 0.0, 0.0);
+        let axis_at = |th: f64| Vec3::new(th.sin(), 0.0, th.cos());
+        let lens = |th: f64| {
+            let u = axis_at(th);
+            Shape::Lens { c1: centre - u * half, c2: centre + u * half, r1: r, r2: r }
+        };
+        let lens_d = |th: f64| {
+            // the axis seeded in `θ`: `d/dθ (sin θ, 0, cos θ) = (cos θ, 0, −sin θ)`
+            let (s, c) = (th.sin(), th.cos());
+            let u = Vec3::new(Dual::new(s, c), Dual::constant(0.0), Dual::new(c, -s));
+            let ctr = Vec3::new(Dual::constant(0.0), Dual::constant(0.0), Dual::constant(0.0));
+            let (hf, rr) = (Dual::constant(half), Dual::constant(r));
+            Shape::Lens { c1: ctr - u * hf, c2: ctr + u * hf, r1: rr, r2: rr }
+        };
+        let lift = |v: Vec3<f64>| Vec3::new(Dual::constant(v.x), Dual::constant(v.y), Dual::constant(v.z));
+
+        let th = 0.4;
+        let eps = 1e-6;
+        // rays across the glass: down the axis, off centre, and slanted
+        for (o, d) in [
+            (Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)),
+            (Vec3::new(0.05, 0.02, 3.0), Vec3::new(0.0, 0.0, -1.0)),
+            (Vec3::new(-0.30, 0.0, 3.0), Vec3::new(0.1, 0.0, -1.0).normalize()),
+            (Vec3::new(-0.10, 0.04, 2.0), Vec3::new(0.05, -0.02, -1.0).normalize()),
+        ] {
+            let (t, n) = lens_d(th).enter(lift(o), lift(d)).expect("the ray meets the glass");
+            let fd = (lens(th + eps).enter(o, d).unwrap().0 - lens(th - eps).enter(o, d).unwrap().0) / (2.0 * eps);
+            assert!((t.dual - fd).abs() < 1e-5 * fd.abs().max(1.0), "entry: dual {} vs {fd}", t.dual);
+            // and the normal's, component by component
+            let (nl, nh) = (lens(th - eps).enter(o, d).unwrap().1, lens(th + eps).enter(o, d).unwrap().1);
+            for (k, (got, want)) in [(0, (n.x.dual, (nh.x - nl.x) / (2.0 * eps))), (1, (n.y.dual, (nh.y - nl.y) / (2.0 * eps))), (2, (n.z.dual, (nh.z - nl.z) / (2.0 * eps)))] {
+                assert!((got - want).abs() < 1e-5 * want.abs().max(1.0), "entry normal {k}: dual {got} vs {want}");
+            }
+            // the exit, from just inside
+            let p = o + d * t.real * 1.000001;
+            let (te, ne) = lens_d(th).exit(lift(p), lift(d)).expect("a ray from inside leaves");
+            let fde = (lens(th + eps).exit(p, d).unwrap().0 - lens(th - eps).exit(p, d).unwrap().0) / (2.0 * eps);
+            assert!((te.dual - fde).abs() < 1e-4 * fde.abs().max(1.0), "exit: dual {} vs {fde}", te.dual);
+            let (el, eh) = (lens(th - eps).exit(p, d).unwrap().1, lens(th + eps).exit(p, d).unwrap().1);
+            for (k, (got, want)) in [(0, (ne.x.dual, (eh.x - el.x) / (2.0 * eps))), (1, (ne.y.dual, (eh.y - el.y) / (2.0 * eps))), (2, (ne.z.dual, (eh.z - el.z) / (2.0 * eps)))] {
+                assert!((got - want).abs() < 1e-4 * want.abs().max(1.0), "exit normal {k}: dual {got} vs {want}");
+            }
+        }
+
+        // and the solid is the glass it says it is: `semi` across the rim and
+        // `2(r − half)` thick, whichever way it is turned
+        let u = axis_at(th);
+        let across = u.cross(&Vec3::y()).normalize();
+        for (dir, want) in [(across, semi), (Vec3::y(), semi), (u, r - half)] {
+            let (t, _) = lens(th).exit(centre, dir).unwrap();
+            assert!((t - want).abs() < 2e-3, "the glass is {t} along {dir:?}, not {want}");
+        }
+    }
+
+    #[test]
+    fn the_capsule_entry_differentiates_in_its_radius() {
+        let d = Vec3::new(-1.0, 0.0, 0.0);
+        let entry = |r: f64, h: f64| {
+            let cap = Shape::Capsule { a: A, b: B, r };
+            cap.enter(Vec3::new(5.0, 0.0, h), d).unwrap().0
+        };
+        // the body, where dt/dr is −1, and the cap, where it is not
+        for h in [0.5, 1.25] {
+            let cap = Shape::Capsule {
+                a: Vec3::new(Dual::constant(A.x), Dual::constant(A.y), Dual::constant(A.z)),
+                b: Vec3::new(Dual::constant(B.x), Dual::constant(B.y), Dual::constant(B.z)),
+                r: Dual::new(R, 1.0),
+            };
+            let o = Vec3::new(Dual::constant(5.0), Dual::constant(0.0), Dual::constant(h));
+            let dd = Vec3::new(Dual::constant(-1.0), Dual::constant(0.0), Dual::constant(0.0));
+            let (t, _) = cap.enter(o, dd).unwrap();
+            let eps = 1e-6;
+            let fd = (entry(R + eps, h) - entry(R - eps, h)) / (2.0 * eps);
+            assert!((t.dual - fd).abs() < 1e-6, "at height {h}: dual {} vs fd {fd}", t.dual);
+        }
     }
 }

@@ -168,9 +168,9 @@ needs is a loop it can close by itself:
   kosm-view; it is never the default.
 - **Deterministic.** Same hash, same bytes. A changed frame means changed
   code.
-- **One import, one doc.** `kosm::prelude`; a repo `CLAUDE.md` with five
-  recipes (build a world, add a body, batch a step, take a gradient, add a
-  lens); doctests on everything the prelude exports.
+- **One import, one doc.** `kosm::prelude`; a repo `CLAUDE.md` with six
+  recipes (build a world, add a body, pick a material, batch a step, take a
+  gradient, add a lens); doctests on everything the prelude exports.
 - **Errors that say what to change.** `KosmError` carries a `help` line:
   "collider has no convex decomposition: wrap it in `hull()` or split the
   difference".

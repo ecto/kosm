@@ -26,6 +26,7 @@ kosm list                    # the tree
 kosm run court               # frames into out/
 kosm run court --out frames  # somewhere else
 kosm run skatepark/warehouse # a nested sim
+kosm run rune                # the cove, baked, solved and swept
 kosm run court --view        # a window (needs --features view)
 ```
 
@@ -513,6 +514,53 @@ open out/maps/skatepark/park.svg
 cd ../ipse && cargo run -p ipse-sim --bin train -- ../kosm/out/maps/skatepark/scenario.toml
 ```
 
+### the rune (`sims/rune`)
+
+`kosm run rune` is the first slice of a game. The level is a cove
+([`sims/rune/scene.rs`](sims/rune/scene.rs)): sand rising out of the sea to a
+cliff, a few boulders, and a stone door set into the cliff face with a small
+round keyhole on it. The keyhole is not geometry — the face is solid stone —
+it is the disc the score is read over. You are a being of glass. A low
+afternoon sun shines through you, and where you stand and how far you lean
+decide where the light you focus lands. Put the caustic in the keyhole and
+hold it, and the door opens. There is no trigger and no flag: the score is
+the photon power the trace deposits inside the aperture, so moving the sun in
+the level moves the pose that solves it.
+
+The run is the headless loop. It evaluates the level and writes
+`out/cove/cove.stl` and `cove.svg`; bakes the ground into a `kosm-scan` map
+in `out/maps/cove/` and checks the field against the beach plane (the sand is
+a *plane*, and trilinear interpolation of an exact plane distance is exact, so
+100 mm cells cost it nothing) and against a glass marble rolled down it at
+`v² = 10/7 · g · Δ`; solves for the pose whose caustic falls in the keyhole
+and prints it, writing `out/solved/rune.params`; sweeps a grid of spawns and
+reports how many of them a gradient ascent walks to an open door (36 of 36);
+and renders one 960×540 still to `out/cove/frame.png`. `scene.rs` carries the
+solver's own answer as the defaults of its `solution_*` knobs — a Rust level
+is not rewritten behind your back, so the solve prints the three `b.param`
+lines and you paste them.
+
+`kosm run rune --view` walks it: WASD and the mouse, the cursor captured,
+lean with the vertical axis. Four threads — the simulation, the rune's score,
+the CPU path tracer, the blit — the court's pacing verbatim, and no HUD: the
+keyhole's rim glows with the score, and thirty seconds without progress puts
+a glint on the sand along the hint's own gradient. There is no GPU tier
+(vcad's compute tracer packs analytic B-reps and the being is a tessellated
+capsule), so it is `kosm_render::pathtrace` at 480×270, one sample a pass,
+through `kosm_view::history`. `--shot out/rune.png` takes the same picture
+headless.
+
+```bash
+cargo run --release -p kosm-cli -- run rune
+cargo run --release -p kosm-cli --features view -- run rune --view
+cargo run --release -p kosm-cli --features view -- run rune --view --shot out/rune.png --passes 64
+cargo test --release -p kosm-cli --features view -- rune
+open out/cove/frame.png
+```
+
+`docs/plans/2026-09-09-rune-cove-design.md` is the design and
+`…-rune-cove-plan.md` the eight steps it was built in.
+
 ## the sound (`audio.rs`)
 
 Nothing is sampled. `audio.rs` asks `vcad-kernel-acoustics` for the level's
@@ -646,11 +694,19 @@ clamp, an à-trous filter on the short-history pixels.
 `--cpu` picks the CPU integrator, and it is a fallback tier and says so: it
 runs the same trait over `kosm_render::gpu::History` on the host, which is a
 plain running mean with **no reprojection and no filter**, so any camera or
-ball move restarts the picture. The old 1,600-line CPU history — the geometric
-change mask, the disjoint rectangles `pathtrace::render_into` re-traced, the
-host-side reprojection — went with the render port rather than being kept as a
-second copy of what the device already does properly. A CPU tier that wants
-its history back grows one behind the trait.
+ball move restarts the picture. The court keeps it that way: what the device
+does properly is not worth a second copy on the host.
+
+A CPU tier that wants its history back grows one behind the trait, and the
+rune did. `kosm_view::history` is the CPU history in full — the geometric
+change mask, the disjoint rectangles `pathtrace::render_into` re-traces, the
+host-side reprojection through the moved eye, an à-trous filter with a
+denoise floor, and a per-pixel firefly cap — and it implements the same
+`TemporalHistory` the court's GPU history does, so the viewer still cannot
+tell the tiers apart. The cove needs it because the cove has no GPU tier at
+all: vcad's compute tracer packs analytic B-reps, and the being is a
+tessellated capsule. `sims/rune/game.rs` drives it through the richer API
+underneath the trait, which is where the masked pass lives.
 
 One box was not enough. The change rects used to be reduced to a single
 bounding box, and with four balls spread across the court that box is most of

@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// A picture, and where it already is.
 ///
@@ -51,6 +51,11 @@ pub enum Key {
     Left,
     Right,
     Home,
+    W,
+    A,
+    S,
+    D,
+    Shift,
 }
 
 /// What the window tells the scene about.
@@ -61,7 +66,17 @@ pub enum Event {
     Drag(f64, f64),
     /// Wheel notches; positive is a scroll up.
     Zoom(f64),
+    /// Relative mouse motion in the device's own units — not the cursor's
+    /// position, and not scaled: what a mouse-look wants, whether or not a
+    /// button is down and whether or not the cursor has hit an edge.
+    Look(f64, f64),
+    /// One per physical press. The OS's auto-repeat is swallowed, so a key
+    /// held down is exactly one `Key` and, when it comes back up, one `KeyUp`
+    /// — which is what a held force needs.
     Key(Key),
+    /// One per physical release, and one for every key still down when the
+    /// window loses focus: nothing stays pressed behind the scene's back.
+    KeyUp(Key),
 }
 
 /// What the window shows. The scene owns its own threads and clock; the
@@ -77,6 +92,13 @@ pub trait Scene {
     fn event(&mut self, event: Event);
     /// The newest picture, or `None` to keep the one already on screen.
     fn image(&mut self) -> Option<Image>;
+    /// Whether the scene wants the mouse: locked to the window and hidden, so
+    /// `Look` keeps arriving after the pointer would have run off the edge.
+    /// Asked once a tick; a scene with nothing to look around ignores it,
+    /// which is what the default does.
+    fn wants_cursor(&self) -> bool {
+        false
+    }
 }
 
 /// Open a window and show `scene` in it until it is closed or Escape is hit.
@@ -90,6 +112,8 @@ pub fn run(title: &str, size: (u32, u32), scene: impl Scene) -> anyhow::Result<(
         gpu: None,
         dragging: false,
         cursor: None,
+        held: Vec::new(),
+        captured: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -407,6 +431,42 @@ struct Viewport<S: Scene> {
     gpu: Option<Gpu>,
     dragging: bool,
     cursor: Option<(f64, f64)>,
+    /// The keys physically down, so the OS's auto-repeat can be told from a
+    /// second press and every `Key` is answered by exactly one `KeyUp`.
+    held: Vec<Key>,
+    /// Whether the mouse is currently locked to the window and hidden.
+    captured: bool,
+}
+
+/// The key this code is, or nothing if the viewport does not pass it on.
+fn key_of(code: KeyCode) -> Option<Key> {
+    Some(match code {
+        KeyCode::Space => Key::Space,
+        KeyCode::ArrowLeft => Key::Left,
+        KeyCode::ArrowRight => Key::Right,
+        KeyCode::Home | KeyCode::KeyR => Key::Home,
+        KeyCode::KeyW => Key::W,
+        KeyCode::KeyA => Key::A,
+        KeyCode::KeyS => Key::S,
+        KeyCode::KeyD => Key::D,
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
+        _ => return None,
+    })
+}
+
+/// Lock the mouse to the window and hide it, or let it go again.
+///
+/// macOS has no `Confined` and X11 no `Locked`; ask for both and keep
+/// whichever the platform actually has. A refusal is not fatal — `Look` still
+/// arrives, it just stops at the edge of the screen.
+fn set_cursor_captured(window: &Window, on: bool) {
+    let wanted: &[CursorGrabMode] = if on {
+        &[CursorGrabMode::Locked, CursorGrabMode::Confined]
+    } else {
+        &[CursorGrabMode::None]
+    };
+    let _ = wanted.iter().find_map(|&m| window.set_cursor_grab(m).ok());
+    window.set_cursor_visible(!on);
 }
 
 impl<S: Scene> ApplicationHandler for Viewport<S> {
@@ -454,16 +514,36 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
                 }
                 self.scene.event(Event::Resized((px.width, px.height)));
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let key = match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => return event_loop.exit(),
-                    PhysicalKey::Code(KeyCode::Space) => Key::Space,
-                    PhysicalKey::Code(KeyCode::ArrowLeft) => Key::Left,
-                    PhysicalKey::Code(KeyCode::ArrowRight) => Key::Right,
-                    PhysicalKey::Code(KeyCode::Home | KeyCode::KeyR) => Key::Home,
-                    _ => return,
+            WindowEvent::KeyboardInput { event, .. } => {
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
                 };
-                self.scene.event(Event::Key(key));
+                if code == KeyCode::Escape {
+                    return event_loop.exit();
+                }
+                let Some(key) = key_of(code) else { return };
+                match event.state {
+                    // The OS repeats a held key at its own rate; the scene
+                    // wants the press, not the stutter.
+                    ElementState::Pressed if !self.held.contains(&key) => {
+                        self.held.push(key);
+                        self.scene.event(Event::Key(key));
+                    }
+                    ElementState::Pressed => {}
+                    ElementState::Released => {
+                        if let Some(i) = self.held.iter().position(|k| *k == key) {
+                            self.held.remove(i);
+                            self.scene.event(Event::KeyUp(key));
+                        }
+                    }
+                }
+            }
+            // A key held when the window goes away never comes back up, so
+            // let go of everything rather than leave a force on.
+            WindowEvent::Focused(false) => {
+                for key in std::mem::take(&mut self.held) {
+                    self.scene.event(Event::KeyUp(key));
+                }
             }
             WindowEvent::MouseInput {
                 button: MouseButton::Left,
@@ -501,9 +581,22 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
         }
     }
 
+    /// Raw mouse motion, straight from the device: the deltas the cursor's
+    /// position cannot give once it is against an edge or locked in place.
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.scene.event(Event::Look(dx, dy));
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
         if let Some(window) = &self.window {
+            let wants = self.scene.wants_cursor();
+            if wants != self.captured {
+                set_cursor_captured(window, wants);
+                self.captured = wants;
+            }
             window.request_redraw();
         }
     }

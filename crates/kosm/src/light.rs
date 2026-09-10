@@ -58,6 +58,49 @@ pub struct Caustic<S: Scalar> {
     pub traced: usize,
     pub tir: usize,
     pub outside: usize,
+    /// How much of the lamp the solid actually caught: the cone's solid angle
+    /// per ray times the aperture weight of every ray that entered the glass,
+    /// summed over the bands.
+    ///
+    /// The denominator a *ratio* wants, and it is here rather than left to
+    /// the caller's own arithmetic because the caller cannot state it. The
+    /// rays are weighted by [`crate::glass::Shape::rim_weight`], which
+    /// feathers the outer few per cent of an aperture so the sum has a
+    /// derivative at all; an analytic projected area is the *hard* disc, and
+    /// dividing the one by the other would be measuring two different pieces
+    /// of glass. Read both ends off the lattice and the feather is in both,
+    /// so it cancels and what is left is the transport — which is what the
+    /// derivative was ever about. `sims/rune`'s `hint::lens_incident` is the
+    /// analytic area kept beside it, and the ratio of the two is what the
+    /// soft rim costs.
+    pub caught: S,
+}
+
+/// The plane the light is caught on: its origin, the normal it is lit from,
+/// and the two in-plane axes the caustic's grid is indexed by.
+///
+/// The plate is the identity case. The cove's door is not: its face is a
+/// vertical wall, and the rune is the caustic read in *its* coordinates, so
+/// the receiver has to be a frame and not an assumption about z.
+#[derive(Clone, Copy, Debug)]
+pub struct Receiver {
+    pub origin: Vec3<f64>,
+    pub normal: Vec3<f64>,
+    pub u: Vec3<f64>,
+    pub v: Vec3<f64>,
+}
+
+impl Receiver {
+    /// The marble's plate: the world's own axes, receiving at z = 0.
+    pub fn plate() -> Self {
+        Self { origin: Vec3::zero(), normal: Vec3::z(), u: Vec3::x(), v: Vec3::y() }
+    }
+
+    /// A world point in the receiver's coordinates.
+    fn point(&self, p: Vec3<f64>) -> Vec3<f64> {
+        let q = p - self.origin;
+        Vec3::new(self.u.dot(&q), self.v.dot(&q), self.normal.dot(&q))
+    }
 }
 
 /// Trace `rays_per_band` light rays per band from the lamp through a glass
@@ -70,10 +113,29 @@ pub fn trace<S: Scalar>(
     cells: usize,
     rays_per_band: usize,
 ) -> Caustic<S> {
+    trace_onto(lamp, shape, nd, Receiver::plate(), window, cells, rays_per_band)
+}
+
+/// The same trace onto any receiving plane. The lamp and the glass are moved
+/// into the receiver's frame — one rigid change of coordinates, which the
+/// duals carry through untouched — and from there this *is* the plate case,
+/// so there is one ray walk and not two to keep in agreement.
+///
+/// The returned `Caustic`'s grid is in the receiver's `(u, v)`.
+pub fn trace_onto<S: Scalar>(
+    lamp: Vec3<f64>,
+    shape: &crate::glass::Shape<S>,
+    nd: S,
+    receiver: Receiver,
+    window: f64,
+    cells: usize,
+    rays_per_band: usize,
+) -> Caustic<S> {
+    let lift = |p: Vec3<f64>| Vec3::new(S::from_f64(p.x), S::from_f64(p.y), S::from_f64(p.z));
+    let shape =
+        &shape.to_frame(lift(receiver.origin), lift(receiver.u), lift(receiver.v), lift(receiver.normal));
+    let lamp = receiver.point(lamp);
     let (centre_s, bound_s) = shape.bounds();
-    let centre = Vec3::new(centre_s.x.to_f64(), centre_s.y.to_f64(), centre_s.z.to_f64());
-    let bound = bound_s.to_f64();
-    let to = centre - lamp;
     // the window: `window` is the cell budget's extent; the grid is centred on
     // where the light actually lands (a first pass on f64 at low density),
     // and grown to hold it, keeping the cell size. A pyramid throws its light
@@ -85,25 +147,76 @@ pub fn trace<S: Scalar>(
         let n = ((ext / cell).ceil() as usize).min(720);
         let ext = n as f64 * cell;
         let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
-        ([c[0] - ext * 0.5, c[1] - ext * 0.5], n)
+        // **Snapped to the cell lattice the receiver's own origin sits on.**
+        //
+        // Where the grid is placed comes out of a first pass on `f64`, so a
+        // `Dual` sees it as a constant — and if it were free to slide, that
+        // constant would be a lie: `gx = (hit − origin)/cell` would be
+        // missing its `∂origin/∂knob` term, and the deposit would
+        // re-quantise under a keyhole that is *not* moving with it. That is
+        // a bias in the derivative and not a noise: it does not fall when
+        // rays are added, because it is not a sampling error.
+        //
+        // Snapping makes the lie true. The origin can then only move a whole
+        // cell at a time, and a whole cell is a *relabelling* — every cell
+        // centre lands where some other cell's centre was, the reader
+        // ([`crate::hint::through`] and its kin) tests those same centres
+        // against the same disc, and the score does not move at all. So the
+        // derivative of the grid's placement really is zero almost
+        // everywhere, which is exactly what the dual carries.
+        let snap = |v: f64| (v / cell).round() * cell;
+        ([snap(c[0] - ext * 0.5), snap(c[1] - ext * 0.5)], n)
     };
     let mut e = vec![vec![S::ZERO; cells * cells]; BANDS.len()];
     let (mut traced, mut tir, mut outside) = (0usize, 0usize, 0usize);
 
-    // rays: a jittered lattice over the disc of directions that covers the
-    // object's bounding sphere
-    let dist = to.norm();
-    let axis = to / dist;
-    let u = if axis.x.abs() < 0.9 { Vec3::x() } else { Vec3::y() };
-    let e1 = axis.cross(&u).normalize();
-    let e2 = axis.cross(&e1);
-    let ang = (bound / dist).min(0.999).asin();
-    let side = (rays_per_band as f64).sqrt().ceil() as usize;
-    let cone_sr = std::f64::consts::TAU * (1.0 - ang.cos());
-    let in_disc = (side * side) as f64 * std::f64::consts::FRAC_PI_4;
-    let d_omega = cone_sr / in_disc;
-    let cell_area = cell * cell;
+    // Rays: a jittered lattice over the disc of directions that covers the
+    // object's bounding sphere.
+    //
+    // **Aimed on `S` and not on real parts**, and that is the difference
+    // between a dual that agrees with a central difference and one that does
+    // not. The cone is a change of variables — the integrand is zero outside
+    // the silhouette and the cone is drawn wider than that, so the domain's
+    // boundary contributes nothing and the estimator is exact under it. Aim
+    // it on real parts instead and a seeded knob slides the *shape* through a
+    // *fixed* lattice: rays that used to hit now miss, the estimate loses
+    // energy that the physics never lost, and the dual reports that loss as a
+    // derivative. How badly depends on how narrow the cone is, which is how
+    // small the solid is against how far away the lamp is — for the marble,
+    // a few per cent; for a 220 mm lens with the lamp a kilometre out, the
+    // cone is a ten-thousandth of a radian and a two-centimetre step is a
+    // fifth of it, which is the whole answer.
+    //
+    // The solid angle carries the dual with it, because a cone that follows
+    // the shape is also a cone that changes size when the shape does.
+    //
+    // **Reciprocals and not divisions**, everywhere the cone is built. A
+    // `Dual`'s division is a multiply by the reciprocal of the divisor and an
+    // `f64`'s is a real divide, so `to / dist` on the two scalars disagrees
+    // in the last bit — and an ulp on the cone's axis is the initial
+    // condition of a walk that reflects up to eight times inside the glass,
+    // which amplifies it until a grazing ray picks the other side of total
+    // internal reflection. Multiplying by a reciprocal on both scalars is the
+    // same arithmetic on both, and it is what keeps the dual's real part the
+    // `f64` answer to the bit.
     let lamp_s = Vec3::new(S::from_f64(lamp.x), S::from_f64(lamp.y), S::from_f64(lamp.z));
+    let to = centre_s - lamp_s;
+    let inv_dist = to.norm().recip();
+    let axis = to * inv_dist;
+    let u = if axis.x.to_f64().abs() < 0.9 { Vec3::x() } else { Vec3::y() };
+    let across = axis.cross(&u);
+    let e1 = across * across.norm().recip();
+    let e2 = axis.cross(&e1);
+    let ang = (bound_s * inv_dist).min(S::from_f64(0.999)).asin();
+    let side = (rays_per_band as f64).sqrt().ceil() as usize;
+    let cone_sr = S::TAU * (S::ONE - ang.cos());
+    let in_disc = (side * side) as f64 * std::f64::consts::FRAC_PI_4;
+    let cell_area = cell * cell;
+    // the cone's solid angle per lattice ray, and the same divided by a
+    // cell's area, which is what turns a ray's power into an irradiance
+    let per_ray = cone_sr * S::from_f64(in_disc.recip());
+    let d_omega = per_ray * S::from_f64(cell_area.recip());
+    let mut caught = S::ZERO;
 
     for (b, (lambda, _)) in BANDS.iter().enumerate() {
         let n_glass = index::<S>(nd, *lambda);
@@ -119,13 +232,25 @@ pub fn trace<S: Scalar>(
                 if a * a + c * c > 1.0 {
                     continue;
                 }
-                let theta = ang * (a * a + c * c).sqrt();
+                let theta = ang * S::from_f64((a * a + c * c).sqrt());
                 let phi = c.atan2(a);
-                let dir = axis * theta.cos() + (e1 * phi.cos() + e2 * phi.sin()) * theta.sin();
-                let d = Vec3::new(S::from_f64(dir.x), S::from_f64(dir.y), S::from_f64(dir.z));
+                // `cos()` and `sin()` and not `sin_cos()`: on `f64` the pair
+                // is one libm call and on `Dual` it is two, and an ulp
+                // between them flips a grazing ray in or out of the glass.
+                // The dual's real part is the `f64` answer, and it is that
+                // exactly.
+                let d = axis * theta.cos() + (e1 * S::from_f64(phi.cos()) + e2 * S::from_f64(phi.sin())) * theta.sin();
                 let Some((t1, n1)) = shape.enter(lamp_s, d) else { continue };
-                traced += 1;
                 let p1 = lamp_s + d * t1;
+                // the feathered aperture: one over nearly all of the glass,
+                // smoothly to zero at the rim, so the sum is C¹ in whatever
+                // moves the silhouette. See `glass::Shape::rim_weight`.
+                let rim = shape.rim_weight(p1);
+                if rim.to_f64() <= 0.0 {
+                    continue;
+                }
+                traced += 1;
+                caught += per_ray * rim;
                 let Some((d_in, cos_i, cos_t)) = crate::glass::refract(d, n1, S::ONE, n_glass) else {
                     tir += 1;
                     continue;
@@ -141,7 +266,7 @@ pub fn trace<S: Scalar>(
                 let tp = -p2.z / d_out.z;
                 let hit = p2 + d_out * tp;
                 let cos_plate = -d_out.z;
-                let power = t_in * t_out * cos_plate * S::from_f64(d_omega / cell_area);
+                let power = t_in * t_out * cos_plate * d_omega * rim;
                 let gx = (hit.x - S::from_f64(origin[0])) / S::from_f64(cell) - S::HALF;
                 let gy = (hit.y - S::from_f64(origin[1])) / S::from_f64(cell) - S::HALF;
                 let (fx, fy) = (gx.to_f64().floor(), gy.to_f64().floor());
@@ -161,7 +286,7 @@ pub fn trace<S: Scalar>(
             }
         }
     }
-    Caustic { origin, cell, n: cells, e, traced, tir, outside }
+    Caustic { origin, cell, n: cells, e, traced, tir, outside, caught }
 }
 
 /// Where the transmitted light lands on the plate: the 2nd..98th percentile
@@ -222,6 +347,8 @@ fn shape_f64<S: Scalar>(shape: &crate::glass::Shape<S>) -> crate::glass::Shape<f
             centre: v(*centre),
             bound_r: bound_r.to_f64(),
         },
+        Shape::Capsule { a, b, r } => Shape::Capsule { a: v(*a), b: v(*b), r: r.to_f64() },
+        Shape::Lens { c1, c2, r1, r2 } => Shape::Lens { c1: v(*c1), c2: v(*c2), r1: r1.to_f64(), r2: r2.to_f64() },
     }
 }
 
@@ -361,4 +488,72 @@ pub fn composite(
 
 pub fn out_dir(out: &Path) -> std::path::PathBuf {
     out.join("light")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glass::Shape;
+
+    /// Plate coordinates as world coordinates for a receiver that is the
+    /// wall `x = 0` facing `+x`: `(X, Y, Z)` on the plate is `(Z, X, Y)` in
+    /// the world, which is the plate stood on end.
+    fn on_end(p: Vec3<f64>) -> Vec3<f64> {
+        Vec3::new(p.z, p.x, p.y)
+    }
+
+    fn wall() -> Receiver {
+        Receiver { origin: Vec3::zero(), normal: Vec3::x(), u: Vec3::y(), v: Vec3::z() }
+    }
+
+    const ND: f64 = 1.5168;
+    const WINDOW: f64 = 0.04;
+    const CELLS: usize = 48;
+    const RAYS: usize = 4_000;
+
+    #[test]
+    fn the_wall_receives_what_the_plate_receives() {
+        let (lamp, centre, r) = (Vec3::new(0.0, 0.0, 0.4), Vec3::new(0.0, 0.0, 0.05), 0.0125);
+        let flat = trace::<f64>(lamp, &Shape::Sphere { centre, r }, ND, WINDOW, CELLS, RAYS);
+        let stood = trace_onto::<f64>(
+            on_end(lamp),
+            &Shape::Sphere { centre: on_end(centre), r },
+            ND,
+            wall(),
+            WINDOW,
+            CELLS,
+            RAYS,
+        );
+        assert!(flat.traced > 1_000, "the plate case traced {} rays", flat.traced);
+        assert!(flat.total(2) > 0.0, "the plate case caught nothing");
+        assert_eq!((flat.n, flat.traced, flat.tir, flat.outside), (stood.n, stood.traced, stood.tir, stood.outside));
+        assert!((flat.origin[0] - stood.origin[0]).abs() < 1e-12 && (flat.origin[1] - stood.origin[1]).abs() < 1e-12);
+        for b in 0..BANDS_LEN {
+            for (f, s) in flat.e[b].iter().zip(&stood.e[b]) {
+                assert!((f - s).abs() <= 1e-12 * f.abs().max(1.0), "band {b}: {f} vs {s}");
+            }
+        }
+    }
+
+    /// The wall is not a second code path, so the dual it carries is the same
+    /// dual the plate carries: `∂E/∂n_d` against central differences.
+    #[test]
+    fn the_wall_still_differentiates_in_the_index() {
+        let (lamp, centre, r) = (Vec3::new(0.0, 0.0, 0.4), Vec3::new(0.0, 0.0, 0.05), 0.0125);
+        let (lamp, centre) = (on_end(lamp), on_end(centre));
+        let total = |nd: f64| {
+            let c = trace_onto::<f64>(lamp, &Shape::Sphere { centre, r }, nd, wall(), WINDOW, CELLS, RAYS);
+            (0..BANDS_LEN).map(|b| c.total(b)).sum::<f64>()
+        };
+        let shape = crate::glass::to_dual(&Shape::Sphere { centre, r });
+        let c = trace_onto::<Dual<f64>>(lamp, &shape, Dual::new(ND, 1.0), wall(), WINDOW, CELLS, RAYS);
+        let d: Dual<f64> = (0..BANDS_LEN).map(|b| c.total(b)).fold(Dual::constant(0.0), |a, v| a + v);
+        let h = 1e-5;
+        let fd = (total(ND + h) - total(ND - h)) / (2.0 * h);
+        // To the bit, even though the cone is aimed on `S` now: see the
+        // reciprocals `trace_onto` builds its frame out of.
+        let want = total(ND);
+        assert!(d.real == want, "the dual's real part is the f64 answer: {} vs {want}", d.real);
+        assert!((d.dual - fd).abs() < 1e-4 * fd.abs().max(1.0), "dual {} vs central differences {fd}", d.dual);
+    }
 }
