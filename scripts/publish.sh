@@ -2,9 +2,9 @@
 # Publish kosm's crates to crates.io, in dependency order.
 #
 # Everything upstream must be on crates.io first — cargo refuses to publish a
-# crate with a git dependency, and the root manifest's phyz/vcad/tang entries
-# are git revs until those repos ship. The preflight below checks the three
-# that gate everything else; see docs/publishing.md for the whole table.
+# crate with a git dependency. The root manifest's phyz/vcad/tang entries are
+# versions; the preflight below re-checks the three that gate everything else,
+# see docs/publishing.md.
 #
 #   scripts/publish.sh            # preflight, then publish
 #   scripts/publish.sh --dry-run  # add --dry-run to every cargo publish
@@ -63,13 +63,40 @@ if ((${#missing[@]})); then
 fi
 
 echo
+# A dry run cannot see the crates this run has not really published: cargo
+# packages each crate against the live index, so the first crate whose
+# workspace upstream is still unpublished fails with "no matching package
+# named <x> found". That is the chain working as designed, not a fault in the
+# manifest, so a dry run reports it and carries on; a real run cannot hit it,
+# because by then the upstream is on the index.
+deferred=()
 for crate in "${CRATES[@]}"; do
   echo "publishing ${crate}"
-  cargo publish -p "$crate" "${DRY[@]}"
-  if [[ "$crate" != "${CRATES[-1]}" ]]; then
+  if ((${#DRY[@]})); then
+    log=$(mktemp)
+    if cargo publish -p "$crate" "${DRY[@]}" 2>&1 | tee "$log"; then
+      :
+    elif grep -q "no matching package named" "$log"; then
+      echo "  not checkable in a dry run: an upstream in this run is not on the index yet"
+      deferred+=("$crate")
+    else
+      rm -f "$log"
+      exit 1
+    fi
+    rm -f "$log"
+    continue
+  fi
+  cargo publish -p "$crate"
+  if [[ "$crate" != "${CRATES[${#CRATES[@]}-1]}" ]]; then
     echo "  waiting 30s for the index"
     sleep 30
   fi
 done
+
+if ((${#deferred[@]})); then
+  echo
+  echo "dry run ok; deferred to the real run (upstream not on the index yet):"
+  printf '  - %s\n' "${deferred[@]}"
+fi
 
 echo "done: ${CRATES[*]}"

@@ -191,7 +191,15 @@ fn geometry_of(solid: &Solid) -> BrepGeom {
     } else {
         Vec::new()
     };
-    BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices))
+    mesh_geom(TriMesh::new(positions, normals, &mesh.indices))
+}
+
+/// `BrepGeom::Mesh`, whose `normals` field is a second copy of what the
+/// `TriMesh` holds — taken back off the mesh so the two can never disagree
+/// about which normals survived construction.
+fn mesh_geom(mesh: TriMesh) -> BrepGeom {
+    let normals = mesh.normals().to_vec();
+    BrepGeom::Mesh { mesh, normals }
 }
 
 /// One traceable scene: the animal, optionally the door, sand underfoot.

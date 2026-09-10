@@ -409,7 +409,7 @@ impl Cast {
     /// normals and neither is a boolean a CAD kernel should be asked to do at
     /// that ratio. Same trade `render.rs` makes for the being's capsule.
     pub fn add_mesh(&mut self, mesh: TriMesh, material: &str, to_world: Transform) {
-        let bvh = Arc::new(Bvh::build(BrepGeom::Mesh(mesh)));
+        let bvh = Arc::new(Bvh::build(mesh_geom(mesh)));
         self.objects.push(Object::placed(bvh, palette(material), to_world));
     }
 
@@ -457,7 +457,15 @@ fn geometry_of(solid: &Solid) -> Geom {
     // and a facet normal on each — so they are not used even when they are
     // there. See [`smooth_normals`].
     let normals = smooth_normals(&positions, &mesh.indices);
-    BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices))
+    mesh_geom(TriMesh::new(positions, normals, &mesh.indices))
+}
+
+/// `BrepGeom::Mesh`, whose `normals` field is a second copy of what the
+/// `TriMesh` holds — taken back off the mesh so the two can never disagree
+/// about which normals survived construction.
+fn mesh_geom(mesh: TriMesh) -> BrepGeom {
+    let normals = mesh.normals().to_vec();
+    BrepGeom::Mesh { mesh, normals }
 }
 
 /// Vertex normals for a tessellation that arrived without any.

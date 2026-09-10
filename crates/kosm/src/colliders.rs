@@ -947,14 +947,15 @@ mod tests {
     fn marble_cup(b: &Builder) -> Shape {
         let (cup_x, cup_r, cup_wall, cup_h) = (90.0, 22.0, 3.0, 14.0);
         let cup_big = cup_r + cup_wall;
-        let tube = b
-            .cylinder(cup_big, cup_h)
-            .at(cup_x, 0.0, 0.0)
-            .difference(b.cylinder(cup_r, 1.1 * cup_h).at(cup_x, 0.0, 0.0));
+        // Mouth first, then the bore — see `sims/marble/scene.rs::cup_hollow`
+        // for why the order is load-bearing under vcad 0.10.
         let mouth = b
             .boxed(1.4444 * cup_big, 1.6630 * cup_big, 1.2 * cup_h)
             .at(cup_x - 1.2778 * cup_big, 0.0, 0.5 * cup_h);
-        tube.difference(mouth)
+        b.cylinder(cup_big, cup_h)
+            .at(cup_x, 0.0, 0.0)
+            .difference(mouth)
+            .difference(b.cylinder(cup_r, 1.1 * cup_h).at(cup_x, 0.0, 0.0))
     }
 
     #[test]

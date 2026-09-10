@@ -3,8 +3,8 @@ name = "kosm-render"
 # Published on its own cadence: vcad depends on this by version, and the
 # workspace's 0.0.1 is the game's number, not the renderer's.
 #
-# 0.2.0: tagged `kosm-render-v0.2.0`, and vcad tracks that tag
-# (`kosm-render = { git = ..., version = "0.2" }`). The workspace no longer
+# 0.2.0: on crates.io, and vcad 0.10 depends on the registry crate
+# (`kosm-render = "0.2"`). The workspace no longer
 # carries a `[patch."https://github.com/ecto/kosm"]` back-edge — with vcad and
 # this workspace agreeing on 0.2, cargo resolves exactly one kosm-render.
 #
