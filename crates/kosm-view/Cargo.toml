@@ -20,6 +20,12 @@ path = "src/main.rs"
 
 [dependencies]
 kosm-render = { path = "../kosm-render", version = "0.2", features = ["gpu"] }
+# The raster tier's contract with the baker: `kosm::material`'s library is the
+# one table both tiers read, and `kosm::light::probes` is the volume it reads.
+kosm = { path = "../kosm", version = "0.0.1" }
+# the caustic gather is thirty thousand density estimates a frame; a walking
+# player pays it whenever the lens moves, and it is embarrassingly parallel
+rayon = "1"
 # the same wgpu the rest of the workspace is on; winit 0.30 is the one it pairs with
 wgpu = "30"
 winit = "0.30"

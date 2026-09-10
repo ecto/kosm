@@ -525,6 +525,22 @@ pub struct BakeSpec<'a> {
     pub suns: Vec<[f64; 3]>,
     /// Switch the sun off in every slice: the sky and the bounces alone.
     pub sky_only: bool,
+    /// Whether the sun's **direct** term goes into the SH.
+    ///
+    /// True — the default, and what a volume read on its own wants — adds
+    /// `E · V · Y(s)` per probe, so `sample` hands back the whole irradiance
+    /// at a point: sun, sky and bounce together.
+    ///
+    /// False leaves it out and keeps everything else, including every bounce
+    /// *of* the sun: the sun still lights the scene the hemisphere rays look
+    /// at, so the warm light the sand throws onto the cliff is still in
+    /// there. What comes out is the term a **rasterizer** wants, because a
+    /// rasterizer computes the direct sun itself, per pixel, against a
+    /// shadow map — and a shadow map is a far better answer than a lattice
+    /// half a metre across sampled with sixteen shadow rays. Adding both is
+    /// the one mistake this flag exists to make impossible: on the cove's
+    /// sunlit sand it is a factor of one and eight tenths.
+    pub sun_direct: bool,
     /// Hemisphere rays per probe. The ambient term's noise falls as
     /// `1/sqrt(rays)`; the sun's does not depend on it at all.
     pub rays: usize,
@@ -567,6 +583,7 @@ impl Default for BakeSpec<'_> {
             volume: VolumeSpec::over([0.0; 3], [1.0; 3], 0.5),
             suns: Vec::new(),
             sky_only: false,
+            sun_direct: true,
             rays: 64,
             seed: 0x5eed_b00c,
             max_depth: 3,
@@ -717,7 +734,16 @@ pub fn bake_with<G: RenderGeometry + Send + Sync>(
                         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                         .wrapping_add((si as u64) << 40)
                         .wrapping_add(i as u64);
-                    let sh = probe_sh(&tracer, p, spec.rays, seed, sun.as_ref(), spec.sun_samples, cap);
+                    let sh = probe_sh(
+                        &tracer,
+                        p,
+                        spec.rays,
+                        seed,
+                        sun.as_ref(),
+                        spec.sun_samples,
+                        cap,
+                        spec.sun_direct,
+                    );
                     probe.copy_from_slice(&sh);
                 }
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -800,6 +826,7 @@ fn probe_sh<G: RenderGeometry>(
     sun: Option<&Sun>,
     sun_samples: usize,
     cap: f32,
+    sun_direct: bool,
 ) -> [f32; SH * BANDS] {
     let mut sh = [0.0f32; SH * BANDS];
     let rays = rays.max(1);
@@ -831,7 +858,9 @@ fn probe_sh<G: RenderGeometry>(
             }
         }
     }
-    if let Some(s) = sun {
+    if let Some(s) = sun
+        && sun_direct
+    {
         let n = sun_samples.max(1);
         let mut visible = 0.0f64;
         for i in 0..n {
@@ -861,7 +890,7 @@ fn probe_sh<G: RenderGeometry>(
 
 /// The environment on its own, projected onto SH: no geometry, no sun.
 fn sky_sh<G: RenderGeometry>(tracer: &Tracer<'_, G>, rays: usize, seed: u64) -> [[f32; BANDS]; SH] {
-    let flat = probe_sh(tracer, [0.0; 3], rays, seed, None, 0, f32::INFINITY);
+    let flat = probe_sh(tracer, [0.0; 3], rays, seed, None, 0, f32::INFINITY, true);
     let mut out = [[0.0f32; BANDS]; SH];
     for k in 0..SH {
         out[k].copy_from_slice(&flat[k * BANDS..(k + 1) * BANDS]);

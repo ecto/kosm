@@ -1475,6 +1475,7 @@ name = "kosm"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "hound",
  "image",
  "kosm-mpm",
@@ -1617,11 +1618,13 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "kosm",
  "kosm-render",
  "kosm-scan",
  "log",
  "phyz-math",
  "pollster 0.4.0",
+ "rayon",
  "serde",
  "serde_json",
  "tang",

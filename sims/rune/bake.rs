@@ -192,6 +192,17 @@ pub fn run_light(scene: &CoveScene, args: &kosm_cli::Args, out: &Path) -> anyhow
             seed,
             max_depth: depth,
             sun_samples,
+            // **The sun's direct term is the raster tier's, not the bake's.**
+            // The volume this writes is read by a rasterizer that computes
+            // `E · max(0, n·s)` itself, per pixel, against a 2048² shadow
+            // map — which resolves the hero's own shadow and the door's jamb,
+            // neither of which a lattice half a metre across ever could. What
+            // is left in the SH is the sky and every bounce, *including* the
+            // sun's: the sun still lights the sand the probes look at, so the
+            // warm throw onto the cliff face is in here. Baking the direct
+            // term as well and letting the shader add its own is a factor of
+            // 1.8 on the cove's sunlit sand, which is what this line is for.
+            sun_direct: false,
             progress: Some(&tick),
             ..BakeSpec::default()
         },

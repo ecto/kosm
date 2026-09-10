@@ -73,13 +73,14 @@ use kosm_render::math::{Point3, Vec3 as RVec3};
 use kosm_render::pathtrace::{self, Camera, Film, PathTraceOptions, Projection};
 use super::being::{Cove, Input, Player, Snapshot};
 use super::render::{self as cove_render, PER_M, Placement};
-use super::{CoveScene, bake, hint, rune};
+use super::{CoveScene, bake, hint, materials, rune};
 use phyz_math::{Mat3, Vec3};
 
 use kosm::player::meter::Meter;
 use kosm::player::rig::{Clearance, Interest, Rig, RigKnobs, Subject};
 use kosm_view::budget::Budget;
 use kosm_view::history::{History, Plan, Pose, View};
+use kosm_view::raster;
 use kosm_view::viewport;
 
 // ---- the knobs the window owns ---------------------------------------------
@@ -836,7 +837,12 @@ struct Job {
 /// the moment it was due.
 struct Shot {
     size: (u32, u32),
+    /// The picture in memory. Empty when [`Shot::tex`] carries it instead.
     rgba: Vec<u8>,
+    /// The picture on the device, when nothing had to come back across the
+    /// bus: the raster tier's own colour target, already sRGB-encoded, on the
+    /// viewport's own device. See [`raster_worker`].
+    tex: Option<std::sync::Arc<wgpu::Texture>>,
     mask: f32,
     mean_spp: f32,
     due: Instant,
@@ -1136,6 +1142,25 @@ impl Tracer {
         self
     }
 
+    /// The level this tracer was built from, for a tier that needs the same
+    /// numbers — the sun, the sea, the door's hinge.
+    fn cove(&self) -> &CoveScene {
+        &self.scene
+    }
+
+    /// The photon map as it stands, for a tier that gathers it onto a texture
+    /// rather than reading it per ray.
+    fn caustic_map(&self) -> &CausticMap {
+        &self.caustics
+    }
+
+    /// What the light meter has multiplied the authored exposure by. One
+    /// until a pass has measured something, which is the authored exposure
+    /// exactly — the level's own answer for the picture it opens on.
+    fn meter_gain(&self) -> f64 {
+        self.meter.as_ref().map_or(1.0, |m| m.exposure())
+    }
+
     /// Whether the being has moved or leaned far enough to be worth a new map.
     fn caustic_is_stale(&self, p: &Placement) -> bool {
         let Some(was) = self.traced_at.as_ref() else {
@@ -1170,15 +1195,21 @@ impl Tracer {
     /// it folded would be paying for pictures nobody is ever shown, and would
     /// cost more frame rate than the fold saves.
     fn pass(&mut self, frame: &Snapshot, size: (u32, u32), lit: Lit, present: bool) -> Passed {
-        // A size step is a new grid, not a new picture: the history is
-        // resampled onto it, keeping the mean, the counts and the guides. That
-        // is what lets [`Budget`] change the size while the picture is
-        // converging — a climb back to the base after a walk seeds itself from
-        // the low-res picture instead of starting from black.
-        self.history.resample(size);
-        if (self.film.width, self.film.height) != size {
-            self.film = Film::new(size.0, size.1);
-        }
+        let ready = self.prepare(frame, lit);
+        self.pass_at(frame, size, lit, present, &ready)
+    }
+
+    /// The half of a pass that is not a trace: where the body is, whether the
+    /// caustic needs retracing, how much simulated time has gone by, and where
+    /// the camera has sprung to.
+    ///
+    /// Split out because **the raster tier needs exactly this and nothing
+    /// else**. Both tiers place the same figure, retrace the same photon map
+    /// on the same rule, and advance the same rig by the same `dt` — so the
+    /// picture the raster draws and the picture the tracer settles into are of
+    /// one camera looking at one pose, which is what makes the blend a fade
+    /// rather than a double exposure.
+    fn prepare(&mut self, frame: &Snapshot, lit: Lit) -> Ready {
         // The figure, placed. The solids are the scene's and were built once;
         // this is one 4×4 a part, from the transforms the simulation put the
         // links at.
@@ -1188,16 +1219,52 @@ impl Tracer {
             .and_then(|parts| self.picture.hero_at(parts, &self.pivots, frame.held));
         let placement =
             placement_of(frame).with_hero(hero).with_score(lit.score).with_glint(lit.glint);
-        let moved = self.caustic_is_stale(&placement);
-        if moved {
-            self.caustics = self.picture.caustic_map(&placement);
-            self.traced_at = Some(placement.clone());
-        }
+        let moved = self.sync_caustics(&placement);
         // The clock both the camera and the meter run on: the *simulation's*,
         // so neither depends on how long a pass happened to take.
         let dt = self.rig_t.map_or(frame.dt, |t| (frame.t - t).max(0.0)).max(0.0);
         self.rig_t = Some(frame.t);
         let cam = self.camera(frame, &placement, dt);
+        Ready { placement, caustic_moved: moved, dt, cam }
+    }
+
+    /// Retrace the photon map if the lens has moved far enough, and say
+    /// whether it did.
+    ///
+    /// The half of [`prepare`](Self::prepare) a tracer that was *handed* its
+    /// pose still has to do for itself: `pass_at` reads `self.caustics`, and
+    /// the rule for when that is stale is a property of the placement, so two
+    /// tracers given the same placements retrace on the same frames and end
+    /// up with the same map.
+    fn sync_caustics(&mut self, placement: &Placement) -> bool {
+        let stale = self.caustic_is_stale(placement);
+        if stale {
+            self.caustics = self.picture.caustic_map(placement);
+            self.traced_at = Some(placement.clone());
+        }
+        stale
+    }
+
+    /// The rest of it: trace a raw sample into `size`, fold it in, resolve.
+    fn pass_at(
+        &mut self,
+        frame: &Snapshot,
+        size: (u32, u32),
+        lit: Lit,
+        present: bool,
+        ready: &Ready,
+    ) -> Passed {
+        // A size step is a new grid, not a new picture: the history is
+        // resampled onto it, keeping the mean, the counts and the guides. That
+        // is what lets [`Budget`] change the size while the picture is
+        // converging — a climb back to the base after a walk seeds itself from
+        // the low-res picture instead of starting from black.
+        self.history.resample(size);
+        if (self.film.width, self.film.height) != size {
+            self.film = Film::new(size.0, size.1);
+        }
+        let Ready { placement, caustic_moved: moved, dt, cam } = ready;
+        let (placement, moved, dt, cam) = (placement, *moved, *dt, *cam);
         let view = View::of(&cam, size.0, size.1);
         let poses = poses(&self.scene, frame, moved, lit.glint);
         let plan: Plan = self.history.plan(&view, &poses, &[]);
@@ -1215,7 +1282,7 @@ impl Tracer {
 
         self.passes += 1;
         let seed = 0x5eed_c0be ^ self.passes.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let picture = self.picture.at(&placement);
+        let picture = self.picture.at(placement);
         let opts = options(&self.scene, seed, false);
         let map = (!self.caustics.is_empty()).then_some(&self.caustics);
         let traced = if full {
@@ -1253,6 +1320,24 @@ impl Tracer {
             exposure: e,
             shutter: self.rig.as_ref().map_or(1, |r| r.shutter_passes()),
         }
+    }
+
+    /// Throw the accumulated picture away: the pose it is of is gone.
+    ///
+    /// What the raster tier does the instant the player moves. The history is
+    /// remade rather than masked, because a mask carries pixels through a move
+    /// and the whole point of the settle blend is that a move shows the
+    /// *raster* frame, sharp, with none of the tracer's past in it.
+    fn restart(&mut self, size: (u32, u32)) {
+        self.history = History::new(size);
+        self.history.set_denoise_floor(
+            self.scene.authored.parameter_or("denoise_floor_live", DENOISE_FLOOR as f64) as f32,
+        );
+        self.history.set_firefly_cap(Some(
+            self.scene.authored.parameter_or("firefly_cap_live", FIREFLY_CAP as f64) as f32,
+        ));
+        self.film = Film::new(size.0, size.1);
+        self.last_view = None;
     }
 
     /// The camera this pass renders from.
@@ -1296,6 +1381,22 @@ fn subject_of(snap: &Snapshot) -> Subject {
         speed: Vec3::new(v.x, v.y, 0.0).norm(),
         lean: up.z.clamp(-1.0, 1.0).acos(),
     }
+}
+
+/// Everything a pass needs that is not a trace. See [`Tracer::prepare`].
+///
+/// `Clone`, because on the raster tier it crosses a channel: the raster
+/// thread is the one that springs the rig and places the body, and the
+/// reference is traced on **its** answer rather than on one a second rig
+/// arrived at separately. Two rigs fed the same snapshots agree at the fixed
+/// point and disagree on the way to it, and the way to it is exactly where a
+/// blend would ghost.
+#[derive(Clone)]
+struct Ready {
+    placement: Placement,
+    caustic_moved: bool,
+    dt: f64,
+    cam: Camera,
 }
 
 /// What one pass came back with, and what the budget reads off it.
@@ -1448,6 +1549,7 @@ fn render_worker(
         let shot = Shot {
             size,
             rgba: done.rgba,
+            tex: None,
             mask: done.mask,
             mean_spp: done.mean_spp,
             due: job.due,
@@ -1516,6 +1618,792 @@ fn render_worker(
         // Measured, then chosen: the next size is a fact about the pass that
         // just ran and about whether anything moved under it.
         size = budget.next(ms, done.repainted, done.camera_moved);
+        if out.send(shot).is_err() {
+            return;
+        }
+    }
+}
+
+
+// ---- the raster tier ---------------------------------------------------------
+
+/// The one camera, in the raster tier's units.
+///
+/// **The two tiers do not measure in the same thing.** The picture the tracer
+/// traces is `cove_render`'s document, and a vcad document is in
+/// *millimetres* — `PER_M` is the constant, and every ray, every solid and
+/// every `Pose` in this file is scaled by it. The raster tier is in
+/// **metres**, because that is what the probe lattice's `origin` and
+/// `spacing` are in, what `kosm::light::probes` bakes, and what the physics
+/// the hero is simulated in uses.
+///
+/// So the rig — which is told `.in_millimetres()` and therefore hands back an
+/// eye in the tracer's units, not the body's — is converted here, once, at
+/// the one point a camera crosses from one tier to the other. Only the
+/// lengths carry the unit: the basis is three unit vectors and the field of
+/// view is an angle, and both are the same number in either.
+///
+/// Getting this wrong is not subtle and is not a seam: an eye a thousand
+/// times too far out sees a level that subtends a milliradian, which is one
+/// pixel of sand in the middle of a sky.
+fn in_metres(cam: &Camera) -> Camera {
+    let s = 1.0 / PER_M;
+    Camera {
+        eye: Point3::new(cam.eye.x * s, cam.eye.y * s, cam.eye.z * s),
+        aperture: cam.aperture * s,
+        focus_dist: cam.focus_dist * s,
+        ortho_half_height: cam.ortho_half_height.map(|h| h * s),
+        ..*cam
+    }
+}
+
+/// Which tier draws the frame.
+///
+/// `--tier raster` is the default: the cove's static light is baked into
+/// spectral SH probes (`kosm run rune --bake-light`), the geometry is
+/// tessellated once, and a wgpu forward pass draws the answer sixty times a
+/// second. `--tier trace` is the path tracer this file has always been —
+/// unchanged, to the byte, and still the reference the raster settles into.
+///
+/// See `docs/plans/2026-09-10-bake-and-raster-design.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Raster,
+    Trace,
+}
+
+/// `--tier raster|trace`. The default is the raster, and it falls back to the
+/// tracer, loudly, when the level asks for something the raster cannot draw.
+fn tier_flag(args: &kosm_cli::Args) -> anyhow::Result<Tier> {
+    match args.value("tier") {
+        None => Ok(Tier::Raster),
+        Some("raster" | "live" | "gpu") => Ok(Tier::Raster),
+        Some("trace" | "tracer" | "cpu" | "reference") => Ok(Tier::Trace),
+        Some(other) => anyhow::bail!("--tier {other}: raster or trace"),
+    }
+}
+
+/// Where the baked light lives, relative to a run's output.
+fn probes_path(out: &Path) -> std::path::PathBuf {
+    out.join("maps").join("cove").join("probes.bin")
+}
+
+/// The level's baked light, or a sky-only stand-in.
+///
+/// A raster tier with no bake is not an error — it is a level nobody has run
+/// `--bake-light` on yet — so what it gets is a volume holding the cove's own
+/// sky and no bounce at all. The picture is flatter and the shadows are
+/// harder; the geometry, the materials, the sun and the caustic are exactly
+/// what they will be, which is enough to work in. The line on stderr says so.
+fn cove_probes(scene: &CoveScene, out: &Path) -> raster::ProbeVolume {
+    let path = probes_path(out);
+    match kosm::light::probes::ProbeVolume::read(&path) {
+        Ok(v) => {
+            eprintln!(
+                "rune   the light: {}×{}×{} probes at {:.0} mm, {} sun{} — {}",
+                v.dims[0],
+                v.dims[1],
+                v.dims[2],
+                v.spacing * 1e3,
+                v.suns.len(),
+                if v.suns.len() == 1 { "" } else { "s" },
+                path.display()
+            );
+            v
+        }
+        Err(e) => {
+            eprintln!(
+                "rune   no baked light at {} ({e}); the sky alone. Run `kosm run rune --bake-light` for the bounce.",
+                path.display()
+            );
+            sky_only_probes(scene)
+        }
+    }
+}
+
+/// The cove's gradient sky, projected onto one probe and spread over the
+/// level's volume. No occlusion and no bounce: the stand-in.
+fn sky_only_probes(scene: &CoveScene) -> raster::ProbeVolume {
+    use kosm_render::pathtrace::Environment;
+    let (env, _) = cove_render::daylight(scene);
+    let Environment::Gradient(g) = env else {
+        return raster::probes::uniform([0.0; 3], 1.0, [2, 2, 2], 0.2);
+    };
+    let (lo, hi) = scene.volume();
+    let spacing = 4.0;
+    let dims = [
+        (((hi.x - lo.x) / spacing).ceil() as u32 + 1).max(2),
+        (((hi.y - lo.y) / spacing).ceil() as u32 + 1).max(2),
+        (((hi.z - lo.z) / spacing).ceil() as u32 + 1).max(2),
+    ];
+    raster::probes::from_radiance([lo.x, lo.y, lo.z], spacing, dims, 512, |_, d| {
+        // `GradientEnv`: the ground colour below the horizon, and horizon to
+        // zenith above it — the same lookup the tracer's environment does.
+        let rgb = if d[2] < 0.0 {
+            g.ground
+        } else {
+            let t = d[2] as f32;
+            [
+                g.horizon[0] + (g.zenith[0] - g.horizon[0]) * t,
+                g.horizon[1] + (g.zenith[1] - g.horizon[1]) * t,
+                g.horizon[2] + (g.zenith[2] - g.horizon[2]) * t,
+            ]
+        };
+        let c = [rgb[0] * g.intensity, rgb[1] * g.intensity, rgb[2] * g.intensity];
+        [c[2], c[2], c[1], c[1], c[0], c[0]]
+    })
+}
+
+/// The cove, as the raster tier draws it.
+///
+/// Built once: every solid tessellated, one material per surface name, the
+/// sea's lattice, the two caustic receivers. What a frame costs after that is
+/// one 4×4 per drawn part.
+struct RasterTier {
+    scene: raster::Scene,
+    raster: raster::Raster,
+    /// One entry per mesh: what it is, and its own placement inside its
+    /// role's frame.
+    parts: Vec<(cove_render::Role, [[f64; 4]; 4], u32)>,
+    /// The link pivots the hero's placement needs.
+    pivots: Vec<Vec3>,
+    /// The keyhole's rim and the glint carry their brightness as a per
+    /// *instance* glow rather than as a material, because the brightness is
+    /// the score — a number the simulation carries — and a material rebuilt
+    /// every frame would be a buffer upload every frame.
+    glow_floor: f64,
+    glow_gain: f64,
+    glint_glow: f64,
+    /// Where the caustic receivers are, so the map can be re-gathered when the
+    /// lens moves.
+    door_quad: ([f64; 3], [f64; 3], [f64; 3]),
+    sand_quad: ([f64; 3], [f64; 3], [f64; 3]),
+    caustic_res: (u32, u32),
+}
+
+/// How fine the two caustic receivers are gathered. 128² over a door a metre
+/// and a half across is a centimetre a texel, which is finer than the photon
+/// map's own gather radius and so is not the limit on anything.
+const CAUSTIC_RES: (u32, u32) = (128, 128);
+
+impl RasterTier {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &CoveScene,
+        probes: raster::ProbeVolume,
+        format: wgpu::TextureFormat,
+    ) -> anyhow::Result<Self> {
+        let a = &scene.authored;
+        let doc = &a.document;
+        let d = scene.sun_dir();
+        let irr = a.parameter_or("sun_irradiance", 6.2) as f32;
+        let sun = raster::Sun::from_rgb(
+            [d.x, d.y, d.z],
+            // the same warm low light `render::daylight` gives the tracer
+            [irr, 0.77 * irr, 0.46 * irr],
+            a.parameter_or("sun_angular_radius", 0.02),
+        );
+        let (mut rs, _by_name) = raster::Scene::new(sun, probes);
+        let (lo, hi) = scene.volume();
+        rs.bounds = ([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
+        rs.exposure = a.parameter_or("exposure", 0.7) as f32;
+
+        // One material per surface the level names, through
+        // `materials::gpu` — which *is* `materials::pbr` laid over the
+        // library, so the two tiers cannot disagree about a colour.
+        let mut by_surface: std::collections::HashMap<String, u32> = Default::default();
+        let mut material_of = |rs: &mut raster::Scene, name: &str| -> u32 {
+            if let Some(i) = by_surface.get(name) {
+                return *i;
+            }
+            let m = match name {
+                "N-BK7" => materials::gpu_being(scene.n_d),
+                other => materials::gpu(doc, other),
+            };
+            let i = rs.push_material(m);
+            by_surface.insert(name.to_owned(), i);
+            i
+        };
+
+        let meshes = cove_render::raster_meshes(scene)?;
+        let mut parts = Vec::with_capacity(meshes.len() + 1);
+        for m in &meshes {
+            let mat = material_of(&mut rs, &m.material);
+            rs.push_mesh(raster::Mesh::from_mm(&m.positions, &m.normals, &m.indices));
+            parts.push((m.role, m.to_world, mat));
+        }
+
+        // The sea: the pool tier's construction at the level's own waterline,
+        // with the level's own swell. It is the last mesh and carries no role
+        // — nothing in the simulation moves it.
+        let sand = material_of(&mut rs, "sand");
+        let water = material_of(&mut rs, "water");
+        let sea = raster::Sea::cove(
+            scene.sea_z,
+            scene.beach_slope,
+            scene.waterline(),
+            scene.cove + scene.seabed,
+        )
+        .with_swell(
+            a.parameter_or("swell_a_mm", 30.0) * kosm::scene::MM,
+            a.parameter_or("swell_l_mm", 7000.0) * kosm::scene::MM,
+            a.parameter_or("swell_b_mm", 20.0) * kosm::scene::MM,
+            a.parameter_or("swell_m_mm", 3000.0) * kosm::scene::MM,
+        )
+        .with_materials(sand, water);
+        let (pts, idx) = sea.lattice(scene.cove, 96);
+        rs.push_mesh(raster::Mesh::from_m(&pts, &[], &idx));
+        parts.push((cove_render::Role::Ground, IDENTITY_ROWS, water));
+        rs.sea = Some(sea);
+
+        // The two receivers the caustic is gathered onto: the door's face, and
+        // a patch of sand in front of it wide enough to hold a focus thrown
+        // wide of the keyhole.
+        let face = scene.cliff_face_y();
+        let door_quad = (
+            [
+                scene.door_x - scene.door_w / 2.0,
+                face - 0.01,
+                scene.door_sill(),
+            ],
+            [scene.door_w, 0.0, 0.0],
+            [0.0, 0.0, scene.door_h],
+        );
+        let patch = a.parameter_or("caustic_patch_m", 8.0);
+        let sand_quad = (
+            [
+                scene.door_x - patch / 2.0,
+                face - patch,
+                scene.sand_z_at(scene.door_x, face - patch) + 0.005,
+            ],
+            [patch, 0.0, 0.0],
+            // the sand is a plane at a grade, so the `v` edge rises with it
+            [0.0, patch, scene.beach_slope * patch],
+        );
+        rs.caustics = vec![
+            raster::CausticQuad::empty(CAUSTIC_RES),
+            raster::CausticQuad::empty(CAUSTIC_RES),
+        ];
+
+        let raster = raster::Raster::new(device, queue, &rs, format)?;
+        eprintln!(
+            "rune   the raster tier: {} meshes, {} triangles, {} materials",
+            rs.meshes.len(),
+            rs.tris(),
+            rs.materials.len()
+        );
+        Ok(Self {
+            scene: rs,
+            raster,
+            parts,
+            pivots: cove_render::Scene::hero_pivots(),
+            glow_floor: scene.glow_floor,
+            glow_gain: scene.glow_gain,
+            glint_glow: scene.glint_glow,
+            door_quad,
+            sand_quad,
+            caustic_res: CAUSTIC_RES,
+        })
+    }
+
+    /// Put every drawn part where this frame says it is.
+    fn place(&mut self, scene: &CoveScene, frame: &Snapshot, placement: &Placement, lit: Lit) {
+        let swing = cove_render::door_swing(scene, placement.door_angle);
+        let rim_glow = {
+            let r = (self.glow_floor + self.glow_gain * lit.score.max(0.0)).max(0.0) as f32;
+            [RIM_TINT[0] * r, RIM_TINT[1] * r, RIM_TINT[2] * r]
+        };
+        let glint_glow = {
+            let r = self.glint_glow.max(0.0) as f32;
+            [GLINT_TINT[0] * r, GLINT_TINT[1] * r, GLINT_TINT[2] * r]
+        };
+        let has_hero = frame.parts.as_ref().is_some_and(|p| !p.is_empty());
+        for (mesh, (role, local, mat)) in self.scene.meshes.iter_mut().zip(self.parts.iter()) {
+            mesh.instances.clear();
+            let (frame_rows, kind, glow) = match *role {
+                cove_render::Role::Ground => (IDENTITY_ROWS, raster::Kind::Solid, [0.0; 3]),
+                cove_render::Role::Door => (swing, raster::Kind::Solid, [0.0; 3]),
+                cove_render::Role::Rim => (swing, raster::Kind::Solid, rim_glow),
+                cove_render::Role::Glint => match lit.glint {
+                    Some(g) => (cove_render::at_frame(g), raster::Kind::Solid, glint_glow),
+                    None => continue,
+                },
+                cove_render::Role::Being => {
+                    if has_hero {
+                        continue;
+                    }
+                    let (centre, rot) = placement.being;
+                    (cove_render::being_frame(centre, &rot), raster::Kind::Lens, [0.0; 3])
+                }
+                cove_render::Role::Hero { link } => {
+                    let (Some(parts), Some(pivot)) = (frame.parts.as_ref(), self.pivots.get(link))
+                    else {
+                        continue;
+                    };
+                    let Some(part) = parts.get(link) else { continue };
+                    (cove_render::hero_frame(part, *pivot), raster::Kind::Solid, [0.0; 3])
+                }
+                cove_render::Role::Held => {
+                    let Some(pose) = frame.held else { continue };
+                    (cove_render::held_frame(&pose), raster::Kind::Solid, [0.0; 3])
+                }
+            };
+            // The lens's glass is the one part of the figure the raster tier
+            // cannot be honest about, so it is drawn as a Fresnel disc; the
+            // brass ring beside it is an ordinary solid.
+            let kind = if matches!(*role, cove_render::Role::Held) {
+                raster::Kind::Lens
+            } else {
+                kind
+            };
+            let mut inst = raster::Instance::from_mm_rows(mul_rows(&frame_rows, local), *mat);
+            inst = inst.with_kind(kind).with_glow(glow);
+            // Neither the sea nor a disc of glass belongs in a shadow map: one
+            // is a swell whose depth buffer is a field of acne, the other is a
+            // surface light goes through.
+            if matches!(kind, raster::Kind::Lens) {
+                inst = inst.casting(false);
+            }
+            mesh.instances.push(inst);
+        }
+        // the sea, which is the last mesh and is drawn as water
+        if let Some(mesh) = self.scene.meshes.last_mut() {
+            if self.scene.sea.is_some() {
+                mesh.instances.clear();
+                let (_, _, mat) = self.parts[self.parts.len() - 1];
+                mesh.instances.push(
+                    raster::Instance { material: mat, ..Default::default() }
+                        .with_kind(raster::Kind::Sea)
+                        .casting(false),
+                );
+            }
+        }
+    }
+
+    /// Re-gather the photon map onto the two receivers.
+    fn gather(&mut self, map: &CausticMap) {
+        let quads = [self.door_quad, self.sand_quad];
+        self.scene.caustics = quads
+            .iter()
+            .map(|(o, u, v)| raster::CausticQuad::gather(map, *o, *u, *v, self.caustic_res))
+            .collect();
+    }
+
+    fn draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        f: &raster::Frame,
+    ) -> std::sync::Arc<wgpu::Texture> {
+        self.raster.draw(device, queue, &self.scene, f)
+    }
+}
+
+/// A row-major identity, millimetres.
+const IDENTITY_ROWS: [[f64; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Two row-major 4×4s, multiplied. The units are the right-hand one's.
+fn mul_rows(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut out = [[0.0f64; 4]; 4];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (c, o) in row.iter_mut().enumerate() {
+            *o = (0..4).map(|k| a[r][k] * b[k][c]).sum();
+        }
+    }
+    out
+}
+
+/// The rim's and the glint's tints, the same two `materials.rs` paints them.
+const RIM_TINT: [f32; 3] = [1.0, 0.86, 0.58];
+const GLINT_TINT: [f32; 3] = [1.0, 0.93, 0.78];
+
+
+/// The raster tier's render thread.
+///
+/// The court's shape, one tier over: a job carries a frame and a deadline,
+/// this thread draws it, and what comes back is a picture. The differences are
+/// the whole design.
+///
+/// **The raster draws every frame.** No budget ladder and no shutter — a
+/// forward pass at the window's own size is milliseconds — so the size is the
+/// window's and the frame rate is the display's.
+///
+/// **The tracer runs only while the hero is still.** A move throws its history
+/// away ([`Tracer::restart`]) and the blend drops to zero on that frame, so
+/// what the player sees the instant they touch the mouse is the raster frame,
+/// sharp. Standing, the tracer accumulates on the rig's exact camera at the
+/// budget's size and the blend fades it up: `(spp − 4) / 24`.
+///
+/// **Nothing crosses the bus while the blend is zero.** A raster-only frame is
+/// handed over as the texture it was drawn into. Only once the reference has
+/// something to say is the frame read back — and by then nobody is moving, so
+/// the readback costs a frame rate nobody is spending.
+#[allow(clippy::too_many_arguments)]
+fn raster_worker(
+    jobs: Receiver<Job>,
+    out: Sender<Shot>,
+    glow: Glow,
+    budget: Budget,
+    ready: Arc<AtomicBool>,
+    sdf: Arc<kosm_scan::SdfGrid>,
+    projection: Option<Projection>,
+    settle_on: bool,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    size: (u32, u32),
+) {
+    eprintln!("rune   evaluating the level…");
+    let mut trace_size = budget.size();
+    let player = Player::from_env();
+    let field = sdf.clone();
+    let mut tracer = match Tracer::new(trace_size) {
+        Ok(t) => t.with_rig(sdf, player).with_projection(projection),
+        Err(e) => return eprintln!("rune: could not build the picture: {e}"),
+    };
+    let mut tier = match RasterTier::new(
+        &device,
+        &queue,
+        tracer.cove(),
+        cove_probes(tracer.cove(), Path::new("out")),
+        wgpu::TextureFormat::Rgba8Unorm,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("rune   the raster tier would not build ({e}); the tracer draws instead");
+            ready.store(true, Ordering::Release);
+            return trace_loop(jobs, out, glow, budget, tracer, true);
+        }
+    };
+    ready.store(true, Ordering::Release);
+    eprintln!(
+        "rune   the raster tier is drawing at {}×{}; the reference settles in at {}×{} when the \
+         hero is still{}",
+        size.0,
+        size.1,
+        trace_size.0,
+        trace_size.1,
+        if settle_on { "" } else { " (--no-settle: it does not)" },
+    );
+
+    // **The reference runs beside the raster, not in front of it.**
+    //
+    // This used to be one loop: draw, then trace, then present. A trace pass
+    // at 480×270 is a hundred and twenty milliseconds, so the *presented*
+    // frame rate fell to seven a second exactly while the picture was
+    // settling, and a walk that quantised to a still camera for one frame
+    // paid a whole pass before it could show the next one. Now the pass goes
+    // to [`settle_worker`] and the raster loop never waits for it: what
+    // arrives back is folded into the next frame it draws.
+    //
+    // The rig is **not** duplicated. The raster thread springs it, and the
+    // [`Ready`] it produces is what crosses the channel, so the reference is
+    // traced from the raster's own camera and the blend is a fade.
+    let (want_tx, want_rx) = std::sync::mpsc::channel::<Trace>();
+    let (got_tx, got_rx) = std::sync::mpsc::channel::<Traced>();
+    if settle_on {
+        std::thread::spawn(move || settle_worker(want_rx, got_tx, budget, field, player, projection));
+    }
+
+    let mut settle = if settle_on { raster::Settle::default() } else { raster::Settle::disabled() };
+    let mut said_at = Instant::now();
+    let mut frames = 0u32;
+    let mut raster_ms = 0.0f64;
+    let mut prep_ms = 0.0f64;
+    let mut last_view: Option<View> = None;
+    // The pose the reference is being traced for. A move bumps it, and a
+    // frame that comes back stamped with an older one is a picture of a place
+    // the player has left — dropped, not blended.
+    let mut generation = 0u64;
+    let mut outstanding = false;
+    let mut reference: Option<(Vec<u8>, (u32, u32))> = None;
+    // The meter's multiplier, as the reference last measured it. One until it
+    // has: the level's authored exposure is its own answer for the picture it
+    // opens on, which is what a walking player is looking at.
+    let mut gain = 1.0f64;
+    loop {
+        // **One job, and it must be a new one.** Re-preparing the frame the
+        // loop already drew steps the rig by a `dt` of zero and reads as a
+        // still camera however fast the player is walking, which is what used
+        // to spend a trace pass in the middle of a stride.
+        let mut latest = None;
+        loop {
+            match jobs.try_recv() {
+                Ok(job) => latest = Some(job),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        let job = match latest {
+            Some(job) => job,
+            None => match jobs.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            },
+        };
+
+        let lap = Instant::now();
+        let lit = *glow.lock().unwrap_or_else(|e| e.into_inner());
+        // The placement, the caustic and the camera: one rig, stepped once,
+        // and both tiers draw the frame it hands back. That is what makes the
+        // blend a fade rather than a double exposure.
+        let prepared = tracer.prepare(&job.frame, lit);
+        if prepared.caustic_moved {
+            tier.gather(tracer.caustic_map());
+        }
+        tier.place(tracer.cove(), &job.frame, &prepared.placement, lit);
+        // What the *pose* cost, before a triangle is drawn. On a walking
+        // frame this is nearly all of it and nearly all of that is the photon
+        // map: the lens moves with the hand, so `sync_caustics` retraces, and
+        // fifty thousand photons is tens of milliseconds. It is the level's
+        // cost and not the tier's — the trace tier pays exactly the same one
+        // out of the same `prepare` — so the pace line states the two halves
+        // separately rather than reporting one number that hides it.
+        let prep = lap.elapsed().as_secs_f64() * 1e3;
+        prep_ms = if prep_ms > 0.0 { 0.7 * prep_ms + 0.3 * prep } else { prep };
+
+        // **Did anything move?** The camera, compared for equality. The rig
+        // quantises its eye to the millimetre and its field of view to a
+        // quarter of a degree, so a standing player is genuinely still and
+        // this is a fact rather than a threshold.
+        let view = View::of(&prepared.cam, size.0, size.1);
+        let moved = last_view != Some(view);
+        last_view = Some(view);
+        if moved {
+            settle.moved();
+            generation += 1;
+            reference = None;
+        } else {
+            settle.still(prepared.dt);
+        }
+
+        // Whatever the reference finished while this loop was drawing.
+        while let Ok(done) = got_rx.try_recv() {
+            outstanding = false;
+            if done.generation == generation {
+                settle.traced(done.spp);
+                trace_size = done.size;
+                gain = done.exposure;
+                if !done.rgba.is_empty() {
+                    reference = Some((done.rgba, done.size));
+                }
+            }
+        }
+        // And the next one, if it is worth asking for: nobody is moving, the
+        // reference is not already there, and the last one has come back.
+        if settle_on && !moved && !settle.is_settled() && !outstanding {
+            let ask = Trace {
+                frame: job.frame.clone(),
+                ready: prepared.clone(),
+                lit,
+                generation,
+            };
+            outstanding = want_tx.send(ask).is_ok();
+        }
+
+        let mut f = raster::Frame::new(in_metres(&prepared.cam), size);
+        f.exposure = tier.scene.exposure * gain as f32;
+        f.time = job.frame.t as f32;
+        f.caustics_dirty = prepared.caustic_moved;
+        let drew = Instant::now();
+        let texture = tier.draw(&device, &queue, &f);
+        let ms = drew.elapsed().as_secs_f64() * 1e3;
+        raster_ms = if raster_ms > 0.0 { 0.7 * raster_ms + 0.3 * ms } else { ms };
+
+        let blend = settle.blend();
+        let shot = if blend > 0.0 {
+            // **The bus is crossed only once the reference has something to
+            // say.** Below that the frame is handed over as the texture it
+            // was drawn into, and nothing is read back at all — which is the
+            // whole of a walking player's frame budget.
+            let img = kosm_view::frame::read_back(&device, &queue, &texture, size).into_raw();
+            let rgba = match &reference {
+                Some((bytes, tsize)) => raster::settle::present(&img, size, bytes, *tsize, blend),
+                // a blend above zero with nothing to blend cannot happen —
+                // the samples come with the picture — but a raw raster frame
+                // is the honest fallback and not a panic
+                None => img,
+            };
+            Shot { size, rgba, tex: None, mask: 0.0, mean_spp: settle.spp(), due: job.due }
+        } else {
+            Shot {
+                size,
+                rgba: Vec::new(),
+                tex: Some(texture),
+                mask: 0.0,
+                mean_spp: settle.spp(),
+                due: job.due,
+            }
+        };
+
+        frames += 1;
+        let elapsed = said_at.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            said_at = Instant::now();
+            eprintln!(
+                "rune   raster {}×{}: {:.1} fps, {:.1} ms drawing + {:.1} ms posing, blend \
+                 {:.2} at {:.1} spp ({}×{} traced) — {}",
+                size.0,
+                size.1,
+                frames as f64 / elapsed,
+                raster_ms,
+                prep_ms,
+                blend,
+                settle.spp(),
+                trace_size.0,
+                trace_size.1,
+                if moved { "moving" } else { "still" },
+            );
+            frames = 0;
+        }
+        if out.send(shot).is_err() {
+            return;
+        }
+    }
+}
+
+/// What the raster thread asks the reference for: a pose, and which pose it
+/// is.
+struct Trace {
+    frame: Snapshot,
+    ready: Ready,
+    lit: Lit,
+    generation: u64,
+}
+
+/// What comes back. `rgba` is empty when the pass folded without resolving.
+struct Traced {
+    rgba: Vec<u8>,
+    size: (u32, u32),
+    spp: f32,
+    /// What the light meter multiplied the authored exposure by.
+    ///
+    /// It rides back with the picture because **the meter lives with the
+    /// tracer**: it is a lens over the radiance a pass measured, and the
+    /// raster thread no longer takes any passes. Tone-mapping the raster half
+    /// of the blend at the authored exposure while the traced half arrived at
+    /// a measured one is a seam, and it is a seam that gets worse the more
+    /// the level's light changes.
+    exposure: f64,
+    generation: u64,
+}
+
+/// The reference, on its own thread.
+///
+/// It owns a second [`Tracer`] — the level evaluated twice, a tenth of a
+/// second — and it never springs a rig: the camera, the placement and the
+/// `dt` all arrive in the [`Ready`] the raster thread computed, so the two
+/// pictures are of one pose and the blend has no parallax in it. What it
+/// *does* do for itself is [`Tracer::sync_caustics`], because `pass_at`
+/// reads its own photon map and the rule for when that is stale is a
+/// property of the placement it was handed.
+///
+/// A new generation is a new pose: the history is thrown away rather than
+/// masked, for the reason [`Tracer::restart`] gives.
+fn settle_worker(
+    want: Receiver<Trace>,
+    out: Sender<Traced>,
+    mut budget: Budget,
+    sdf: Arc<kosm_scan::SdfGrid>,
+    player: Player,
+    projection: Option<Projection>,
+) {
+    let mut size = budget.size();
+    let mut tracer = match Tracer::new(size) {
+        Ok(t) => t.with_rig(sdf, player).with_projection(projection),
+        Err(e) => return eprintln!("rune: the reference would not build: {e}"),
+    };
+    let mut generation = u64::MAX;
+    loop {
+        // Only the newest ask matters: an older one is a pose the player has
+        // already left, and tracing it would be spending the frame budget on
+        // a picture nobody will be shown.
+        let mut ask = match want.recv() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        while let Ok(newer) = want.try_recv() {
+            ask = newer;
+        }
+        if ask.generation != generation {
+            generation = ask.generation;
+            tracer.restart(size);
+        }
+        tracer.sync_caustics(&ask.ready.placement);
+        let t0 = Instant::now();
+        let done = tracer.pass_at(&ask.frame, size, ask.lit, true, &ask.ready);
+        let at = size;
+        size = budget.next(t0.elapsed().as_secs_f64() * 1e3, done.repainted, done.camera_moved);
+        let reply = Traced {
+            rgba: done.rgba,
+            size: at,
+            spp: done.mean_spp,
+            exposure: done.exposure,
+            generation: ask.generation,
+        };
+        if out.send(reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// The trace tier's loop with a tracer already built — the fallback path when
+/// the raster tier cannot be made on this machine.
+fn trace_loop(
+    jobs: Receiver<Job>,
+    out: Sender<Shot>,
+    glow: Glow,
+    mut budget: Budget,
+    mut tracer: Tracer,
+    shutter_on: bool,
+) {
+    let mut size = budget.size();
+    let mut current: Option<Job> = None;
+    let mut folded = 0u32;
+    let mut want = 1u32;
+    loop {
+        let mut latest = None;
+        loop {
+            match jobs.try_recv() {
+                Ok(job) => latest = Some(job),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if latest.is_none() && current.is_none() {
+            match jobs.recv() {
+                Ok(job) => latest = Some(job),
+                Err(_) => return,
+            }
+        }
+        if let Some(job) = latest {
+            current = Some(job);
+        }
+        let Some(job) = current.clone() else { continue };
+        let lap = Instant::now();
+        let lit = *glow.lock().unwrap_or_else(|e| e.into_inner());
+        let present = folded + 1 >= want;
+        let done = tracer.pass(&job.frame, size, lit, present);
+        folded += 1;
+        if !present {
+            continue;
+        }
+        want = if shutter_on { done.shutter.max(1) } else { 1 };
+        folded = 0;
+        let shot = Shot {
+            size,
+            rgba: done.rgba,
+            tex: None,
+            mask: done.mask,
+            mean_spp: done.mean_spp,
+            due: job.due,
+        };
+        size = budget.next(lap.elapsed().as_secs_f64() * 1e3, done.repainted, done.camera_moved);
         if out.send(shot).is_err() {
             return;
         }
@@ -1783,6 +2671,184 @@ fn snapshot_of(p: &Placement, scene: &CoveScene) -> Snapshot {
     }
 }
 
+
+/// `kosm run rune --view --shot out/rune.png --tier raster`: one raster frame,
+/// headless.
+///
+/// The same tier the window draws, on a device this function opens for itself
+/// — `kosm_render::gpu::GpuContext` is the headless adapter and it is the one
+/// the crate's own GPU tests run on. The hero settles for [`SETTLE`] seconds
+/// exactly as [`still`] settles it, so the two stills are of one pose and can
+/// be differenced.
+///
+/// `--settle` folds `passes` of the reference over the raster frame at the
+/// blend those samples earn, which is the picture a standing player ends up
+/// looking at. Without it the file is the raster frame alone, which is what a
+/// walking player sees.
+fn raster_still(
+    path: &Path,
+    size: (u32, u32),
+    budget: Budget,
+    projection: Option<Projection>,
+    settle_in: bool,
+    passes: u32,
+) -> anyhow::Result<()> {
+    let size = (size.0.max(16), if size.1 == 0 { (size.0 * 9 / 16).max(9) } else { size.1 });
+    let ctx = kosm_render::gpu::GpuContext::init_blocking()
+        .map_err(|e| anyhow::anyhow!("--tier raster needs a device: {e}"))?;
+    let (device, queue) = (&ctx.device, &ctx.queue);
+
+    let mut budget = budget;
+    let trace_size = budget.size();
+    let mut tracer = Tracer::new(trace_size)?.with_projection(projection);
+    if !raster::Raster::supports(tracer.projection) {
+        anyhow::bail!(
+            "--tier raster cannot draw an equidistant fisheye: `r = f·θ` is not a projective \
+             map. Use --tier trace, or --projection rectilinear."
+        );
+    }
+    let scene = CoveScene::bundled()?;
+    let which = Player::from_env();
+    // The pose: the hero settled at its doorstep, or the capsule at the level's
+    // solution — the same two [`still`] photographs, so the two files differ in
+    // the tier and in nothing else.
+    // **The rig, always.** Not for the unit — the rig is told
+    // `.in_millimetres()` and hands back an eye in the tracer's units like
+    // everything else, and [`in_metres`] is what crosses it over — but
+    // because the rig is the camera the *window* draws with. A still composed
+    // through `cove_render::camera` and a window composed through the rig are
+    // two different framings, and a parity number between the tiers would
+    // then be measuring the composition. One camera, converted once.
+    let (frame, sdf) = still_pose(&scene, which)?;
+    tracer = tracer.with_rig(sdf, which);
+
+    let photons = live_photons(&scene.authored);
+    let frac = live_frac(&scene, &frame, photons);
+    let lit = Lit { score: frac, glint: None };
+
+    let mut tier = RasterTier::new(
+        device,
+        queue,
+        tracer.cove(),
+        cove_probes(tracer.cove(), Path::new("out")),
+        wgpu::TextureFormat::Rgba8Unorm,
+    )?;
+
+    let prepared = tracer.prepare(&frame, lit);
+    tier.gather(tracer.caustic_map());
+    tier.place(tracer.cove(), &frame, &prepared.placement, lit);
+
+    // **The reference first, when there is going to be one.**
+    //
+    // The exposure is not the level's authored number, it is that number
+    // times what [`Meter`] measured off the last pass — and a meter that has
+    // never seen a pass reads one. In the window that only means the raster
+    // is a frame behind a gain that is already converged; in a *still* it
+    // means the raster half of the blend would be drawn at the authored
+    // exposure and the traced half at the measured one, which is two
+    // different pictures fading into each other. Tracing first costs the
+    // still nothing — the pose is prepared and neither half depends on the
+    // other — and it is what makes the blend a fade.
+    let mut blend = 0.0f32;
+    let mut spp = 0.0f32;
+    let mut traced: Option<(Passed, (u32, u32))> = None;
+    if settle_in {
+        let mut settle = raster::Settle::default();
+        let mut at = trace_size;
+        for _ in 0..passes.max(1) {
+            let p = tracer.pass_at(&frame, at, lit, true, &prepared);
+            settle.traced(p.mean_spp);
+            let sized = at;
+            at = budget.next(0.0, p.repainted, p.camera_moved);
+            blend = settle.blend();
+            spp = p.mean_spp;
+            traced = Some((p, sized));
+        }
+    }
+
+    let gain = tracer.meter_gain();
+    let t0 = Instant::now();
+    let mut f = raster::Frame::new(in_metres(&prepared.cam), size);
+    f.exposure = tier.scene.exposure * gain as f32;
+    f.time = frame.t as f32;
+    f.caustics_dirty = true;
+    let texture = tier.draw(device, queue, &f);
+    let raster_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let mut rgba = kosm_view::frame::read_back(device, queue, &texture, size).into_raw();
+    if let Some((p, sized)) = traced.as_ref() {
+        rgba = raster::settle::present(&rgba, size, &p.rgba, *sized, blend);
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    image::RgbaImage::from_raw(size.0, size.1, rgba)
+        .ok_or_else(|| anyhow::anyhow!("the raster frame is the wrong size"))?
+        .save(path)?;
+    println!(
+        "rune   the raster tier drew {}×{} in {:.1} ms at exposure {:.3} (×{gain:.3} metered); \
+         the rune scores {frac:.3} of {:.2}; blend {blend:.2} at {spp:.1} samples a pixel → {}",
+        size.0,
+        size.1,
+        raster_ms,
+        f.exposure,
+        scene.open_frac,
+        path.display()
+    );
+    Ok(())
+}
+
+/// The pose both stills photograph: the hero settled at its doorstep, or the
+/// capsule at the level's solution.
+///
+/// Lifted out of [`still`] so the raster tier stands the same body in the same
+/// place — a parity number between two tiers means nothing if they are looking
+/// at two poses.
+fn still_pose(
+    scene: &CoveScene,
+    which: Player,
+) -> anyhow::Result<(Snapshot, Arc<kosm_scan::SdfGrid>)> {
+    let solution = rune::Pose::solution(scene);
+    let at_spawn = std::env::var("KOSM_RUNE_SPAWN").is_ok_and(|v| v != "0");
+    let (x, y, tilt) = if solution.is_solved() && !at_spawn {
+        (solution.x, solution.y, solution.tilt)
+    } else {
+        (scene.spawn_x, scene.spawn_y, 0.0)
+    };
+    let baked = bake::bake(scene, &Path::new("out").join("maps").join("cove"))?;
+    match which {
+        Player::Capsule => Ok((
+            snapshot_of(&Placement::standing(scene, x, y, tilt), scene),
+            Arc::new(baked.sdf),
+        )),
+        Player::Hero => {
+            let step = super::hero::doorstep();
+            let ap = scene.door_frame().origin;
+            let (hx, hy) = (
+                step.stance.feet.x * kosm::scene::MM + ap.x,
+                step.stance.feet.y * kosm::scene::MM + ap.y,
+            );
+            let (hx, hy) = if at_spawn { (x, y) } else { (hx, hy) };
+            let yaw = if at_spawn {
+                std::f64::consts::FRAC_PI_2
+            } else {
+                std::f64::consts::FRAC_PI_2 + step.stance.yaw
+            };
+            let sdf = Arc::new(baked.sdf.clone());
+            let mut cove = Cove::with_player(scene, baked.sdf, Player::Hero)?;
+            cove.face(yaw);
+            cove.place(hx, hy, 0.0);
+            cove.hold_still(SETTLE);
+            eprintln!(
+                "rune   the hero settled at ({hx:+.2}, {hy:+.2}) m, facing {:.0}°: {} parts",
+                yaw.to_degrees(),
+                cove.hero_parts().len()
+            );
+            Ok((cove.snapshot(), sdf))
+        }
+    }
+}
+
 // ---- the window ----------------------------------------------------------------
 
 /// The cove on screen. It owns the recording and the controls; the picture is
@@ -1815,6 +2881,13 @@ struct App {
     /// render thread with everything else it is started with.
     projection: Option<Projection>,
     shutter: Option<bool>,
+    /// Which tier draws, and whether it settles into the reference.
+    tier: Tier,
+    settle: bool,
+    /// The window's own size in physical pixels, which is what the raster tier
+    /// draws at — there is no ladder on that tier, because a forward pass at
+    /// full size is milliseconds.
+    window_px: (u32, u32),
 
     lookahead: Lookahead,
     latency_ms: f64,
@@ -1875,7 +2948,7 @@ impl viewport::Scene for App {
     /// The render thread wants no device — there is no GPU tier here — but it
     /// is still started from `init`, so that the window is up and saying
     /// something before the level's minute of evaluation begins.
-    fn init(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {
+    fn init(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.started {
             return;
         }
@@ -1888,9 +2961,26 @@ impl viewport::Scene for App {
         let ready = self.ready.clone();
         let sdf = self.sdf.clone();
         let (projection, shutter) = (self.projection, self.shutter);
-        std::thread::spawn(move || {
-            render_worker(jobs, shots, glow, budget, ready, sdf, projection, shutter)
-        });
+        // The raster tier draws on the *viewport's* device, so the texture it
+        // draws into is the texture the blit samples and a raster-only frame
+        // never crosses the bus.
+        let (device, queue) = (device.clone(), queue.clone());
+        let (settle, size) = (self.settle, self.window_px);
+        match self.tier {
+            Tier::Raster => {
+                std::thread::spawn(move || {
+                    raster_worker(
+                        jobs, shots, glow, budget, ready, sdf, projection, settle, device, queue,
+                        size,
+                    )
+                });
+            }
+            Tier::Trace => {
+                std::thread::spawn(move || {
+                    render_worker(jobs, shots, glow, budget, ready, sdf, projection, shutter)
+                });
+            }
+        }
     }
 
     fn event(&mut self, event: viewport::Event) {
@@ -1903,7 +2993,7 @@ impl viewport::Scene for App {
             _ => None,
         };
         match event {
-            Event::Resized(_) => {}
+            Event::Resized(px) => self.window_px = px,
             Event::Look(dx, dy) => {
                 let mut c = self.held.lock().unwrap_or_else(|e| e.into_inner());
                 // Mouse right turns the being to its right, which is a
@@ -1947,7 +3037,12 @@ impl viewport::Scene for App {
             let ms = Instant::now().saturating_duration_since(shot.due).as_secs_f64() * 1e3;
             self.latency_ms = if self.latency_ms > 0.0 { 0.8 * self.latency_ms + 0.2 * ms } else { ms };
             self.worst_ms = self.worst_ms.max(ms);
-            newest = Some(viewport::Image::Bytes { size: shot.size, rgba: shot.rgba });
+            newest = Some(match shot.tex {
+                // Nothing crossed the bus: the raster tier drew into a texture
+                // on this very device and the blit samples it where it is.
+                Some(t) => viewport::Image::Texture(t),
+                None => viewport::Image::Bytes { size: shot.size, rgba: shot.rgba },
+            });
         }
         self.lookahead.store(self.head_start().as_micros() as u64, Ordering::Relaxed);
         if self.said_pace.elapsed().as_secs() >= 2 {
@@ -2049,8 +3144,22 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     };
     let walk: u32 = num("walk").unwrap_or(0);
     let projection = projection_flag(args)?;
+    let tier = tier_flag(args)?;
+    let settle = !args.flag("no-settle");
     if let Some(path) = args.value("shot") {
-        return still(Path::new(path), num("passes").unwrap_or(64), walk, budget, projection);
+        return match tier {
+            Tier::Trace => {
+                still(Path::new(path), num("passes").unwrap_or(64), walk, budget, projection)
+            }
+            Tier::Raster => raster_still(
+                Path::new(path),
+                (num("rune-width").unwrap_or(1280), 0),
+                budget,
+                projection,
+                settle && args.flag("settle"),
+                num("passes").unwrap_or(64),
+            ),
+        };
     }
     // `--cpu` is the court's flag for "do not hand the render thread a
     // device", and this tier never does; it is accepted and says so rather
@@ -2059,8 +3168,13 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         eprintln!("rune   --cpu: this tier is the CPU integrator either way");
     }
     let frames: usize = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0);
-    window(frames, budget, walk, projection, shutter_flag(args)?)
+    window(frames, budget, walk, projection, shutter_flag(args)?, tier, settle)
 }
+
+/// The window the cove opens at, physical pixels. The raster tier draws at
+/// this size and the tracer at the budget's, which is why the settle blend
+/// upscales the reference on its way over.
+const WINDOW: (u32, u32) = (1280, 720);
 
 /// The window itself: four threads and a viewport.
 ///
@@ -2068,12 +3182,15 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
 /// keyboard: it is how the pass rate while walking is measured, and it is
 /// exactly the same held direction a key press sets, so the simulation cannot
 /// tell the difference.
+#[allow(clippy::too_many_arguments)]
 pub fn window(
     frames: usize,
     budget: Budget,
     walk: u32,
     projection: Option<Projection>,
     shutter: Option<bool>,
+    tier: Tier,
+    settle: bool,
 ) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (job_tx, job_rx) = std::sync::mpsc::channel();
@@ -2132,7 +3249,7 @@ pub fn window(
 
     viewport::run(
         "Kosm — the cove",
-        (1280, 720),
+        WINDOW,
         App {
             rx,
             shots: shot_rx,
@@ -2150,6 +3267,9 @@ pub fn window(
             sdf,
             projection,
             shutter,
+            tier,
+            settle,
+            window_px: WINDOW,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
@@ -2683,6 +3803,169 @@ mod tests {
         let d = scene.sun_dir();
         assert!(p.x > centre.x && p.y > centre.y, "the shadow is up-sun of the being ({d:?})");
         assert!(r > scene.being_h / 2.0, "a low sun throws a long shadow, not a short one");
+        Ok(())
+    }
+
+    /// **The cove, on both tiers, at the pose the level is about.**
+    ///
+    /// The design's number: the raster frame against the traced one at the
+    /// hero's solved pose, mean absolute difference over the sand and over
+    /// the door's face, and it is one camera — [`Tracer::prepare`] places the
+    /// body, retraces the caustic and springs the rig once, and both tiers
+    /// draw what it hands back. The raster's copy of that camera goes through
+    /// [`in_metres`], which is the whole of the units story.
+    ///
+    /// **The two regions are not held to one tolerance, and the reason is the
+    /// tier's own design.**
+    ///
+    /// - The **sand** is sunlit, and on a sunlit surface the direct term is
+    ///   most of the answer. The raster computes it per pixel — the same
+    ///   `E · max(0, n·s)` the tracer integrates, against a 2048² shadow map
+    ///   — so the two agree to a fraction of a code. This is the number that
+    ///   catches the mistake that matters: `sims/rune/bake.rs` bakes the
+    ///   volume with `sun_direct: false` exactly so the shader is not adding
+    ///   a sun the probes already carry, and if that flag ever flips back
+    ///   this assert is a factor of 1.8 out.
+    /// - The **door's face** is in the cliff's shadow, so every photon on it
+    ///   arrived by bounce, and bounce is the half the raster tier reads out
+    ///   of nine spherical harmonics on a half-metre lattice where the tracer
+    ///   integrates twelve of them per pixel. Five per cent low is what L2
+    ///   costs on a plane whose radiance field has a hard horizon in it;
+    ///   neither a finer lattice (250 mm) nor eight times the rays moves it,
+    ///   which is how we know it is the truncation and not the bake.
+    ///
+    /// Skips without an adapter, like the rest of the tier's GPU tests.
+    #[test]
+    fn the_cove_agrees_with_the_reference_on_the_sand_and_the_door() -> anyhow::Result<()> {
+        let Ok(ctx) = kosm_render::gpu::GpuContext::init_blocking() else {
+            eprintln!("skipping the_cove_agrees_with_the_reference: no GPU");
+            return Ok(());
+        };
+        let (device, queue) = (&ctx.device, &ctx.queue);
+        let size = (320u32, 180u32);
+        let scene = CoveScene::bundled()?;
+        let which = Player::from_env();
+
+        let mut tracer = Tracer::new(size)?;
+        let (frame, sdf) = still_pose(&scene, which)?;
+        tracer = tracer.with_rig(sdf, which);
+        let lit = Lit { score: live_frac(&scene, &frame, live_photons(&scene.authored)), glint: None };
+
+        let probes = cove_probes(tracer.cove(), Path::new("out"));
+        if probes.suns.is_empty() || probes.data.iter().all(|v| *v == 0.0) {
+            eprintln!("skipping the_cove_agrees_with_the_reference: no baked light");
+            return Ok(());
+        }
+        let mut tier = RasterTier::new(
+            device,
+            queue,
+            tracer.cove(),
+            probes,
+            wgpu::TextureFormat::Rgba8Unorm,
+        )?;
+
+        let prepared = tracer.prepare(&frame, lit);
+        tier.gather(tracer.caustic_map());
+        tier.place(tracer.cove(), &frame, &prepared.placement, lit);
+
+        // The reference first, so the meter has measured before the raster is
+        // drawn at its exposure — the same order [`raster_still`] takes.
+        let mut reference = Vec::new();
+        for _ in 0..32 {
+            let p = tracer.pass_at(&frame, size, lit, true, &prepared);
+            if !p.rgba.is_empty() {
+                reference = p.rgba;
+            }
+        }
+        anyhow::ensure!(!reference.is_empty(), "the tracer resolved nothing");
+
+        let cam = in_metres(&prepared.cam);
+        let mut f = raster::Frame::new(cam, size);
+        f.exposure = tier.scene.exposure * tracer.meter_gain() as f32;
+        f.time = frame.t as f32;
+        f.caustics_dirty = true;
+        let texture = tier.draw(device, queue, &f);
+        let raster = kosm_view::frame::read_back(device, queue, &texture, size).into_raw();
+
+        // Where to look, in the world rather than in the frame: a pixel box
+        // written down by hand would be a box about one composition, and the
+        // rig springs.
+        let vp = kosm_view::raster::pipeline::view_proj(&cam, size.0 as f32 / size.1 as f32);
+        let project = |p: [f64; 3]| -> Option<(u32, u32)> {
+            let (x, y, z, w) = (
+                vp[0] * p[0] as f32 + vp[4] * p[1] as f32 + vp[8] * p[2] as f32 + vp[12],
+                vp[1] * p[0] as f32 + vp[5] * p[1] as f32 + vp[9] * p[2] as f32 + vp[13],
+                vp[2] * p[0] as f32 + vp[6] * p[1] as f32 + vp[10] * p[2] as f32 + vp[14],
+                vp[3] * p[0] as f32 + vp[7] * p[1] as f32 + vp[11] * p[2] as f32 + vp[15],
+            );
+            if w <= 0.0 || z < 0.0 {
+                return None;
+            }
+            let (sx, sy) = ((x / w * 0.5 + 0.5) * size.0 as f32, (0.5 - y / w * 0.5) * size.1 as f32);
+            (sx >= 4.0 && sy >= 4.0 && sx < size.0 as f32 - 4.0 && sy < size.1 as f32 - 4.0)
+                .then(|| (sx as u32, sy as u32))
+        };
+        let mad = |at: &[(u32, u32)]| -> Option<f64> {
+            let (mut sum, mut n) = (0.0f64, 0.0f64);
+            for (cx, cy) in at {
+                for y in cy.saturating_sub(3)..(cy + 4).min(size.1) {
+                    for x in cx.saturating_sub(3)..(cx + 4).min(size.0) {
+                        let i = ((y * size.0 + x) * 4) as usize;
+                        for c in 0..3 {
+                            sum += (raster[i + c] as f64 - reference[i + c] as f64).abs() / 255.0;
+                            n += 1.0;
+                        }
+                    }
+                }
+            }
+            (n > 0.0).then(|| sum / n)
+        };
+
+        let door = scene.door_frame().origin;
+        let face = scene.cliff_face_y();
+        // the door's face, a little off the keyhole either way so the rim's
+        // own glow and the caustic's focus are not what is being measured
+        let on_door: Vec<_> = [-0.45f64, 0.45]
+            .iter()
+            .filter_map(|dx| {
+                project([door.x + dx, face - 0.02, scene.door_sill() + scene.aperture_z])
+            })
+            .collect();
+        // and the open sand in front of it, out of the hero's own shadow
+        let on_sand: Vec<_> = [(-2.2f64, 3.0f64), (2.2, 3.5), (-1.4, 5.0), (1.4, 5.5)]
+            .iter()
+            .filter_map(|(dx, back)| {
+                let (x, y) = (door.x + dx, face - back);
+                project([x, y, scene.sand_z_at(x, y) + 0.01])
+            })
+            .collect();
+
+        let sand = mad(&on_sand);
+        let doorface = mad(&on_door);
+        eprintln!(
+            "cove parity {}×{}: sand {} over {} patches, door face {} over {} patches",
+            size.0,
+            size.1,
+            sand.map_or("—".into(), |v| format!("{v:.4}")),
+            on_sand.len(),
+            doorface.map_or("—".into(), |v| format!("{v:.4}")),
+            on_door.len(),
+        );
+
+        if let Some(v) = sand {
+            anyhow::ensure!(
+                v < 0.04,
+                "the sunlit sand disagrees by {v:.4}, which is not a shading difference — \
+                 check that `bake.rs` still bakes the volume with `sun_direct: false`"
+            );
+        }
+        if let Some(v) = doorface {
+            anyhow::ensure!(v < 0.10, "the door's face disagrees by {v:.4}, over the L2 bound");
+        }
+        anyhow::ensure!(
+            sand.is_some() || doorface.is_some(),
+            "neither region landed in the frame; the rig's composition has moved"
+        );
         Ok(())
     }
 }

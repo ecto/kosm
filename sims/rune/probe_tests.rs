@@ -69,11 +69,16 @@ fn three_probes_of_the_cove_are_pinned() -> anyhow::Result<()> {
 
 #[test]
 fn the_rock_is_inside_and_the_sand_is_lit() -> anyhow::Result<()> {
-    // Two claims the raster tier leans on: the sun reaches the open sand —
-    // the cove's sun is low over the sea and rakes the beach, which is why
-    // the door's own face is lit too — and a probe buried in the cliff is
-    // *marked* rather than baked, so a sampler never drags the inside of the
-    // rock onto the face of it.
+    // Two claims about the bake, at its own defaults. The sun reaches the
+    // open sand — the cove's sun is low over the sea and rakes the beach,
+    // which is why the door's own face is lit too — and a probe buried in the
+    // cliff is *marked* rather than baked, so a sampler never drags the
+    // inside of the rock onto the face of it.
+    //
+    // The first is about `BakeSpec::sun_direct`, which is true here and is
+    // **false** in `bake::run_light`: the volume the raster tier reads leaves
+    // the direct term to the shader and its shadow map, and keeps every
+    // bounce. This test is the one that says the term is there to leave out.
     let scene = CoveScene::bundled()?;
     let mut picture = render::Scene::new(&scene)?;
     picture.set_being_visible(false);

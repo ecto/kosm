@@ -11,6 +11,11 @@
 //! readback both the window and a still share, and [`ride`] the
 //! recorded-rollout player.
 //!
+//! [`raster`] is the live tier the reference tracer keeps honest: meshes,
+//! baked spectral SH probes, one shadow map and one forward pass, plus the
+//! [`Settle`] that fades the tracer's own frame over it when nothing is
+//! moving. See `docs/plans/2026-09-10-bake-and-raster-design.md`.
+//!
 //! [`View`] carries a [`Projection`], so the map a camera draws with is part
 //! of what a history reprojects through rather than an assumption baked into
 //! it. `kosm_render`'s equidistant fisheye is therefore a live camera and not
@@ -23,6 +28,7 @@
 pub mod budget;
 pub mod frame;
 pub mod history;
+pub mod raster;
 pub mod temporal;
 pub mod viewport;
 
@@ -30,6 +36,7 @@ pub mod viewport;
 pub mod ride;
 
 pub use budget::Budget;
+pub use raster::{Raster, Scene as RasterScene, Settle};
 pub use frame::{Camera, read_back};
 pub use temporal::{Pose, Projection, TemporalHistory, View};
 pub use viewport::{Event, Image, Key, Scene};
