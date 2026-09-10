@@ -478,7 +478,7 @@ fn geometry_of(solid: &Solid) -> Geom {
 ///   comes out smooth and the sharp lip where the cut meets it stays sharp,
 ///   which is exactly the distinction a CAD surface carries and a naive
 ///   average destroys.
-fn smooth_normals(positions: &[Point3], indices: &[u32]) -> Vec<Vec3> {
+pub fn smooth_normals(positions: &[Point3], indices: &[u32]) -> Vec<Vec3> {
     let key = |p: &Point3| {
         let q = |v: f64| (v * 1e3).round() as i64;
         (q(p.x), q(p.y), q(p.z))

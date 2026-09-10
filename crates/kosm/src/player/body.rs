@@ -1411,6 +1411,18 @@ impl Body {
         Some((self.root() + r_bw.mul_vec(Vec3::z()) * (height / 2.0 - self.consts.foot_drop), r_bw))
     }
 
+    /// The root's orientation: **body → world**, whose columns are the body's
+    /// own `+x` forward, `+y` left and `+z` up read in the world.
+    ///
+    /// The cheap way to ask. [`Body::snapshot`] carries the same rotation (as
+    /// its transpose, which is phyz's way round) but runs the whole tree's
+    /// forward kinematics to get there; a caller that wants a body-relative
+    /// world point every step — an aim for the hand, a place to put a
+    /// camera — wants one quaternion and not thirteen frames.
+    pub fn orientation(&self) -> Mat3 {
+        self.body_to_world()
+    }
+
     /// Where the body's feet are on the ground, world: the root, less how far
     /// up its own axis the root sits.
     pub fn footing(&self) -> Vec3 {

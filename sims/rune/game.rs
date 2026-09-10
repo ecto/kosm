@@ -71,11 +71,13 @@ use std::time::{Duration, Instant};
 use kosm_render::caustics::CausticMap;
 use kosm_render::math::{Point3, Vec3 as RVec3};
 use kosm_render::pathtrace::{self, Camera, Film, PathTraceOptions};
-use super::being::{Cove, Input, Snapshot};
+use super::being::{Cove, Input, Player, Snapshot};
 use super::render::{self as cove_render, PER_M, Placement};
 use super::{CoveScene, bake, hint, rune};
 use phyz_math::{Mat3, Vec3};
 
+use kosm::player::meter::Meter;
+use kosm::player::rig::{Clearance, Interest, Rig, RigKnobs, Subject};
 use kosm_view::budget::Budget;
 use kosm_view::history::{History, Plan, Pose, View};
 use kosm_view::viewport;
@@ -139,6 +141,15 @@ const CAUSTIC_LEANED_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 
 /// How long the score has to hold above `open_frac`, in simulated seconds.
 const HOLD: f64 = 1.0;
+
+/// How long a `--shot` of the hero lets the figure settle before it is
+/// photographed, in simulated seconds.
+///
+/// A metre-ten figure on a six per cent grade with its boots 236 mm apart
+/// across it takes the first couple of seconds to find its stance, and the
+/// arm carrying the glass takes about as long to reach where it was asked to
+/// go. `sims/rune/tests.rs` measures both.
+const SETTLE: f64 = 3.0;
 
 /// The most the simulation runs ahead of the wall clock, and the most it will
 /// chase before the clock is re-based. Both are the court's, scaled for a pass
@@ -352,6 +363,17 @@ fn rune_pose(snap: &Snapshot) -> rune::Pose {
     rune::Pose { x: centre.x, y: centre.y, tilt: (-axis.y).atan2(axis.z) }
 }
 
+/// The lens the snapshot is holding, as the scorer's refractor.
+///
+/// `Snapshot::held` is the lens's own frame — `+z` is the optical axis, which
+/// is what `hero/kit.rs` cuts the glass about — so the axis is that frame's
+/// third column. [`None`] is the capsule, and the capsule is scored on
+/// itself.
+fn held_lens(snap: &Snapshot) -> Option<rune::Held> {
+    let pose = snap.held?;
+    Some(rune::Held { centre: pose.pos, axis: pose.rot.mul_vec(Vec3::z()) })
+}
+
 /// The live being as the renderer's placement.
 ///
 /// `Snapshot::being` carries phyz's world → body rotation, whose `y` column is
@@ -378,6 +400,10 @@ fn placement_of(snap: &Snapshot) -> Placement {
     let right = facing.cross(&up);
     Placement {
         being: (centre, columns(right, facing, up)),
+        // The figure's solids are the render thread's and are attached in
+        // `Tracer::pass`, which is the one place that has both the snapshot
+        // and the scene that built them.
+        hero: None,
         door_angle: snap.door_angle,
         score: 0.0,
         glint: None,
@@ -431,8 +457,9 @@ fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool, glint: Option<
     let (centre, _) = snap.being;
     let mut out = Vec::with_capacity(4);
     let c = centre * PER_M;
-    out.push(Pose::still([c.x, c.y, c.z], (scene.being_h / 2.0 + scene.being_r) * PER_M));
-    if let Some((s, r)) = shadow(scene, centre) {
+    let extent = body_extent(scene, snap);
+    out.push(Pose::still([c.x, c.y, c.z], extent * PER_M));
+    if let Some((s, r)) = shadow_of(scene, centre, extent) {
         let s = s * PER_M;
         out.push(Pose::still([s.x, s.y, s.z], r * PER_M));
     }
@@ -451,6 +478,27 @@ fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool, glint: Option<
     out
 }
 
+/// How big a ball the body needs, metres: the radius the mask masks it with
+/// and the half-extent its shadow is stretched from.
+///
+/// The capsule's is exactly its own bounding sphere. The hero's is **one
+/// ball round the whole figure** and not a ball per link, and that is the
+/// deliberate choice: the mask compares its list of poses for equality frame
+/// by frame, and thirteen balls that each wander by a micrometre while the
+/// figure stands is thirteen chances a second for the plan to come back
+/// non-empty and throw converged pixels away. One ball 0.7 m across covers a
+/// 1.11 m figure with its arm up, is still and equal to itself when the hero
+/// is still, and repaints exactly what a walking hero changes.
+fn body_extent(scene: &CoveScene, snap: &Snapshot) -> f64 {
+    if snap.parts.is_some() { HERO_EXTENT } else { scene.being_h / 2.0 + scene.being_r }
+}
+
+/// The radius of that ball. Seven hundred millimetres: the hero's own
+/// `Rig::DEFAULT` is 1113 mm tall, its capsule proxy's centre sits near the
+/// middle of it, and an arm held up at 46° reaches about 640 mm off that
+/// centre with the glass on the end of it.
+const HERO_EXTENT: f64 = 0.7;
+
 /// Where the sun puts the being's shadow on the sand, and how wide it is.
 /// Metres.
 ///
@@ -460,7 +508,7 @@ fn poses(scene: &CoveScene, snap: &Snapshot, caustic_moved: bool, glint: Option<
 /// the being's own extent stretched by the sun's elevation — a low sun throws
 /// a long shadow, and a mask that did not know it would repaint the wrong end
 /// of it.
-fn shadow(scene: &CoveScene, centre: Vec3) -> Option<(Vec3, f64)> {
+fn shadow_of(scene: &CoveScene, centre: Vec3, extent: f64) -> Option<(Vec3, f64)> {
     let d = scene.sun_dir();
     let denom = scene.beach_slope * d.y - d.z;
     if denom.abs() < 1e-9 {
@@ -472,13 +520,13 @@ fn shadow(scene: &CoveScene, centre: Vec3) -> Option<(Vec3, f64)> {
     }
     let p = centre - d * t;
     let stretch = 1.0 / scene.sun_el.sin().max(0.15);
-    Some((p, (scene.being_h / 2.0 + scene.being_r) * stretch))
+    Some((p, extent * stretch))
 }
 
 // ---- the simulation ----------------------------------------------------------
 
 /// A frame and the wall-clock moment it is for.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Timed {
     frame: Snapshot,
     due: Instant,
@@ -499,28 +547,23 @@ fn simulate(
     gate: Arc<AtomicBool>,
     frames: usize,
     lookahead: Lookahead,
+    sdf: Arc<kosm_scan::SdfGrid>,
 ) {
     let scene = match CoveScene::bundled() {
         Ok(s) => s,
         Err(e) => return eprintln!("rune: could not build the cove: {e}"),
     };
-    let t0 = Instant::now();
-    let baked = match bake::bake(&scene, &Path::new("out").join("maps").join("cove")) {
-        Ok(b) => b,
-        Err(e) => return eprintln!("rune: could not bake the cove: {e}"),
-    };
-    eprintln!(
-        "rune   the cove baked: {}×{}×{} at {:.0} mm cells in {:.1} s",
-        baked.sdf.nx,
-        baked.sdf.ny,
-        baked.sdf.nz,
-        baked.sdf.cell * 1e3,
-        t0.elapsed().as_secs_f64()
-    );
-    let mut cove = match Cove::new(&scene, baked.sdf) {
+    let mut cove = match Cove::new(&scene, (*sdf).clone()) {
         Ok(c) => c,
         Err(e) => return eprintln!("rune: could not build the cove: {e}"),
     };
+    eprintln!(
+        "rune   the player is {}",
+        match cove.player() {
+            Player::Hero => "the hero, with the lens in its hand",
+            Player::Capsule => "the capsule (KOSM_RUNE_PLAYER=capsule)",
+        }
+    );
     let dt = cove.dt();
     let fps = scene.authored.parameter_or("fps", 30.0).max(1.0);
     let steps_per_frame = (1.0 / fps / dt).round().max(1.0) as usize;
@@ -583,7 +626,8 @@ fn simulate(
         solved += lap.elapsed();
 
         let frame = cove.snapshot();
-        *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+        *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame.clone());
+        let being = frame.being;
         if tx.send(Timed { frame, due }).is_err() {
             return;
         }
@@ -594,8 +638,8 @@ fn simulate(
                  the being at ({:+.2}, {:+.2}) m, {:.1}° of lean, {:.2} m/s{}",
                 solved.as_secs_f64() * 1e3 / f,
                 f / said_at.elapsed().as_secs_f64(),
-                frame.being.0.x,
-                frame.being.0.y,
+                being.0.x,
+                being.0.y,
                 cove.lean().to_degrees(),
                 cove.walking_speed(),
                 if slips > 0 { format!("; slipped {slips}×") } else { String::new() },
@@ -640,7 +684,7 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
     let mut said_cost = false;
     let mut best = 0.0f64;
     loop {
-        let snap = *latest.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(snap) = snap else {
             std::thread::sleep(Duration::from_millis(10));
             continue;
@@ -652,12 +696,23 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
         scored = snap.t;
         let pose = rune_pose(&snap);
         let lap = Instant::now();
-        let frac = rune::score(&scene, &pose, photons).frac;
+        // Whichever refractor the level actually has. A hero holding the
+        // glass is scored on the glass — that is the whole of step 2 — and a
+        // capsule is scored on itself, which is every number the sweep and
+        // the recorded solution were measured with.
+        let frac = match held_lens(&snap) {
+            Some(lens) => rune::score_lens(&scene, &lens, photons).frac,
+            None => rune::score(&scene, &pose, photons).frac,
+        };
         // What the puzzle's clock costs, once. It is the reason this is a
         // thread and not a line in the solver's loop, so it is worth a line.
         if !said_cost {
             said_cost = true;
-            eprintln!("rune   the score is {photons} photons in {:.1} ms", lap.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "rune   the score is {photons} photons through {} in {:.1} ms",
+                if held_lens(&snap).is_some() { "the lens in the hero's hand" } else { "the being" },
+                lap.elapsed().as_secs_f64() * 1e3
+            );
         }
         best = best.max(frac);
         let was = g.is_open();
@@ -718,7 +773,7 @@ fn rune_worker(latest: Latest, gate: Arc<AtomicBool>, photons: usize, glow: Glow
 /// No size. The size is [`render_worker`]'s, because it is chosen from what
 /// that thread measured; the window's job is to say *which* frame it wants and
 /// *when*, and to blit whatever size comes back.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Job {
     frame: Snapshot,
     due: Instant,
@@ -828,6 +883,27 @@ struct Tracer {
     /// this side owns rather than one read back out of the history's plan. A
     /// size step is not a camera move, so the comparison is at the new size.
     last_view: Option<View>,
+    /// The camera, when it is a *body*: `kosm::player::Rig`, two springs and
+    /// an arm, quantised to the millimetre it is written in.
+    ///
+    /// [`None`] is the offline path — `--shot`, and `kosm run rune`'s own
+    /// frame — which keeps [`cove_render::camera`] and is therefore still
+    /// pixel-identical to what it was. The two framings are not the same
+    /// camera: the rig places its eye from the *body* and pulls its aim to an
+    /// [`Interest`] at the aperture, and `render::camera` blends a second eye
+    /// measured from the cliff face. Re-expressing the still through the rig
+    /// would move every committed frame in the level, so the still keeps the
+    /// camera it was composed with and the window gets the one that breathes.
+    rig: Option<Rig>,
+    /// The simulated time the rig last stepped to, so its `dt` is the sim's
+    /// own clock and not the wall's.
+    rig_t: Option<f64>,
+    /// The exposure meter: a lens over the last pass's radiance, feeding the
+    /// tonemap. Built on the first pass, so the level's authored exposure is
+    /// taken to be right for the picture the level opens on.
+    meter: Option<Meter>,
+    /// The link pivots the hero's parts are placed from. Built once.
+    pivots: Vec<phyz_math::Vec3>,
 }
 
 impl Tracer {
@@ -895,7 +971,58 @@ impl Tracer {
             traced_at: None,
             passes: 0,
             last_view: None,
+            rig: None,
+            rig_t: None,
+            meter: None,
+            pivots: cove_render::Scene::hero_pivots(),
         })
+    }
+
+    /// Give this tracer the follow camera. What the window does and the still
+    /// does not; see [`Tracer::rig`].
+    fn with_rig(mut self, sdf: Arc<kosm_scan::SdfGrid>, which: Player) -> Self {
+        let a = &self.scene.authored;
+        let mut knobs = RigKnobs::from_params(|n, d| a.parameter_or(n, d))
+            .in_millimetres()
+            .with_water(self.scene.sea_z);
+        // Two of the level's numbers were written for a capsule and a capsule
+        // has no sides, so the hero re-reads them.
+        if which == Player::Hero {
+            // **The shoulder step goes the other way.** `cam_side_mm` steps the
+            // eye to the being's *right*, which for a capsule is a free
+            // choice — a surface of revolution has no sides — and for the
+            // hero is the one place the camera must not be: the right hand is
+            // what holds the glass, and at the door the eye ends up directly
+            // behind the arm the picture is about, with the keyhole behind the
+            // lens rather than under it. Stepping to the other shoulder puts
+            // the figure on one side of the frame and leaves the door it is
+            // aimed at clear, which is the picture: you can see what you are
+            // aiming at. What it costs is the glass, which is then on the far
+            // shoulder — visible walking, and taken on trust at the door.
+            //
+            // Widening the step instead was tried and is worse: at three and
+            // a half metres out the door goes edge-on and the rim is a dot.
+            knobs.side = -a.parameter_or("cam_hero_side_mm", a.parameter_or("cam_side_mm", 2000.0)) / 1000.0;
+            // **And the field of view stops chasing the gait.** A settling
+            // figure's speed is never exactly zero — its boots are two
+            // contacts on a six per cent grade — and four degrees of field of
+            // view per metre per second turns a centimetre a second of
+            // shuffle into a hundredth of a degree, which is a *moved* camera
+            // to `History` and a full repaint every pass for ever. A quarter
+            // of a degree is half a per cent of the frame and takes six
+            // centimetres a second to reach.
+            knobs.fov_quantum_deg = a.parameter_or("cam_fov_quantum_deg", 0.25);
+        }
+        let ap = self.scene.door_frame().origin;
+        self.rig = Some(
+            Rig::new(knobs)
+                .with_ground(Clearance::sdf(sdf))
+                .with_interest(Interest {
+                    point: Vec3::new(ap.x, ap.y, ap.z),
+                    reach: a.parameter_or("cam_door_reach_m", 2.0).max(1e-3),
+                }),
+        );
+        self
     }
 
     /// Whether the being has moved or leaned far enough to be worth a new map.
@@ -935,13 +1062,25 @@ impl Tracer {
         if (self.film.width, self.film.height) != size {
             self.film = Film::new(size.0, size.1);
         }
-        let placement = placement_of(frame).with_score(lit.score).with_glint(lit.glint);
+        // The figure, placed. The solids are the scene's and were built once;
+        // this is one 4×4 a part, from the transforms the simulation put the
+        // links at.
+        let hero = frame
+            .parts
+            .as_ref()
+            .and_then(|parts| self.picture.hero_at(parts, &self.pivots, frame.held));
+        let placement =
+            placement_of(frame).with_hero(hero).with_score(lit.score).with_glint(lit.glint);
         let moved = self.caustic_is_stale(&placement);
         if moved {
             self.caustics = self.picture.caustic_map(&placement);
-            self.traced_at = Some(placement);
+            self.traced_at = Some(placement.clone());
         }
-        let cam = quantised(&cove_render::camera(&self.scene, &placement));
+        // The clock both the camera and the meter run on: the *simulation's*,
+        // so neither depends on how long a pass happened to take.
+        let dt = self.rig_t.map_or(frame.dt, |t| (frame.t - t).max(0.0)).max(0.0);
+        self.rig_t = Some(frame.t);
+        let cam = self.camera(frame, &placement, dt);
         let view = View::of(&cam, size.0, size.1);
         let poses = poses(&self.scene, frame, moved, lit.glint);
         let plan: Plan = self.history.plan(&view, &poses, &[]);
@@ -970,14 +1109,63 @@ impl Tracer {
             Some(plan.rects.clone())
         };
         self.history.merge(&self.film, &view, &poses, &[], traced.as_deref());
-        let rgba = self.history.resolve(self.exposure, &options(&self.scene, seed, true));
+        // The meter reads the *film* — this pass's own linear radiance,
+        // before any tonemap — and not the picture it just made. Feeding a
+        // meter the frame it exposed is a loop with a gain of one: whatever
+        // multiplier it chose, the frame comes back that much brighter and
+        // the reading says the exposure is already right. One sample a pixel
+        // is a noisy estimate of that radiance, but a log-average over a
+        // hundred thousand of them is not, and the meter's own second of lag
+        // is what is left to smooth.
+        let meter = self.meter.get_or_insert_with(|| Meter::calibrated(&self.film.rgb).bounded(0.5, 2.0));
+        let e = meter.follow(&self.film.rgb, dt);
+        let rgba = self.history.resolve(self.exposure * e as f32, &options(&self.scene, seed, true));
         Passed {
             rgba,
             mask: self.history.mask_fraction(),
             mean_spp: self.history.mean_samples(),
             repainted,
             camera_moved,
+            exposure: e,
+            shutter: self.rig.as_ref().map_or(1, |r| r.shutter_passes()),
         }
+    }
+
+    /// The camera this pass renders from.
+    ///
+    /// The window's is the rig: a [`Subject`] read off the body's own
+    /// snapshot, advanced by the simulation's own `dt`, and quantised to the
+    /// millimetre by the rig itself — which is the same rounding
+    /// [`quantised`] used to do here and for the same reason, that a still
+    /// player must be *still* or the history reprojects for ever.
+    ///
+    /// The still's is [`cove_render::camera`], unchanged.
+    fn camera(&mut self, frame: &Snapshot, placement: &Placement, dt: f64) -> Camera {
+        let Some(rig) = self.rig.as_ref() else {
+            return quantised(&cove_render::camera(&self.scene, placement));
+        };
+        rig.follow(&subject_of(frame), dt)
+    }
+}
+
+/// The body, as the camera needs it.
+///
+/// The rig frames the *proxy centre* and not the root: a figure's root is its
+/// pelvis, and a camera aimed at a pelvis puts the head at the top of the
+/// frame. `Snapshot::being` is the capsule proxy's centre for both bodies,
+/// which sits near the middle of either of them, and it is already what every
+/// other reading in this file is taken from.
+fn subject_of(snap: &Snapshot) -> Subject {
+    let (centre, world_to_body) = snap.being;
+    let (s, c) = snap.facing.sin_cos();
+    let v = snap.being_vel.0;
+    let up = world_to_body.transpose().mul_vec(Vec3::z());
+    Subject {
+        position: centre,
+        velocity: v,
+        facing: Vec3::new(c, s, 0.0),
+        speed: Vec3::new(v.x, v.y, 0.0).norm(),
+        lean: up.z.clamp(-1.0, 1.0).acos(),
     }
 }
 
@@ -993,6 +1181,17 @@ struct Passed {
     mean_spp: f32,
     repainted: f32,
     camera_moved: bool,
+    /// What the light meter multiplied the authored exposure by.
+    exposure: f64,
+    /// How many passes of the history the rig's shutter is open for.
+    ///
+    /// **Read and reported, not yet spent.** Consuming it means integrating
+    /// that many passes into one presented frame, and this tier presents
+    /// every pass it takes — there is no frame/pass distinction here to spend
+    /// it on, and lowering [`Budget`]'s target instead would be a different
+    /// knob wearing the shutter's name. It is on the pace line so the number
+    /// is visible while the loop that would use it is written.
+    shutter: u32,
 }
 
 /// The renderer: build the picture once, then keep adding passes to whatever
@@ -1004,11 +1203,18 @@ struct Passed {
 /// from what this thread measured and nobody else has that number. A job that
 /// asks for a size the budget did not choose is a job whose picture would not
 /// match the history the next pass carries.
-fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow, mut budget: Budget, ready: Arc<AtomicBool>) {
+fn render_worker(
+    jobs: Receiver<Job>,
+    out: Sender<Shot>,
+    glow: Glow,
+    mut budget: Budget,
+    ready: Arc<AtomicBool>,
+    sdf: Arc<kosm_scan::SdfGrid>,
+) {
     eprintln!("rune   evaluating the level…");
     let mut size = budget.size();
     let mut tracer = match Tracer::new(size) {
-        Ok(t) => t,
+        Ok(t) => t.with_rig(sdf, Player::from_env()),
         Err(e) => return eprintln!("rune: could not build the picture: {e}"),
     };
     // The level is up. `--walk` waits on this: a scripted walk that started
@@ -1047,7 +1253,7 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow, mut budget:
         if let Some(job) = latest {
             current = Some(job);
         }
-        let Some(job) = current else { continue };
+        let Some(job) = current.clone() else { continue };
         if size.0 == 0 || size.1 == 0 {
             continue;
         }
@@ -1071,15 +1277,19 @@ fn render_worker(jobs: Receiver<Job>, out: Sender<Shot>, glow: Glow, mut budget:
             said_at = Instant::now();
             eprintln!(
                 "rune   cpu {}×{} (×{:.2}{}) at 1 spp: {:.0} ms a pass, {:.1} passes a second, \
-                 {:.0}% repainted, {:.1} samples a pixel — {}",
+                 {:.0}% repainted ({:.0}% masked), {:.1} samples a pixel, ×{:.2} exposure, \
+                 {} shutter — {}",
                 shot.size.0,
                 shot.size.1,
                 budget.scale(),
                 if budget.is_on() { "" } else { ", pinned" },
                 ms,
                 since_said as f64 / elapsed,
+                100.0 * done.repainted,
                 100.0 * shot.mask,
                 shot.mean_spp,
+                done.exposure,
+                done.shutter,
                 if budget.is_still() { "still" } else { "walking" },
             );
             since_said = 0;
@@ -1120,23 +1330,73 @@ pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow:
     // is stuck. Paired with `KOSM_GLINT_AFTER`, that is a still of the level's
     // whole hint without a level file of its own.
     let at_spawn = std::env::var("KOSM_RUNE_SPAWN").is_ok_and(|v| v != "0");
-    let (x, y, tilt) = if solution.is_solved() && !at_spawn {
+    let (mut x, mut y, tilt) = if solution.is_solved() && !at_spawn {
         (solution.x, solution.y, solution.tilt)
     } else {
         (scene.spawn_x, scene.spawn_y, 0.0)
     };
-    // The still runs the tier off a placement rather than off a simulation:
-    // a `Snapshot` is the only thing `Tracer::pass` takes, so one is built
-    // that says the being stands there.
-    let stand = Placement::standing(&scene, x, y, tilt);
-    let frame = snapshot_of(&stand, &scene);
+    // How the being gets into the picture, and it is two different things.
+    //
+    // The **capsule** is a pose and nothing else: a `Snapshot` is the only
+    // thing `Tracer::pass` takes, so one is built that says the being stands
+    // there, and no simulation runs at all. That path is unchanged and is
+    // what `kosm run rune`'s own frame and every committed still are.
+    //
+    // The **hero** cannot be posed that way, because a figure is not three
+    // numbers: where its knees are, and where the glass in its hand got to,
+    // are the answer to a settle. So the hero's still bakes the field, stands
+    // a real [`Cove`] on it, and holds it still for [`SETTLE`] seconds — the
+    // same body the window walks, asked to stop moving.
+    let which = Player::from_env();
+    let mut field: Option<Arc<kosm_scan::SdfGrid>> = None;
+    let frame = match which {
+        Player::Capsule => snapshot_of(&Placement::standing(&scene, x, y, tilt), &scene),
+        Player::Hero => {
+            // Where the *hero* stands, which is not where the capsule does.
+            // `solution_*` is the capsule's pose — 400 mm off the cliff, with
+            // a metre of glass for a body — and a figure standing on it has
+            // its own hood over the keyhole it is solving. The hero's is
+            // `hero::doorstep`'s: the stance solved for the lens it is
+            // holding, mapped out of `hero/stage.rs`'s frame (the cove with
+            // the keyhole at the origin) into the cove's by the one
+            // translation that separates them.
+            let step = super::hero::doorstep();
+            let ap = scene.door_frame().origin;
+            let (hx, hy) = (step.stance.feet.x * kosm::scene::MM + ap.x, step.stance.feet.y * kosm::scene::MM + ap.y);
+            let (hx, hy) = if at_spawn { (x, y) } else { (hx, hy) };
+            let yaw = if at_spawn { std::f64::consts::FRAC_PI_2 } else { std::f64::consts::FRAC_PI_2 + step.stance.yaw };
+            let t0 = Instant::now();
+            let baked = bake::bake(&scene, &Path::new("out").join("maps").join("cove"))?;
+            field = Some(Arc::new(baked.sdf.clone()));
+            let mut cove = Cove::with_player(&scene, baked.sdf, Player::Hero)?;
+            cove.face(yaw);
+            cove.place(hx, hy, 0.0);
+            cove.hold_still(SETTLE);
+            eprintln!(
+                "rune   the hero settled at ({hx:+.2}, {hy:+.2}) m, facing {:.0}°, in {:.1} s: {} parts, the lens {}",
+                yaw.to_degrees(),
+                t0.elapsed().as_secs_f64(),
+                cove.hero_parts().len(),
+                match cove.held_lens() {
+                    Some(p) => format!("at ({:+.2}, {:+.2}, {:+.2}) m", p.pos.x, p.pos.y, p.pos.z),
+                    None => "nowhere".to_owned(),
+                }
+            );
+            (x, y) = (hx, hy);
+            cove.snapshot()
+        }
+    };
 
     // The hint, exactly as the window would have it after standing here long
     // enough to earn it. The score is taken once and reused for every pass, so
     // the rim's radiance is a fact about the pose and not about the photon
     // budget's noise, and the still is reproducible.
     let pose = rune_pose(&frame);
-    let frac = rune::score(&scene, &pose, live_photons(&scene.authored)).frac;
+    let photons = live_photons(&scene.authored);
+    let frac = match held_lens(&frame) {
+        Some(lens) => rune::score_lens(&scene, &lens, photons).frac,
+        None => rune::score(&scene, &pose, photons).frac,
+    };
     let after = glint_after(&scene);
     let mut glint = Glint::new(after, scene.open_frac);
     glint.read(0.0, frac);
@@ -1156,15 +1416,39 @@ pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow:
 
     // A step a pass, along the beach and back — the same order of movement a
     // walking player makes between two passes, so the budget sees the same
-    // signal it would see in the window.
+    // signal it would see in the window. The hero does not walk here: its
+    // pose is a settle and a settle is not a function of `k`, so `--walk` on
+    // a hero still holds the settled frame and measures the ladder's climb
+    // with the picture standing.
     let stride = 0.04;
     let walked = |k: u32| -> Snapshot {
+        if which == Player::Hero {
+            return frame.clone();
+        }
         let d = stride * k as f64;
         snapshot_of(&Placement::standing(&scene, x + d, y, tilt), &scene)
     };
 
     let mut at = budget.size();
+    // The **capsule's** still keeps [`cove_render::camera`], and keeps it to
+    // the byte: `kosm run rune`'s `frame.png` is composed with that camera and
+    // is the picture every measurement in this level has been read off.
+    //
+    // The **hero's** still gets the rig, snapped rather than sprung — a first
+    // call has no history to be late against, so `follow` with no elapsed time
+    // places the eye where it wants to be and stops. That is the third of the
+    // options this camera had, taken exactly where it costs nothing: there is
+    // no committed hero frame for it to move, and the doorstep the hero stands
+    // on is a metre and a quarter off the cliff rather than the capsule's four
+    // hundred millimetres — far enough out that
+    // [`cove_render::camera`]'s blend is only a third of the way round and the
+    // keyhole ends up behind the hood. The rig's [`Interest`] is on the
+    // aperture and its arm is on the same field the boots stand on, so it
+    // frames the door from over the hero's shoulder wherever the hero is.
     let mut tracer = Tracer::new(at)?;
+    if let Some(sdf) = field {
+        tracer = tracer.with_rig(sdf, which);
+    }
     let t0 = Instant::now();
     let mut rgba = Vec::new();
     let mut mean = 0.0;
@@ -1213,8 +1497,12 @@ pub fn still(path: &Path, passes: u32, walk: u32, mut budget: Budget) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("the history is the wrong size"))?
         .save(path)?;
     println!(
-        "rune   the being {} at ({x:+.2}, {y:+.2}) m, {:.1}° of lean; the rune scores {frac:.3} \
+        "rune   the {} {} at ({x:+.2}, {y:+.2}) m, {:.1}° of lean; the rune scores {frac:.3} \
          of {:.2}; {}×{} over {} passes ({:.1} samples a pixel) in {:.1} s → {}",
+        match which {
+            Player::Hero => "hero",
+            Player::Capsule => "being",
+        },
         match (solution.is_solved(), at_spawn) {
             (true, false) => "at the solved pose",
             (true, true) => "at its spawn (the level is solved; KOSM_RUNE_SPAWN asked)",
@@ -1254,8 +1542,12 @@ fn snapshot_of(p: &Placement, scene: &CoveScene) -> Snapshot {
             Vec3::new(scene.door_x, scene.cliff_face_y(), scene.door_sill()),
         ),
         gate_open: false,
-        // A still is a pose, and nothing in it holds anything.
+        // A still built from a placement is a pose, and a pose has no arms.
+        // The hero's still is not built this way — it steps a `Cove` and
+        // takes its snapshot, which is where the parts and the glass come
+        // from; see [`still`].
         held: None,
+        parts: None,
     }
 }
 
@@ -1284,6 +1576,9 @@ struct App {
     /// Set by the render thread once the level has evaluated: what a scripted
     /// walk waits on.
     ready: Arc<AtomicBool>,
+    /// The baked field, handed to the render thread with everything else it
+    /// is started with: the camera's arm keeps the eye out of it.
+    sdf: Arc<kosm_scan::SdfGrid>,
 
     lookahead: Lookahead,
     latency_ms: f64,
@@ -1335,7 +1630,7 @@ impl App {
         let Some(timed) = self.frames.get(self.cursor) else {
             return;
         };
-        let _ = self.jobs.send(Job { frame: timed.frame, due: timed.due });
+        let _ = self.jobs.send(Job { frame: timed.frame.clone(), due: timed.due });
         self.asked = Some(timed.frame.t);
     }
 }
@@ -1355,7 +1650,8 @@ impl viewport::Scene for App {
         let glow = self.glow.clone();
         let budget = self.budget.clone();
         let ready = self.ready.clone();
-        std::thread::spawn(move || render_worker(jobs, shots, glow, budget, ready));
+        let sdf = self.sdf.clone();
+        std::thread::spawn(move || render_worker(jobs, shots, glow, budget, ready, sdf));
     }
 
     fn event(&mut self, event: viewport::Event) {
@@ -1527,7 +1823,26 @@ pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
     let gate = Arc::new(AtomicBool::new(false));
     let glow: Glow = Arc::new(Mutex::new(Lit::default()));
 
-    let photons = live_photons(&CoveScene::bundled()?.authored);
+    let scene = CoveScene::bundled()?;
+    let photons = live_photons(&scene.authored);
+
+    // The field, baked once and shared: the body stands on it and the
+    // camera's arm keeps out of it. It used to be the simulation thread's
+    // alone, which was fine while the camera was a formula; a rig with a
+    // spring arm needs the same distances the feet do, and baking it twice
+    // would be two copies of sixty megabytes and four seconds of nobody's
+    // time.
+    let t0 = Instant::now();
+    let baked = bake::bake(&scene, &Path::new("out").join("maps").join("cove"))?;
+    eprintln!(
+        "rune   the cove baked: {}×{}×{} at {:.0} mm cells in {:.1} s",
+        baked.sdf.nx,
+        baked.sdf.ny,
+        baked.sdf.nz,
+        baked.sdf.cell * 1e3,
+        t0.elapsed().as_secs_f64()
+    );
+    let sdf = Arc::new(baked.sdf);
 
     let ready = Arc::new(AtomicBool::new(false));
     if walk > 0 {
@@ -1546,7 +1861,8 @@ pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
 
     {
         let (held, latest, gate, lookahead) = (held.clone(), latest.clone(), gate.clone(), lookahead.clone());
-        std::thread::spawn(move || simulate(tx, held, latest, gate, frames, lookahead));
+        let sdf = sdf.clone();
+        std::thread::spawn(move || simulate(tx, held, latest, gate, frames, lookahead, sdf));
     }
     {
         let (latest, gate, glow) = (latest.clone(), gate.clone(), glow.clone());
@@ -1570,6 +1886,7 @@ pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
             glow,
             budget,
             ready,
+            sdf,
             lookahead,
             latency_ms: 0.0,
             worst_ms: 0.0,
@@ -1585,6 +1902,7 @@ pub fn window(frames: usize, budget: Budget, walk: u32) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::skatepark::Baked;
+    use kosm::scene::MM;
 
     /// The cove, baked once for every test that stands a body on it. The bake
     /// is a couple of seconds and cannot have changed between two tests in one
@@ -1660,7 +1978,7 @@ mod tests {
     #[test]
     fn the_door_swings_when_the_gate_opens_and_not_before() -> anyhow::Result<()> {
         let (scene, baked) = field()?;
-        let mut cove = Cove::new(&scene, baked.sdf.clone())?;
+        let mut cove = Cove::with_player(&scene, baked.sdf.clone(), Player::Capsule)?;
         cove.hold_still(0.5);
         assert_eq!(cove.door_angle(), 0.0, "the door moved with the gate shut");
 
@@ -1733,7 +2051,9 @@ mod tests {
         // The being placed there, held, and scored through the same reading
         // the window takes — off the snapshot, not off the pose it was placed
         // from, so the sim's own settling is in the number.
-        let mut cove = Cove::new(&scene, baked.sdf.clone())?;
+        // The capsule, said out loud: this is the *capsule's* solved pose and
+        // the capsule's own caustic, which is what `solution_*` records.
+        let mut cove = Cove::with_player(&scene, baked.sdf.clone(), Player::Capsule)?;
         cove.place(solution.x, solution.y, solution.tilt);
         cove.hold_still(0.5);
         let live = rune::score(&scene, &rune_pose(&cove.snapshot()), 200_000);
@@ -1944,6 +2264,149 @@ mod tests {
         Ok(())
     }
 
+    /// **The hero is drawn where the simulation put it.** Every part of the
+    /// figure that the picture places comes back at its own link's transform,
+    /// and the glass comes back at the pose `Body::held` says the arm got it
+    /// to — not at the pose the arm was asked for, and not at the origin.
+    ///
+    /// The check is the one that catches the mistake this is made of: the
+    /// hero-millimetre → body-metre change of frame is a rotation *and* a
+    /// scale, and getting either wrong puts the whole figure somewhere
+    /// plausible and wrong. So a named part with a known place — the boot,
+    /// which is on the sand, and the head, which is a metre over it — is
+    /// asked where it ended up in the world, and compared with where the body
+    /// says its own link is.
+    #[test]
+    fn the_heros_parts_are_drawn_at_the_snapshots_transforms() -> anyhow::Result<()> {
+        let (scene, baked) = field()?;
+        let mut cove = Cove::with_player(&scene, baked.sdf.clone(), Player::Hero)?;
+        cove.face(std::f64::consts::FRAC_PI_2);
+        cove.place(scene.solution_x, scene.solution_y, 0.0);
+        cove.hold_still(3.0);
+        let snap = cove.snapshot();
+        let parts = snap.parts.clone().expect("the hero has parts");
+
+        let picture = cove_render::Scene::new(&scene)?;
+        let pivots = cove_render::Scene::hero_pivots();
+        let placed = picture.hero_at(&parts, &pivots, snap.held).expect("the hero is placed");
+        assert!(placed.len() > 30, "the figure came back as {} solids", placed.len());
+
+        // Where a named part's link actually is, world millimetres.
+        let link = |name: &str| -> Vec3 {
+            let i = parts.iter().position(|p| p.name == name).unwrap_or_else(|| panic!("no `{name}` link"));
+            parts[i].pose.pos * PER_M
+        };
+        // …and where the solids the picture drew for it ended up, as the mean
+        // of their translations.
+        let drawn = |name: &str| -> Vec3 {
+            let mut sum = Vec3::zeros();
+            let mut n = 0.0;
+            for part in placed.iter().filter(|p| p.name == name) {
+                let c = part.to_world.matrix.c3;
+                sum += Vec3::new(c.x, c.y, c.z);
+                n += 1.0;
+            }
+            assert!(n > 0.0, "nothing was drawn for `{name}`");
+            sum / n
+        };
+
+        // The boot rides the boot link: its solids are built about the ankle
+        // and sit within a boot's radius of it.
+        for (solid, joint) in [("boot_r", "boot_r"), ("boot_l", "boot_l")] {
+            let (a, b) = (drawn(solid), link(joint));
+            assert!(
+                (a - b).norm() < 400.0,
+                "`{solid}` was drawn {:.0} mm from its own ankle",
+                (a - b).norm()
+            );
+            assert!(a.z < link("pelvis").z, "a boot was drawn above the hips");
+        }
+        // The hood rides the neck: over the pelvis and near the head.
+        let (hood, neck) = (drawn("hood"), link("neck"));
+        assert!((hood - neck).norm() < 500.0, "the hood was drawn {:.0} mm off the neck", (hood - neck).norm());
+        assert!(hood.z > link("pelvis").z + 300.0, "the hood was drawn at hip height");
+
+        // And the glass is at the held pose, to the millimetre.
+        let held = snap.held.expect("the hero holds the lens");
+        let lens = drawn("lens");
+        let want = held.pos * PER_M;
+        assert!((lens - want).norm() < 1e-6, "the lens was drawn {:.1} mm off the pose the arm got it to", (lens - want).norm());
+        // …which is up, out, and clear of the hood.
+        assert!(lens.z > hood.z - 400.0, "the lens is not held up: {:.0} mm against the hood's {:.0}", lens.z, hood.z);
+        assert!((lens - hood).norm() > 300.0, "the lens is {:.0} mm from the hood — it is inside the head", (lens - hood).norm());
+        println!(
+            "the hero draws {} solids; the lens is at ({:+.0}, {:+.0}, {:+.0}) mm, {:.0} mm clear of the hood",
+            placed.len(),
+            lens.x,
+            lens.y,
+            lens.z,
+            (lens - hood).norm()
+        );
+        Ok(())
+    }
+
+    /// **The live gate reads the glass.** With the hero holding the lens at
+    /// the cove's doorstep, `rune::score_lens` puts light through the keyhole:
+    /// the score is a positive number and it is *bigger* than what the same
+    /// lens throws from twenty metres down the beach.
+    ///
+    /// It is not asserted against `open_frac`, and the reason is named rather
+    /// than hidden: **the hero's solve is not wired**. `hero::doorstep` solves
+    /// where a hero must stand for the lens it is holding to put the sun in
+    /// the keyhole — two constraints, two unknowns, iterated — and it does it
+    /// in `hero/stage.rs`'s frame, which is the cove's translated so the
+    /// keyhole is the origin. Wiring it means a `--solve hero` beside
+    /// `rune::solve_and_record`: map the stance into the cove, drive the body
+    /// to it, and record the pose the way `solution_*` records the capsule's.
+    /// TODO(rune): `--solve hero`, from `sims/rune/hero/mod.rs::doorstep`.
+    /// Until then this is what the level honestly has — a lens that throws a
+    /// caustic at the door, and a number that rises as it is aimed.
+    #[test]
+    fn the_held_lens_lights_the_keyhole_from_the_doorstep() -> anyhow::Result<()> {
+        let (scene, baked) = field()?;
+        let mut cove = Cove::with_player(&scene, baked.sdf.clone(), Player::Hero)?;
+
+        // The doorstep, mapped: `hero/stage.rs` is the cove with the keyhole
+        // moved to the origin, so the two frames differ by one translation.
+        let step = crate::rune::hero::doorstep();
+        let ap = scene.door_frame().origin;
+        let (fx, fy) = (step.stance.feet.x * MM + ap.x, step.stance.feet.y * MM + ap.y);
+        cove.face(std::f64::consts::FRAC_PI_2 + step.stance.yaw);
+        cove.place(fx, fy, 0.0);
+        cove.hold_still(SETTLE);
+
+        let near = cove.lens().expect("the hero holds the lens");
+        let here = rune::score_lens(&scene, &near, 200_000);
+        println!(
+            "the hero at the doorstep ({fx:+.2}, {fy:+.2}) m holds the lens at \
+             ({:+.2}, {:+.2}, {:+.2}) m along ({:+.2}, {:+.2}, {:+.2}); the rune scores {:.4} \
+             of {:.2} ({:.3e} deposited over {:.3e} incident)",
+            near.centre.x,
+            near.centre.y,
+            near.centre.z,
+            near.axis.x,
+            near.axis.y,
+            near.axis.z,
+            here.frac,
+            scene.open_frac,
+            here.deposited[1],
+            here.incident,
+        );
+        assert!(here.frac > 0.0, "the lens at the doorstep put nothing through the keyhole");
+
+        // …and it is the *aim* that earns it: the same lens, the same pose,
+        // twenty metres down the beach, scores nothing.
+        let away = rune::Held { centre: near.centre + Vec3::new(0.0, -20.0, 0.0), ..near };
+        let there = rune::score_lens(&scene, &away, 200_000);
+        assert!(
+            there.frac < here.frac,
+            "the lens twenty metres out scored {:.4} against the doorstep's {:.4}",
+            there.frac,
+            here.frac
+        );
+        Ok(())
+    }
+
     /// The shadow the mask repaints is under the being and down-sun of it: the
     /// sun is low off −x, −y, so the shadow runs to +x, +y and lands on the
     /// sand rather than in the air.
@@ -1951,7 +2414,8 @@ mod tests {
     fn the_shadow_lands_on_the_sand_down_sun_of_the_being() -> anyhow::Result<()> {
         let scene = CoveScene::bundled()?;
         let centre = Vec3::new(0.0, -4.0, scene.sand_z_at(0.0, -4.0) + scene.being_h / 2.0);
-        let (p, r) = shadow(&scene, centre).expect("the sun casts a shadow");
+        let extent = scene.being_h / 2.0 + scene.being_r;
+        let (p, r) = shadow_of(&scene, centre, extent).expect("the sun casts a shadow");
         assert!((p.z - scene.sand_z_at(p.x, p.y)).abs() < 1e-9, "the shadow is off the sand plane");
         let d = scene.sun_dir();
         assert!(p.x > centre.x && p.y > centre.y, "the shadow is up-sun of the being ({d:?})");

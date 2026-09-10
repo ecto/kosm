@@ -121,11 +121,22 @@ pub type Picture = pathtrace::Scene<CoveGeom>;
 /// way of getting one. A solved pose, a hand-placed pose and a live snapshot
 /// all arrive here as the same three numbers, which is what lets the offline
 /// frame exist before the being can walk.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Placement {
     /// The being's centre in world metres, and its body → world rotation.
     /// The body's axes are right, facing, up.
     pub being: (PVec3, Mat3),
+    /// The hero's solids, placed — every part of the figure and the glass in
+    /// its hand, at the transforms one snapshot of the simulation puts them
+    /// at. [`None`] is the capsule, which is what the offline still and the
+    /// solvability sweep are written against.
+    ///
+    /// The solids themselves are [`Scene`]'s and are built once; what changes
+    /// per frame is the fourth field of each of these, so a walking hero costs
+    /// one 4×4 a part and not one tessellation. An `Arc<[_]>` rather than a
+    /// `Vec`, because a `Placement` is cloned per pass and compared against
+    /// the pose the caustic map was traced at.
+    pub hero: Option<Arc<[HeroPart]>>,
     /// How far the door has swung, radians. Zero is shut; positive opens it
     /// out of the cliff into the cove.
     pub door_angle: f64,
@@ -167,10 +178,22 @@ impl Placement {
         let lean_facing = facing * c + up * s;
         Self {
             being: (centre, columns(right, lean_facing, lean_up)),
+            hero: None,
             door_angle: 0.0,
             score: 0.0,
             glint: None,
         }
+    }
+
+    /// The same pose, with the hero's solids placed on it.
+    pub fn with_hero(mut self, hero: Option<Arc<[HeroPart]>>) -> Self {
+        self.hero = hero;
+        self
+    }
+
+    /// Whether this placement draws the figure rather than the capsule.
+    pub fn is_hero(&self) -> bool {
+        self.hero.as_ref().is_some_and(|h| !h.is_empty())
     }
 
     /// The same pose, with the rune's score on it.
@@ -190,6 +213,103 @@ impl Placement {
         let r = self.being.1;
         PVec3::new(r[(0, 1)], r[(1, 1)], r[(2, 1)])
     }
+}
+
+// ---- the hero -------------------------------------------------------------
+
+/// One of the hero's solids, placed for one frame.
+///
+/// The name is `sims/rune/hero/figure.rs`'s body name — `hood`, `boot_r`,
+/// `strap` — or `lens` and `lens_ring` for the glass in the hand. It is
+/// carried because a part that is drawn in the wrong place is a bug you can
+/// only see, and a name in a test is how you see it in a number instead.
+#[derive(Clone)]
+pub struct HeroPart {
+    pub name: String,
+    pub bvh: Arc<Bvh<CoveGeom>>,
+    pub to_world: Transform,
+    pub pbr: Pbr,
+}
+
+// A BVH has no `Debug` and would be no use as one; what a reader of a
+// `Placement` wants to know about a part is its name and where it ended up.
+impl std::fmt::Debug for HeroPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = self.to_world.matrix.c3;
+        f.debug_struct("HeroPart").field("name", &self.name).field("at", &[c.x, c.y, c.z]).finish()
+    }
+}
+
+/// One of the hero's solids as it was **authored**: which of the body's links
+/// carries it, and where it sits in that link's own frame.
+///
+/// This is the whole of "build once, re-place per frame". `figure()` is
+/// evaluated exactly once, at [`Scene::new`], and every primitive its bodies
+/// are a union of gets one BVH; what a walking hero costs after that is one
+/// 4×4 per primitive per frame.
+struct HeroSolid {
+    name: String,
+    bvh: Arc<Bvh<CoveGeom>>,
+    pbr: Pbr,
+    /// Which link of `kosm::player::BodySpec::hero` this rides on: an index
+    /// into `Snapshot::parts`, which is in the spec's link order.
+    link: usize,
+    /// Primitive → the link's own frame, in **hero-local millimetres**.
+    local: Transform,
+}
+
+/// Hero-local millimetres as the body's own frame: `+y` forward becomes `+x`,
+/// `+x` right becomes `−y`, `z` is `z`.
+///
+/// The rotation half of [`kosm::player::body::hero_local`], without its
+/// millimetres — because the picture is assembled in millimetres and the
+/// thousand cancels. That cancellation is the only reason this matrix and not
+/// that function is what the placement uses; they are the same map.
+fn hero_axes() -> Mat3 {
+    Mat3::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+}
+
+/// How far outside link `i`'s own flesh a body-local point is, metres.
+///
+/// The **signed** distance to the nearest lump, so a part that overlaps two
+/// links goes to the one it is deepest inside rather than to the one whose
+/// pivot happens to be nearer. That distinction is not academic: the cloak's
+/// skirt cone has its centroid 117 mm from the pelvis ball's centre and 87 mm
+/// from the chest's, so a nearest-centre rule would hang the skirt off the
+/// torso and swing it when the hero leaned.
+fn lump_depth(link: &kosm::player::Link, q: PVec3) -> f64 {
+    link.lumps
+        .iter()
+        .map(|l| {
+            let d = l.to - l.from;
+            let t = if d.norm_squared() > 1e-18 { ((q - l.from).dot(&d) / d.norm_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            (q - (l.from + d * t)).norm() - l.radius
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// A solid of the hero's, traced with **smoothed** vertex normals.
+///
+/// [`geometry_of`] is the cove's and shades a boolean's tessellation flat,
+/// which is right for a cliff cut out of a slab and wrong for a hood: the
+/// figure's cowl is a union of spheres and a torus and a hood with facets on
+/// it is a hood nobody believes. `hero/stage.rs::smooth_normals` is the rule
+/// the hero's own stills are drawn with — welded by position, creased at 46°
+/// — so the live figure and the doorstep plate shade the same way.
+fn hero_geometry(solid: &Solid) -> CoveGeom {
+    if let Some(brep) = solid.as_brep() {
+        let brep = Arc::new(brep.clone());
+        let faces = brep.topology.faces.iter().map(|(id, _)| id).collect();
+        return CoveGeom::Brep(BrepGeom::BRep { brep, faces });
+    }
+    let mut mesh = solid.to_mesh(0);
+    vcad_kernel::vcad_kernel_tessellate::render_bake_default(&mut mesh);
+    let n = mesh.vertices.len() / 3;
+    let positions: Vec<Point3> = (0..n)
+        .map(|i| Point3::new(mesh.vertices[i * 3] as f64, mesh.vertices[i * 3 + 1] as f64, mesh.vertices[i * 3 + 2] as f64))
+        .collect();
+    let normals = super::hero::stage::smooth_normals(&positions, &mesh.indices);
+    CoveGeom::Brep(BrepGeom::Mesh(TriMesh::new(positions, normals, &mesh.indices)))
 }
 
 /// A body → world rotation from its three axes, as columns.
@@ -234,6 +354,13 @@ pub struct Scene {
     glint_glow: f64,
     /// The being, centred on the origin with its axis along +z.
     being: Placed,
+    /// The hero's costume, built once, each part in the frame of the link
+    /// that carries it. Empty when the level could not evaluate the figure.
+    hero: Vec<HeroSolid>,
+    /// The glass in the hand and the ring around it, in the lens's own frame:
+    /// centred on the origin with the optical axis along +z, which is what
+    /// `hero/kit.rs` cuts them in.
+    held: Vec<HeroSolid>,
     env: Environment,
     sun: Sun,
     ground: Option<Ground>,
@@ -355,6 +482,16 @@ impl Scene {
             material: materials::pbr(doc, "water"),
             shadow_catcher: false,
         });
+        // The figure, evaluated once. A level that cannot build it says so and
+        // carries on with the capsule rather than failing to open a window.
+        let (hero, held) = match hero_solids(doc, scene) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("cove   the hero could not be built ({e}); the capsule stands in");
+                (Vec::new(), Vec::new())
+            }
+        };
+
         Ok(Self {
             statics,
             door,
@@ -365,6 +502,8 @@ impl Scene {
             glint,
             glint_glow: scene.glint_glow,
             being,
+            hero,
+            held,
             env,
             sun,
             ground,
@@ -444,6 +583,74 @@ impl Scene {
         self.gather * widen.clamp(1.0, MAX_WIDENING)
     }
 
+    /// The hero's solids at one snapshot of the body: every costume part on
+    /// the link that carries it, and the glass wherever the arm actually got
+    /// it to.
+    ///
+    /// The whole per-frame cost of drawing a figure. A part authored at
+    /// `p_mm` in the hero's own millimetres, on a link whose pivot is `pivot`
+    /// (body-local metres) and whose frame the simulation has put at
+    /// `(pos, R)` (world metres, `R` body → world), is drawn at
+    ///
+    /// ```text
+    /// world_mm = R · P · p_mm + 1000 · (pos − R · pivot)
+    /// ```
+    ///
+    /// where `P` is [`hero_axes`]. The thousand that turns hero-millimetres
+    /// into body-metres and the thousand that turns world-metres back into
+    /// the picture's millimetres cancel in the linear part and survive only
+    /// in the translation, which is why this is one 4×4 and not two.
+    pub fn hero_at(
+        &self,
+        parts: &[kosm::player::Part],
+        pivots: &[PVec3],
+        held: Option<kosm::player::Pose>,
+    ) -> Option<Arc<[HeroPart]>> {
+        if self.hero.is_empty() || parts.is_empty() {
+            return None;
+        }
+        let axes = hero_axes();
+        let mut out: Vec<HeroPart> = Vec::with_capacity(self.hero.len() + self.held.len());
+        for solid in &self.hero {
+            let (Some(part), Some(pivot)) = (parts.get(solid.link), pivots.get(solid.link)) else { continue };
+            let (pos, r) = (part.pose.pos, part.pose.rot);
+            let t = (pos - r.mul_vec(*pivot)) * PER_M;
+            let frame = rigid(&r.mul_mat(&axes), t.x, t.y, t.z);
+            out.push(HeroPart {
+                name: solid.name.clone(),
+                bvh: solid.bvh.clone(),
+                pbr: solid.pbr,
+                to_world: Transform::from_matrix(frame.matrix * solid.local.matrix),
+            });
+        }
+        // The glass is not on a link. It is where `Body::held` says it is,
+        // which is not where the arm was asked to put it, because an arm has
+        // mass — and that is the pose the scorer reads too.
+        if let Some(pose) = held {
+            let c = pose.pos * PER_M;
+            let frame = rigid(&pose.rot, c.x, c.y, c.z);
+            for solid in &self.held {
+                out.push(HeroPart {
+                    name: solid.name.clone(),
+                    bvh: solid.bvh.clone(),
+                    pbr: solid.pbr,
+                    to_world: Transform::from_matrix(frame.matrix * solid.local.matrix),
+                });
+            }
+        }
+        (!out.is_empty()).then(|| out.into())
+    }
+
+    /// The link pivots the hero's placement needs, body-local metres. Built
+    /// once by the caller and handed to [`Scene::hero_at`] each frame.
+    pub fn hero_pivots() -> Vec<PVec3> {
+        kosm::player::BodySpec::hero(&super::being::hero_skeleton(&super::hero::figure::Rig::DEFAULT))
+            .links
+            .iter()
+            .map(|l| l.pivot)
+            .collect()
+    }
+
     /// The picture at one pose: the static half, the being where it stands,
     /// the door at its hinge angle.
     pub fn at(&mut self, p: &Placement) -> Picture {
@@ -482,7 +689,17 @@ impl Scene {
             ));
         }
         objects.extend(self.extras.iter().map(Placed::object));
-        if self.show_being {
+        // The body: the figure when there is one, and the capsule when there
+        // is not. Never both — the capsule is the hero's *optical* proxy and
+        // a figure standing inside a lens the size of itself is worse than
+        // either half of that sentence.
+        if let Some(hero) = p.hero.as_ref().filter(|h| !h.is_empty()) {
+            if self.show_being {
+                for part in hero.iter() {
+                    objects.push(Object::placed(part.bvh.clone(), part.pbr, part.to_world.clone()));
+                }
+            }
+        } else if self.show_being {
             let (centre, rot) = p.being;
             let c = centre * PER_M;
             objects.push(Object::placed(self.being.bvh.clone(), being_pbr, rigid(&rot, c.x, c.y, c.z)));
@@ -542,6 +759,99 @@ impl Scene {
             tang::Mat4::translation(h.x, h.y, h.z) * r.matrix * tang::Mat4::translation(-h.x, -h.y, -h.z),
         )
     }
+}
+
+/// The hero's solids: the costume on its links, and the glass in its hand.
+///
+/// Evaluated once. Every body of `hero/figure.rs` is walked into the placed
+/// primitives its union is made of, each distinct solid gets one BVH, and
+/// each primitive is assigned to **the link whose flesh it is deepest
+/// inside** ([`lump_depth`]) — so a bone drawn between the hip and the knee
+/// rides the thigh, the shin below it rides the shin, and the cowl rides the
+/// neck. Nothing here is a table of names: the assignment is geometric,
+/// because the pivots the figure is drawn from and the pivots the body is
+/// built from are the same `Rig::pivots()`.
+///
+/// The lens and its ring come back separately: they hang off
+/// [`kosm::player::Body::held`], which is where the arm actually got the
+/// glass to rather than where it was asked to put it.
+fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Vec<HeroSolid>, Vec<HeroSolid>)> {
+    use super::hero::{figure, kit};
+    use kosm::build::Params;
+
+    // The same rig the body is built from — `being::hero_skeleton(Rig::DEFAULT)`
+    // — so a part's rest pose and its link's pivot are the same number.
+    let built = figure::figure(&Params::default())?;
+    let spec = kosm::player::BodySpec::hero(&super::being::hero_skeleton(&figure::Rig::DEFAULT));
+
+    let mut prims = Prims::default();
+    let mut bvhs: HashMap<usize, Arc<Bvh<CoveGeom>>> = HashMap::new();
+    let mut parts = Vec::new();
+    for body in &built.bodies {
+        let pbr = materials::pbr(&built.document, &body.material);
+        for inst in instances::instances(&built.document, body.root, &mut prims)? {
+            let bvh = bvhs
+                .entry(Arc::as_ptr(&inst.solid) as usize)
+                .or_insert_with(|| Arc::new(Bvh::build(hero_geometry(&inst.solid))))
+                .clone();
+            let Some(local) = bvh.bounds() else { continue };
+            let to_world = placement(&inst.to_world);
+            // where this primitive sits in the body's own frame, metres
+            let box_mm = transform_aabb(&local, &to_world);
+            let mid = Point3::new(
+                0.5 * (box_mm.min.x + box_mm.max.x),
+                0.5 * (box_mm.min.y + box_mm.max.y),
+                0.5 * (box_mm.min.z + box_mm.max.z),
+            );
+            let q = kosm::player::body::hero_local(mid.x, mid.y, mid.z);
+            let link = (0..spec.links.len())
+                .min_by(|&a, &b| {
+                    lump_depth(&spec.links[a], q)
+                        .partial_cmp(&lump_depth(&spec.links[b], q))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            parts.push(HeroSolid { name: body.name.clone(), bvh, pbr, link, local: to_world });
+        }
+    }
+    anyhow::ensure!(!parts.is_empty(), "the hero evaluated to no solid");
+
+    // The glass. `lens_mesh` is exact spherical caps with analytic normals,
+    // which is the same trade the being's capsule makes and for the same
+    // reason: the boolean is two spheres two and a half metres across meeting
+    // in a disc a hundred and ten millimetres wide.
+    let a = &scene.authored;
+    let lens = Arc::new(Bvh::build(mesh_geometry(kit::lens_mesh(
+        a.parameter_or("lens_segments", 96.0).max(8.0) as usize,
+        a.parameter_or("lens_rings", 24.0).max(2.0) as usize,
+    ))));
+    let mut held = vec![HeroSolid {
+        name: "lens".into(),
+        bvh: lens,
+        pbr: materials::lens_glass(scene.n_d),
+        link: 0,
+        local: Transform::identity(),
+    }];
+    // …and its brass ring, out of the same `Built` the doorstep stills use.
+    // Decoration, and it earns the line: a rimless disc of glass in a fist is
+    // a hole in the picture, and the ring is what says the hero is holding
+    // something rather than standing behind it.
+    if let Ok(hardware) = kit::hardware(&Params::default()) {
+        for body in &hardware.bodies {
+            let pbr = materials::pbr(doc, &body.material);
+            for inst in instances::instances(&hardware.document, body.root, &mut prims)? {
+                let bvh = Arc::new(Bvh::build(hero_geometry(&inst.solid)));
+                held.push(HeroSolid {
+                    name: body.name.clone(),
+                    bvh,
+                    pbr,
+                    link: 0,
+                    local: placement(&inst.to_world),
+                });
+            }
+        }
+    }
+    Ok((parts, held))
 }
 
 /// Which of the cove's surfaces one primitive of the `ground` root is.

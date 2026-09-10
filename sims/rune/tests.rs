@@ -81,10 +81,15 @@ fn field() -> anyhow::Result<(CoveScene, &'static crate::skatepark::Baked)> {
     Ok((scene, baked))
 }
 
-/// A cove with the being at the spawn, standing.
+/// A cove with the **capsule** at the spawn, standing.
+///
+/// Said explicitly and not left to [`being::Player::from_env`], whose default
+/// is the hero now. Everything below this line is a measurement of the
+/// capsule — its mass, its spring, the speed `walk_mps` caps, how deep it
+/// wades — and a figure has none of those numbers.
 fn standing() -> anyhow::Result<(CoveScene, being::Cove)> {
     let (scene, baked) = field()?;
-    let cove = being::Cove::new(&scene, baked.sdf.clone())?;
+    let cove = being::Cove::with_player(&scene, baked.sdf.clone(), being::Player::Capsule)?;
     Ok((scene, cove))
 }
 

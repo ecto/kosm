@@ -132,6 +132,17 @@ pub enum Piece {
     /// The being: the segment `a`→`b` swept by `r`, solved as one solid so a
     /// dielectric never meets an interface that is not on its surface.
     Capsule { a: Point3, b: Point3, r: f64 },
+    /// The hero's lens: the **intersection of two spheres** of radius `r`
+    /// whose centres are `a` and `b`, which is a symmetric biconvex lens
+    /// whose rim lies in the plane halfway between them.
+    ///
+    /// The same arithmetic `sims/rune/hero/kit.rs::lens_mesh` tessellates —
+    /// the top cap belongs to the sphere below the centre and the bottom cap
+    /// to the one above it — so the scorer and the picture are the same
+    /// glass. Solved as one solid for the same reason the capsule is: a
+    /// dielectric must never meet an interface that is not on its surface,
+    /// and two overlapping spheres would give it four.
+    Lens { a: Point3, b: Point3, r: f64 },
 }
 
 /// A bag of [`Piece`]s. A `Scene` is generic over one `Geometry`, so the
@@ -156,6 +167,21 @@ impl Geometry for Pieces {
                 }
                 bb
             }
+            // The lens lies inside the convex hull of its rim disc and its
+            // two poles, so a box that holds both holds it.
+            Piece::Lens { a, b, r } => {
+                let mid = *a + (*b - *a) * 0.5;
+                let half_sep = 0.5 * (*b - *a).norm();
+                let u = if half_sep > 1e-12 { (*b - *a) / (2.0 * half_sep) } else { Vec3::new(0.0, 0.0, 1.0) };
+                let h = (r * r - half_sep * half_sep).max(0.0).sqrt();
+                let bulge = r - half_sep;
+                let at = |c: f64| h * (1.0 - c * c).max(0.0).sqrt() + bulge * c.abs();
+                let pad = Vec3::new(at(u.x), at(u.y), at(u.z));
+                let mut bb = Aabb::empty();
+                bb.include_point(&(mid - pad));
+                bb.include_point(&(mid + pad));
+                bb
+            }
         }
     }
 
@@ -165,6 +191,15 @@ impl Geometry for Pieces {
             Piece::Capsule { a, b, r } => {
                 let mut best: Option<(f64, Vec3)> = None;
                 capsule_hits(*a, *b, *r, ray, &mut |t, n| {
+                    if t > t_min && t < t_max && best.is_none_or(|(bt, _)| t < bt) {
+                        best = Some((t, n));
+                    }
+                });
+                best.map(|(t, n)| Hit::new(t, ray.at(t), Dir3::new_normalize(n), Point2::new(0.0, 0.0), i as u32))
+            }
+            Piece::Lens { a, b, r } => {
+                let mut best: Option<(f64, Vec3)> = None;
+                lens_hits(*a, *b, *r, ray, &mut |t, n| {
                     if t > t_min && t < t_max && best.is_none_or(|(bt, _)| t < bt) {
                         best = Some((t, n));
                     }
@@ -182,8 +217,40 @@ impl Geometry for Pieces {
             Piece::Capsule { a, b, r } => capsule_hits(*a, *b, *r, ray, &mut |t, n| {
                 out.push(Hit::new(t, ray.at(t), Dir3::new_normalize(n), Point2::new(0.0, 0.0), i as u32));
             }),
+            Piece::Lens { a, b, r } => lens_hits(*a, *b, *r, ray, &mut |t, n| {
+                out.push(Hit::new(t, ray.at(t), Dir3::new_normalize(n), Point2::new(0.0, 0.0), i as u32));
+            }),
         }
     }
+}
+
+/// Where a ray enters and leaves the intersection of two spheres, with the
+/// outward normal at each.
+///
+/// An intersection of convex solids is convex, and a ray meets a convex solid
+/// in one interval — so the answer is the intersection of the two spheres'
+/// own intervals, and the normal at each end belongs to whichever sphere is
+/// the one being crossed there. Two roots or none; never four.
+fn lens_hits(a: Point3, b: Point3, r: f64, ray: &Ray, out: &mut impl FnMut(f64, Vec3)) {
+    let d = ray.direction.into_inner();
+    let span = |centre: Point3| -> Option<(f64, f64)> {
+        let oc = ray.origin - centre;
+        let bq = oc.dot(d);
+        let disc = bq * bq - (oc.dot(oc) - r * r);
+        (disc >= 0.0).then(|| {
+            let s = disc.sqrt();
+            (-bq - s, -bq + s)
+        })
+    };
+    let (Some((a0, a1)), Some((b0, b1))) = (span(a), span(b)) else { return };
+    // whichever sphere is entered last, and whichever is left first
+    let (enter, on_enter) = if a0 > b0 { (a0, a) } else { (b0, b) };
+    let (exit, on_exit) = if a1 < b1 { (a1, a) } else { (b1, b) };
+    if !(enter < exit) {
+        return;
+    }
+    out(enter, (ray.at(enter) - on_enter) / r);
+    out(exit, (ray.at(exit) - on_exit) / r);
 }
 
 /// Every root of the ray against the capsule `a`→`b` of radius `r`, with the
@@ -263,7 +330,18 @@ fn capsule_hits(a: Point3, b: Point3, r: f64, ray: &Ray, out: &mut impl FnMut(f6
 /// below the keyhole shows up as sand instead of as silence.
 pub fn picture(scene: &CoveScene, pose: &Pose) -> Scene<Pieces> {
     let (a, b, r) = being_capsule(scene, pose);
-    let being = Pieces(vec![Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r }]);
+    picture_of(scene, Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r })
+}
+
+/// The same scene with any one refractor in it: the being's capsule, or the
+/// lens the hero is holding.
+///
+/// The door and the sand do not care which body throws the caustic, and the
+/// score does not either — it reads the power inside the aperture disc and
+/// divides by the power the sun put into the refractor. So there is one
+/// scene, and [`Piece`] is what changes.
+pub fn picture_of(scene: &CoveScene, refractor: Piece) -> Scene<Pieces> {
+    let being = Pieces(vec![refractor]);
 
     let face = scene.cliff_face_y();
     let sill = scene.door_sill();
@@ -322,7 +400,87 @@ pub struct Score {
 /// Split out from [`score`] because the sweep and the diagnostics want the
 /// map as well as the number, and tracing it twice is the expensive half.
 pub fn trace(scene: &CoveScene, pose: &Pose, photons: usize) -> (CausticMap, Score) {
-    let picture = picture(scene, pose);
+    let (a, b, r) = being_capsule(scene, pose);
+    read(
+        scene,
+        Piece::Capsule { a: Point3::from_vec(a), b: Point3::from_vec(b), r },
+        projected_area(scene, pose),
+        photons,
+    )
+}
+
+/// The rune's score at a pose.
+pub fn score(scene: &CoveScene, pose: &Pose, photons: usize) -> Score {
+    trace(scene, pose, photons).1
+}
+
+// ─── the lens in the hero's hand ───────────────────────────────────────────
+
+/// Where a held lens is: the centre of the glass and its optical axis, world
+/// metres. Everything else about it — the surface radius, the separation of
+/// the two sphere centres — is `hero/kit.rs`'s and is the same for every lens
+/// the hero owns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Held {
+    pub centre: Vec3,
+    pub axis: Vec3,
+}
+
+/// The lens's own numbers in **metres**: the surface radius, half the
+/// separation of the two sphere centres, and the semi-diameter of the rim.
+///
+/// Straight out of [`super::hero::kit::lens_numbers`], which cuts the glass
+/// for `LENS_F` by the thick lensmaker's equation. One statement of the
+/// shape, two readers: the mesh the picture traces and the piece the score
+/// does.
+pub fn lens_numbers_m() -> (f64, f64, f64) {
+    let (r, a, _) = super::hero::kit::lens_numbers();
+    (r * MM, a * MM, 0.5 * super::hero::kit::LENS_D * MM)
+}
+
+/// The held lens as a [`Piece`]: two spheres whose intersection is the glass.
+///
+/// `lens_mesh` builds the cap on `+z` out of the sphere centred at `−a`, so
+/// that is the way round the centres go here.
+pub fn lens_piece(held: &Held) -> Piece {
+    let (r, a, _) = lens_numbers_m();
+    let u = if held.axis.norm() > 1e-12 { held.axis.normalize() } else { Vec3::new(0.0, 0.0, 1.0) };
+    Piece::Lens {
+        a: Point3::from_vec(held.centre - u * a),
+        b: Point3::from_vec(held.centre + u * a),
+        r,
+    }
+}
+
+/// The lens's cross-section as the sun sees it: the rim disc foreshortened,
+/// plus the knife edge it presents when it is turned edge-on.
+///
+/// The score's denominator for a held lens, exactly as [`projected_area`] is
+/// the being's — the power the sun actually puts into the glass, so `frac`
+/// stays the fraction of *caught* light that reached the keyhole and stays
+/// comparable with the capsule's number.
+pub fn lens_projected_area(scene: &CoveScene, held: &Held) -> f64 {
+    let (r, a, h) = lens_numbers_m();
+    let u = if held.axis.norm() > 1e-12 { held.axis.normalize() } else { Vec3::new(0.0, 0.0, 1.0) };
+    let cos = u.dot(&scene.sun_dir()).abs();
+    let thickness = 2.0 * (r - a);
+    std::f64::consts::PI * h * h * cos + 2.0 * h * thickness * (1.0 - cos * cos).max(0.0).sqrt()
+}
+
+/// The caustic map the held lens throws, and the score read off it.
+pub fn trace_lens(scene: &CoveScene, held: &Held, photons: usize) -> (CausticMap, Score) {
+    read(scene, lens_piece(held), lens_projected_area(scene, held), photons)
+}
+
+/// The rune's score with the lens as the refractor.
+pub fn score_lens(scene: &CoveScene, held: &Held, photons: usize) -> Score {
+    trace_lens(scene, held, photons).1
+}
+
+/// One refractor, one denominator, one reading of the keyhole. What both
+/// [`trace`] and [`trace_lens`] are.
+fn read(scene: &CoveScene, refractor: Piece, area: f64, photons: usize) -> (CausticMap, Score) {
+    let picture = picture_of(scene, refractor);
     let map = kosm_render::caustics::trace(
         &picture,
         &CausticOptions { photons, radius: Some(0.02), max_bounces: 8, ..Default::default() },
@@ -333,14 +491,9 @@ pub fn trace(scene: &CoveScene, pose: &Pose, photons: usize) -> (CausticMap, Sco
         Vec3::new(frame.normal.x, frame.normal.y, frame.normal.z),
         scene.aperture_r,
     );
-    let incident = luminance(SUN_IRRADIANCE) * projected_area(scene, pose);
+    let incident = luminance(SUN_IRRADIANCE) * area;
     let frac = if incident > 0.0 { luminance(deposited) / incident } else { 0.0 };
     (map, Score { frac, deposited, incident })
-}
-
-/// The rune's score at a pose.
-pub fn score(scene: &CoveScene, pose: &Pose, photons: usize) -> Score {
-    trace(scene, pose, photons).1
 }
 
 /// Where the caustic actually landed on the door's face, in the frame's

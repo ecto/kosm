@@ -32,11 +32,18 @@
 //! costume's substances for the masses and the boots for the contacts;
 //! [`Player::Capsule`] is the glass capsule the level was written against,
 //! and is still what `being_r_mm` and `being_h_mm` describe. `KOSM_RUNE_PLAYER`
-//! picks. Either way the *optics* still see a capsule: the rune is traced
-//! through a lens of glass, and until that lens is the refractor in the hero's
-//! hand rather than the being's whole body, [`Cove::being_pose`] hands back
-//! the capsule proxy at whatever pose the body has got to — see
-//! [`Cove::held_lens`], which is where the real answer will come from.
+//! picks, and the hero is the default now.
+//!
+//! **And the hero holds the lens.** [`Cove::with_player`] puts
+//! `hero/kit.rs`'s two-and-a-half-metre crown glass in its right hand, the
+//! arm's own PD carries it to [`LENS_AIM`] — up and out, the way somebody
+//! sighting through a lens holds one — and [`Cove::held_lens`] hands back
+//! where it *actually got to*, which is not where it was asked to be because
+//! an arm has mass. That pose is what `rune::score_lens` traces the live gate
+//! through and what the picture draws the glass at, so the number and the
+//! image are the same piece of glass. [`Cove::being_pose`]'s capsule proxy
+//! survives for the capsule body and for the hint's gradient, which is still
+//! written on the capsule's two knobs.
 //!
 //! Everything the dynamics needs from the player arrives as [`Input`], and
 //! everything the picture needs comes back as [`Snapshot`].
@@ -44,11 +51,11 @@
 //! Metres, radians, seconds; z up.
 
 use std::f64::consts::PI;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use kosm::player::body::TILT_MAX as PLAYER_TILT_MAX;
 use kosm::player::ground::step_on;
-use kosm::player::{Body, BodySpec, Drive, Netted, Nowhere, Part, Pose, SdfGround, Skeleton, Water};
+use kosm::player::{Body, BodySpec, Drive, Netted, Nowhere, Part, Pose, SdfGround, Skeleton, Tool, Water};
 use kosm_scan::SdfGrid;
 use phyz_contact::{ContactCache, ContactMaterial};
 use phyz_math::{GRAVITY, Mat3, SpatialInertia, SpatialTransform, Vec3};
@@ -112,19 +119,28 @@ pub enum Player {
 impl Player {
     /// What `KOSM_RUNE_PLAYER` says, or the default.
     ///
-    /// Default **capsule**, and that is a statement about the *optics*, not
-    /// about the body: the cove's rune is a caustic traced through a lens of
-    /// glass, and every one of `rune_tests.rs`'s numbers — the focal length,
-    /// the solvable band, the door's score — is that capsule's. A hero with
-    /// the capsule bolted to it as a proxy would be a figure that does not
-    /// refract standing inside a lens that is not held, which is worse than
-    /// either. `KOSM_RUNE_PLAYER=hero` is the body with legs, and it is what
-    /// the level switches to on the day the lens is the thing in its hand.
+    /// Default **hero**, and that is now a statement about the optics as much
+    /// as about the body. The day this comment was written the other way
+    /// round has arrived: the lens is the thing in the hero's hand
+    /// ([`Cove::held_lens`]), the live gate scores the caustic *that* throws
+    /// ([`super::rune::score_lens`]), and the figure is drawn from its own
+    /// solids at the transforms the simulation puts them at. A capsule of
+    /// glass with no legs is the level's old body and its old optics, and
+    /// `KOSM_RUNE_PLAYER=capsule` is still every one of `rune_tests.rs`'s
+    /// numbers — the focal length, the solvable band, the recorded solution —
+    /// because the offline solve and the solvability sweep are on the
+    /// capsule's own `rune::Pose` and have not moved.
     pub fn from_env() -> Self {
         match std::env::var("KOSM_RUNE_PLAYER").ok().as_deref() {
-            Some("hero") => Player::Hero,
-            _ => Player::Capsule,
+            Some("capsule") => Player::Capsule,
+            _ => Player::Hero,
         }
+    }
+}
+
+impl Default for Player {
+    fn default() -> Self {
+        Player::Hero
     }
 }
 
@@ -164,6 +180,38 @@ pub fn hero_skeleton(rig: &Rig) -> Skeleton {
         head_density: density("skin"),
         capsule: None,
     }
+}
+
+/// Where the hero's hand is asked to go, in the **body's own frame**: up and
+/// out to its right, at nearly the arm's full reach.
+///
+/// The direction is `hero/mod.rs`'s doorstep swing and elevation — 28° out
+/// and 46° up at the shoulder — read into the player's frame (`+x` forward,
+/// `+y` left, `+z` up) rather than the figure's. That is a pose and not a
+/// solve: it is how a person holds a lens up, and it is what puts the glass
+/// clear of a 456 mm head on a 1113 mm frame. Where the hero has to *stand*
+/// for that lens to put the sun in the keyhole is `hero::doorstep`'s
+/// question, and it is not answered here.
+const LENS_AIM: [f64; 3] = [0.613, -0.326, 0.719];
+
+/// How much of the arm's straight reach the aim asks for.
+const LENS_REACH: f64 = 0.97;
+
+/// Where the glass sits relative to the fist that is holding its rim.
+///
+/// A hand on a rim holds the lens a semi-diameter away in the lens's own
+/// plane, and the optical axis runs across it. So the grip puts the centre of
+/// the glass `LENS_D/2` up-and-outboard of the hand and turns the lens's own
+/// `+z` — which is the optical axis `hero/kit.rs` cuts it about — onto the
+/// body's forward. `hero/mod.rs::GRIP_HINT` is the same offset in the
+/// figure's frame.
+fn lens_grip() -> Pose {
+    let hint = Vec3::new(0.15, -0.55, 0.82).normalize();
+    let radius = 0.5 * super::hero::kit::LENS_D / 1000.0;
+    // the lens's own axes in the hand's frame, as columns: +z forward,
+    // +x to the body's left, +y up
+    let rot = Mat3::new(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    Pose::new(hint * radius, rot)
 }
 
 /// The door's substance, read off the door body the level built.
@@ -213,7 +261,7 @@ impl Input {
 }
 
 /// The cove at one instant, as the picture wants it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     /// The simulation's own clock, seconds.
     pub t: f64,
@@ -235,13 +283,18 @@ pub struct Snapshot {
     pub gate_open: bool,
     /// Where the held lens is, if the hero is holding one.
     pub held: Option<Pose>,
+    /// Every link of the figure, placed — [`None`] for the capsule, which has
+    /// only the one.
+    pub parts: Option<Arc<Vec<Part>>>,
 }
 
-// `Snapshot` is `Copy` on purpose: `game.rs` sends one down a channel to the
-// render thread every frame and keeps the last one behind a mutex, and a
-// `Vec` in here would put an allocation in both. The body's *parts* are
-// therefore not a field — [`Cove::hero_parts`] is where they are, asked for
-// by the one caller that draws them.
+// `Snapshot` was `Copy` and is not any more, and the `Arc` is why it is still
+// cheap. `game.rs` sends one down a channel to the render thread every frame
+// and keeps the last one behind a mutex; the *parts* are what the render
+// thread places the figure from, so they have to travel with it, and the only
+// two ways to do that are to allocate a `Vec` per frame on the simulation
+// thread or to refcount one. The body builds the `Vec` once per snapshot
+// either way; this way nothing after that copies it.
 
 /// The door's numbers and where in its own little state its one DOF lives.
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +330,10 @@ pub struct Cove {
     capsule: (f64, f64),
     which: Player,
     gate: bool,
+    /// Where the hand is asked to put the glass, world metres. `None` lets
+    /// the arm hang, which is the capsule's whole story and is also what a
+    /// hero that has put the lens away would be.
+    aim: Option<Vec3>,
 }
 
 impl Cove {
@@ -297,7 +354,13 @@ impl Cove {
         .with_friction(BEING_FRICTION)
         .with_speeds(scene.walk_mps, 2.6)
         .with_dt(1e-3);
-        let body = Body::new(spec);
+        let mut body = Body::new(spec);
+        // The glass goes in the hand at build time, because the level is
+        // about the glass: from here on `Body::held` is where the refractor
+        // is and `being_pose` is only a proxy.
+        if which == Player::Hero {
+            body.hold(Tool::new("lens").with_grip(lens_grip()));
+        }
 
         // ---- the door ------------------------------------------------------
         // It hangs from its +x edge, at the middle of its thickness, on the
@@ -351,7 +414,9 @@ impl Cove {
             capsule,
             which,
             gate: false,
+            aim: None,
         };
+        cove.hold_lens_up();
         cove.place(scene.spawn_x, scene.spawn_y, 0.0);
         Ok(cove)
     }
@@ -370,12 +435,14 @@ impl Cove {
     pub fn place(&mut self, x: f64, y: f64, lean: f64) {
         let facing = self.body.facing();
         self.body.place(x, y, self.beach.z_at(x, y), facing, lean);
+        self.hold_lens_up();
     }
 
     /// Point the being. `tests.rs`'s compass, and the window's mouse.
     pub fn face(&mut self, facing: f64) {
         let (p, lean) = (self.body.footing(), 0.0);
         self.body.place(p.x, p.y, self.beach.z_at(p.x, p.y), facing, lean);
+        self.hold_lens_up();
     }
 
     /// Set the lean the player is asking for, radians.
@@ -385,7 +452,9 @@ impl Cove {
 
     /// One step: the being through its controllers, then the door.
     pub fn step(&mut self, input: &Input) {
-        self.body.step(&input.drive(), &self.ground, &self.sea, 1e-3);
+        self.hold_lens_up();
+        let drive = Drive { aim: self.aim, ..input.drive() };
+        self.body.step(&drive, &self.ground, &self.sea, 1e-3);
 
         // The door: a damper always, so a door let go of stops rather than
         // coasting on a frictionless hinge, and the spring toward open only
@@ -406,6 +475,45 @@ impl Cove {
         for _ in 0..(seconds / self.dt()).round().max(0.0) as usize {
             self.step(input);
         }
+    }
+
+    /// Where the hand is asked to go, world metres, or `None`.
+    ///
+    /// Set by [`Cove::hold_lens_up`] at every step, so it moves with the
+    /// body. What comes back out of [`Cove::held_lens`] is where the arm
+    /// actually got to, which trails this by however much an arm's own PD
+    /// trails a target it is chasing.
+    pub fn aim(&self) -> Option<Vec3> {
+        self.aim
+    }
+
+    /// Hold the lens up: the aim, in the body's own frame, at [`LENS_AIM`].
+    ///
+    /// **Recomputed every step**, and that is not an optimisation to be
+    /// undone later — it is the difference between a pose and a tug of war.
+    /// [`kosm::player::Drive::aim`] is a *world* point, so an aim set once at
+    /// the spawn is a point the hero walks away from: the arm reaches after
+    /// it, the reach torques the body, the body leans, the lean starts a
+    /// walk, and the walk moves the shoulder further from the point. The
+    /// first run of this walked a hero that had let go of W across four
+    /// metres of beach at a metre and a half a second and never stopped. An
+    /// aim in the body's own frame is a hero holding a lens up; an aim in the
+    /// world's is a hero holding on to one.
+    ///
+    /// [`Body::orientation`] rather than [`Body::snapshot`] because this runs
+    /// at the solver's kilohertz: one quaternion, not thirteen frames of
+    /// forward kinematics.
+    pub fn hold_lens_up(&mut self) {
+        if self.which != Player::Hero {
+            return;
+        }
+        let Some(arm) = self.body.spec().arm else { return };
+        let links = &self.body.spec().links;
+        let shoulder = links[arm.shoulder].pivot;
+        let out = LENS_REACH * (arm.upper + arm.lower);
+        let dir = Vec3::new(LENS_AIM[0], LENS_AIM[1], LENS_AIM[2]);
+        let local = shoulder + dir * out - links[0].pivot;
+        self.aim = Some(self.body.root() + self.body.orientation().mul_vec(local));
     }
 
     /// Let the rune drive the door. Step 4 calls this from the score.
@@ -530,14 +638,23 @@ impl Cove {
 
     /// Where the held lens is, if the hero is holding one.
     ///
-    /// **Nothing puts one there yet**, and that is the gap: the rune's score
-    /// is still read off [`Cove::being_pose`]'s capsule, because the caustic
-    /// in the live scene is the being's own glass and not a refractor in a
-    /// hand. When `sims/rune/hero/kit.rs`'s lens is what the hero carries,
-    /// this is the pose `rune::score` takes and `being_pose` becomes a
-    /// renderer's detail.
+    /// Not where the arm was *asked* to put it — [`Cove::aim`] is that — but
+    /// where it actually got to, because an arm has mass. This is the pose
+    /// [`super::rune::score_lens`] traces the live gate through and the pose
+    /// `render.rs` draws the glass at, so the number and the picture are the
+    /// same piece of glass at the same moment.
+    ///
+    /// The lens's own frame: `+z` is the optical axis, which is what
+    /// `hero/kit.rs` cuts it about.
     pub fn held_lens(&self) -> Option<Pose> {
         self.body.held().map(|(pose, _)| pose)
+    }
+
+    /// The held lens as the scorer's refractor: its centre and its optical
+    /// axis, world metres.
+    pub fn lens(&self) -> Option<super::rune::Held> {
+        let pose = self.held_lens()?;
+        Some(super::rune::Held { centre: pose.pos, axis: pose.rot.mul_vec(Vec3::z()) })
     }
 
     /// The hero's parts, placed, for the renderer. Empty for the capsule.
@@ -563,6 +680,7 @@ impl Cove {
             door: self.door_transform(),
             gate_open: self.gate,
             held: snap.held,
+            parts: (self.which == Player::Hero).then(|| Arc::new(snap.parts)),
         }
     }
 }

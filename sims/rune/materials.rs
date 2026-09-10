@@ -70,6 +70,11 @@ fn substance(name: &str) -> Option<Substance> {
         "rock" | "stone" | DOOR => material::named(DOOR)?,
         "water" => material::named("sea water")?,
         "porcelain" | "brass" => material::named(name)?,
+        // The hero's costume. Every one of these is an entry in the library
+        // in its own right — `sims/rune/hero/figure.rs` weighs the figure out
+        // of exactly these — so the colour the cove paints a sleeve and the
+        // density the sleeve swings with come out of one line.
+        "cloak" | "cream" | "skin" | "blush" | "ink" | "boot" | "leather" => material::named(name)?,
         // Lacquered wood is not one substance and the library is right not to
         // have a line for it: it is a coat over a substrate, and `coated` is
         // the rule. Thirty microns of lacquer, which is thick enough not to
@@ -155,8 +160,49 @@ fn cove(name: &str) -> Option<Pbr> {
         // the beach and as a colour up close. Smooth, because lacquer is: the
         // long soft highlight down a rod is the whole reason to lacquer it.
         "lacquer" => Pbr { base_color: [0.34, 0.038, 0.028], roughness: 0.10, specular: 0.6, ..substance("lacquer")?.pbr() },
+        // ---- the hero --------------------------------------------------------
+        // The costume of `sims/rune/hero`, drawn in the cove's own light. The
+        // six library colours stand as they are — they were chosen against
+        // this sand and this cliff — and the only override is the cove's flat
+        // rule: a weak dielectric highlight and **no subsurface**, because the
+        // library's `skin` scatters, as skin does, and this look does not.
+        //
+        // These are the same numbers `hero/stage.rs::palette` paints its
+        // stills with, for the same reason and out of the same library; what
+        // this arm buys is that the *live* cove resolves them through the one
+        // path a cove surface is resolved through, so a document that repaints
+        // the cloak repaints the hero too.
+        "cloak" | "cream" | "skin" | "blush" | "ink" | "boot" => {
+            Pbr { specular: 0.25, subsurface: 0.0, ..substance(name)?.pbr() }
+        }
+        // The satchel and its strap: russet leather, the one warm accent on
+        // the figure and the mark that says which way it is facing.
+        "leather" => flat("leather", [0.30, 0.105, 0.045], 0.65)?,
         _ => return None,
     })
+}
+
+/// The glass the hero's lens is cut from: N-BK7, with the Sellmeier pair.
+///
+/// [`being`] is the *capsule's* glass and carries a metre of iron in the melt
+/// with it, which is right for a body a metre through and wrong for a wafer
+/// eleven millimetres thick — a tint authored for a metre of path is
+/// invisible in the lens and would only cost the caustic its neutrality. What
+/// is kept is the pair `kosm_render::caustics::is_caustic_refractor` looks
+/// for, `transmission: 1.0` and not thin-walled: declaring this **is**
+/// declaring what the photon pass is aimed at, and with the hero in the cove
+/// the lens is the only thing in the level that carries it.
+///
+/// The same glass `hero/stage.rs::glass` paints the doorstep stills with.
+pub fn lens_glass(n_d: f64) -> Pbr {
+    let glass = super::sim::GLASS.with_params(&[kosm::world::Param::new("N-BK7.n_d", n_d)]);
+    Pbr {
+        base_color: [1.0, 1.0, 1.0],
+        roughness: 0.0,
+        transmission: 1.0,
+        specular: 1.0,
+        ..glass.pbr()
+    }
 }
 
 /// The being: a body of N-BK7, at the index the level authored.
