@@ -253,18 +253,35 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
 
         // ---- the cliff ----------------------------------------------------------
         // The +y edge of the cove, from below the sand to cliff_h_mm above the
-        // sand at its foot, with the door's recess cut out of its face.
+        // sand at its foot, with the door's recess in its face.
+        //
+        // The recess is **built, not cut**: the face is a sill, a lintel and two
+        // jambs around the doorway, and the stone behind the recess is a slab of
+        // its own. A `Difference` here is what the cove used to do and it cannot
+        // survive the trip — vcad 0.10 degrades a boolean it cannot complete to
+        // its left operand and says nothing (ecto/vcad#886), and the union this
+        // difference fed came out of that having quietly dropped half the beach:
+        // 12 627 triangles instead of 25 000, a hole in the sand over the whole
+        // +x side of the cove, and a being that walked 315° straight through the
+        // floor. `tests::the_cove_ground_is_closed` is the guard.
         let cliff_face_y = half_cove - cliff_t; // the face the door is set into
         let door_sill = sand_z(cliff_face_y); // the sand at the door
         let cliff_lo = sea_z - 4000.0;
         let cliff_hi = sand_z(half_cove) + cliff_h;
-        let recess = b
-            .boxed(door_w, door_t + 20.0, door_h)
-            .at(door_x, cliff_face_y + 0.5 * door_t, door_sill + 0.5 * door_h);
-        let cliff = b
-            .boxed(cove, cliff_t, cliff_hi - cliff_lo)
-            .at(0.0, 0.5 * (cliff_face_y + half_cove), 0.5 * (cliff_lo + cliff_hi))
-            .difference(recess);
+        // a box over the given ranges, the way the old `recess` cut read
+        let span = |x: (f64, f64), y: (f64, f64), z: (f64, f64)| {
+            b.boxed(x.1 - x.0, y.1 - y.0, z.1 - z.0).at(0.5 * (x.0 + x.1), 0.5 * (y.0 + y.1), 0.5 * (z.0 + z.1))
+        };
+        let recess_back = cliff_face_y + door_t + 10.0; // as deep as the slab plus its clearance
+        let door_lo = door_x - 0.5 * door_w;
+        let door_hi = door_x + 0.5 * door_w;
+        let head = door_sill + door_h;
+        let face = (cliff_face_y, recess_back); // the depth the doorway is open through
+        let cliff = span((-half_cove, half_cove), face, (cliff_lo, door_sill)) // under the sill
+            .union(span((-half_cove, half_cove), face, (head, cliff_hi))) // over the lintel
+            .union(span((-half_cove, door_lo), face, (door_sill, head))) // the −x jamb
+            .union(span((door_hi, half_cove), face, (door_sill, head))) // the +x jamb
+            .union(span((-half_cove, half_cove), (recess_back, half_cove), (cliff_lo, cliff_hi))); // the stone behind it
 
         // ---- the rocks -----------------------------------------------------------
         // Boulders half buried in the sand and one sea stack, unioned into the

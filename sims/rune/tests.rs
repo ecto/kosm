@@ -445,3 +445,60 @@ fn the_reef_has_no_gap_the_being_fits_through() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// **The ground has no holes in it.** Before any physics runs: a ray straight
+/// down at every point of a 1 m grid over the cove hits the `ground` mesh. This
+/// is cheap — the authored document tessellated, no bake and no step — and it is
+/// the check that catches a boolean that quietly did not happen. vcad 0.10
+/// degrades a failed boolean to its left operand rather than erroring
+/// (ecto/vcad#886), and the composition that ate the cove's recess that way lost
+/// half the beach with it: 12 627 tris instead of 25 000, 493 of these columns
+/// falling through nothing, and a being walking 315° dropping 426 mm past the
+/// sand it was standing on. It says nothing about *how high* the ground is —
+/// boulders and the reef stand over the sand on purpose — only that there is
+/// some.
+#[test]
+fn the_cove_ground_is_closed() -> anyhow::Result<()> {
+    let scene = CoveScene::bundled()?;
+    let parts = scene.parts()?;
+    let ground = parts.iter().find(|p| p.name == "ground").expect("the cove has a `ground` root");
+
+    // The highest triangle of the ground under `(x, y)`, by the barycentric
+    // coordinates of a vertical ray in the xy plane.
+    let top = |x: f64, y: f64| -> Option<f64> {
+        let mut best = f64::NEG_INFINITY;
+        for t in &ground.tris {
+            let (a, b, c) = (t[0], t[1], t[2]);
+            let d = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+            if d.abs() < 1e-12 {
+                continue;
+            }
+            let u = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / d;
+            let v = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / d;
+            if u < -1e-9 || v < -1e-9 || u + v > 1.0 + 1e-9 {
+                continue;
+            }
+            let z = a.z + u * (b.z - a.z) + v * (c.z - a.z);
+            best = best.max(z);
+        }
+        best.is_finite().then_some(best)
+    };
+
+    // The baked volume, inset half a metre so no column lands exactly on the
+    // outermost face of the slab.
+    let (lo, hi) = scene.volume();
+    let (x0, x1) = (lo.x + 0.5, hi.x - 0.5);
+    let (y0, y1) = (lo.y + 0.5, hi.y - 0.5);
+    let n = |a: f64, b: f64| ((b - a).round() as usize).max(1);
+    let (nx, ny) = (n(x0, x1), n(y0, y1));
+    for iy in 0..=ny {
+        let y = y0 + (y1 - y0) * iy as f64 / ny as f64;
+        for ix in 0..=nx {
+            let x = x0 + (x1 - x0) * ix as f64 / nx as f64;
+            top(x, y).ok_or_else(|| {
+                anyhow::anyhow!("nothing is under ({x:+.2}, {y:+.2}) m: the ground has a hole in it, which is a boolean that did not happen")
+            })?;
+        }
+    }
+    Ok(())
+}
