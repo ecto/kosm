@@ -251,6 +251,13 @@ struct HeroSolid {
     name: String,
     bvh: Arc<Bvh<CoveGeom>>,
     pbr: Pbr,
+    /// The cove's surface name this part is painted with — `cloak`, `boot`,
+    /// `brass` — kept so the raster tier can resolve it to the same library
+    /// entry `pbr` was derived from.
+    material: String,
+    /// The solid itself, for a tier that needs triangles rather than a BVH.
+    /// `None` for the parts this file tessellates itself.
+    solid: Option<Arc<Solid>>,
     /// Which link of `kosm::player::BodySpec::hero` this rides on: an index
     /// into `Snapshot::parts`, which is in the spec's link order.
     link: usize,
@@ -811,7 +818,15 @@ fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Ve
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap_or(0);
-            parts.push(HeroSolid { name: body.name.clone(), bvh, pbr, link, local: to_world });
+            parts.push(HeroSolid {
+                name: body.name.clone(),
+                bvh,
+                pbr,
+                material: body.material.clone(),
+                solid: Some(inst.solid.clone()),
+                link,
+                local: to_world,
+            });
         }
     }
     anyhow::ensure!(!parts.is_empty(), "the hero evaluated to no solid");
@@ -829,6 +844,12 @@ fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Ve
         name: "lens".into(),
         bvh: lens,
         pbr: materials::lens_glass(scene.n_d),
+        material: "N-BK7".into(),
+        // The lens is `kit::lens_mesh`'s triangles and not a solid at all —
+        // the boolean is two spheres two and a half metres across meeting in
+        // a disc a hundred and ten millimetres wide. The raster tier asks
+        // `kit::lens_mesh` for the same triangles.
+        solid: None,
         link: 0,
         local: Transform::identity(),
     }];
@@ -845,6 +866,8 @@ fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Ve
                     name: body.name.clone(),
                     bvh,
                     pbr,
+                    material: body.material.clone(),
+                    solid: Some(inst.solid.clone()),
                     link: 0,
                     local: placement(&inst.to_world),
                 });
@@ -1348,3 +1371,319 @@ mod tests {
 }
 
 
+
+// ---- the raster tier's view of the same level -------------------------------
+//
+// Everything below is **additive**: it hands the same solids this file already
+// traces to `kosm_view::raster` as triangles, and changes nothing about the
+// picture the tracer makes. Two tiers, one level — see
+// `docs/plans/2026-09-10-bake-and-raster-design.md`.
+
+/// What one tessellated part of the cove is, so the raster tier knows how to
+/// move it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The beach, the cliff, the boulders, the headlands, the reef: fixed.
+    Ground,
+    /// The door leaf, which swings on the hinge.
+    Door,
+    /// The keyhole's rim, which rides the same hinge and glows with the score.
+    Rim,
+    /// The glint, placed on the sand wherever the hint puts it.
+    Glint,
+    /// The capsule, when the level is played with one.
+    Being,
+    /// A part of the hero's costume, riding link `link` of the body.
+    Hero { link: usize },
+    /// The glass in the hand and its brass ring, in the lens's own frame.
+    Held,
+}
+
+/// One tessellated part, in the frame [`RasterMesh::to_world`] maps out of.
+///
+/// Millimetres — the picture's units — because everything else in this file
+/// is, and because the one conversion belongs at the boundary rather than
+/// scattered through the walk. `kosm_view::raster::Mesh::from_mm` is the
+/// boundary.
+pub struct RasterMesh {
+    /// The document's own body name, or the level's word for it.
+    pub name: String,
+    /// The cove's surface name — `sand`, `rock`, `stone`, `cloak` — which
+    /// resolves through [`materials::gpu_cove`] to one library entry.
+    pub material: String,
+    pub positions: Vec<[f64; 3]>,
+    pub normals: Vec<[f64; 3]>,
+    pub indices: Vec<u32>,
+    /// The part's own placement inside its role's frame, row-major
+    /// millimetres. For [`Role::Ground`] this is the whole placement; for a
+    /// hero part it is the primitive's frame *inside* the link.
+    pub to_world: [[f64; 4]; 4],
+    pub role: Role,
+}
+
+/// The cove, tessellated once, for the raster tier.
+///
+/// The same walk [`Scene::new`] does — the document's roots into placed
+/// primitives, `ground_material` splitting the one ground solid into sand and
+/// rock, the door picked out by its root — with `to_mesh` where that builds a
+/// BVH. The normals are **smoothed** throughout, with `hero/stage.rs`'s own
+/// welding rule, because a raster tier has no analytic surface to fall back on
+/// and a facetted cliff is a low-poly mountain.
+///
+/// The rim, the glint and the capsule come from the same [`annulus_mesh`] and
+/// [`capsule_mesh`] the tracer draws, so the two tiers are the same shapes.
+pub fn raster_meshes(scene: &CoveScene) -> anyhow::Result<Vec<RasterMesh>> {
+    let a = &scene.authored;
+    let doc = &a.document;
+    let mut prims = Prims::default();
+    let mut out = Vec::new();
+    let segments = a.parameter_or("raster_segments", RASTER_SEGMENTS as f64).max(3.0) as u32;
+
+    for root in &doc.roots {
+        for inst in instances::instances(doc, root.root, &mut prims)? {
+            let (positions, normals, indices) = tessellate(&inst.solid, segments);
+            if indices.is_empty() {
+                continue;
+            }
+            let to_world = placement(&inst.to_world);
+            let (role, material) = if root.material == "door" || root.material == materials::DOOR {
+                (Role::Door, materials::DOOR.to_owned())
+            } else {
+                let local = aabb_of(&positions);
+                let world = transform_aabb(&local, &to_world);
+                (Role::Ground, ground_material(&world, scene).to_owned())
+            };
+            out.push(RasterMesh {
+                name: root.material.clone(),
+                material,
+                positions,
+                normals,
+                indices,
+                to_world: rows(&to_world),
+                role,
+            });
+        }
+    }
+    anyhow::ensure!(
+        out.iter().any(|m| m.role == Role::Door),
+        "the cove needs a `door` root to draw"
+    );
+
+    // The keyhole's rim, in the door's shut world frame — the hinge carries
+    // both, exactly as it does for the tracer.
+    out.push(mesh_part(
+        "rim",
+        "stone",
+        annulus_mesh(
+            Point3::new(
+                scene.door_x * PER_M,
+                (scene.cliff_face_y() - RIM_PROUD_MM * MM) * PER_M,
+                (scene.door_sill() + scene.aperture_z) * PER_M,
+            ),
+            scene.aperture_r * PER_M,
+            (scene.aperture_r + scene.rim_w) * PER_M,
+            a.parameter_or("rim_segments", 96.0).max(8.0) as usize,
+        ),
+        Role::Rim,
+    ));
+
+    let glint_r = scene.glint_r * PER_M;
+    out.push(mesh_part(
+        "glint",
+        "sand",
+        capsule_mesh(glint_r, 2.0 * glint_r, 32, 12),
+        Role::Glint,
+    ));
+    out.push(mesh_part(
+        "being",
+        "N-BK7",
+        capsule_mesh(
+            scene.being_r * PER_M,
+            scene.being_h * PER_M,
+            a.parameter_or("being_segments", 96.0).max(8.0) as usize,
+            a.parameter_or("being_rings", 32.0).max(3.0) as usize,
+        ),
+        Role::Being,
+    ));
+
+    // The figure and the glass. `hero_solids` already decides which link
+    // carries which primitive; this repeats the walk for the triangles and
+    // takes the same answer, so the raster hero and the traced hero are one
+    // costume on one skeleton.
+    if let Ok((parts, held)) = hero_solids(doc, scene) {
+        for (solids, role) in [(&parts, None), (&held, Some(Role::Held))] {
+            for s in solids {
+                let (positions, normals, indices) = match s.solid.as_ref() {
+                    Some(solid) => tessellate(solid, segments),
+                    // the lens: `kit::lens_mesh`'s exact spherical caps, the
+                    // same triangles with the same analytic normals the
+                    // tracer refracts through
+                    None => {
+                        let mesh = super::hero::kit::lens_mesh(
+                            a.parameter_or("lens_segments", 96.0).max(8.0) as usize,
+                            a.parameter_or("lens_rings", 24.0).max(2.0) as usize,
+                        );
+                        (
+                            mesh.positions().iter().map(|p| [p.x, p.y, p.z]).collect(),
+                            mesh.normals().iter().map(|n| [n.x, n.y, n.z]).collect(),
+                            mesh.triangles().iter().flat_map(|t| t.iter().copied()).collect(),
+                        )
+                    }
+                };
+                if indices.is_empty() {
+                    continue;
+                }
+                out.push(RasterMesh {
+                    name: s.name.clone(),
+                    material: s.material.clone(),
+                    positions,
+                    normals,
+                    indices,
+                    to_world: rows(&s.local),
+                    role: role.unwrap_or(Role::Hero { link: s.link }),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A part built from a mesh this file already makes, centred in its own frame.
+fn mesh_part(name: &str, material: &str, mesh: TriMesh, role: Role) -> RasterMesh {
+    let positions = mesh.positions().iter().map(|p| [p.x, p.y, p.z]).collect();
+    let normals = mesh.normals().iter().map(|n| [n.x, n.y, n.z]).collect();
+    let indices = mesh.triangles().iter().flat_map(|t| t.iter().copied()).collect();
+    RasterMesh {
+        name: name.to_owned(),
+        material: material.to_owned(),
+        positions,
+        normals,
+        indices,
+        to_world: rows(&Transform::identity()),
+        role,
+    }
+}
+
+/// How finely a B-rep is tessellated for the raster tier.
+///
+/// **`to_mesh(0)` is not "the default", it is the floor.**
+/// `TessellationParams::from_segments(0)` clamps to three segments round a
+/// circle and four bands of latitude, which is a sphere drawn as an
+/// octahedron. Nothing in the tracer ever noticed, because
+/// [`hero_geometry`] and [`geometry_of`] hand a B-rep to the integrator as a
+/// *B-rep* — the rays intersect the analytic sphere and the picture is round
+/// however coarse a mesh of it would have been. A rasterizer has no such
+/// fallback: the silhouette it draws is the triangles it is given.
+///
+/// Forty-eight is where the cove stops changing: the hero's cowl is a
+/// four-hundred-millimetre sphere seen from a metre and a half, which is
+/// about seven hundred pixels across at 1280 wide, and forty-eight segments
+/// put a facet under fifteen of them — under the crease angle
+/// `stage::smooth_normals` welds across, so the shading is smooth and only
+/// the silhouette is polygonal at all. It costs triangles and nothing else:
+/// the tier draws the cove once and the buffers never change.
+const RASTER_SEGMENTS: u32 = 48;
+
+/// A solid's triangles with smoothed normals, millimetres.
+fn tessellate(solid: &Solid, segments: u32) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<u32>) {
+    let mut mesh = solid.to_mesh(segments);
+    vcad_kernel::vcad_kernel_tessellate::render_bake_default(&mut mesh);
+    let n = mesh.vertices.len() / 3;
+    let pts: Vec<Point3> = (0..n)
+        .map(|i| {
+            Point3::new(
+                mesh.vertices[i * 3] as f64,
+                mesh.vertices[i * 3 + 1] as f64,
+                mesh.vertices[i * 3 + 2] as f64,
+            )
+        })
+        .collect();
+    // `render_bake` is vcad's own "prepare for rendering" pass and it leaves
+    // crease-aware vertex normals behind; they are the ones the tracer's mesh
+    // path ([`geometry_of`]) shades with, so taking them here is what keeps
+    // the two tiers on one surface. The welded fallback is for a solid that
+    // arrived as bare triangles with none.
+    let normals = if mesh.normals.len() == mesh.vertices.len() {
+        (0..n)
+            .map(|i| {
+                [
+                    mesh.normals[i * 3] as f64,
+                    mesh.normals[i * 3 + 1] as f64,
+                    mesh.normals[i * 3 + 2] as f64,
+                ]
+            })
+            .collect()
+    } else {
+        super::hero::stage::smooth_normals(&pts, &mesh.indices)
+            .iter()
+            .map(|v| [v.x, v.y, v.z])
+            .collect()
+    };
+    (pts.iter().map(|p| [p.x, p.y, p.z]).collect(), normals, mesh.indices.clone())
+}
+
+/// A `Transform` as row-major rows, which is how the raster tier reads a vcad
+/// placement.
+fn rows(t: &Transform) -> [[f64; 4]; 4] {
+    let m = &t.matrix;
+    [
+        [m.c0.x, m.c1.x, m.c2.x, m.c3.x],
+        [m.c0.y, m.c1.y, m.c2.y, m.c3.y],
+        [m.c0.z, m.c1.z, m.c2.z, m.c3.z],
+        [m.c0.w, m.c1.w, m.c2.w, m.c3.w],
+    ]
+}
+
+fn aabb_of(positions: &[[f64; 3]]) -> Aabb {
+    let mut b = Aabb::empty();
+    for p in positions {
+        b.include_point(&Point3::new(p[0], p[1], p[2]));
+    }
+    b
+}
+
+/// The door's hinge turn at `angle`, as the raster tier's rows.
+///
+/// The tracer's [`Scene::swing`] without a built scene in hand: the same
+/// rotation about the vertical through the hung edge, so the two tiers swing
+/// one door.
+pub fn door_swing(scene: &CoveScene, angle: f64) -> [[f64; 4]; 4] {
+    let h = Point3::new(
+        (scene.door_x - scene.door_w / 2.0) * PER_M,
+        scene.cliff_face_y() * PER_M,
+        0.0,
+    );
+    let r = Transform::rotation_z(-angle);
+    rows(&Transform::from_matrix(
+        tang::Mat4::translation(h.x, h.y, h.z) * r.matrix * tang::Mat4::translation(-h.x, -h.y, -h.z),
+    ))
+}
+
+/// The world frame link `link` puts its solids in, millimetres.
+///
+/// The translation half of [`Scene::hero_at`], stated for a caller that has
+/// the parts and the pivots but not a built scene: `world_mm = R·P·p_mm +
+/// 1000·(pos − R·pivot)`, where `P` is [`hero_axes`].
+pub fn hero_frame(part: &kosm::player::Part, pivot: PVec3) -> [[f64; 4]; 4] {
+    let (pos, r) = (part.pose.pos, part.pose.rot);
+    let t = (pos - r.mul_vec(pivot)) * PER_M;
+    rows(&rigid(&r.mul_mat(&hero_axes()), t.x, t.y, t.z))
+}
+
+/// The frame the glass in the hand is in, millimetres.
+pub fn held_frame(pose: &kosm::player::Pose) -> [[f64; 4]; 4] {
+    let c = pose.pos * PER_M;
+    rows(&rigid(&pose.rot, c.x, c.y, c.z))
+}
+
+/// The being's own frame, millimetres, from a `Placement`'s body → world pair.
+pub fn being_frame(centre: PVec3, rot: &Mat3) -> [[f64; 4]; 4] {
+    let c = centre * PER_M;
+    rows(&rigid(rot, c.x, c.y, c.z))
+}
+
+/// A translation, millimetres — where the glint goes.
+pub fn at_frame(p: PVec3) -> [[f64; 4]; 4] {
+    let c = p * PER_M;
+    rows(&Transform::translation(c.x, c.y, c.z))
+}

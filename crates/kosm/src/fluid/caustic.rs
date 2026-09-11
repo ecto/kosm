@@ -59,7 +59,6 @@ pub fn caustic_for_geometry(
     let margin = 1.5;
     let (lx, ly) = (((2.0 * half + 2.0 * margin) / cell) as usize, ((2.0 * half + 2.0 * margin) / cell) as usize);
     let l_origin = [-half - margin, -half - margin];
-    let mut e = vec![0.0; nx * ny];
     let s = sun_dir();
     let d = -s;
     // reference: a flat surface refracts the sun to a fixed direction with a

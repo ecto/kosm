@@ -102,12 +102,36 @@ pub trait Scene {
 }
 
 /// Open a window and show `scene` in it until it is closed or Escape is hit.
+///
+/// The redraw cadence is [`TICK`]. A tier whose passes are a tenth of a second
+/// wants nothing else; one that draws a frame in two milliseconds wants
+/// [`run_at`].
 pub fn run(title: &str, size: (u32, u32), scene: impl Scene) -> anyhow::Result<()> {
+    run_at(title, size, TICK, scene)
+}
+
+/// The same window at a chosen redraw cadence.
+///
+/// **The present is vsync-blocked** — the surface is `AutoVsync`, so
+/// `get_current_texture` waits for the next vertical blank — which means the
+/// tick is not a frame rate, it is a *delay in front of* one: a sixteen
+/// millisecond wait followed by a blit that then misses the vblank it was
+/// aiming at is two vblanks a frame, thirty a second on a sixty hertz display,
+/// however fast the scene can draw. So a tier that draws in milliseconds passes
+/// something well under a refresh period here and leaves the pacing to the
+/// display; see `sims/rune/game.rs::REDRAW`.
+pub fn run_at(
+    title: &str,
+    size: (u32, u32),
+    tick: Duration,
+    scene: impl Scene,
+) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = Viewport {
         scene,
         title: title.to_owned(),
         size,
+        tick,
         window: None,
         gpu: None,
         dragging: false,
@@ -419,14 +443,17 @@ impl Gpu {
 
 // ---- the event loop ---------------------------------------------------------
 
-/// How often the loop wakes to look for a newer picture. The scene's renderer
-/// is far slower than this; the cost of a wake with nothing new is one blit.
-const TICK: Duration = Duration::from_millis(16);
+/// How often the loop wakes to look for a newer picture, by default. The
+/// court's renderer is far slower than this; the cost of a wake with nothing
+/// new is one blit. [`run_at`] takes another for a tier that is not.
+pub const TICK: Duration = Duration::from_millis(16);
 
 struct Viewport<S: Scene> {
     scene: S,
     title: String,
     size: (u32, u32),
+    /// How long the loop waits between redraws. See [`run_at`].
+    tick: Duration,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     dragging: bool,
@@ -590,7 +617,7 @@ impl<S: Scene> ApplicationHandler for Viewport<S> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + self.tick));
         if let Some(window) = &self.window {
             let wants = self.scene.wants_cursor();
             if wants != self.captured {

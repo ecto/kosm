@@ -33,7 +33,7 @@
 //! definition still wins over everything here, so a level can repaint itself
 //! without touching this file.
 
-use kosm::material::{self, Material as Substance};
+use kosm::material::{self, GpuMaterial, Material as Substance};
 use kosm_render::pathtrace::Pbr;
 use vcad_ir::Document;
 
@@ -310,6 +310,103 @@ pub fn achromatic(pbr: Pbr) -> Pbr {
     Pbr { sellmeier: None, abbe: 0.0, ..pbr }
 }
 
+
+// ---- the same table, as the raster tier reads it ----------------------------
+
+/// The cove's surface `name` as a [`GpuMaterial`].
+///
+/// **There is no second list.** This is [`pbr`] — the document's own
+/// definition first, then [`cove`]'s art direction, then vcad-render's
+/// library — laid over the substance's own [`kosm::material::Material::gpu`].
+/// Whatever [`cove`] overrides on the `Pbr`, this overrides on the
+/// `GpuMaterial`, because it *reads the same `Pbr`*: a line added to `cove`
+/// reaches both tiers in the same edit, and a test below asserts that the
+/// albedo the shader gets projects to the base colour the tracer gets, name
+/// by name.
+///
+/// What survives from the substance is everything the flat `Pbr` cannot
+/// carry: the six-band reflectance where the level did not repaint it, and
+/// the film. Everything the level *does* state — the colour, the roughness,
+/// the highlight, the metal, the transmission, the index, the subsurface
+/// weight, the emission — comes off the `Pbr`, so the two tiers cannot
+/// disagree about any of it.
+pub fn gpu(doc: &Document, name: &str) -> GpuMaterial {
+    over(substance(name).map(|s| s.gpu()), &pbr(doc, name))
+}
+
+/// One `Pbr` laid over a substance's GPU facet.
+fn over(base: Option<GpuMaterial>, p: &Pbr) -> GpuMaterial {
+    let mut g = base.unwrap_or(GpuMaterial {
+        albedo: [0.0; 8],
+        emission: [0.0; 8],
+        roughness: 0.8,
+        metallic: 0.0,
+        specular: 0.25,
+        transmission: 0.0,
+        ior: 1.5,
+        film_nm: 0.0,
+        film_ior: 1.3,
+        sss_weight: 0.0,
+        sss_radius_m: [0.0; 3],
+        sss_aniso: 0.0,
+    });
+    // The albedo keeps its measured spectral shape only while the level has
+    // not repainted it. A `Pbr` is RGB, so a repainted surface has no
+    // spectrum to keep and the honest thing is to spread the colour the
+    // tracer was given over the two bands each primary owns — which is
+    // exactly what makes the parity number a statement about the *shading*.
+    let projected = material::bands_to_rgb(&g.bands());
+    if (0..3).any(|c| (projected[c] - p.base_color[c]).abs() > 1e-6) {
+        let c = p.base_color;
+        g.albedo = [c[2], c[2], c[1], c[1], c[0], c[0], 0.0, 0.0];
+    }
+    let e = p.emissive;
+    if e.iter().any(|v| *v > 0.0) {
+        g.emission = [e[2], e[2], e[1], e[1], e[0], e[0], 0.0, 0.0];
+    }
+    g.roughness = p.roughness;
+    g.metallic = p.metallic;
+    g.specular = p.specular;
+    g.transmission = p.transmission;
+    g.ior = p.ior;
+    g.sss_weight = p.subsurface;
+    g.sss_radius_m = [
+        p.subsurface_radius[0] as f32,
+        p.subsurface_radius[1] as f32,
+        p.subsurface_radius[2] as f32,
+    ];
+    g.sss_aniso = p.subsurface_anisotropy;
+    g.film_nm = p.thin_film_thickness;
+    g.film_ior = p.thin_film_ior;
+    g
+}
+
+/// The being's glass, as the raster tier draws it.
+pub fn gpu_being(n_d: f64) -> GpuMaterial {
+    over(material::named("N-BK7").map(|m| m.gpu()), &being(n_d))
+}
+
+/// The hero's lens, ditto.
+pub fn gpu_lens(n_d: f64) -> GpuMaterial {
+    over(material::named("N-BK7").map(|m| m.gpu()), &lens_glass(n_d))
+}
+
+/// The keyhole's rim at a score, and the glint: emissive, and the same two
+/// functions the tracer uses.
+pub fn gpu_rim(floor: f64, gain: f64, score: f64) -> GpuMaterial {
+    over(None, &rim(floor, gain, score))
+}
+
+pub fn gpu_glint(radiance: f64) -> GpuMaterial {
+    over(None, &glint(radiance))
+}
+
+/// Every name the cove paints, so a tier that wants a table can build one.
+pub const NAMES: &[&str] = &[
+    "sand", "rock", "stone", DOOR, "water", "porcelain", "brass", "lacquer", "cloak", "cream",
+    "skin", "blush", "ink", "boot", "leather",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +467,44 @@ mod tests {
         let g = being(1.6);
         assert_eq!(g.ior, 1.6);
         assert_eq!(g.sellmeier, material::named("N-BK7").unwrap().pbr().sellmeier);
+    }
+
+    /// **One list, two tiers.** Every name the cove paints hands the raster
+    /// tier an albedo that projects to exactly the base colour it hands the
+    /// tracer, and a roughness, a metal and a transmission that are the same
+    /// numbers — because [`gpu`] *is* [`pbr`] laid over the substance rather
+    /// than a second table beside it.
+    #[test]
+    fn the_raster_tier_reads_the_same_table_the_tracer_does() {
+        let doc = Document::new();
+        for name in NAMES {
+            let p = pbr(&doc, name);
+            let g = gpu(&doc, name);
+            let rgb = material::bands_to_rgb(&g.bands());
+            for c in 0..3 {
+                assert!(
+                    (rgb[c] - p.base_color[c]).abs() < 1e-6,
+                    "{name}: the shader sees {rgb:?}, the tracer sees {:?}",
+                    p.base_color
+                );
+            }
+            assert_eq!(g.roughness, p.roughness, "{name} roughness");
+            assert_eq!(g.metallic, p.metallic, "{name} metallic");
+            assert_eq!(g.specular, p.specular, "{name} specular");
+            assert_eq!(g.transmission, p.transmission, "{name} transmission");
+            assert_eq!(g.sss_weight, p.subsurface, "{name} subsurface");
+        }
+        // …and so do the four that are not names: the glass twice, the rim
+        // and the glint.
+        let b = gpu_being(1.5168);
+        assert!(b.transmission > 0.0 && b.ior > 1.5);
+        assert!(gpu_rim(0.8, 4.0, 1.0).emission[4] > gpu_rim(0.8, 4.0, 0.0).emission[4]);
+        assert!(gpu_glint(6.0).emission[4] > 0.0);
+        // brass is the one surface the cove does not repaint at all, so its
+        // six measured bands survive into the shader
+        let brass = gpu(&doc, "brass");
+        let lib = material::named("brass").unwrap().gpu();
+        assert_eq!(brass.albedo, lib.albedo, "brass keeps its measured spectrum");
     }
 
     /// The rim is always visible and always rises with the score, and it is

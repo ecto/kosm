@@ -494,7 +494,6 @@ impl Water {
         // the raw node mass is too noisy an estimate (the water boils); a
         // 3x3x3 box blur is not, and unlike integrating the divergence it
         // cannot drift from the positions
-        let full_node = 1000.0 * h * h * h; // a node's mass at rest density
         let g_blur: Vec<f64> = (0..nx * ny * nz)
             .into_par_iter()
             .map(|g| {

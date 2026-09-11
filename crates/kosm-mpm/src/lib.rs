@@ -522,7 +522,6 @@ impl GpuMpm {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             let (pg, pgy) = Self::groups(self.n);
             let (bg, bgy) = Self::groups(self.bbn[0] * self.bbn[1] * self.bbn[2]);
-            let (wg, wgy) = if self.nblocks <= 65535 { (self.nblocks, 1) } else { (65535, self.nblocks.div_ceil(65535)) };
             for s in 0..subs {
                 let off = (s as u64 * PARAMS_STRIDE) as u32;
                 // sort the particles by block, from bufs[cur] into bufs[1 - cur]

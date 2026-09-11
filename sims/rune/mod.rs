@@ -52,6 +52,8 @@ pub mod sim;
 #[cfg(feature = "view")]
 pub mod game;
 #[cfg(test)]
+mod probe_tests;
+#[cfg(test)]
 mod rune_tests;
 #[cfg(test)]
 mod tests;
@@ -347,6 +349,12 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let scene = CoveScene::bundled()?;
     for w in &scene.authored.warnings {
         eprintln!("cove warning: {w}");
+    }
+    // `--bake-light` is the light half of the bake and nothing else: it does
+    // not solve, sweep or draw, because a probe volume takes minutes and the
+    // things that follow it take more.
+    if args.flag("bake-light") {
+        return bake::run_light(&scene, args, out);
     }
     let dir = out.join("cove");
     fs::create_dir_all(&dir)?;

@@ -93,6 +93,23 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         b.param("glint_r_mm", 60.0); // the spark itself
         b.param("glint_glow", 6.0); // and its radiance: a spark, not a second keyhole
 
+        // ---- the window ------------------------------------------------------
+        // How fast the level is *played*, which is not how fast it is solved.
+        // The simulation steps at 1 ms and hands a snapshot over `fps` times a
+        // second, and the window can only present a frame it has been handed:
+        // at thirty this knob was the frame rate, whatever the tier drew at.
+        // Sixty costs nothing — the solver is four tenths of a millisecond a
+        // frame — and it is what the raster tier is capable of.
+        b.param("fps", 60.0);
+        // How often the live photon map may be retraced while the lens is
+        // moving, milliseconds. The map is fifty thousand photons and tens of
+        // milliseconds, and it is wanted by two things that can both wait: the
+        // caustic on the door and the sand, and the gate's own score (which
+        // holds for a second before it opens anything). So it is traced off
+        // the frame path, at most this often while the lens is moving, and
+        // once more when it stops. See `game.rs::Retrace`.
+        b.param("caustic_live_ms", 100.0);
+
         // ---- the camera ------------------------------------------------------
         // Over the shoulder out on the sand, and something else at the door:
         // the solved pose stands the being 400 mm off the cliff, and three
