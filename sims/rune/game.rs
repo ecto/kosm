@@ -2005,9 +2005,11 @@ fn tier_flag(args: &kosm_cli::Args) -> anyhow::Result<Tier> {
     }
 }
 
-/// Where the baked light lives, relative to a run's output.
+/// Where the baked light lives: under a run's output, with a relative `out/`
+/// resolved against the workspace root as `--bake-light` writes it, so a
+/// window opened from any directory finds the same bake.
 fn probes_path(out: &Path) -> std::path::PathBuf {
-    out.join("maps").join("cove").join("probes.bin")
+    bake::probes_path(out)
 }
 
 /// The level's baked light, or a sky-only stand-in.
@@ -4461,8 +4463,9 @@ mod tests {
     /// **The two regions are not held to one tolerance, and the reason is the
     /// tier's own design.**
     ///
-    /// - The **sand** is sunlit, and on a sunlit surface the direct term is
-    ///   most of the answer. The raster computes it per pixel — the same
+    /// - The **sand** is sunlit — open sand inside the door's apron, where no
+    ///   prop stands — and on a sunlit surface the direct term is most of the
+    ///   answer. The raster computes it per pixel — the same
     ///   `E · max(0, n·s)` the tracer integrates, against a 2048² shadow map
     ///   — so the two agree to a fraction of a code. This is the number that
     ///   catches the mistake that matters: `sims/rune/bake.rs` bakes the
@@ -4476,6 +4479,13 @@ mod tests {
     ///   costs on a plane whose radiance field has a hard horizon in it;
     ///   neither a finer lattice (250 mm) nor eight times the rays moves it,
     ///   which is how we know it is the truncation and not the bake.
+    ///
+    /// **The light is the test's own.** It bakes the level's probe volume
+    /// ([`bake::bake_light`] at [`bake::Light::level`], which is what
+    /// `--bake-light` writes) rather than reading `out/maps/cove/probes.bin`:
+    /// `cargo test` runs in the crate's directory, where no such file is, and
+    /// the raster fell back to the sky alone and read the sand 0.134 off a
+    /// traced frame that had every bounce in it.
     ///
     /// Skips without an adapter, like the rest of the tier's GPU tests.
     #[test]
@@ -4491,14 +4501,14 @@ mod tests {
 
         let mut tracer = Tracer::new(size)?;
         let (frame, sdf) = still_pose(&scene, which)?;
+        let field = Arc::clone(&sdf);
         tracer = tracer.with_rig(sdf, which);
         let lit = Lit { score: live_frac(&scene, &frame, live_photons(&scene.authored)), glint: None };
 
-        let probes = cove_probes(tracer.cove(), Path::new("out"));
-        if probes.suns.is_empty() || probes.data.iter().all(|v| *v == 0.0) {
-            eprintln!("skipping the_cove_agrees_with_the_reference: no baked light");
-            return Ok(());
-        }
+        // The level's own light, baked here against the field the pose stood
+        // on: never a `probes.bin` some earlier run left, and never the
+        // sky-only stand-in a missing one falls back to.
+        let probes = bake::bake_light(tracer.cove(), &bake::Light::level(tracer.cove()), &field, None)?;
         let mut tier = RasterTier::new(
             device,
             queue,
@@ -4574,12 +4584,49 @@ mod tests {
                 project([door.x + dx, face - 0.02, scene.door_sill() + scene.aperture_z])
             })
             .collect();
-        // and the open sand in front of it, out of the hero's own shadow
-        let on_sand: Vec<_> = [(-2.2f64, 3.0f64), (2.2, 3.5), (-1.4, 5.0), (1.4, 5.5)]
+        // and the open sand in front of it. **Inside the door's apron**, which
+        // is the three metres `dressing::Site::clear` stands no prop in: a
+        // patch on a tuft of marram measures the blades and the tracer's noise
+        // in them, not the light, and that is what the patches three to five
+        // metres out came to measure once the rig moved in (0.09 on one tuft
+        // with three of four out of the frame). Seaward of the threshold's
+        // 700 mm, and clear of the hero and the shadow it throws down-sun —
+        // which the hero's settled pose decides, so it is decided here per run
+        // rather than written into the list.
+        let (hero, _) = frame.being;
+        let hero_sand = scene.sand_z_at(hero.x, hero.y);
+        let hero_h = (2.0 * (hero.z - hero_sand)).max(0.5);
+        let sun = scene.sun_dir();
+        let flat = sun.x.hypot(sun.y).max(1e-6);
+        let down = (-sun.x / flat, -sun.y / flat);
+        let reach = hero_h * flat / sun.z.max(1e-3) + 0.5;
+        let shaded = |x: f64, y: f64| {
+            let (px, py) = (x - hero.x, y - hero.y);
+            let along = px * down.0 + py * down.1;
+            let across = (px * down.1 - py * down.0).abs();
+            along > -0.8 && along < reach && across < 0.8
+        };
+        // …and not behind it from the camera: the hero's column on screen,
+        // fattened by its own projected half-metre and the patch's half-width.
+        let column: Vec<(u32, u32)> =
+            (0..=8).filter_map(|k| project([hero.x, hero.y, hero_sand + hero_h * k as f64 / 8.0])).collect();
+        let girth = match (project([hero.x, hero.y, hero.z]), project([hero.x + 0.6, hero.y, hero.z])) {
+            (Some(a), Some(b)) => (a.0 as f64 - b.0 as f64).hypot(a.1 as f64 - b.1 as f64) + 5.0,
+            _ => 40.0,
+        };
+        let behind = |at: (u32, u32)| {
+            column.iter().any(|c| (c.0 as f64 - at.0 as f64).hypot(c.1 as f64 - at.1 as f64) < girth)
+        };
+        let on_sand: Vec<_> = [1.2f64, 1.8, 2.4]
             .iter()
+            .flat_map(|back| [-2.0f64, -1.0, 0.0, 1.0, 2.0].map(|dx| (dx, *back)))
+            .filter(|(dx, back)| dx.hypot(*back) <= super::super::dressing::APRON * MM - 0.4)
             .filter_map(|(dx, back)| {
                 let (x, y) = (door.x + dx, face - back);
-                project([x, y, scene.sand_z_at(x, y) + 0.01])
+                if shaded(x, y) {
+                    return None;
+                }
+                project([x, y, scene.sand_z_at(x, y) + 0.01]).filter(|at| !behind(*at))
             })
             .collect();
 
@@ -4606,9 +4653,11 @@ mod tests {
             anyhow::ensure!(v < 0.10, "the door's face disagrees by {v:.4}, over the L2 bound");
         }
         anyhow::ensure!(
-            sand.is_some() || doorface.is_some(),
-            "neither region landed in the frame; the rig's composition has moved"
+            on_sand.len() >= 2,
+            "{} of the apron's sand patches landed in the frame clear of the hero; the rig's composition has moved",
+            on_sand.len()
         );
+        anyhow::ensure!(doorface.is_some(), "the door's face is out of the frame; the rig's composition has moved");
         Ok(())
     }
 }
