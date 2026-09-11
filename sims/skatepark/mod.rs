@@ -299,15 +299,46 @@ pub fn bake_parts(authored: &dyn Authored, parts: &[Part], opts: BakeOpts, dir: 
 }
 
 /// The colliding parts' triangles, and the mesh the field is baked against.
+///
+/// **Welded, one part at a time.** [`TriMesh::new`] takes welded vertices,
+/// and the pseudonormal sign rule needs them: an edge's pseudonormal is the
+/// sum of the two faces that meet there only if both faces name the same two
+/// vertices. Handed a vertex per triangle corner, every edge carried one face's
+/// normal, and in a face's plane past a convex edge — which is where a bedding
+/// plane that is also a grid plane puts a whole row of the rune cove's nodes —
+/// the sign was a coin toss.
+///
+/// Within a part the corners a tessellation shares are bitwise the same, so
+/// the weld is on exact f64 bit patterns (with `-0.0` folded into `0.0`), the
+/// way [`TriMesh::from_soup`] welds an STL. **Not across parts**: a level
+/// like the cove is fifty closed roots poured into one soup with no union, and
+/// roots that touch share corners bit for bit along every bedding plane.
+/// Welded across that seam, a vertex's pseudonormal would sum the faces of two
+/// shells that point at each other. Each part welded alone is a closed shell
+/// with its own pseudonormals, which is what `sims/rune/scene.rs`'s argument
+/// for a soup without a union assumes.
 pub fn collision_mesh(parts: &[Part]) -> anyhow::Result<(Vec<[Vec3; 3]>, TriMesh)> {
-    let tris: Vec<[Vec3; 3]> = parts.iter().filter(|p| p.collides()).flat_map(|p| p.tris.clone()).collect();
+    use std::collections::HashMap;
+    let colliding: Vec<&Part> = parts.iter().filter(|p| p.collides()).collect();
+    let tris: Vec<[Vec3; 3]> = colliding.iter().flat_map(|p| p.tris.iter().copied()).collect();
     anyhow::ensure!(!tris.is_empty(), "the level has no collision geometry");
-    let mut vertices = Vec::with_capacity(tris.len() * 3);
+    let mut vertices: Vec<Vec3> = Vec::with_capacity(tris.len());
     let mut triangles = Vec::with_capacity(tris.len());
-    for t in &tris {
-        let i = vertices.len() as u32;
-        vertices.extend_from_slice(t);
-        triangles.push([i, i + 1, i + 2]);
+    for part in colliding {
+        let mut index: HashMap<[u64; 3], u32> = HashMap::new();
+        for t in &part.tris {
+            let mut ids = [0u32; 3];
+            for (k, v) in t.iter().enumerate() {
+                let key = [(v.x + 0.0).to_bits(), (v.y + 0.0).to_bits(), (v.z + 0.0).to_bits()];
+                ids[k] = *index.entry(key).or_insert_with(|| {
+                    vertices.push(*v);
+                    (vertices.len() - 1) as u32
+                });
+            }
+            if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
+                triangles.push(ids);
+            }
+        }
     }
     let mesh = TriMesh::new(vertices, triangles);
     Ok((tris, mesh))
