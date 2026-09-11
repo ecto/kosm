@@ -1620,8 +1620,18 @@ pub fn raster_meshes(scene: &CoveScene) -> anyhow::Result<Vec<RasterMesh>> {
     let mut prims = Prims::default();
     let mut out = Vec::new();
     let segments = a.parameter_or("raster_segments", RASTER_SEGMENTS as f64).max(3.0) as u32;
+    let budget = Budget {
+        geology: segments,
+        props: a.parameter_or("prop_segments", PROP_SEGMENTS as f64).max(3.0) as u32,
+        figures: a.parameter_or("figure_segments", FIGURE_SEGMENTS as f64).max(3.0) as u32,
+    };
 
-    for root in &doc.roots {
+    // `Builder::finish` pushes one root per body, in body order, so the
+    // body's name is the root's — which is what says whether it is cliff,
+    // grass or doll.
+    for (i, root) in doc.roots.iter().enumerate() {
+        let name = a.bodies.get(i).map_or(root.material.as_str(), |b| b.name.as_str());
+        let segments = budget.of(name);
         for inst in instances::instances(doc, root.root, &mut prims)? {
             let (positions, normals, indices) = tessellate(&inst.solid, segments);
             if indices.is_empty() {
@@ -1634,7 +1644,7 @@ pub fn raster_meshes(scene: &CoveScene) -> anyhow::Result<Vec<RasterMesh>> {
                 (Role::Ground, root.material.clone())
             };
             out.push(RasterMesh {
-                name: root.material.clone(),
+                name: name.to_owned(),
                 material,
                 positions,
                 normals,
@@ -1779,6 +1789,56 @@ fn mesh_part(name: &str, material: &str, mesh: TriMesh, role: Role) -> RasterMes
 /// the silhouette is polygonal at all. It costs triangles and nothing else:
 /// the tier draws the cove once and the buffers never change.
 const RASTER_SEGMENTS: u32 = 48;
+
+/// The scatter's tessellation: the pebbles, shells, driftwood, kelp and
+/// marram, `prop_segments` over the level.
+///
+/// **Forty-eight was a number for the hero's cowl**, and the dressing was
+/// drawn at it because it was the only number there was. A pebble is a
+/// hundred and twenty millimetres across and never nearer the camera than a
+/// couple of metres, so at 1280 wide it is twenty or thirty pixels and twelve
+/// segments put a facet under two of them; a marram blade is eighteen
+/// millimetres at its root and a sliver of a pixel at its tip. At forty-eight
+/// the scatter was seven hundred thousand of the cove's million triangles,
+/// drawn three times a frame, and none of them changed a pixel anybody could
+/// see. The normals are smooth either way; only the silhouette is polygonal.
+const PROP_SEGMENTS: u32 = 12;
+
+/// The two inhabitants', `figure_segments`: the automaton stands a metre from
+/// the doorstep camera and its collar is a hundred and thirty pixels across,
+/// which twelve segments would facet visibly. Twenty-four keeps the facet
+/// under a pixel there and still quarters what forty-eight cost.
+const FIGURE_SEGMENTS: u32 = 24;
+
+/// The roots drawn at [`PROP_SEGMENTS`] — `dressing::scatter`'s five bodies.
+const DRESSING: [&str; 5] = ["pebbles", "shells", "driftwood", "kelp", "marram"];
+
+/// The roots that are the level's architecture rather than its scatter: they
+/// keep the geology's budget along with the ground and the door.
+const ARCHITECTURE: [&str; 2] = ["door_frame", "cornice"];
+
+/// Segments round a circle for each kind of root.
+struct Budget {
+    geology: u32,
+    props: u32,
+    figures: u32,
+}
+
+impl Budget {
+    /// The geology, the door and the architecture at the full count; the
+    /// scatter at the prop count; anything else — the two inhabitants, which
+    /// are dozens of bodies with names like `thigh_l` and `gills` — at the
+    /// figures'.
+    fn of(&self, name: &str) -> u32 {
+        if super::is_solid_root(name) || ARCHITECTURE.contains(&name) {
+            self.geology
+        } else if DRESSING.contains(&name) {
+            self.props
+        } else {
+            self.figures
+        }
+    }
+}
 
 /// A solid's triangles with smoothed normals, millimetres.
 fn tessellate(solid: &Solid, segments: u32) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<u32>) {

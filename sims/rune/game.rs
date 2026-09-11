@@ -2211,7 +2211,10 @@ impl RasterTier {
             i
         };
 
-        let meshes = cove_render::raster_meshes(scene)?;
+        let meshes = merge_parts(
+            cove_render::raster_meshes(scene)?,
+            a.parameter_or("raster_cell_mm", MERGE_CELL_MM),
+        );
         let mut parts = Vec::with_capacity(meshes.len() + 1);
         for m in &meshes {
             let mat = material_of(&mut rs, &m.material);
@@ -2373,6 +2376,95 @@ impl RasterTier {
     ) -> std::sync::Arc<wgpu::Texture> {
         self.raster.draw(device, queue, &self.scene, f)
     }
+}
+
+/// How wide a patch of the static cove is merged into one draw, millimetres.
+///
+/// Six metres: a few dozen patches over the cove, so the frustum test in
+/// `raster::pipeline` still has something to throw away behind the camera,
+/// and a few draws a patch rather than a few hundred.
+const MERGE_CELL_MM: f64 = 6000.0;
+
+/// The cove's parts, merged into one mesh per thing that moves as one.
+///
+/// **One draw per vcad instance was the frame.** The instance walk hands back
+/// a placement per primitive — fourteen hundred of them, every grass blade
+/// and pebble its own — and the raster tier drew each as its own mesh with
+/// its own instance buffer: three draws apiece, a `write_buffer` apiece, four
+/// and a half milliseconds of encoding before the device ran a triangle, and
+/// three times that with the reference tracer busy on every other core.
+///
+/// A part's frame in the world is `frame(role) · to_world`, and the first
+/// factor depends on the role alone — the hinge for the door, the link for a
+/// piece of the hero, the identity for the ground. So every part that shares
+/// a role and a material can have its own `to_world` baked into its vertices
+/// and be drawn as one mesh at the identity, and the picture cannot tell: the
+/// shader's position is the same product, and its normal is
+/// `normalize(M₃ · n)`, which is unchanged by normalising the inner factor
+/// first. The ground is split further into patches of `cell_mm` by where each
+/// part is, so what is behind the camera is still a draw that can be culled.
+fn merge_parts(meshes: Vec<cove_render::RasterMesh>, cell_mm: f64) -> Vec<cove_render::RasterMesh> {
+    use std::collections::HashMap;
+    let cell_mm = cell_mm.max(1.0);
+    let mut out: Vec<cove_render::RasterMesh> = Vec::new();
+    let mut at: HashMap<(String, String, i64, i64), usize> = HashMap::new();
+    for m in meshes {
+        let r = m.to_world;
+        let place = |p: &[f64; 3]| -> [f64; 3] {
+            std::array::from_fn(|k| r[k][0] * p[0] + r[k][1] * p[1] + r[k][2] * p[2] + r[k][3])
+        };
+        let turn = |n: &[f64; 3]| -> [f64; 3] {
+            let v: [f64; 3] = std::array::from_fn(|k| r[k][0] * n[0] + r[k][1] * n[1] + r[k][2] * n[2]);
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if l > 1e-12 { [v[0] / l, v[1] / l, v[2] / l] } else { [0.0, 0.0, 1.0] }
+        };
+        // The same normals `Mesh::from_mm` would have made for this part on
+        // its own: smoothing after the merge would weld across two parts
+        // that happen to touch, which the unmerged tier never did.
+        let smooth;
+        let normals = if m.normals.len() == m.positions.len() {
+            &m.normals
+        } else {
+            smooth = raster::smooth_normals(&m.positions, &m.indices);
+            &smooth
+        };
+        let positions: Vec<[f64; 3]> = m.positions.iter().map(place).collect();
+        let normals: Vec<[f64; 3]> = normals.iter().map(turn).collect();
+        let (cx, cy) = if m.role == cove_render::Role::Ground && !positions.is_empty() {
+            let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+            for p in &positions {
+                for k in 0..2 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (
+                ((lo[0] + hi[0]) * 0.5 / cell_mm).floor() as i64,
+                ((lo[1] + hi[1]) * 0.5 / cell_mm).floor() as i64,
+            )
+        } else {
+            (0, 0)
+        };
+        let key = (format!("{:?}", m.role), m.material.clone(), cx, cy);
+        let i = *at.entry(key).or_insert_with(|| {
+            out.push(cove_render::RasterMesh {
+                name: m.name.clone(),
+                material: m.material.clone(),
+                positions: Vec::new(),
+                normals: Vec::new(),
+                indices: Vec::new(),
+                to_world: IDENTITY_ROWS,
+                role: m.role,
+            });
+            out.len() - 1
+        });
+        let g = &mut out[i];
+        let base = g.positions.len() as u32;
+        g.positions.extend(positions);
+        g.normals.extend(normals);
+        g.indices.extend(m.indices.iter().map(|k| k + base));
+    }
+    out
 }
 
 /// A row-major identity, millimetres.
@@ -2659,6 +2751,12 @@ fn raster_worker(
                 got_maps as f64 / elapsed,
                 if moved { "moving" } else { "still" },
             );
+            // The device's own clock, pass by pass: the "drawing" above is
+            // the encode and the submit, which is CPU time and backpressure,
+            // and it is not where a trim should be aimed.
+            if let Some(p) = tier.raster.profile() {
+                eprintln!("rune   passes: {}", p.line());
+            }
             frames = 0;
             got_maps = 0;
         }
@@ -3099,6 +3197,7 @@ fn raster_still(
     projection: Option<Projection>,
     settle_in: bool,
     passes: u32,
+    profile: u32,
 ) -> anyhow::Result<()> {
     let size = (size.0.max(16), if size.1 == 0 { (size.0 * 9 / 16).max(9) } else { size.1 });
     let ctx = kosm_render::gpu::GpuContext::init_blocking()
@@ -3202,6 +3301,51 @@ fn raster_still(
         scene.open_frac,
         path.display()
     );
+
+    // `--profile N`: the same frame N more times, each one waited for, and the
+    // device's own clock round every pass averaged over them. Waiting is what
+    // a window does not do and is why this is the number to trim against: a
+    // window's "drawing" is the encode plus whatever backpressure the driver
+    // applied, and two sessions sharing the machine move it by a factor of two.
+    if profile > 0 {
+        f.caustics_dirty = false;
+        let warm = 3;
+        let mut sum = raster::Report::default();
+        let mut wall = Vec::with_capacity(profile as usize);
+        let mut encode = Vec::with_capacity(profile as usize);
+        for i in 0..profile + warm {
+            let t = Instant::now();
+            let _ = tier.draw(device, queue, &f);
+            let enc = t.elapsed().as_secs_f64() * 1e3;
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if i < warm {
+                continue;
+            }
+            wall.push(ms);
+            encode.push(enc);
+            if let Some(r) = tier.raster.profile() {
+                for (a, b) in sum.ms.iter_mut().zip(r.ms.iter()) {
+                    *a += b / profile as f64;
+                }
+                sum.span += r.span / profile as f64;
+                sum.shadow = r.shadow;
+                sum.camera = r.camera;
+            }
+        }
+        wall.sort_by(|a, b| a.total_cmp(b));
+        encode.sort_by(|a, b| a.total_cmp(b));
+        let median = wall[wall.len() / 2];
+        let (lo, hi) = (wall[0], wall[wall.len() - 1]);
+        println!(
+            "rune   profile over {profile} frames at {}×{}: encode {:.2} ms median, submit-to-idle \
+             {median:.2} ms median ({lo:.2}–{hi:.2})",
+            size.0,
+            size.1,
+            encode[encode.len() / 2],
+        );
+        println!("rune   passes: {}", sum.line());
+    }
     Ok(())
 }
 
@@ -3626,6 +3770,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
                 projection,
                 settle && args.flag("settle"),
                 num("passes").unwrap_or(64),
+                num("profile").unwrap_or(0),
             ),
         };
     }

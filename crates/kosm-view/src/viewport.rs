@@ -194,6 +194,10 @@ impl Gpu {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("kosm-view"),
                 required_limits: adapter.limits(),
+                // The device's own clock round each raster pass, where the
+                // adapter has one: `raster::profile` is what reads it, and a
+                // wall clock round `draw` measures the encode instead.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 ..Default::default()
             }))?;
 

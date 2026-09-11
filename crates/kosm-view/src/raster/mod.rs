@@ -88,11 +88,14 @@
 //!   nothing is moving, in bytes.
 //! - [`blend`] — the same mix on the device, so a standing frame crosses the
 //!   bus no more often than a walking one does.
+//! - [`profile`] — the device's own clock round every pass, and the draw
+//!   calls, instances and triangles each geometry pass submitted.
 
 pub mod blend;
 pub mod material;
 pub mod pipeline;
 pub mod probes;
+pub mod profile;
 pub mod settle;
 pub mod shadow;
 pub mod water;
@@ -101,6 +104,7 @@ pub use blend::Blend;
 pub use material::{GpuMaterial, band_to_rgb, library_gpu};
 pub use pipeline::{Frame, Raster};
 pub use probes::ProbeVolume;
+pub use profile::{Counts, Report};
 pub use settle::{Settle, SettleReport};
 pub use water::{COVE_SCATTER, Sea, absorption_per_m};
 

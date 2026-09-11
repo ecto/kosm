@@ -299,10 +299,10 @@ fn sh_cosine(n: vec3<f32>) -> array<f32, 9> {
 // `probe_sh` interpolates the nine coefficients at a point: trilinear over the
 // lattice, linear over the sun's fractional index, probes inside solids
 // dropped and the rest renormalised. `convolve` turns that block into
-// irradiance at a normal. They are separate because **a fragment reads the
-// same block twice** — once at the shading normal and once at the mirror
-// direction for the sky term — and interpolating 54 floats twice is the
-// difference between forty frames a second and sixty.
+// irradiance at a normal. The shading does not take this path any more — see
+// `probe_irradiance2`, which reads the lattice once for both of a fragment's
+// lobes and never builds the block — and the two fallbacks that want a sky
+// out of the probes (no sky model bound) still do.
 fn probe_sh(p: vec3<f32>) -> array<f32, 54> {
     var out: array<f32, 54>;
     for (var i = 0u; i < 54u; i = i + 1u) { out[i] = 0.0; }
@@ -384,6 +384,109 @@ fn convolve(sh: array<f32, 54>, n: vec3<f32>) -> array<f32, 6> {
 
 fn probe_irradiance(p: vec3<f32>, n: vec3<f32>) -> array<f32, 6> {
     return convolve(probe_sh(p), n);
+}
+
+// Six bands of irradiance at two directions, as two halves of three.
+struct Irradiance2 {
+    n_lo: vec3<f32>,
+    n_hi: vec3<f32>,
+    r_lo: vec3<f32>,
+    r_hi: vec3<f32>,
+};
+
+// **The same two numbers as `convolve(probe_sh(p), n)` and
+// `convolve(probe_sh(p), r)`, summed in the other order.**
+//
+// The cosine lobe is linear in the coefficients, so
+//
+//   Σ_q k_q(n) · (Σ_c w_c L_cq) / Σw  =  (Σ_c w_c Σ_q k_q(n) L_cq) / Σw,
+//
+// and the right-hand side never builds the interpolated block. That block is
+// fifty-four floats written through a loop the compiler cannot unroll, which
+// a GPU keeps in thread memory rather than in registers — and reading it, and
+// copying it into `convolve` twice, was the most expensive thing in the
+// frame: taking the probe read out altogether took a third off the shading
+// pass. This keeps twelve accumulators and the two lobes' nine weights each,
+// and reads every coefficient exactly once. `probe_sh` stays for the two
+// fallbacks that want the block itself.
+fn probe_irradiance2(p: vec3<f32>, n: vec3<f32>, r: vec3<f32>) -> Irradiance2 {
+    var o: Irradiance2;
+    o.n_lo = vec3<f32>(0.0);
+    o.n_hi = vec3<f32>(0.0);
+    o.r_lo = vec3<f32>(0.0);
+    o.r_hi = vec3<f32>(0.0);
+    let nx = u.probe_dims.x;
+    let ny = u.probe_dims.y;
+    let nz = u.probe_dims.z;
+    let ns = u.probe_dims.w;
+    if nx == 0u || ny == 0u || nz == 0u || ns == 0u {
+        return o;
+    }
+    let sp = max(u.probe_origin.w, 1e-6);
+    let t = (p - u.probe_origin.xyz) / sp;
+    let last = vec3<f32>(f32(nx - 1u), f32(ny - 1u), f32(nz - 1u));
+    let cl = clamp(floor(t), vec3<f32>(0.0), max(last - vec3<f32>(1.0), vec3<f32>(0.0)));
+    let f = clamp(t - cl, vec3<f32>(0.0), vec3<f32>(1.0));
+    let base = vec3<u32>(u32(cl.x), u32(cl.y), u32(cl.z));
+
+    let si = clamp(u.knobs.x, 0.0, f32(ns - 1u));
+    let s0 = u32(floor(si));
+    let s1 = min(s0 + 1u, ns - 1u);
+    let ts = si - floor(si);
+    let per_probe = SH * BANDS;
+    let probes_per_sun = nx * ny * nz;
+    let kn = sh_cosine(n);
+    let kr = sh_cosine(r);
+
+    var total = 0.0;
+    for (var c = 0u; c < 8u; c = c + 1u) {
+        let dx = c & 1u;
+        let dy = (c >> 1u) & 1u;
+        let dz = (c >> 2u) & 1u;
+        var w = 1.0;
+        if nx <= 1u { if dx == 1u { w = 0.0; } } else if dx == 0u { w = w * (1.0 - f.x); } else { w = w * f.x; }
+        if ny <= 1u { if dy == 1u { w = 0.0; } } else if dy == 0u { w = w * (1.0 - f.y); } else { w = w * f.y; }
+        if nz <= 1u { if dz == 1u { w = 0.0; } } else if dz == 0u { w = w * (1.0 - f.z); } else { w = w * f.z; }
+        if w <= 0.0 { continue; }
+        let ix = min(base.x + dx, nx - 1u);
+        let iy = min(base.y + dy, ny - 1u);
+        let iz = min(base.z + dz, nz - 1u);
+        let flat = (iz * ny + iy) * nx + ix;
+        if ((probe_inside[flat / 32u] >> (flat % 32u)) & 1u) == 1u { continue; }
+        total = total + w;
+        let a = (s0 * probes_per_sun + flat) * per_probe;
+        let b = (s1 * probes_per_sun + flat) * per_probe;
+        for (var q = 0u; q < SH; q = q + 1u) {
+            let i = a + q * BANDS;
+            var lo = vec3<f32>(probes[i], probes[i + 1u], probes[i + 2u]);
+            var hi = vec3<f32>(probes[i + 3u], probes[i + 4u], probes[i + 5u]);
+            if ts > 0.0 {
+                let j = b + q * BANDS;
+                lo = mix(lo, vec3<f32>(probes[j], probes[j + 1u], probes[j + 2u]), ts);
+                hi = mix(hi, vec3<f32>(probes[j + 3u], probes[j + 4u], probes[j + 5u]), ts);
+            }
+            let wn = w * kn[q];
+            let wr = w * kr[q];
+            o.n_lo = o.n_lo + wn * lo;
+            o.n_hi = o.n_hi + wn * hi;
+            o.r_lo = o.r_lo + wr * lo;
+            o.r_hi = o.r_hi + wr * hi;
+        }
+    }
+    if total > 1e-9 {
+        let inv = 1.0 / total;
+        o.n_lo = o.n_lo * inv;
+        o.n_hi = o.n_hi * inv;
+        o.r_lo = o.r_lo * inv;
+        o.r_hi = o.r_hi * inv;
+    }
+    // L2 ringing can undershoot and irradiance cannot be negative — the same
+    // clamp `convolve` applies, per band, after the whole sum
+    o.n_lo = max(o.n_lo, vec3<f32>(0.0));
+    o.n_hi = max(o.n_hi, vec3<f32>(0.0));
+    o.r_lo = max(o.r_lo, vec3<f32>(0.0));
+    o.r_hi = max(o.r_hi, vec3<f32>(0.0));
+    return o;
 }
 
 // A sixteen-point Poisson-ish disc, used twice: once to look for blockers and
@@ -799,11 +902,14 @@ fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, ao: f32
     for (var b = 0u; b < BANDS; b = b + 1u) {
         direct[b] = sun_band(b) * shadow * lambert;
     }
-    let sh = probe_sh(p);
-    var indirect = convolve(sh, n);
-    for (var b = 0u; b < BANDS; b = b + 1u) {
-        indirect[b] = indirect[b] * ao;
-    }
+    // The probes, read once for both lobes: the diffuse one at the normal and
+    // the sky's reflection at the mirror direction.
+    let refl = reflect(-v, n);
+    let e = probe_irradiance2(p, n, normalize(refl));
+    var indirect = array<f32, 6>(
+        e.n_lo.x * ao, e.n_lo.y * ao, e.n_lo.z * ao,
+        e.n_hi.x * ao, e.n_hi.y * ao, e.n_hi.z * ao,
+    );
 
     // ---- the diffuse half: spectral, then projected ----------------------
     var lit = array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -822,11 +928,14 @@ fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, ao: f32
         sun_band(3u), sun_band(4u), sun_band(5u),
     ));
     colour = colour + fspec * spec_weight * sun_rgb * shadow;
-    // and the sky's own reflection, at the mirror direction
-    let refl = reflect(-v, n);
-    // the sky's reflection is ambient too, so the occlusion applies to it —
-    // a rock in a crevice does not mirror a sky it cannot see
-    colour = colour + fresnel(f0, ndv) * sky_from(sh, refl) * (1.0 - m.roughness * 0.85) * ao;
+    // and the sky's own reflection, at the mirror direction: `sky_from`, off
+    // the irradiance the fused read already took there. The sky's reflection
+    // is ambient too, so the occlusion applies to it — a rock in a crevice
+    // does not mirror a sky it cannot see.
+    let sky_refl = to_rgb(array<f32, 6>(
+        e.r_lo.x, e.r_lo.y, e.r_lo.z, e.r_hi.x, e.r_hi.y, e.r_hi.z,
+    )) / PI;
+    colour = colour + fresnel(f0, ndv) * sky_refl * (1.0 - m.roughness * 0.85) * ao;
 
     // ---- what it emits ---------------------------------------------------
     var em = array<f32, 6>(
@@ -856,6 +965,15 @@ fn shade_sea(p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     let f0 = 0.02;
     let fr = f0 + (1.0 - f0) * pow(1.0 - cos_i, 5.0);
 
+    // the horizon fade, first, because at 1 nothing under the water is seen
+    // and at 0 the horizon's own sky is not
+    let far = clamp((u.sea.z - p.y) / max(u.sea.w, 1e-3), 0.0, 1.0);
+    let fade = smoothstep(0.55, 1.0, far);
+    let horizon = sky_rgb(normalize(vec3<f32>(d.x, d.y, 0.02)));
+    if fade >= 1.0 {
+        return horizon;
+    }
+
     // the seabed: the beach's own plane, carried on under the water
     let slope = u.sea.y;
     let denom = dr.z - slope * dr.y;
@@ -883,9 +1001,7 @@ fn shade_sea(p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
 
     // the horizon: past the lattice's reach the sea becomes the sky it
     // reflects, so the far edge of the field is not an edge
-    let far = clamp((u.sea.z - p.y) / max(u.sea.w, 1e-3), 0.0, 1.0);
-    let fade = smoothstep(0.55, 1.0, far);
-    return mix(c, sky_rgb(normalize(vec3<f32>(d.x, d.y, 0.02))), fade);
+    return mix(c, horizon, fade);
 }
 
 // The lens: a thin disc with a view-dependent Fresnel highlight and the sky

@@ -1,11 +1,14 @@
 //! The two passes and everything they bind.
 //!
 //! One shadow pass into a 2048² depth map along the sun, then one forward
-//! pass over the same vertex and instance buffers. Nothing is deferred,
-//! nothing is instanced across materials, and there is no G-buffer: the whole
-//! tier is a hundred thousand triangles under a fragment shader that reads
-//! nine coefficients out of a storage buffer, which is a rounding error on
-//! any GPU that can open a window.
+//! pass over the same vertex and instance buffers. Nothing is deferred and
+//! there is no G-buffer: the dressed cove is three to four hundred thousand
+//! triangles in about sixty draws a camera pass — `sims/rune` merges every
+//! part that moves with the same frame into one mesh, and a mesh the frustum
+//! misses is not drawn — under a fragment shader that reads nine coefficients
+//! a band out of a storage buffer once a pixel. [`super::profile`] is the
+//! device's own clock round every pass, and it is what to read before
+//! trimming any of them.
 //!
 //! The **projection must be the tracer's**, to the pixel, or the settle blend
 //! shows a seam at every silhouette. [`view_proj`] is
@@ -19,7 +22,8 @@ use std::sync::Arc;
 
 use wgpu::util::DeviceExt as _;
 
-use super::{CausticQuad, Instance, Scene, Vertex};
+use super::profile::{self, Counts, Profiler, Report};
+use super::{CausticQuad, Instance, Kind, Scene, Vertex};
 use crate::Projection;
 
 /// The shadow map's side, in texels. One map for the level; see
@@ -184,6 +188,65 @@ struct MeshGpu {
     n: u32,
     inst: wgpu::Buffer,
     cap: u32,
+    /// The vertices' bounding sphere in the mesh's own frame, metres: what
+    /// the frustum test and the front-to-back order read.
+    centre: [f32; 3],
+    radius: f32,
+    /// What the instance buffer last had written into it. A static mesh
+    /// places the same instance every frame, and a frame that changes nothing
+    /// writes nothing.
+    written: Vec<Instance>,
+}
+
+/// A mesh's vertices' bounding sphere: the box's centre and the farthest
+/// vertex from it. Not the smallest sphere, and it does not need to be — it
+/// only has to contain them.
+fn bounds(vertices: &[Vertex]) -> ([f32; 3], f32) {
+    if vertices.is_empty() {
+        return ([0.0; 3], 0.0);
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in vertices {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v.pos[k]);
+            hi[k] = hi[k].max(v.pos[k]);
+        }
+    }
+    let c: [f32; 3] = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
+    let r2 = vertices.iter().fold(0.0f32, |r2, v| {
+        let d: [f32; 3] = std::array::from_fn(|k| v.pos[k] - c[k]);
+        r2.max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+    });
+    (c, r2.sqrt())
+}
+
+/// A bounding sphere carried into the world by an instance's model matrix:
+/// the centre transformed, the radius scaled by the longest axis.
+fn world_sphere(model: &[f32; 16], c: [f32; 3], r: f32) -> ([f32; 3], f32) {
+    let w: [f32; 3] =
+        std::array::from_fn(|k| model[k] * c[0] + model[4 + k] * c[1] + model[8 + k] * c[2] + model[12 + k]);
+    let axis = |i: usize| {
+        (model[i] * model[i] + model[i + 1] * model[i + 1] + model[i + 2] * model[i + 2]).sqrt()
+    };
+    (w, r * axis(0).max(axis(4)).max(axis(8)))
+}
+
+/// The six planes of a column-major view-projection, `ax + by + cz + d ≥ 0`
+/// inside, for wgpu's `0 ≤ z ≤ w` clip volume.
+fn frustum_planes(vp: &[f32; 16]) -> [[f32; 4]; 6] {
+    let row = |r: usize| [vp[r], vp[4 + r], vp[8 + r], vp[12 + r]];
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    let add = |a: [f32; 4], b: [f32; 4], s: f32| -> [f32; 4] { std::array::from_fn(|k| a[k] + s * b[k]) };
+    [add(r3, r0, 1.0), add(r3, r0, -1.0), add(r3, r1, 1.0), add(r3, r1, -1.0), r2, add(r3, r2, -1.0)]
+}
+
+/// Whether any of a sphere is inside the frustum. Conservative: a sphere
+/// near a corner can pass all six planes and still miss, and is drawn.
+fn sphere_visible(planes: &[[f32; 4]; 6], c: [f32; 3], r: f32) -> bool {
+    planes.iter().all(|p| {
+        let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] >= -r * n
+    })
 }
 
 /// The tier's GPU resources.
@@ -250,6 +313,10 @@ pub struct Raster {
     caustic_res: (u32, u32),
     meshes: Vec<MeshGpu>,
     targets: Option<Targets>,
+    /// The device's own clock around each pass, when the adapter has
+    /// `TIMESTAMP_QUERY`. See [`super::profile`]: a wall clock round `draw`
+    /// measures the encode and not the draw.
+    profiler: Option<Profiler>,
 }
 
 /// Everything whose size is the frame's.
@@ -679,6 +746,7 @@ impl Raster {
             let filler = [Vertex::default()];
             let verts: &[Vertex] =
                 if mesh.vertices.is_empty() { &filler } else { mesh.vertices.as_slice() };
+            let (centre, radius) = bounds(&mesh.vertices);
             meshes.push(MeshGpu {
                 vb: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("raster mesh"),
@@ -693,6 +761,9 @@ impl Raster {
                     mapped_at_creation: false,
                 }),
                 cap,
+                centre,
+                radius,
+                written: Vec::new(),
             });
         }
 
@@ -731,6 +802,7 @@ impl Raster {
             caustic_res,
             meshes,
             targets: None,
+            profiler: Profiler::new(device, queue),
         };
         me.upload_caustics(queue, &scene.caustics);
         Ok(me)
@@ -817,7 +889,8 @@ impl Raster {
         let inv = invert4(&vp);
         self.write_uniforms(queue, scene, frame, (w, h), &vp, &inv, &fr);
 
-        // the instances, grown where a mesh has more copies than it had
+        // the instances, grown where a mesh has more copies than it had, and
+        // written only where they changed
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (g, mesh) in self.meshes.iter_mut().zip(scene.meshes.iter()) {
             let n = mesh.instances.len() as u32;
@@ -829,11 +902,78 @@ impl Raster {
                     mapped_at_creation: false,
                 });
                 g.cap = n;
+                g.written.clear();
             }
-            if n > 0 {
+            let same = bytemuck::cast_slice::<Instance, u8>(&mesh.instances)
+                == bytemuck::cast_slice::<Instance, u8>(&g.written);
+            if n > 0 && !same {
                 queue.write_buffer(&g.inst, 0, bytemuck::cast_slice(&mesh.instances));
+                g.written.clear();
+                g.written.extend_from_slice(&mesh.instances);
             }
             counts.push(n);
+        }
+
+        // **What the camera draws, and in what order.** A mesh none of whose
+        // instances reach the frustum is not drawn by the prepass or the
+        // shading — it cannot put a fragment on the screen, so the picture is
+        // the same and the draw is free. The sea is never culled: its swell
+        // moves its vertices after any bound of them was taken.
+        //
+        // The **prepass** draws what is left nearest first, so its early
+        // depth test throws away what is behind before it is rasterised. The
+        // **shading** does not need that — it tests `LessEqual` against the
+        // prepass's finished depth, so nothing hidden is shaded in any order
+        // — and it keeps the meshes' own order instead, because where two
+        // authored faces are coplanar `LessEqual` passes both and the last
+        // one drawn is the colour. Reordering those would change which face a
+        // seam shows, for no frame time at all. The sea is last either way.
+        // The sun's map draws every mesh that casts at all.
+        let planes = frustum_planes(&vp);
+        let eye = [
+            frame.camera.eye.x as f32,
+            frame.camera.eye.y as f32,
+            frame.camera.eye.z as f32,
+        ];
+        let mut order: Vec<(f32, usize)> = Vec::with_capacity(self.meshes.len());
+        let mut casting: Vec<usize> = Vec::with_capacity(self.meshes.len());
+        for (i, (g, mesh)) in self.meshes.iter().zip(scene.meshes.iter()).enumerate() {
+            if counts[i] == 0 || g.n == 0 {
+                continue;
+            }
+            if mesh.instances.iter().any(|x| x.casts != 0) {
+                casting.push(i);
+            }
+            let sea = mesh.instances.iter().any(|x| x.kind == Kind::Sea as u32);
+            let mut nearest = f32::MAX;
+            for inst in &mesh.instances {
+                let (c, r) = world_sphere(&inst.model, g.centre, g.radius);
+                if sea || sphere_visible(&planes, c, r) {
+                    let d: [f32; 3] = std::array::from_fn(|k| c[k] - eye[k]);
+                    nearest = nearest.min((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() - r);
+                }
+            }
+            if nearest < f32::MAX {
+                order.push((if sea { f32::INFINITY } else { nearest }, i));
+            }
+        }
+        let mut shading: Vec<usize> = order.iter().map(|&(_, i)| i).collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let nearest_first: Vec<usize> = order.into_iter().map(|(_, i)| i).collect();
+        // the sea last in the shading too, wherever the scene put it
+        shading.sort_by_key(|&i| {
+            scene.meshes[i].instances.iter().any(|x| x.kind == Kind::Sea as u32)
+        });
+
+        let ao_on = scene.ao_strength > 0.0 && self.ao_binds.len() == 3;
+        let bloom_on = scene.bloom_strength > 0.0 && self.post_binds.len() == 4;
+        let mut ran = [true; profile::PASSES.len()];
+        for i in 0..3 {
+            ran[profile::AO + i] = ao_on;
+            ran[profile::BLOOM + i] = bloom_on;
+        }
+        if let Some(p) = self.profiler.as_mut() {
+            p.collect(device, ran);
         }
 
         let t = self.targets.as_ref().expect("target");
@@ -842,24 +982,27 @@ impl Raster {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("raster"),
         });
+        let prof = self.profiler.as_ref();
+        let ts = |i: usize| prof.and_then(|p| p.writes(i));
 
         // ── the sun's own depth ────────────────────────────────────────────
-        {
-            let mut pass = depth_pass(&mut enc, "raster shadow", &self.shadow_map);
+        let shadow_counts = {
+            let mut pass =
+                depth_pass(&mut enc, "raster shadow", &self.shadow_map, ts(profile::SHADOW));
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_bind, &[]);
-            draw_meshes(&mut pass, &self.meshes, &counts);
-        }
+            draw_meshes(&mut pass, &self.meshes, &counts, &casting)
+        };
         // ── the camera's, so the occlusion has something to read and the
         //    shading runs once a pixel ──────────────────────────────────────
         {
-            let mut pass = depth_pass(&mut enc, "raster prepass", &t.depth);
+            let mut pass = depth_pass(&mut enc, "raster prepass", &t.depth, ts(profile::PREPASS));
             pass.set_pipeline(&self.prepass_pipeline);
             pass.set_bind_group(0, bind, &[]);
-            draw_meshes(&mut pass, &self.meshes, &counts);
+            draw_meshes(&mut pass, &self.meshes, &counts, &nearest_first);
         }
         // ── the occlusion, and two bilateral blurs over it ─────────────────
-        if scene.ao_strength > 0.0 && self.ao_binds.len() == 3 {
+        if ao_on {
             for (i, (pipeline, target)) in [
                 (&self.ao_pipeline, 0usize),
                 (&self.ao_blur_pipeline, 1),
@@ -868,15 +1011,17 @@ impl Raster {
             .into_iter()
             .enumerate()
             {
-                let mut pass = colour_pass(&mut enc, "raster ao", &t.ao[target]);
+                let mut pass =
+                    colour_pass(&mut enc, "raster ao", &t.ao[target], ts(profile::AO + i));
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &self.ao_binds[i], &[]);
                 pass.draw(0..4, 0..1);
             }
         }
         // ── the sky, then the shading over it ──────────────────────────────
+        let camera_counts;
         {
-            let mut pass = colour_pass(&mut enc, "raster sky", &t.hdr);
+            let mut pass = colour_pass(&mut enc, "raster sky", &t.hdr, ts(profile::SKY));
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..4, 0..1);
@@ -903,16 +1048,16 @@ impl Raster {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: ts(profile::SCENE),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind, &[]);
-            draw_meshes(&mut pass, &self.meshes, &counts);
+            camera_counts = draw_meshes(&mut pass, &self.meshes, &counts, &shading);
         }
         // ── the film ───────────────────────────────────────────────────────
-        if scene.bloom_strength > 0.0 && self.post_binds.len() == 4 {
+        if bloom_on {
             for (i, (pipeline, target)) in [
                 (&self.bright_pipeline, 0usize),
                 (&self.bloom_blur_pipeline, 1),
@@ -921,20 +1066,32 @@ impl Raster {
             .into_iter()
             .enumerate()
             {
-                let mut pass = colour_pass(&mut enc, "raster bloom", &t.bloom[target]);
+                let mut pass =
+                    colour_pass(&mut enc, "raster bloom", &t.bloom[target], ts(profile::BLOOM + i));
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &self.post_binds[i], &[]);
                 pass.draw(0..4, 0..1);
             }
         }
         {
-            let mut pass = colour_pass(&mut enc, "raster resolve", &t.colour_view);
+            let mut pass =
+                colour_pass(&mut enc, "raster resolve", &t.colour_view, ts(profile::RESOLVE));
             pass.set_pipeline(&self.resolve_pipeline);
             pass.set_bind_group(0, &self.post_binds[3], &[]);
             pass.draw(0..4, 0..1);
         }
+        let copied = prof.is_some_and(|p| p.resolve(&mut enc));
         queue.submit([enc.finish()]);
+        if let Some(p) = self.profiler.as_mut() {
+            p.after_submit(copied, shadow_counts, camera_counts);
+        }
         out
+    }
+
+    /// The last per-pass table the device's clock produced, a frame or two
+    /// old, or [`None`] when the adapter has no timestamp queries.
+    pub fn profile(&self) -> Option<&Report> {
+        self.profiler.as_ref().map(Profiler::report)
     }
 
     /// Every uniform block the chain reads, written for this frame.
@@ -1305,6 +1462,7 @@ fn depth_pass<'a>(
     enc: &'a mut wgpu::CommandEncoder,
     label: &str,
     view: &'a wgpu::TextureView,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
 ) -> wgpu::RenderPass<'a> {
     enc.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
@@ -1317,7 +1475,7 @@ fn depth_pass<'a>(
             }),
             stencil_ops: None,
         }),
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
         multiview_mask: None,
     })
@@ -1330,6 +1488,7 @@ fn colour_pass<'a>(
     enc: &'a mut wgpu::CommandEncoder,
     label: &str,
     view: &'a wgpu::TextureView,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
 ) -> wgpu::RenderPass<'a> {
     enc.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
@@ -1343,22 +1502,32 @@ fn colour_pass<'a>(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
         multiview_mask: None,
     })
 }
 
-/// Every mesh with an instance, into whichever pass is open.
-fn draw_meshes(pass: &mut wgpu::RenderPass<'_>, meshes: &[MeshGpu], counts: &[u32]) {
-    for (g, n) in meshes.iter().zip(counts.iter().copied()) {
+/// The meshes `order` names, in that order, into whichever pass is open, and
+/// what that came to.
+fn draw_meshes(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &[MeshGpu],
+    counts: &[u32],
+    order: &[usize],
+) -> Counts {
+    let mut drawn = Counts::default();
+    for &i in order {
+        let (g, n) = (&meshes[i], counts[i]);
         if n == 0 || g.n == 0 {
             continue;
         }
         pass.set_vertex_buffer(0, g.vb.slice(..));
         pass.set_vertex_buffer(1, g.inst.slice(..));
         pass.draw(0..g.n, 0..n);
+        drawn.add(g.n, n);
     }
+    drawn
 }
 
 /// The inverse of a column-major 4×4, by cofactors.
@@ -1576,8 +1745,10 @@ mod tests {
     #[test]
     fn the_uniform_block_is_the_shaders() {
         // 528 was the block before the sky, the air and the film's own pass;
-        // the six additions are a 4×4 and five `vec4`s.
-        assert_eq!(std::mem::size_of::<Uniforms>(), 528 + 64 + 5 * 16);
+        // the six additions are a 4×4 and five `vec4`s, and the shore's three
+        // — the sea's scattering, the foam and wet band, the foam's albedo —
+        // are three more.
+        assert_eq!(std::mem::size_of::<Uniforms>(), 528 + 64 + 5 * 16 + 3 * 16);
         assert_eq!(std::mem::size_of::<AoUniforms>() % 16, 0);
         assert_eq!(std::mem::size_of::<PostUniforms>(), 48);
         assert_eq!(std::mem::size_of::<Uniforms>() % 16, 0);
