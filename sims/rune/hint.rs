@@ -219,7 +219,8 @@ fn ratio<S: Scalar>(c: &Caustic<S>, scene: &CoveScene) -> S {
     if caught.to_f64() <= 0.0 {
         return S::ZERO;
     }
-    through(c, scene.aperture_r) / (caught * S::from_f64(obliquity(scene)))
+    // `recip`, for the reason [`lens_shape`] gives
+    through(c, scene.aperture_r) * (caught * S::from_f64(obliquity(scene))).recip()
 }
 
 /// The power the grid holds inside a disc of radius `r` about its origin,

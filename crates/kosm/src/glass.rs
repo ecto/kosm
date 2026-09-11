@@ -107,8 +107,8 @@ impl<S: Scalar> Shape<S> {
                     let r = if r1.to_f64() < r2.to_f64() { *r1 } else { *r2 };
                     return (*c1, r);
                 }
-                // reciprocals and not divisions, here and everywhere else the
-                // lens is arithmetic on `S`: see [`Shape::rim_weight`]
+                // reciprocals and not divisions, here and everywhere else a
+                // shape is arithmetic on `S`: see [`Shape::rim_weight`]
                 let u = (*c2 - *c1) * sep.recip();
                 // where the two surfaces cross, along the line of centres
                 let a = (sep * sep + *r1 * *r1 - *r2 * *r2) * (S::TWO * sep).recip();
@@ -131,7 +131,7 @@ impl<S: Scalar> Shape<S> {
                     return None;
                 }
                 let t = -b - disc.sqrt();
-                (t > S::from_f64(1e-7)).then(|| (t, (o + d * t - *centre) / *r))
+                (t > S::from_f64(1e-7)).then(|| (t, (o + d * t - *centre) * r.recip()))
             }
             Shape::Convex { planes, .. } => {
                 let (mut t_in, mut t_out) = (S::NEG_INFINITY, S::INFINITY);
@@ -145,7 +145,7 @@ impl<S: Scalar> Shape<S> {
                         }
                         continue;
                     }
-                    let t = num / denom;
+                    let t = num * denom.recip();
                     if denom < S::ZERO {
                         if t > t_in {
                             t_in = t;
@@ -179,7 +179,7 @@ impl<S: Scalar> Shape<S> {
                 let b = oc.dot(&d);
                 let disc = (b * b - (oc.norm_sq() - *r * *r)).max(S::ZERO);
                 let t = -b + disc.sqrt();
-                Some((t, (o + d * t - *centre) / *r))
+                Some((t, (o + d * t - *centre) * r.recip()))
             }
             Shape::Convex { planes, .. } => {
                 let mut best: Option<(S, Vec3<S>)> = None;
@@ -188,7 +188,7 @@ impl<S: Scalar> Shape<S> {
                     if denom <= S::from_f64(1e-12) {
                         continue;
                     }
-                    let t = (*dd - n.dot(&o)) / denom;
+                    let t = (*dd - n.dot(&o)) * denom.recip();
                     if best.as_ref().is_none_or(|b| t < b.0) {
                         best = Some((t, *n));
                     }
@@ -353,10 +353,11 @@ fn capsule_hit<S: Scalar>(a: Vec3<S>, b: Vec3<S>, r: S, o: Vec3<S>, d: Vec3<S>, 
         let h = k1 * k1 - k2 * k0;
         if h >= S::ZERO {
             let hs = h.sqrt();
-            let t = if near { (-k1 - hs) / k2 } else { (-k1 + hs) / k2 };
+            let inv_k2 = k2.recip();
+            let t = if near { (-k1 - hs) * inv_k2 } else { (-k1 + hs) * inv_k2 };
             let y = baoc + t * bard;
             if y > S::ZERO && y < baba {
-                take(t, (m + d * t - ba * (y / baba)) / r);
+                take(t, (m + d * t - ba * (y * baba.recip())) * r.recip());
             }
         }
     }
@@ -374,7 +375,7 @@ fn capsule_hit<S: Scalar>(a: Vec3<S>, b: Vec3<S>, r: S, o: Vec3<S>, d: Vec3<S>, 
         let t = if near { -bq - ds } else { -bq + ds };
         let y = baoc + t * bard;
         if (beyond_a && y <= S::ZERO) || (!beyond_a && y >= baba) {
-            take(t, (oc + d * t) / r);
+            take(t, (oc + d * t) * r.recip());
         }
     }
     best

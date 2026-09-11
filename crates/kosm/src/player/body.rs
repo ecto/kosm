@@ -541,7 +541,9 @@ pub struct Arm {
     /// Where the hand is at rest, body-local. The IK target, and where a tool
     /// is bolted to the forearm link.
     pub hand: Vec3,
-    /// Which way the elbow points: out and back.
+    /// Which way the elbow points: out and back. What `figure.rs`'s picture
+    /// solve uses; [`arm_solve`] no longer reads it — the rest pose's own
+    /// elbow decides the swing, which is the least turn (see there).
     pub hint: Vec3,
 }
 
@@ -1808,8 +1810,16 @@ impl Body {
         // breath. It is kept apart from [`Body::crouch`] so that a jump's
         // squat, a landing's dip and a breath do not have to share one lag —
         // the first two are events and the third never stops.
+        //
+        // **Except while sighting.** A body lining a lens up down its own
+        // arm holds its breath, and it has to: the arm is near straight, where
+        // the law of cosines turns a millimetre of reach into a degree of
+        // elbow, so five millimetres of hip swung the held glass four degrees
+        // every four seconds — measured, against an aim fixed in the world —
+        // and threw the caustic about the door with it.
         let standing = self.push == Push::None
             && self.hold.is_none()
+            && drive.aim.is_none()
             && !drive.crouch
             && self.air_time <= 0.05
             && self.velocity().x.hypot(self.velocity().y) < super::gait::STANDING;
@@ -2211,7 +2221,15 @@ impl Body {
                     let current = quat_exp(&Vec3::new(self.state.q[q0], self.state.q[q0 + 1], self.state.q[q0 + 2]));
                     let want = quat_exp(&targets[i]);
                     // In the child's own frame, which is where its `ctrl` is.
-                    let error = quat_log(&current.conjugate().mul(&want));
+                    //
+                    // **The short way round.** `q` and `−q` are one rotation
+                    // and `quat_log` takes whichever sign it is handed, so a
+                    // joint whose rotation vector has passed π would be given
+                    // an error of nearly 2π and driven the long way round for
+                    // ever — measured, on a shoulder asked for 3.2 rad.
+                    let r = current.conjugate().mul(&want);
+                    let r = if r.w < 0.0 { Quat { w: -r.w, v: -r.v } } else { r };
+                    let error = quat_log(&r);
                     let (e, h) = ([error.x, error.y, error.z], [hold.x, hold.y, hold.z]);
                     for a in 0..3 {
                         self.state.ctrl[v0 + a] = k * e[a] - c * self.state.v[v0 + a] + h[a];
@@ -2536,10 +2554,26 @@ fn link_inertia(link: &Link) -> SpatialInertia {
 /// The shoulder's target rotation — a rotation vector in the shoulder's
 /// *parent* frame — and the elbow's target angle, for a hand at `goal`.
 ///
-/// The two-link solve of `sims/rune/hero/figure.rs::joint`: the elbow lies on
-/// a circle about the line from shoulder to hand, and the hint picks the point
-/// on it. When the target is out of reach the chain straightens and points at
-/// it rather than failing.
+/// **Exact, and the least turn that is.** The elbow first: the law of
+/// cosines on the reach says how far off straight it has to be, and bending
+/// the rest pose's forearm by that much about its own hinge gives the chord
+/// from shoulder to hand the arm will have. Then the shoulder: the shortest
+/// rotation taking that chord onto the line to `goal`. The hand lands on the
+/// goal to rounding, the elbow swings out wherever the rest pose's own elbow
+/// was, and no shoulder is ever asked to turn past π. When the target is out
+/// of reach the chain straightens and points at it rather than failing.
+///
+/// What it replaced was `figure.rs::joint`'s solve — the elbow on a circle
+/// about the reach, [`Arm::hint`] picking the point, the shoulder the
+/// shortest arc onto the *upper arm* — and that last step is where it went
+/// wrong. A ball joint has three degrees and a bone's direction pins two; the
+/// arc left the twist about the upper arm to chance, so the forearm bent by
+/// the right amount about a hinge tipped out of the plane and the hand landed
+/// off it: 24 mm from a target at the chest and 182 mm from every lens the
+/// cove's hero held up, with the PD tracking its targets to a tenth of a
+/// degree. Turning the hinge back into the hint's plane is exact too, but
+/// the hint's plane costs a 3.2 rad shoulder at those reaches, which is why
+/// the chord and not the hint decides the swing.
 ///
 /// A free function and not a method because [`hand_for`] runs it with no body
 /// at all — one statement of the solve, two callers, and the test that holds
@@ -2547,22 +2581,28 @@ fn link_inertia(link: &Link) -> SpatialInertia {
 pub fn arm_solve(spec: &BodySpec, arm: &Arm, parent_rot: Mat3, shoulder_world: Vec3, goal: Vec3) -> (Vec3, f64) {
     let shoulder_pivot = spec.links[arm.shoulder].pivot;
     let elbow_pivot = spec.links[arm.elbow].pivot;
-    let hint = parent_rot.mul_vec(arm.hint);
-    let elbow_world = two_link(shoulder_world, goal, arm.upper, arm.lower, hint);
+    let (rest_upper, rest_lower) = (elbow_pivot - shoulder_pivot, arm.hand - elbow_pivot);
 
-    // The shoulder: the shortest rotation taking the rest upper-arm
-    // direction onto the one the solve wants, read in the parent's frame.
-    let rest_upper = (elbow_pivot - shoulder_pivot).normalize();
-    let want = parent_rot.transpose().mul_vec((elbow_world - shoulder_world).normalize());
-    let shoulder = shortest_arc(rest_upper, want);
+    // The elbow: the interior angle the reach needs, less the one the rest
+    // pose has. Positive bends, as the hinge is written.
+    let (u, l) = (arm.upper, arm.lower);
+    let reach = (goal - shoulder_world).norm().clamp((u - l).abs() + 1e-6, u + l - 1e-6);
+    let angle = ((reach * reach - u * u - l * l) / (2.0 * u * l)).clamp(-1.0, 1.0).acos();
+    let elbow = angle - bend(shoulder_pivot, elbow_pivot, arm.hand);
 
-    // The elbow: the interior angle, less the one the rest pose has.
-    let rest_lower = (arm.hand - elbow_pivot).normalize();
-    let rest_angle = rest_upper.dot(rest_lower).clamp(-1.0, 1.0).acos();
-    let upper = (elbow_world - shoulder_world).normalize();
-    let lower = (goal - elbow_world).normalize();
-    let angle = upper.dot(lower).clamp(-1.0, 1.0).acos();
-    (shoulder, angle - rest_angle)
+    // The shoulder: the shortest rotation taking the bent arm's chord onto
+    // the line to the goal, read in the parent's frame.
+    let hinge = match spec.links[arm.elbow].kind {
+        PivotKind::Revolute(a) => a.normalize(),
+        PivotKind::Spherical => Vec3::y(),
+    };
+    let chord = rest_upper + quat_exp(&(hinge * elbow)).to_matrix().mul_vec(rest_lower);
+    let want = parent_rot.transpose().mul_vec(goal - shoulder_world);
+    let shoulder = match (chord.try_normalize(), want.try_normalize()) {
+        (Some(c), Some(w)) => shortest_arc(c, w),
+        _ => Vec3::zeros(),
+    };
+    (shoulder, elbow)
 }
 
 /// Where the hand — and so whatever is gripped in it — ends up when the arm
@@ -2575,12 +2615,13 @@ pub fn arm_solve(spec: &BodySpec, arm: &Arm, parent_rot: Mat3, shoulder_world: V
 /// body for a second to find out — a photon score is expensive enough without
 /// a settle in front of it — and a pose that only the physics can state is a
 /// pose no search can reach. `sims/rune`'s `HeroPose` is written on this, and
-/// `rune_tests` holds this arithmetic and a settled [`Body::held`] within a
-/// centimetre and a degree of each other.
+/// `rune_tests` holds this arithmetic and a settled [`Body::held`] within
+/// five millimetres and half a degree of each other.
 ///
-/// The gap between the two is the arm's own sag, which the joint PD's gravity
-/// compensation makes small but not zero; the root's is that a body standing
-/// with one arm up leans a little into it.
+/// Both put the hand *on* `goal` — [`arm_solve`] is exact inside reach, and
+/// the joints carry the limb's weight as feed-forward — so what is left is
+/// the PD's tracking and the frame: a body standing with one arm up breathes
+/// and leans a little, and the chord is turned in the trunk it stands on.
 pub fn hand_for(spec: &BodySpec, root: Pose, goal: Vec3) -> Option<Pose> {
     let arm = spec.arm?;
     let parts = parts_for(spec, root, Some(goal));

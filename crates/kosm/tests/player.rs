@@ -248,7 +248,10 @@ fn the_hand_reaches_and_the_tool_follows_it() {
     let miss = (hand.pos - goal).norm();
     let (tool, _) = body.held().expect("the hero is holding the refractor");
     println!("reach  hand {:.1} mm from the target; the tool is {:.1} mm from the hand", miss * 1e3, (tool.pos - hand.pos).norm() * 1e3);
-    assert!(miss < 0.05, "the hand stopped {:.1} mm from the target", miss * 1e3);
+    // Five millimetres. The solve is exact and the joints carry the limb's
+    // weight as feed-forward, so what is left is the PD's tracking: 0.3 mm,
+    // measured. It was 24 mm while the shoulder's twist was left to chance.
+    assert!(miss < 0.005, "the hand stopped {:.1} mm from the target", miss * 1e3);
     assert!((tool.pos - hand.pos).norm() < 1e-9, "an ungripped tool is not in the hand");
     // and it moves with the body
     let before = body.held().unwrap().0.pos;

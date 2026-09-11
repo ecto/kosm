@@ -269,19 +269,20 @@ pub fn scene(params: &Params) -> anyhow::Result<Built> {
         // rule as above — solved, printed, written to
         // `out/solved/rune.params`, and pasted back here by hand.
         //
-        // The lift is at its clamp and that is the answer rather than an
-        // accident: `rune::hero_merit` spends score on *standoff* once the
-        // door is comfortably open, and the only way to stand further back
-        // is to hold the glass higher, so the arm's limit is what decides
-        // where the hero stands. It lands 1.14 m off the face, which is
-        // `hero/mod.rs`'s own chief-ray answer for a lens held as high as a
-        // 1.11 m adventurer's arm reaches.
-        b.param("hero_x_mm", -610.4487);
-        b.param("hero_y_mm", 14858.2961); // 1.14 m off the cliff face: a place, not a doorframe
-        b.param("hero_yaw_deg", 58.1072);
-        b.param("hero_aim_el_deg", 80.2141); // the arm at its limit, which is what buys the standoff
+        // `rune::hero_merit` spends score on *standoff* once the door is
+        // comfortably open, so the answer is the furthest back the hero can
+        // stand with the glass still in the sun's line to the keyhole: 1.09 m
+        // off the face at frac 0.750. Re-solved when the arm's two-link solve
+        // was made exact — the old one left the hand 182 mm off every aim, so
+        // the previous answer (80.2° up, 66.5° canted, 1.14 m off) was a lens
+        // no arm could hold where the arithmetic said. The wrist is now at its
+        // clamp, the grip turned right over, and the lift is not.
+        b.param("hero_x_mm", -647.4135);
+        b.param("hero_y_mm", 14906.1456); // 1.09 m off the cliff face: a place, not a doorframe
+        b.param("hero_yaw_deg", 55.6558);
+        b.param("hero_aim_el_deg", 72.9176);
         b.param("hero_aim_az_deg", -28.0000);
-        b.param("hero_cant_deg", 66.5040);
+        b.param("hero_cant_deg", 180.0000); // the wrist at its clamp: the grip turned over
         b.param("hero_mass_kg", 30.0); // a 1.11 m figure of cloth and leather, not a bollard
 
         // ---- the bake ----------------------------------------------------------
