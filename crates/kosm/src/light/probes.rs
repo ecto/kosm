@@ -571,7 +571,17 @@ pub struct BakeSpec<'a> {
     /// spacing. Sixteen costs six per cent of a 256-ray bake.
     pub sun_samples: usize,
     /// "Is this point inside a solid?", when the caller has something better
-    /// than six rays — the cove has a baked signed distance field. Metres.
+    /// than the crossing count — the cove has a baked signed distance field.
+    /// Metres.
+    ///
+    /// `None` falls back to [`inside_solid`], which is only an inside test for
+    /// a scene of **one closed shell**. A scene that is several overlapping
+    /// closed shells in one soup — the cove's ground is fifty, and no union —
+    /// hands it doubled and missed crossings wherever two shells share or
+    /// graze a face, and it reads buried points as air. Such a scene passes
+    /// its own test here: the cove's (`sims/rune/bake.rs`, `Rock`) is its
+    /// field's sign, which is exact outside the union, and each closed part's
+    /// own signed distance for what the field calls air.
     pub inside: Option<&'a (dyn Fn([f64; 3]) -> bool + Sync)>,
     /// Called with `(done, total)` as probes land.
     pub progress: Option<&'a (dyn Fn(usize, usize) + Sync)>,
@@ -627,8 +637,8 @@ pub fn bake<G: RenderGeometry + Send + Sync>(
 /// probes inside each. Every probe:
 ///
 /// 1. **inside?** `spec.inside` if the caller has one, else [`inside_solid`]'s
-///    crossing count. Geometry does not move between sun positions, so this
-///    is done once for the whole bake. An inside probe carries nothing and is
+///    crossing count, which is exact for one closed shell only. Geometry does
+///    not move between sun positions, so this is done once for the whole bake. An inside probe carries nothing and is
 ///    skipped by [`ProbeVolume::sample`].
 /// 2. **the sky and the bounces.** `rays` directions on a jittered spherical
 ///    spiral, one path each, projected onto SH with weight `4π/rays`, each
@@ -789,6 +799,16 @@ fn with_sun<G>(scene: &Scene<G>, sun: Option<Sun>) -> Scene<G> {
 /// Three axes and a majority, because an open surface — the sea is a height
 /// field, not a solid — can hand one axis a spurious exit and cannot hand
 /// two.
+///
+/// **It is only right for one closed shell**, and it is only the fallback for
+/// when [`BakeSpec::inside`] is `None`. The argument above assumes every
+/// crossing is seen exactly once, and overlapping shells break that: where two
+/// of them are coplanar or meet along a crease, a ray meets both faces at one
+/// distance, the step past the first skips the second or lands on it again,
+/// and one miscounted crossing on two axes flips the vote. The cove's ground
+/// is fifty closed roots poured into one soup, and this read the sand half a
+/// metre under its door as air; a scene like that passes an inside test of its
+/// own as [`BakeSpec::inside`] instead.
 fn inside_solid<G: RenderGeometry>(tracer: &Tracer<'_, G>, p: [f64; 3]) -> bool {
     const DIRS: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     const MAX_HITS: usize = 64;

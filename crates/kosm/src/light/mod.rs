@@ -271,12 +271,15 @@ pub fn trace_onto<S: Scalar>(
                 if d_out.z >= S::ZERO {
                     continue;
                 }
-                let tp = -p2.z / d_out.z;
+                // reciprocals and not divisions, as in the cone above: a
+                // `Dual` divides by multiplying by the reciprocal, and an ulp
+                // here is an ulp in the cell the ray lands in
+                let tp = -p2.z * d_out.z.recip();
                 let hit = p2 + d_out * tp;
                 let cos_plate = -d_out.z;
                 let power = t_in * t_out * cos_plate * d_omega * rim;
-                let gx = (hit.x - S::from_f64(origin[0])) / S::from_f64(cell) - S::HALF;
-                let gy = (hit.y - S::from_f64(origin[1])) / S::from_f64(cell) - S::HALF;
+                let gx = (hit.x - S::from_f64(origin[0])) * S::from_f64(cell.recip()) - S::HALF;
+                let gy = (hit.y - S::from_f64(origin[1])) * S::from_f64(cell.recip()) - S::HALF;
                 let (fx, fy) = (gx.to_f64().floor(), gy.to_f64().floor());
                 if !(fx > -2.0 && fy > -2.0 && fx < cells as f64 + 1.0 && fy < cells as f64 + 1.0) {
                     outside += 1;

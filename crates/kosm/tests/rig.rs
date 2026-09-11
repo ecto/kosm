@@ -477,3 +477,57 @@ fn the_arm_sweeps_the_cove_without_entering_it() {
     assert!(poses > 100, "only {poses} open poses in the cove — is the bake right?");
     assert!(shortened > 0, "the arm never shortened anywhere in the cove");
 }
+
+/// **A breathing body does not move the camera.** A body at rest breathes: its
+/// centre rises and falls five millimetres at a quarter of a hertz and sways
+/// three, its lean wanders a fifth of a degree, and the velocity that carries
+/// is millimetres a second. None of it may reach the camera, or the history
+/// under it never sees a still frame and the settle blend never rises. Stop
+/// after a walk and breathe for eight seconds: once the eye's spring has
+/// settled, every camera is the same camera, and it is the camera an
+/// unbreathing stop settles on, to the bit.
+#[test]
+fn a_breathing_body_does_not_move_the_camera() {
+    let stop = 2.0;
+    let breathe = |script: &mut Vec<(f64, Subject)>| {
+        let w = std::f64::consts::TAU * 0.25;
+        for (t, s) in script.iter_mut() {
+            let tb = *t - stop;
+            if tb <= 0.0 {
+                continue;
+            }
+            let (sn, cs) = (w * tb).sin_cos();
+            s.position = s.position + Vec3::new(0.0, 0.003 * sn, 0.005 * sn);
+            s.velocity = Vec3::new(0.0, 0.003 * w * cs, 0.005 * w * cs);
+            s.speed = s.velocity.y.abs();
+            s.lean = 0.2f64.to_radians() * sn;
+        }
+    };
+    let run = |script: &[(f64, Subject)]| {
+        let rig = Rig::default();
+        rig.follow(&script[0].1, 0.0);
+        script[1..]
+            .iter()
+            .map(|(t, s)| {
+                let c = rig.follow(s, DT);
+                (*t, c.eye, c.forward, c.fov_deg)
+            })
+            .collect::<Vec<_>>()
+    };
+    let calm = run(&walk(1.4, stop, 8.0));
+    let mut script = walk(1.4, stop, 8.0);
+    breathe(&mut script);
+    let breathing = run(&script);
+    let tail: Vec<_> = breathing.iter().filter(|c| c.0 > stop + 1.5).collect();
+    assert!(tail.len() > 700, "{} frames of breathing", tail.len());
+    for c in &tail {
+        assert_eq!(c.1, tail[0].1, "the eye moved with the breath at t = {:.2} s", c.0);
+        assert_eq!(c.2, tail[0].2, "the look moved with the breath at t = {:.2} s", c.0);
+        assert_eq!(c.3, tail[0].3, "the field of view moved with the breath at t = {:.2} s", c.0);
+    }
+    let settled = calm.last().expect("a calm run");
+    assert_eq!(tail[0].1, settled.1, "the breathing stop settled somewhere the calm one did not");
+    assert_eq!(tail[0].2, settled.2);
+    assert_eq!(tail[0].3, settled.3);
+    println!("{} breathing frames, one camera: eye {:?}", tail.len(), tail[0].1);
+}

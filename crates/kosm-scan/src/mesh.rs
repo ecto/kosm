@@ -9,6 +9,17 @@
 //! is, and [`TriMesh::from_soup`] welds on exact f32 bit patterns for that
 //! reason (a tolerance weld would quietly merge genuinely distinct geometry
 //! on a coarse scan).
+//!
+//! Ties are counted, not broken. A point in a face's plane past a convex edge
+//! is exactly as far from both triangles that meet there, and a point over a
+//! vertex from all of its triangles. Every triangle within [`TIE`] of the
+//! nearest distance votes with the cosine between the offset and its own
+//! pseudonormal, and the sign is the sum's. On a welded mesh the tied
+//! triangles report the same feature and the same pseudonormal, so the vote
+//! is the pseudonormal test itself. On an unwelded edge each reports its own
+//! face's normal and the sum is the welded edge's — where first-wins handed
+//! the sign to whichever triangle the tree reached first, and one of the two
+//! is perpendicular to the offset. The distance is the nearest either way.
 
 use phyz_math::Vec3;
 
@@ -117,22 +128,21 @@ impl TriMesh {
     /// the winding's normals face), negative inside.
     pub fn signed_distance(&self, p: Vec3) -> f64 {
         let hit = self.closest(p);
-        let delta = p - hit.point;
-        let dist = delta.norm();
+        let dist = (p - hit.point).norm();
         if dist == 0.0 {
             return 0.0;
         }
-        let sign = if delta.dot(hit.pseudonormal) >= 0.0 { 1.0 } else { -1.0 };
+        let sign = if hit.vote >= 0.0 { 1.0 } else { -1.0 };
         sign * dist
     }
 
-    /// Closest surface point to `p`, with the pseudonormal of the feature
-    /// (face interior, edge, or vertex) it landed on.
+    /// Closest surface point to `p`, and the summed sign vote of every
+    /// triangle tied for it (see the module doc).
     fn closest(&self, p: Vec3) -> ClosestHit {
         let mut best = ClosestHit {
             dist_sq: f64::INFINITY,
             point: Vec3::zeros(),
-            pseudonormal: Vec3::z(),
+            vote: 0.0,
         };
         self.bvh.nearest(p, &mut |tri_idx| {
             let t = self.triangles[tri_idx];
@@ -143,14 +153,32 @@ impl TriMesh {
             ];
             let (cp, feature) = closest_point_triangle(p, a, b, c);
             let d2 = (p - cp).norm_squared();
-            if d2 < best.dist_sq {
+            let tied = best.dist_sq.is_finite() && (d2 - best.dist_sq).abs() <= TIE * d2.max(best.dist_sq);
+            if tied {
+                best.vote += self.vote(p, cp, tri_idx, feature);
+                if d2 < best.dist_sq {
+                    best.dist_sq = d2;
+                    best.point = cp;
+                }
+            } else if d2 < best.dist_sq {
                 best.dist_sq = d2;
                 best.point = cp;
-                best.pseudonormal = self.feature_normal(tri_idx, feature);
+                best.vote = self.vote(p, cp, tri_idx, feature);
             }
-            best.dist_sq
+            // Prune only what is farther than a tie, so every tied triangle is
+            // visited whatever order the tree hands them over in.
+            best.dist_sq * (1.0 + TIE)
         });
         best
+    }
+
+    /// One triangle's say in the sign: the cosine between the offset from its
+    /// closest point and the pseudonormal of the feature that point is on.
+    fn vote(&self, p: Vec3, cp: Vec3, tri_idx: usize, feature: Feature) -> f64 {
+        match (p - cp).try_normalize() {
+            Some(d) => d.dot(self.feature_normal(tri_idx, feature)),
+            None => 0.0,
+        }
     }
 
     fn feature_normal(&self, tri_idx: usize, feature: Feature) -> Vec3 {
@@ -173,10 +201,16 @@ impl TriMesh {
     }
 }
 
+/// Two squared distances this close, relatively, are the same distance: the
+/// two triangles at an edge compute the one closest point from opposite ends
+/// of it and round differently.
+const TIE: f64 = 1e-10;
+
 struct ClosestHit {
     dist_sq: f64,
     point: Vec3,
-    pseudonormal: Vec3,
+    /// Sum over the tied triangles of cos(offset, pseudonormal).
+    vote: f64,
 }
 
 /// Which feature of the triangle the closest point landed on. Edge `k` is the
@@ -499,5 +533,77 @@ pub mod tests {
         let m = TriMesh::from_soup(&soup);
         assert_eq!(m.vertices.len(), 4);
         assert_eq!(m.triangles.len(), 2);
+    }
+
+    /// Rodrigues: `v` turned by `angle` about the unit axis `k`.
+    fn turn(v: Vec3, k: Vec3, angle: f64) -> Vec3 {
+        let (s, c) = angle.sin_cos();
+        v * c + k.cross(v) * s + k * (k.dot(v) * (1.0 - c))
+    }
+
+    /// The same mesh with every vertex turned, triangles untouched.
+    fn turned(m: &TriMesh, k: Vec3, angle: f64) -> TriMesh {
+        TriMesh::new(m.vertices.iter().map(|&v| turn(v, k, angle)).collect(), m.triangles.clone())
+    }
+
+    /// The same mesh handed over the way `collision_mesh` used to: every
+    /// triangle its own three vertices, so no edge knows its second face.
+    fn unwelded(m: &TriMesh) -> TriMesh {
+        let (mut vertices, mut triangles) = (Vec::new(), Vec::new());
+        for t in &m.triangles {
+            let i = vertices.len() as u32;
+            vertices.extend(t.iter().map(|&k| m.vertices[k as usize]));
+            triangles.push([i, i + 1, i + 2]);
+        }
+        TriMesh::new(vertices, triangles)
+    }
+
+    /// **A point in a face's plane, past the convex edge that face shares with
+    /// another, is outside — welded or not.**
+    ///
+    /// There the two triangles that meet at the edge are exactly as far away as
+    /// each other. Welded, both report the edge and its pseudonormal is the sum
+    /// of both faces. Unwelded, each reports its own face's normal as the
+    /// edge's, and one of those is the normal of the plane the point lies in —
+    /// perpendicular to the offset, so the sign is whatever the rounding makes
+    /// of a dot product that should be zero. First-wins then handed the sign to
+    /// whichever triangle the tree reached first. The box is turned so no
+    /// normal is axis-aligned and that dot product really is rounding noise, the
+    /// way it is on the rune cove's battered beds.
+    #[test]
+    fn beyond_a_convex_edge_in_a_faces_plane_is_outside() {
+        let k = Vec3::new(0.3, -0.7, 0.5).normalize();
+        let angle = 0.83;
+        let welded = turned(&box_mesh(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0)), k, angle);
+        let soup = unwelded(&welded);
+        let axes = [Vec3::x(), Vec3::y(), Vec3::z()];
+        let mut checked = 0;
+        for a in 0..3 {
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            for s1 in [-1.0, 1.0] {
+                for s2 in [-1.0, 1.0] {
+                    for t in [-0.6, -0.1, 0.35, 0.8] {
+                        let edge = axes[a] * t + axes[b] * s1 + axes[c] * s2;
+                        // in face c's plane past the edge, and in face b's
+                        for off in [axes[b] * (0.5 * s1), axes[c] * (0.5 * s2)] {
+                            let p = turn(edge + off, k, angle);
+                            for (name, m) in [("welded", &welded), ("unwelded", &soup)] {
+                                let d = m.signed_distance(p);
+                                assert!(
+                                    (d - 0.5).abs() < 1e-9,
+                                    "{name}: {p:?}, half a metre past an edge in a face's plane, reads {d:+.12}"
+                                );
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 4 * 4 * 2);
+        // and inside, midway between two opposite faces, both vote inside
+        for m in [&welded, &soup] {
+            assert!((m.signed_distance(turn(Vec3::zeros(), k, angle)) + 1.0).abs() < 1e-9);
+        }
     }
 }

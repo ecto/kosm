@@ -333,6 +333,421 @@ fn the_sea_is_bluer_than_the_sand_under_it() {
     );
 }
 
+// ── the pace ──────────────────────────────────────────────────────────────
+
+/// **What the whole chain costs at the window's own size.**
+///
+/// Eight passes now, where there were two: a depth prepass, a half-resolution
+/// occlusion and two blurs over it, a full-screen sky, the shading, and a
+/// bloom in three. The design's line is that a walking frame is drawn in
+/// single-digit milliseconds — the tier exists because the tracer could not —
+/// so this draws a level-sized scene at 1280×720 until the queue has caught
+/// up and divides.
+///
+/// It is a *wall-clock* number on whatever adapter is running the test, so it
+/// is reported always and only asserted loosely: the assert is there to catch
+/// a pass that went quadratic, not to pin a machine's speed.
+#[test]
+fn the_whole_chain_draws_a_window_frame_in_single_digit_milliseconds() {
+    let Some(ctx) = ctx_or_skip("the_whole_chain_draws_a_window_frame") else { return };
+    use kosm_render::env::SkyEnv;
+
+    let sun_dir = Vec3::new(-0.32, -0.87, 0.375).normalize();
+    let build = |effects: bool| {
+        let probes = uniform_probes([-24.0, -24.0, -4.0], 0.5, [97, 97, 33], 0.16);
+        let (mut s, _) = Scene::new(
+            Sun::from_rgb([sun_dir.x, sun_dir.y, sun_dir.z], [6.2, 4.8, 2.9], 0.02),
+            probes,
+        );
+        s.bounds = ([-24.0, -24.0, -4.0], [24.0, 24.0, 12.0]);
+        s.exposure = 0.7;
+        if effects {
+            s.sky = Some(SkyEnv::new(sun_dir, 2.5, [0.42, 0.36, 0.24], 0.163, 0.02));
+            s.air = kosm_render::post::Aerial { density: 0.0045, scale_h: 60.0 };
+            s.ao_strength = 1.0;
+            s.vignette = 0.35;
+            s.bloom_threshold = 1.05;
+            s.bloom_strength = 0.1;
+        }
+        let rock = s.push_material(rgb_material([0.30, 0.29, 0.27], 0.85, 0.15));
+        let sand = s.push_material(rgb_material([0.62, 0.52, 0.35], 0.95, 0.12));
+        let mut floor = floor_mesh();
+        floor.instances.push(Instance { material: sand, ..Default::default() });
+        s.push_mesh(floor);
+        // ~90 k triangles of scattered geometry, which is the cove's own order
+        let mut b = sphere_mesh([0.0, 0.0, 0.0], 0.6, 24, 12);
+        for k in 0..160 {
+            let a = k as f64 * 2.39996;
+            let r = 0.6 * (k as f64).sqrt();
+            b.instances.push(Instance::rigid(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [r * a.cos(), r * a.sin(), 0.5],
+                rock,
+            ));
+        }
+        s.push_mesh(b);
+        s
+    };
+    let size = (1280u32, 720u32);
+    let cam = kosm_render::Camera::look_at(
+        Point3::new(0.0, -9.0, 1.8),
+        Point3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        55.0,
+    );
+    let mut f = Frame::new(cam, size);
+    f.exposure = 0.7;
+
+    for (name, effects) in [("plain", false), ("with the light", true)] {
+        let s = build(effects);
+        let mut r = Raster::new(&ctx.device, &ctx.queue, &s, wgpu::TextureFormat::Rgba8Unorm)
+            .expect("the raster tier builds");
+        // warm the pipeline caches and the allocator
+        for _ in 0..8 {
+            let _ = r.draw(&ctx.device, &ctx.queue, &s, &f);
+        }
+        let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let n = 40;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = r.draw(&ctx.device, &ctx.queue, &s, &f);
+        }
+        let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+        eprintln!("pace {name:>15}: {ms:.2} ms a frame at {}×{} ({} tris)", size.0, size.1, s.tris());
+        assert!(ms < 25.0, "{name} draws a window frame in {ms:.2} ms, which is not a live tier");
+    }
+}
+
+// ── what the probes cannot see ────────────────────────────────────────────
+
+/// **The occlusion darkens a crease and leaves the open floor alone.**
+///
+/// The indirect half of every pixel is nine coefficients off a lattice metres
+/// across, which has nothing to say about the centimetre where a wall meets a
+/// floor. The reference tracer resolves that exactly, by tracing the
+/// hemisphere. This puts a box on the floor with **no sun at all** — so every
+/// photon in the frame is the probe term and the occlusion is the whole of
+/// what is being measured — and asks whether the floor beside the box went
+/// darker while the floor across the room did not.
+#[test]
+fn the_occlusion_darkens_the_foot_of_a_wall() {
+    let Some(ctx) = ctx_or_skip("the_occlusion_darkens_the_foot_of_a_wall") else { return };
+    let build = |strength: f32| {
+        let probes = uniform_probes([-12.0, -12.0, -1.0], 4.0, [7, 7, 4], 0.25);
+        // no sun: the whole picture is the probe read, times the occlusion
+        let (mut s, _) = Scene::new(Sun::from_rgb([0.0, 0.0, 1.0], [0.0; 3], 0.01), probes);
+        s.bounds = ([-11.0, -11.0, -0.5], [11.0, 11.0, 4.0]);
+        s.exposure = 1.0;
+        s.ao_radius_m = 0.6;
+        s.ao_strength = strength;
+        let white = s.push_material(rgb_material([0.8, 0.8, 0.8], 1.0, 0.0));
+        let mut floor = floor_mesh();
+        floor.instances.push(Instance { material: white, ..Default::default() });
+        s.push_mesh(floor);
+        // a wall standing on the floor, its foot along y = 0
+        let mut wall = box_mesh(4.0, 0.15, 1.5);
+        wall.instances.push(Instance::rigid(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, 1.5],
+            white,
+        ));
+        s.push_mesh(wall);
+        s
+    };
+    // low and to one side, so the floor in front of the wall fills the frame
+    let cam = kosm_render::Camera::look_at(
+        Point3::new(0.0, -4.0, 1.2),
+        Point3::new(0.0, 0.4, 0.4),
+        Vec3::new(0.0, 0.0, 1.0),
+        55.0,
+    );
+    let size = (256u32, 144u32);
+    let mut f = Frame::new(cam, size);
+    f.exposure = 1.0;
+    let off = draw(ctx, &build(0.0), &f);
+    let on = draw(ctx, &build(1.0), &f);
+
+    // the floor a hand's breadth from the wall's foot, and the floor by the
+    // camera's own feet, both projected rather than guessed at
+    let vp = kosm_view::raster::pipeline::view_proj(&cam, size.0 as f32 / size.1 as f32);
+    let at = |p: [f32; 3]| -> (u32, u32) {
+        let (x, y, w) = (
+            vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12],
+            vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13],
+            vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15],
+        );
+        (
+            ((x / w * 0.5 + 0.5) * size.0 as f32) as u32,
+            ((0.5 - y / w * 0.5) * size.1 as f32) as u32,
+        )
+    };
+    let crease = at([0.0, -0.25, 0.0]);
+    let open = at([0.0, -3.0, 0.0]);
+    let d_crease = patch(&off, crease.0, crease.1, 2) - patch(&on, crease.0, crease.1, 2);
+    let d_open = patch(&off, open.0, open.1, 3) - patch(&on, open.0, open.1, 3);
+    eprintln!("ao: the crease lost {d_crease:.4}, the open floor {d_open:.4}");
+    assert!(d_crease > 0.04, "the occlusion did not find the crease: {d_crease:.4}");
+    assert!(
+        d_open < d_crease * 0.4,
+        "the occlusion is a wash: the open floor lost {d_open:.4} against {d_crease:.4}"
+    );
+}
+
+// ── the sky, and the film it goes through ─────────────────────────────────
+
+/// **The WGSL sky is the Rust sky, and the WGSL film is the Rust film.**
+///
+/// The settle blend fades the raster frame into the traced one, and the sky
+/// fills most of a frame looking out to sea — so if the two tiers' Preetham
+/// disagreed anywhere, or their vignette did, a standing player would watch
+/// the horizon change colour as the reference arrived. This draws a frame with
+/// **no geometry in it at all**, so every pixel is `fs_sky` and the post pass,
+/// and compares it against `SkyEnv::radiance` put through
+/// `kosm_render::post::Post` on the CPU.
+///
+/// The tolerance is a code and a half of 255, which is `f16` in the HDR target
+/// plus the difference between an `exp` on a GPU and one in libm.
+#[test]
+fn the_sky_and_the_film_agree_with_the_reference() {
+    let Some(ctx) = ctx_or_skip("the_sky_and_the_film_agree_with_the_reference") else { return };
+    use kosm_render::env::SkyEnv;
+    use kosm_render::post::Post;
+
+    let size = (192u32, 108u32);
+    let sun_dir = Vec3::new(-0.35, -0.45, 0.42).normalize();
+    let sky = SkyEnv::new(sun_dir, 2.5, [0.42, 0.36, 0.24], 0.163, 0.02);
+
+    // An empty scene, so nothing is drawn over the sky. The probes are still
+    // bound — an empty storage buffer is not a binding — but nothing reads
+    // them once a sky model is set.
+    let probes = uniform_probes([-4.0, -4.0, -1.0], 4.0, [2, 2, 2], 0.0);
+    let (mut s, _) = Scene::new(
+        Sun::from_rgb([sun_dir.x, sun_dir.y, sun_dir.z], [0.0; 3], 0.02),
+        probes,
+    );
+    s.bounds = ([-4.0, -4.0, -1.0], [4.0, 4.0, 4.0]);
+    s.exposure = 0.7;
+    s.sky = Some(sky);
+    s.vignette = 0.35;
+
+    // Level and looking a little off the sun's azimuth, so the frame has the
+    // horizon, the zenith and the aureole in it rather than one of them.
+    let cam = kosm_render::Camera::look_at(
+        Point3::new(0.0, 0.0, 1.6),
+        Point3::new(-1.0, -1.0, 1.9),
+        Vec3::new(0.0, 0.0, 1.0),
+        50.0,
+    );
+    let mut f = Frame::new(cam, size);
+    f.exposure = s.exposure;
+    let got = draw(ctx, &s, &f);
+
+    // the same picture, in Rust: a film whose radiance is the sky along each
+    // pixel's own ray, through the same post chain
+    let mut film = kosm_render::Film::new(size.0, size.1);
+    let half_h = (cam.fov_deg.to_radians() * 0.5).tan();
+    let half_w = half_h * size.0 as f64 / size.1 as f64;
+    for j in 0..size.1 {
+        let sy = 1.0 - 2.0 * (j as f64 + 0.5) / size.1 as f64;
+        for i in 0..size.0 {
+            let sx = 2.0 * (i as f64 + 0.5) / size.0 as f64 - 1.0;
+            let d = (cam.forward + cam.right * (sx * half_w) + cam.up * (sy * half_h)).normalize();
+            let c = sky.radiance(d);
+            let k = ((j * size.0 + i) * 3) as usize;
+            film.rgb[k..k + 3].copy_from_slice(&c);
+        }
+    }
+    let want = Post { exposure: f.exposure, vignette: 0.35, ..Post::default() }
+        .apply(&film, &cam, false);
+
+    let mut worst = 0u8;
+    let mut sum = 0.0f64;
+    for (k, (g, w)) in got.as_raw().iter().zip(want.iter()).enumerate() {
+        if k % 4 == 3 {
+            continue;
+        }
+        worst = worst.max(g.abs_diff(*w));
+        sum += g.abs_diff(*w) as f64;
+    }
+    let mean = sum / (got.as_raw().len() as f64 * 0.75);
+    eprintln!("sky parity: worst {worst} codes, mean {mean:.3}");
+    assert!(worst <= 2, "the two skies differ by {worst} codes");
+    assert!(mean < 0.5, "the two skies differ by {mean:.3} codes on average");
+
+    // and the vignette is actually doing something, or the test above would
+    // pass with both tiers ignoring it
+    let plain = Post { exposure: f.exposure, ..Post::default() }.apply(&film, &cam, false);
+    let corner = |v: &[u8]| v[((size.1 - 1) * size.0) as usize * 4] as i32;
+    assert!(
+        corner(&plain) - corner(&want) > 8,
+        "the vignette darkened the corner by {} codes, which is not a vignette",
+        corner(&plain) - corner(&want)
+    );
+}
+
+/// **Aerial perspective: the far headland hazes and the near sand does not.**
+///
+/// The exact closed form is `kosm_render::post::Aerial`'s own unit test and
+/// the WGSL is a line-for-line port of it; what a GPU can be asked is whether
+/// the term is wired to the right things — that it grows with distance, that
+/// it pulls toward the *sky's* colour and not toward grey, and that the sky
+/// itself is left alone (a background pixel is already the sky, and hazing it
+/// again would double the term at the horizon, which is where it would show).
+#[test]
+fn the_haze_grows_with_distance_and_leaves_the_sky_alone() {
+    let Some(ctx) = ctx_or_skip("the_haze_grows_with_distance") else { return };
+    use kosm_render::env::SkyEnv;
+
+    let sun_dir = Vec3::new(-0.32, -0.87, 0.375).normalize();
+    let sky = SkyEnv::new(sun_dir, 2.5, [0.42, 0.36, 0.24], 0.163, 0.02);
+    let build = |density: f32| {
+        let probes = uniform_probes([-200.0, -20.0, -4.0], 100.0, [5, 3, 3], 0.16);
+        let (mut s, _) = Scene::new(
+            Sun::from_rgb([sun_dir.x, sun_dir.y, sun_dir.z], [0.0; 3], 0.02),
+            probes,
+        );
+        s.bounds = ([-200.0, -20.0, -4.0], [200.0, 180.0, 60.0]);
+        s.exposure = 0.7;
+        s.sky = Some(sky);
+        s.air = kosm_render::post::Aerial { density, scale_h: 60.0 };
+        // a dark wall, so the haze has somewhere to go
+        let dark = s.push_material(rgb_material([0.06, 0.06, 0.06], 0.9, 0.0));
+        // near, on the left of the frame; far, on the right — same material,
+        // same normal, so the only difference between them is the distance
+        // Wide enough that each fills its own half of the frame right out to
+        // the edge — a wall that ran out before the patch did was the sky —
+        // and **low enough that the sky is still visible above both**, which
+        // is what the last assertion needs. The tops are different heights
+        // because the two are at different distances and the same height
+        // would put one horizon line at the top of the frame.
+        for (y, x0, x1, top) in [
+            (8.0f64, -900.0f64, -0.02f64, 3.0f64),
+            (160.0, 0.02, 900.0, 60.0),
+        ] {
+            let mut w = Mesh::from_m(
+                &[[x0, y, -400.0], [x1, y, -400.0], [x1, y, top], [x0, y, top]],
+                &[[0.0, -1.0, 0.0]; 4],
+                &[0, 1, 2, 0, 2, 3],
+            );
+            w.instances.push(Instance { material: dark, ..Default::default() });
+            s.push_mesh(w);
+        }
+        s
+    };
+    let size = (256u32, 144u32);
+    let cam = kosm_render::Camera::look_at(
+        Point3::new(0.0, 0.0, 1.6),
+        Point3::new(0.0, 20.0, 1.6),
+        Vec3::new(0.0, 0.0, 1.0),
+        50.0,
+    );
+    let mut f = Frame::new(cam, size);
+    f.exposure = 0.7;
+    let off = draw(ctx, &build(0.0), &f);
+    let on = draw(ctx, &build(0.006), &f);
+
+    // Which half of the frame world `+x` lands on is `Camera::look_at`'s own
+    // handedness, so the two are told apart by the haze itself: the far wall
+    // is the one that moved.
+    let (lx, rx) = (size.0 / 4, size.0 * 3 / 4);
+    let l = (patch(&off, lx, size.1 / 2, 8), patch(&on, lx, size.1 / 2, 8));
+    let r = (patch(&off, rx, size.1 / 2, 8), patch(&on, rx, size.1 / 2, 8));
+    let (near, far, fx) = if r.1 - r.0 > l.1 - l.0 { (l, r, rx) } else { (r, l, lx) };
+    let (near_off, near_on) = near;
+    let (far_off, far_on) = far;
+    eprintln!(
+        "haze: the near wall {near_off:.4} → {near_on:.4}, the far one {far_off:.4} → {far_on:.4}"
+    );
+    assert!(far_on - far_off > 0.05, "the far wall did not haze: {far_off:.4} → {far_on:.4}");
+    assert!(
+        far_on - far_off > 3.0 * (near_on - near_off),
+        "the haze does not grow with distance: near +{:.4}, far +{:.4}",
+        near_on - near_off,
+        far_on - far_off
+    );
+    // **And it pulls toward the sky, not toward grey.** Not toward the sky at
+    // the top of the frame — toward the sky *along the wall's own view ray*,
+    // which at this pixel is the anti-solar horizon of a 22° afternoon and is
+    // warm rather than blue. So the target is computed here, from the same
+    // `SkyEnv` the shader was handed, and the wall has to have moved toward
+    // it.
+    let hue = |img: &image::RgbaImage| {
+        let p = img.get_pixel(fx, size.1 / 2);
+        p[2] as i32 - p[0] as i32
+    };
+    let half_h = (cam.fov_deg.to_radians() * 0.5).tan();
+    let half_w = half_h * size.0 as f64 / size.1 as f64;
+    let sx = 2.0 * (fx as f64 + 0.5) / size.0 as f64 - 1.0;
+    let d = (cam.forward + cam.right * (sx * half_w)).normalize();
+    let c = sky.radiance(d);
+    let code = |v: f32| {
+        kosm_render::cpu::film::linear_to_srgb(kosm_render::cpu::film::tonemap_aces(v * 0.7))
+            * 255.0
+    };
+    let target = (code(c[2]) - code(c[0])) as i32;
+    let (was, now) = (hue(&off), hue(&on));
+    assert!(
+        (now - was).signum() == (target - was).signum() && (now - was).abs() >= 3,
+        "the haze is grey and not sky: the wall went {was} → {now}, and the sky along \
+         that ray is {target}"
+    );
+    // the sky is a background pixel and is not hazed twice
+    for (x, y) in [(8u32, 4u32), (size.0 - 8, 4)] {
+        let (a, b) = (off.get_pixel(x, y), on.get_pixel(x, y));
+        assert_eq!(a, b, "the sky at ({x}, {y}) was hazed on top of itself");
+    }
+}
+
+/// **Bloom, on the device, spreads a bright pixel the way the Rust does.**
+///
+/// The sun's own disc is the brightest thing the tier ever draws, so this puts
+/// it in frame and asks whether the sky *beside* it brightened when bloom was
+/// switched on — which is the one thing a bloom has to do and the one thing a
+/// threshold set wrong would silently not.
+#[test]
+fn the_bloom_bleeds_off_the_sun() {
+    let Some(ctx) = ctx_or_skip("the_bloom_bleeds_off_the_sun") else { return };
+    use kosm_render::env::SkyEnv;
+
+    let size = (160u32, 120u32);
+    let sun_dir = Vec3::new(0.0, -0.6, 0.8).normalize();
+    let probes = uniform_probes([-4.0, -4.0, -1.0], 4.0, [2, 2, 2], 0.0);
+    let build = |bloom: f32| {
+        let (mut s, _) = Scene::new(
+            Sun::from_rgb([sun_dir.x, sun_dir.y, sun_dir.z], [6.0, 4.8, 3.0], 0.03),
+            probes.clone(),
+        );
+        s.bounds = ([-4.0, -4.0, -1.0], [4.0, 4.0, 4.0]);
+        s.exposure = 0.7;
+        s.sky = Some(SkyEnv::new(sun_dir, 2.5, [0.4; 3], 0.163, 0.03));
+        s.bloom_threshold = 1.0;
+        s.bloom_strength = bloom;
+        s.bloom_radius_px = 8.0;
+        s
+    };
+    let cam = kosm_render::Camera::look_at(
+        Point3::new(0.0, 0.0, 1.6),
+        Point3::new(0.0, 0.0, 1.6) + Vec3::new(sun_dir.x, sun_dir.y, sun_dir.z),
+        Vec3::new(0.0, 0.0, 1.0),
+        60.0,
+    );
+    let f = Frame::new(cam, size);
+    let off = draw(ctx, &build(0.0), &f);
+    let on = draw(ctx, &build(0.25), &f);
+
+    // Twelve pixels off the disc, which subtends three. **The kernel reaches
+    // four quarter-resolution texels, so sixteen full pixels is its whole
+    // extent** — a bloom asked about further out than that is asking about a
+    // tail the nine-tap Gaussian does not have, on either tier.
+    let ring = patch(&on, size.0 / 2 + 12, size.1 / 2, 3) - patch(&off, size.0 / 2 + 12, size.1 / 2, 3);
+    eprintln!("bloom: the sky 12 px off the sun gained {ring:.4}");
+    assert!(ring > 0.01, "the bloom did not bleed off the disc: {ring:.4}");
+    // and the far corner is untouched, or it is a wash and not a bloom
+    let corner = patch(&on, 6, 6, 4) - patch(&off, 6, 6, 4);
+    assert!(corner.abs() < ring * 0.5, "the bloom is a wash: corner {corner:.4} against {ring:.4}");
+}
+
 // ── the datasheet's parity ────────────────────────────────────────────────
 
 /// A UV sphere of radius `r` centred at `c`, metres, with exact normals.

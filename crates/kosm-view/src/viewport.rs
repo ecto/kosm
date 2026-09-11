@@ -56,6 +56,9 @@ pub enum Key {
     S,
     D,
     Shift,
+    /// Either control key, or `C`: one key for "crouch", because the two are
+    /// the two things everybody's hand reaches for.
+    Ctrl,
 }
 
 /// What the window tells the scene about.
@@ -191,6 +194,10 @@ impl Gpu {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("kosm-view"),
                 required_limits: adapter.limits(),
+                // The device's own clock round each raster pass, where the
+                // adapter has one: `raster::profile` is what reads it, and a
+                // wall clock round `draw` measures the encode instead.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 ..Default::default()
             }))?;
 
@@ -477,6 +484,7 @@ fn key_of(code: KeyCode) -> Option<Key> {
         KeyCode::KeyS => Key::S,
         KeyCode::KeyD => Key::D,
         KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
+        KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::KeyC => Key::Ctrl,
         _ => return None,
     })
 }
