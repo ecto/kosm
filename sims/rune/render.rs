@@ -417,14 +417,15 @@ impl Scene {
                     .entry(Arc::as_ptr(&inst.solid) as usize)
                     .or_insert_with(|| Arc::new(Bvh::build(geometry_of(&inst.solid))))
                     .clone();
-                let Some(local) = bvh.bounds() else { continue };
+                if bvh.bounds().is_none() {
+                    continue;
+                }
                 let to_world = placement(&inst.to_world);
                 if root.material == "door" || root.material == materials::DOOR {
                     door.push(Placed { bvh, pbr: materials::pbr(doc, materials::DOOR), to_world });
                 } else {
-                    // one root, three surfaces; see `ground_material`
-                    let name = ground_material(&transform_aabb(&local, &to_world), scene);
-                    statics.push(Placed { bvh, pbr: materials::pbr(doc, name), to_world });
+                    // one root, one surface: the one it was declared with
+                    statics.push(Placed { bvh, pbr: materials::pbr(doc, &root.material), to_world });
                 }
             }
         }
@@ -438,6 +439,23 @@ impl Scene {
             pbr: materials::pbr(doc, "water"),
             to_world: Transform::identity(),
         });
+        // …and the sea's own material again, in each tide pool. The height
+        // field stops at the waterline and the basins are above it, so each one
+        // gets a disc of water at the level `dressing::Pool::fill` fills it to.
+        // A flat disc and not a second lattice: a pool 1.9 m across is still
+        // water when the swell in it is nothing at all.
+        for p in super::dressing::pools(&|n: &str, d: f64| a.parameter_or(n, d)) {
+            let z = scene.sand_z_at(p.x * MM, p.y * MM) * PER_M - p.depth + p.fill();
+            statics.push(Placed {
+                bvh: Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(disc_mesh(
+                    Point3::new(p.x, p.y, z),
+                    p.water_r(),
+                    a.parameter_or("pool_segments", 48.0).max(8.0) as usize,
+                ))))),
+                pbr: materials::pbr(doc, "water"),
+                to_world: Transform::identity(),
+            });
+        }
 
         let being = Placed {
             bvh: Arc::new(Bvh::build(CoveGeom::Brep(BrepGeom::Mesh(capsule_mesh(
@@ -877,26 +895,20 @@ fn hero_solids(doc: &vcad_ir::Document, scene: &CoveScene) -> anyhow::Result<(Ve
     Ok((parts, held))
 }
 
-/// Which of the cove's surfaces one primitive of the `ground` root is.
-///
-/// The document unions the beach, the cliff, the boulders, the headlands and
-/// the reef into one solid because the bake wants one inside; the picture wants
-/// two colours out of it. The instance walk hands back the primitives that
-/// union was made of, so the split is geometric and is stated here once: the
-/// sand — beach and seabed, which are one slab — is the only primitive that
-/// covers the cove in *both* directions, and everything standing on it is rock.
-///
-/// Both halves of that test are load-bearing now that the slab runs on past the
-/// waterline. The headlands are cut like the beach and so are just as long in y
-/// as it is; what separates them is that they are five metres wide in x, not
-/// forty. The cliff is the mirror image — the width, not the length. So the
-/// rule is the conjunction, and a primitive has to be the whole floor to be
-/// sand. Millimetres, because these are world bounds of a vcad solid.
-fn ground_material(world: &Aabb, scene: &CoveScene) -> &'static str {
-    let half = 0.5 * scene.cove * PER_M;
-    let (w, l) = (world.max.x - world.min.x, world.max.y - world.min.y);
-    if w > half && l > half { "sand" } else { "rock" }
-}
+// Which of the cove's surfaces a root is: the one it was declared with.
+//
+// There used to be a function here, and its absence is the change. The
+// geology was one `ground` solid the picture had to take apart again — the
+// sand was whichever primitive covered the cove in *both* directions, and
+// everything else was rock by the parity of the bed its top face landed in —
+// and both halves of that were a footprint measured back off a solid whose
+// pieces the level already knew. It is one root per piece now (`scene.rs`'s
+// module doc says why), and each was declared with the surface it is: `sand`
+// for the beach, `rock` or `limestone` for a bed of the cliff, a headland's
+// step, a boulder, a pool's lip. The parity rule did not go anywhere — it is
+// applied where the bed is laid, by `scene.rs`'s `bed_rock`.
+//
+// So both tiers now read `root.material` and nothing else.
 
 /// The level's daylight: a low afternoon sun and the sky it hangs in.
 ///
@@ -1137,6 +1149,30 @@ fn annulus_mesh(centre: Point3, r_in: f64, r_out: f64, segments: usize) -> TriMe
         let (a0, a1, b0, b1) = (2 * i, 2 * i + 1, 2 * j, 2 * j + 1);
         indices.extend_from_slice(&[a0, a1, b1]);
         indices.extend_from_slice(&[a0, b1, b0]);
+    }
+    TriMesh::new(positions, normals, &indices)
+}
+
+/// A flat disc in the plane `z = centre.z`, facing +z: the water in a tide
+/// pool.
+///
+/// Millimetres and world-placed, like [`annulus_mesh`], because it belongs to
+/// the basin `scene.rs` cut and not to a frame of its own. One vertex at the
+/// centre and a ring round it; the normal is exact for a flat disc.
+fn disc_mesh(centre: Point3, radius: f64, segments: usize) -> TriMesh {
+    let n = Vec3::new(0.0, 0.0, 1.0);
+    let mut positions = vec![centre];
+    let mut normals = vec![n];
+    for i in 0..segments {
+        let th = std::f64::consts::TAU * i as f64 / segments as f64;
+        let (s, c) = th.sin_cos();
+        positions.push(Point3::new(centre.x + radius * c, centre.y + radius * s, centre.z));
+        normals.push(n);
+    }
+    let mut indices: Vec<u32> = Vec::with_capacity(3 * segments);
+    for i in 0..segments as u32 {
+        let j = (i + 1) % segments as u32;
+        indices.extend_from_slice(&[0, 1 + i, 1 + j]);
     }
     TriMesh::new(positions, normals, &indices)
 }
@@ -1415,33 +1451,74 @@ mod tests {
         assert!(!materials::achromatic(picture.being.pbr).is_dispersive());
     }
 
-    /// One primitive of the `ground` root is the floor and every other one is
-    /// rock. The rule is a footprint test (see [`ground_material`]) and the
-    /// footprints moved when the cove was closed: the sand slab now runs
-    /// fourteen metres past the waterline, and the headlands cut out of the
-    /// same plane are exactly as long as it is. So the check is that there is
-    /// still precisely *one* sand — the beach and its seabed — and that the
-    /// cliff, the boulders, the headlands and the reef are all rock.
+    /// **The cove is one beach and a geology on top of it.**
+    ///
+    /// The geology is fifty roots now rather than one solid (`scene.rs`'s
+    /// module doc says why), and each was declared with the surface it is:
+    /// exactly one of them is the beach, and every other piece is one of the
+    /// two bedded rocks by the parity of the bed its top reaches into. This is
+    /// the check that the split survived the move off the footprint rule —
+    /// that there is still one sand, that both beds are actually cut, and that
+    /// nothing else leaked into the geology's colours.
     #[test]
-    fn the_ground_is_one_beach_and_the_rest_of_it_is_rock() -> anyhow::Result<()> {
+    fn the_ground_is_one_beach_and_two_beds_of_rock() -> anyhow::Result<()> {
         let scene = CoveScene::bundled()?;
         let picture = Scene::new(&scene)?;
-        let sand = materials::pbr(&scene.authored.document, "sand").base_color;
-        let rock = materials::pbr(&scene.authored.document, "rock").base_color;
-        // the sea is in `statics` too, and it is neither
-        let water = materials::pbr(&scene.authored.document, "water").base_color;
-        let (mut sands, mut rocks) = (0, 0);
+        let doc = &scene.authored.document;
+        let of = |n: &str| materials::pbr(doc, n).base_color;
+        let (sand, rock, pale, water) = (of("sand"), of("rock"), of("limestone"), of("water"));
+        let (mut sands, mut rocks, mut pales, mut waters) = (0, 0, 0, 0);
         for p in &picture.statics {
             match p.pbr.base_color {
                 c if c == sand => sands += 1,
                 c if c == rock => rocks += 1,
-                c if c == water => {}
-                c => panic!("the ground grew a surface that is neither sand nor rock: {c:?}"),
+                c if c == pale => pales += 1,
+                c if c == water => waters += 1,
+                // the dressing: its own roots, its own substances, and now
+                // painted exactly as these are — by name.
+                _ => {}
             }
         }
-        assert_eq!(sands, 1, "the beach and its seabed are one slab, so exactly one primitive is sand");
-        // three boulders, a sea stack, the cliff, six headland steps and the reef
-        assert!(rocks >= 10, "only {rocks} of the cove's primitives came out as rock");
+        assert_eq!(sands, 1, "the beach and its seabed are one slab and one root, so exactly one primitive is sand");
+        // twelve beds, a buttress, a cornice, six boulders, a sea stack, ten
+        // headland steps, the reef and two pool lips, split between the two
+        // rocks — and neither bed may come out empty, or the parity rule is
+        // painting the whole cliff one colour.
+        assert!(rocks >= 8, "only {rocks} of the cove's primitives came out as the dark bed");
+        assert!(pales >= 4, "only {pales} of the cove's primitives came out as the pale bed");
+        // the sea, and one disc of it in each tide pool
+        assert_eq!(waters, 1 + super::super::dressing::pools(&|n: &str, d: f64| scene.authored.parameter_or(n, d)).len());
+        Ok(())
+    }
+
+    /// **The light path is empty.** The rune is the sun through the hero's lens
+    /// into the keyhole, and the design's one hard rule is that nothing may
+    /// shadow it. The dressing keeps [`super::super::dressing::APRON`] clear in
+    /// front of the door; this is the claim that the segment the rune actually
+    /// travels is inside that apron, so keeping it clear is enough.
+    #[test]
+    fn the_lens_to_keyhole_segment_is_inside_the_apron() -> anyhow::Result<()> {
+        use super::super::{dressing, rune};
+        let scene = CoveScene::bundled()?;
+        let hero = rune::HeroPose::solution(&scene);
+        anyhow::ensure!(hero.is_solved(), "scene.rs has no hero solution");
+        let lens = rune::hero_lens_pose(&scene, &hero).pos;
+        let key = scene.door_frame().origin;
+        let foot = (scene.door_x, scene.cliff_face_y());
+        let apron = dressing::APRON * MM;
+        let mut worst: f64 = 0.0;
+        for k in 0..=64 {
+            let t = k as f64 / 64.0;
+            let p = lens + (key - lens) * t;
+            worst = worst.max((p.x - foot.0).hypot(p.y - foot.1));
+        }
+        println!("the rune travels at most {:.2} m from the door's foot; the apron is {apron:.2} m", worst);
+        assert!(worst < apron, "the rune reaches {worst:.2} m out, past the {apron:.2} m apron the dressing keeps clear");
+        // …and the sun's own half of it needs no apron at all: the sun travels
+        // shoreward and down, so every point between it and the lens is
+        // further from the cliff than the lens is, and nothing standing
+        // between the hero and the door can be in it at any height.
+        assert!(scene.sun_dir().y < 0.0 && scene.sun_dir().z > 0.0, "the sun is over the sea and above the horizon");
         Ok(())
     }
 
@@ -1529,8 +1606,8 @@ pub struct RasterMesh {
 /// The cove, tessellated once, for the raster tier.
 ///
 /// The same walk [`Scene::new`] does — the document's roots into placed
-/// primitives, `ground_material` splitting the one ground solid into sand and
-/// rock, the door picked out by its root — with `to_mesh` where that builds a
+/// primitives, each root painted with the surface it was declared with, the
+/// door picked out by its root — with `to_mesh` where that builds a
 /// BVH. The normals are **smoothed** throughout, with `hero/stage.rs`'s own
 /// welding rule, because a raster tier has no analytic surface to fall back on
 /// and a facetted cliff is a low-poly mountain.
@@ -1554,9 +1631,7 @@ pub fn raster_meshes(scene: &CoveScene) -> anyhow::Result<Vec<RasterMesh>> {
             let (role, material) = if root.material == "door" || root.material == materials::DOOR {
                 (Role::Door, materials::DOOR.to_owned())
             } else {
-                let local = aabb_of(&positions);
-                let world = transform_aabb(&local, &to_world);
-                (Role::Ground, ground_material(&world, scene).to_owned())
+                (Role::Ground, root.material.clone())
             };
             out.push(RasterMesh {
                 name: root.material.clone(),
@@ -1591,6 +1666,22 @@ pub fn raster_meshes(scene: &CoveScene) -> anyhow::Result<Vec<RasterMesh>> {
         ),
         Role::Rim,
     ));
+
+    // The tide pools' water, exactly as the tracer lays it: the same disc at
+    // the same fill, so the two tiers put the same surface in the same basin.
+    for p in super::dressing::pools(&|n: &str, d: f64| a.parameter_or(n, d)) {
+        let z = scene.sand_z_at(p.x * MM, p.y * MM) * PER_M - p.depth + p.fill();
+        out.push(mesh_part(
+            "pool",
+            "water",
+            disc_mesh(
+                Point3::new(p.x, p.y, z),
+                p.water_r(),
+                a.parameter_or("pool_segments", 48.0).max(8.0) as usize,
+            ),
+            Role::Ground,
+        ));
+    }
 
     let glint_r = scene.glint_r * PER_M;
     out.push(mesh_part(
@@ -1739,13 +1830,6 @@ fn rows(t: &Transform) -> [[f64; 4]; 4] {
     ]
 }
 
-fn aabb_of(positions: &[[f64; 3]]) -> Aabb {
-    let mut b = Aabb::empty();
-    for p in positions {
-        b.include_point(&Point3::new(p[0], p[1], p[2]));
-    }
-    b
-}
 
 /// The door's hinge turn at `angle`, as the raster tier's rows.
 ///

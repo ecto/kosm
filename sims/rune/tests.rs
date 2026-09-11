@@ -445,3 +445,135 @@ fn the_reef_has_no_gap_the_being_fits_through() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// The ground is fifty roots and no boolean. `scene.rs`'s module doc is the
+// argument — the sign of a mesh signed distance is the nearest triangle's
+// pseudonormal, so outside the union a soup of parts and their union agree
+// exactly — and everything below is the argument checked where it is allowed
+// to be delicate: *inside*, in the first few millimetres a foot ever reaches.
+
+/// The field at a point, or a readable error.
+fn at(baked: &crate::skatepark::Baked, p: phyz_math::Vec3) -> anyhow::Result<f64> {
+    baked.sdf.sample(p).ok_or_else(|| anyhow::anyhow!("({:+.2}, {:+.2}, {:+.2}) m is outside the baked volume", p.x, p.y, p.z))
+}
+
+/// **The sand is under the feet that stand on it.** Five millimetres below the
+/// sand plane is inside the ground and five above is outside, at the spawn and
+/// at the pose the hero solves the rune from.
+///
+/// This is the check the split into roots is most exposed to. The hero stands
+/// 1.14 m off the cliff's face, which is where the beach slab, the cliff's
+/// lowest beds and the buttress all overlap: if any of their buried faces came
+/// within a foot's penetration of the sand there, the field five millimetres
+/// down would take that face's sign and the boots would find nothing to stand
+/// on. It is also the one place in the cove where being wrong would be
+/// invisible — the still would render, the solve would solve, and the figure
+/// would sink.
+#[test]
+fn the_field_is_the_sand_where_the_being_stands() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    let eps = 0.005;
+    for (what, x, y) in [
+        ("the spawn", scene.spawn_x, scene.spawn_y),
+        ("the solved standing point", scene.hero_x, scene.hero_y),
+        ("the capsule's solution", scene.solution_x, scene.solution_y),
+    ] {
+        let z = scene.sand_z_at(x, y);
+        let on = at(baked, phyz_math::Vec3::new(x, y, z))?;
+        let up = at(baked, phyz_math::Vec3::new(x, y, z + eps))?;
+        let down = at(baked, phyz_math::Vec3::new(x, y, z - eps))?;
+        println!("{what} at ({x:+.2}, {y:+.2}) m: the field is {:+.1} mm on the sand, {:+.1} mm {:.0} mm above it and {:+.1} mm below", on * 1e3, up * 1e3, eps * 1e3, down * 1e3);
+        assert!(up > 0.0, "{what}: {:.1} mm over the sand the field reads {:+.2} mm, which is inside the ground", eps * 1e3, up * 1e3);
+        assert!(down < 0.0, "{what}: {:.1} mm under the sand the field reads {:+.2} mm, which is outside the ground", eps * 1e3, down * 1e3);
+        assert!(on.abs() < scene.cell / 20.0, "{what}: the sand plane itself reads {:+.2} mm", on * 1e3);
+    }
+    Ok(())
+}
+
+/// **The cliff is a wall, and the wall is where the beds say it is.**
+///
+/// Walk up the cliff's face and, at each height, read across it: 400 mm out in
+/// the cove is air, the rock starts within a centimetre of where the bed
+/// lattice puts that bed's face, and from there it is rock for 100 mm — the
+/// cell contact is solved in, and deeper than a foot is ever pushed.
+///
+/// A hundred and not three hundred, because the cove's recess is 220 mm deep
+/// and the beds share their bedding planes: half a metre inside the rock the
+/// nearest surface is a bedding plane rather than the face, and there the soup
+/// and the union disagree about the sign. `scene.rs`'s bed loop has the
+/// measurement and the two arrangements that were tried. None of it reaches the
+/// cell the face is resolved in, which is what this reads.
+///
+/// **Except within 200 mm of a bedding plane**, and the exception is older than
+/// this file. A bedding plane is a grid plane (the lattice is 1.1 m, the cell
+/// is 0.1 m, and the sill is on both), so a whole row of nodes lands exactly in
+/// the plane of the overhang a proud bed makes — and there the two triangles
+/// that meet at that convex edge are exactly equidistant, because
+/// [`crate::skatepark::collision_mesh`] hands [`kosm_scan::TriMesh`] an
+/// *unwelded* soup and an unwelded edge carries one face's normal instead of
+/// the sum of two. The tie goes to whichever the BVH reaches first, and when it
+/// is the underside the whole row reads negative. The field baked from the one
+/// unioned solid this pass replaced has the identical rows, node for node, so
+/// the exception is not the split into roots — it is the weld, and it belongs
+/// in `collision_mesh`.
+#[test]
+fn the_cliff_is_a_wall_at_every_bed() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    // Clear of the doorway and its buttress, and of the fall of rock at the
+    // cliff's foot.
+    let x = scene.door_x - 3.0;
+    let face = scene.cliff_face_y();
+    let (sill, h) = (scene.door_sill(), scene.strata_h);
+    let relief = scene.authored.parameter_or("strata_relief_mm", 220.0) * kosm::scene::MM;
+    let batter = scene.authored.parameter_or("batter_deg", 2.5).to_radians().tan();
+    // Where the union's face is at that height: the bed lattice, exactly as
+    // `scene.rs` lays it.
+    let face_at = |z: f64| {
+        let k = ((z - sill) / h).floor();
+        // the bed's own top, clamped at the skyline exactly as `scene.rs` clamps it
+        let z1 = (sill + (k + 1.0) * h).min(scene.cliff_top());
+        let proud = if (k as i64).rem_euclid(2) == 1 { relief } else { 0.0 };
+        face - proud + batter * (z1 - sill)
+    };
+    let deep = 0.1;
+    let (mut heights, mut worst, mut worst_at) = (0usize, f64::NEG_INFINITY, (0.0, 0.0));
+    let mut z = scene.door_sill() + 0.3;
+    while z < scene.cliff_top() - 0.1 {
+        // the unwelded-edge rows, above
+        if ((z - sill) / h).fract().min(1.0 - ((z - sill) / h).fract()) * h < 0.20 {
+            z += 0.02;
+            continue;
+        }
+        let f = face_at(z);
+        let air = at(baked, phyz_math::Vec3::new(x, f - 0.4, z))?;
+        assert!(air > 0.0, "the cove reads {:+.0} mm — inside the ground — 400 mm off the cliff at z = {z:.2} m", air * 1e3);
+        let lip = at(baked, phyz_math::Vec3::new(x, f - 0.01, z))?;
+        assert!(lip > 0.0, "the field puts the cliff 10 mm in front of the bed lattice's face at z = {z:.2} m");
+        let mut y = f + 0.01;
+        while y <= f + deep {
+            let d = at(baked, phyz_math::Vec3::new(x, y, z))?;
+            if d > worst {
+                worst = d;
+                worst_at = (y, z);
+            }
+            y += 0.01;
+        }
+        heights += 1;
+        z += 0.02;
+    }
+    println!(
+        "{heights} heights up the cliff face: the nearest the field comes to reading air inside the first 100 mm of rock is {:+.1} mm, at ({:+.2}, {:.2}) m",
+        worst * 1e3,
+        worst_at.0,
+        worst_at.1
+    );
+    assert!(
+        worst < 0.0,
+        "the field reads {:+.1} mm — outside the ground — at y = {:+.2} m, z = {:.2} m, inside the first 100 mm of the cliff",
+        worst * 1e3,
+        worst_at.0,
+        worst_at.1
+    );
+    Ok(())
+}

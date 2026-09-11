@@ -1,11 +1,14 @@
 //! The cove baked into a map a body can stand on.
 //!
-//! The skatepark's bake path, pointed at [`super::scene`]: every root but
-//! the door — the beach, the cliff and the rocks are one solid, so that is the
-//! `ground` root — goes into `mesh.stl` and decides the sign of the field. The
-//! door is left out because it is the one part of the level that moves; until
-//! it is a hinged body it is a door-shaped hole in the cliff, which is what a
-//! doorway is.
+//! The skatepark's bake path, pointed at [`super::scene`]: every
+//! [`ground`](super::is_ground) root — the beach, the cliff's beds, the
+//! headlands, the reef, the boulders and the pools' lips — goes into
+//! `mesh.stl` as triangles and together they decide the sign of the field.
+//! They are separate solids and no union holds them together; `scene.rs`'s
+//! module doc is the argument for why the field does not care. The door is
+//! left out because it is the one part of the level that moves; until it is a
+//! hinged body it is a door-shaped hole in the cliff, which is what a doorway
+//! is.
 //!
 //! The field is sampled over the cove square, from a metre under the waterline
 //! to the top of the cliff. At the document's 100 mm cell that is 401 × 401 ×
@@ -28,8 +31,15 @@ use crate::skatepark::{self, Baked};
 
 /// Bake the cove into `dir`: `mesh.stl`, `sdf.bin`, `map.toml`, the SVG, and
 /// `parts/<root>.stl` for everything the level draws, the door included.
+///
+/// It is handed [`CoveScene::solids`] and not the whole document, for the
+/// reason [`super::is_solid_root`] gives: `bake_parts` draws its `park.svg`
+/// from whatever it is given, and a drawing of the whole level is a drawing of
+/// six hundred blades of marram. The geology and the door are what a map's
+/// companion drawing is *of*, and it is the same view `kosm run rune` writes
+/// beside the STL — minutes, and now a third of a second.
 pub fn bake(scene: &CoveScene, dir: &Path) -> anyhow::Result<Baked> {
-    skatepark::bake_parts(&scene.authored, &scene.parts()?, scene.opts(), dir)
+    skatepark::bake_parts(&scene.solids(), &scene.parts()?, scene.opts(), dir)
 }
 
 /// How far the baked field is from zero on the sand, sampled up the fall line
@@ -57,11 +67,18 @@ pub const ROLL_GUARD: f64 = 1.0;
 /// Bake the cove and roll the marble down it, printing both.
 pub fn run(scene: &CoveScene, out: &Path) -> anyhow::Result<()> {
     let dir = out.join("maps").join("cove");
+    // The two halves, separately: evaluating the level's solid roots to
+    // triangles, and turning those triangles into a field. The first is the
+    // one the dressing pass made minutes long, so it is printed rather than
+    // folded into the second.
+    let t_eval = std::time::Instant::now();
+    let parts = scene.parts()?;
+    let eval_s = t_eval.elapsed().as_secs_f64();
     let t0 = std::time::Instant::now();
-    let baked = bake(scene, &dir)?;
+    let baked = skatepark::bake_parts(&scene.solids(), &parts, scene.opts(), &dir)?;
     let s = &baked.sdf;
     println!(
-        "cove bake: {} roots, {} collision tris → {}  sdf {}×{}×{} at {:.0} mm cells ({} cells, {:.0} MB), baked in {:.1} s",
+        "cove bake: {} roots evaluated in {eval_s:.1} s, {} collision tris → {}  sdf {}×{}×{} at {:.0} mm cells ({} cells, {:.0} MB), baked in {:.1} s",
         baked.parts,
         baked.tris,
         dir.display(),
