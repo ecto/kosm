@@ -56,6 +56,12 @@ struct Uniforms {
     air: [f32; 4],
     screen: [f32; 4],
     shadow_m: [f32; 4],
+    /// The sea's scattering per RGB metre, and `w` the foam's depth in metres.
+    sea_scatter: [f32; 4],
+    /// `x` the foam's strength, `y` the wet band's width in metres, `zw` spare.
+    sea_shore: [f32; 4],
+    /// The foam's linear-RGB albedo, from the library's `sea foam`.
+    foam_albedo: [f32; 4],
 }
 
 /// What the ambient-occlusion pass and its two blurs read. See
@@ -1028,6 +1034,19 @@ impl Raster {
                 fr.depth_m,
                 (scene.sun.angular_radius as f32).tan(),
                 fr.texel_m,
+            ],
+            sea_scatter: [
+                sea.scatter[0] as f32,
+                sea.scatter[1] as f32,
+                sea.scatter[2] as f32,
+                sea.foam_depth as f32,
+            ],
+            sea_shore: [sea.foam_strength as f32, sea.wet_band as f32, 0.0, 0.0],
+            foam_albedo: [
+                sea.foam_albedo[0] as f32,
+                sea.foam_albedo[1] as f32,
+                sea.foam_albedo[2] as f32,
+                0.0,
             ],
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));

@@ -17,6 +17,10 @@
 // up, is indistinguishable and is the difference between a pass that costs
 // two milliseconds and one that costs half.
 //
+// The cosine an occluder has to clear above the receiver's own tangent plane
+// before it counts. Six degrees; see `fs_ao` for what it is protecting against.
+const ANGLE_BIAS: f32 = 0.1;
+
 // The estimator is the plain hemisphere kind — sample points in a ball of
 // `radius_m` around the pixel, project each back to the screen, and count the
 // ones the depth buffer says are in front — with the usual range check so a
@@ -165,17 +169,29 @@ fn fs_ao(in: Out) -> @location(0) vec4<f32> {
         // Is the surface the depth buffer holds *in front of* the sample?
         // Then the sample is inside something and this direction is blocked.
         let gap = length(sample - a.eye.xyz) - length(seen.xyz - a.eye.xyz);
-        if gap > bias {
-            // **The range check, and nothing else.** A blocker further away
-            // than the radius is not this pixel's occluder — it is the cliff
-            // behind the hero — and without this a silhouette against a
-            // distant background darkens everything it overlaps. What it must
-            // *not* be is a weight that falls off as the blocker gets nearer,
-            // which is the mistake that made a wall's own foot lighter than
-            // the floor a metre out from it.
-            let d = length(seen.xyz - here.xyz);
-            occluded = occluded + clamp(radius / max(d, 1e-4), 0.0, 1.0);
+        if gap <= bias {
+            continue;
         }
+        let toward = seen.xyz - here.xyz;
+        let d = length(toward);
+        // **The angle bias, and it is not optional.** A blocker has to be
+        // genuinely *above* this pixel's own tangent plane. Without the test a
+        // flat wall occludes itself: the normal comes from a depth gradient,
+        // the neighbouring texels of a surface seen at a slant differ by more
+        // than the depth bias, and half the taps come back "blocked" in a
+        // pattern that follows the sampling spiral — which drew a set of faint
+        // diagonal stripes down the cove's cliff, on a face with nothing in
+        // front of it at all.
+        if dot(n, toward / max(d, 1e-6)) <= ANGLE_BIAS {
+            continue;
+        }
+        // **The range check.** A blocker further away than the radius is not
+        // this pixel's occluder — it is the cliff behind the hero — and
+        // without this a silhouette against a distant background darkens
+        // everything it overlaps. What it must *not* be is a weight that falls
+        // off as the blocker gets *nearer*, which is the mistake that made a
+        // wall's own foot lighter than the floor a metre out from it.
+        occluded = occluded + clamp(radius / max(d, 1e-4), 0.0, 1.0);
     }
     return vec4<f32>(clamp(1.0 - occluded / 16.0, 0.0, 1.0));
 }

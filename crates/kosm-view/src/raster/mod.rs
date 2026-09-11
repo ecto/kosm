@@ -102,7 +102,7 @@ pub use material::{GpuMaterial, band_to_rgb, library_gpu};
 pub use pipeline::{Frame, Raster};
 pub use probes::ProbeVolume;
 pub use settle::{Settle, SettleReport};
-pub use water::Sea;
+pub use water::{COVE_SCATTER, Sea, absorption_per_m};
 
 use probes::BANDS;
 

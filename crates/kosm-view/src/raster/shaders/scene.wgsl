@@ -45,9 +45,9 @@ struct Uniforms {
     swell: vec4<f32>,
     // its angles and speed: angle1, angle2, speed, the water's index
     swell_angle: vec4<f32>,
-    // the sea's absorption per RGB metre, w the seabed's material index
+    // the sea's absorption per RGB metre, w the *water's* material index
     sea_absorb: vec4<f32>,
-    // x the water's material index, y whether there is a sea at all, zw spare
+    // x the *seabed's* material index, y whether there is a sea at all, zw spare
     sea_flags: vec4<u32>,
     // two receiver rectangles: origin.xyz + w unused, then the u and v edges
     caustic_origin: array<vec4<f32>, 2>,
@@ -73,6 +73,13 @@ struct Uniforms {
     // the sun's shadow frustum in world metres: its width, its depth range,
     // the tangent of the sun's angular radius, and one texel of its width
     shadow_m: vec4<f32>,
+    // the sea's scattering per RGB metre, w the foam's depth in metres. What
+    // the water gives back rather than eats; `water.rs` is the argument.
+    sea_scatter: vec4<f32>,
+    // x the foam's strength, y the wet band's width in metres, zw spare
+    sea_shore: vec4<f32>,
+    // the foam's linear-RGB albedo, from the library's `sea foam`
+    foam_albedo: vec4<f32>,
 };
 
 struct GpuMaterial {
@@ -158,6 +165,72 @@ fn swell_normal(x: f32, y: f32) -> vec3<f32> {
     let a1 = u.swell.x * k1 * cos(k1 * (x * c1 + y * s1) - t);
     let a2 = u.swell.z * k2 * cos(k2 * (x * c2 + y * s2) + 1.7 - t);
     return normalize(vec3<f32>(-(a1 * c1 + a2 * c2), -(a1 * s1 + a2 * s2), 1.0));
+}
+
+// ---- the shore -------------------------------------------------------------
+//
+// `water.rs::Sea::depth`, `::foam` and `::wet` are these three functions in
+// Rust and the tests there are what holds the two copies together. The foam
+// and the wet band are **raster-only decorations**: the reference tracer
+// draws one smooth opaque sea and one dry beach, so wherever the tiers are
+// differenced these two regions are excluded and the parity test says so.
+
+// How much water stands over the seabed under a point of the surface. Never
+// negative: where the trough is under the sand there is none, and that is
+// where the foam is.
+fn sea_depth(x: f32, y: f32) -> f32 {
+    let bed = u.sea.x + u.sea.y * (y - u.sea.z);
+    return max(u.sea.x + swell_height(x, y) - bed, 0.0);
+}
+
+// The foam, 0..1. A band where the water has run out, whose edge is displaced
+// by the swell's own phase so it breathes with the sets instead of lying on
+// the beach as a contour line, plus the crests of the swell while it is still
+// shallow — which is a wave breaking.
+fn foam_at(x: f32, y: f32) -> f32 {
+    let strength = u.sea_shore.x;
+    if strength <= 0.0 {
+        return 0.0;
+    }
+    let e = max(u.sea_scatter.w, 1e-4);
+    let amp = max(u.swell.x + u.swell.z, 1e-4);
+    let h = swell_height(x, y);
+    let d = sea_depth(x, y);
+    let edge = max(e * (1.0 + 0.6 * h / amp), 1e-4);
+    let band = 1.0 - smoothstep(0.0, edge, d);
+    let crest = smoothstep(0.45 * amp, 0.95 * amp, h)
+        * (1.0 - smoothstep(8.0 * e, 30.0 * e, d));
+    return clamp(strength * max(band, crest), 0.0, 1.0);
+}
+
+// How wet the ground at a point is: one at and under the water, nothing a
+// band above the swell's current top.
+fn wet_at(p: vec3<f32>) -> f32 {
+    if u.sea_flags.y == 0u {
+        return 0.0;
+    }
+    let level = u.sea.x + swell_height(p.x, p.y);
+    if u.sea_shore.y <= 0.0 {
+        return select(0.0, 1.0, p.z <= level);
+    }
+    return 1.0 - smoothstep(0.0, u.sea_shore.y, p.z - level);
+}
+
+// `kosm::material::Material::wet`'s rule, as a factor: albedo x0.6, roughness
+// x0.75, and the dielectric highlight a wet grain has and a dry one does not.
+// One entry in the library, one rule, applied here to the pixels the sea
+// actually reaches rather than to a second material.
+fn wetted(m: GpuMaterial, w: f32) -> GpuMaterial {
+    var o = m;
+    if w <= 0.0 {
+        return o;
+    }
+    let k = 1.0 - 0.4 * w;
+    o.albedo[0] = m.albedo[0] * k;
+    o.albedo[1] = m.albedo[1] * k;
+    o.roughness = m.roughness * (1.0 - 0.25 * w);
+    o.specular = mix(m.specular, max(m.specular, 0.5), w);
+    return o;
 }
 
 @vertex
@@ -369,6 +442,14 @@ fn sun_shadow(p: vec3<f32>, n: vec3<f32>) -> f32 {
     // the whole frustum away — capped at eight texels, because past that the
     // taps scatter into geometry that has nothing to do with this pixel.
     let search = clamp(tan_a * depth_m * per_m, texel, 8.0 * texel);
+    // **The blocker search needs the bias of its own radius, not of a texel.**
+    // A lit plane that leans away from the sun rises across the search disc by
+    // the slope times its *width*; tested against a one-texel bias, half the
+    // taps on a flat sunlit cliff come back as blockers, the penumbra estimate
+    // follows the sixteen-tap spiral, and the wall wears a set of faint
+    // diagonal stripes. Scaling the same slope-scaled bias by how many texels
+    // wide the search is is the whole fix.
+    let search_bias = bias * max(search / texel, 1.0);
     var blocker = 0.0;
     var found = 0.0;
     for (var i = 0u; i < 16u; i = i + 1u) {
@@ -381,7 +462,7 @@ fn sun_shadow(p: vec3<f32>, n: vec3<f32>) -> f32 {
             vec2<i32>(i32(side) - 1, i32(side) - 1),
         );
         let d = textureLoad(shadow_tex, q, 0);
-        if d < ndc.z - bias {
+        if d < ndc.z - search_bias {
             blocker = blocker + d;
             found = found + 1.0;
         }
