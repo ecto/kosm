@@ -22,6 +22,31 @@
 //!   [`RUN`] m/s, and a diagonal that is not faster than a straight.
 //! - **gait** ([`super::gait`]) and **the tool socket** ([`super::tool`]).
 //!
+//! …and four more that make it a game rather than a walk cycle, every one of
+//! them a joint target or a contact and none of them a number added to a
+//! velocity:
+//!
+//! - **the push-off** — [`Push`] is a squat, an extension and an absorb, all
+//!   three of them one *hip height* ([`Consts::leg`]) turned into two joint
+//!   angles by the leg's own triangle. The leg extends against the ground and
+//!   the contact solver supplies the reaction; nothing anywhere writes a
+//!   take-off speed. [`CROUCH_DEEP`], [`PUSH_MS`] and [`PUSH_GAIN`] are what
+//!   move the apex, and `tests/feel.rs` is what says where it landed.
+//! - **the air** — with nothing under the feet and nothing in the hands the
+//!   drive force is *zero* ([`Body::root_force`]). The upright spring's
+//!   torque stays, because a torque moves angular momentum and not a centre of
+//!   mass; [`AIR_YAW_RATE`] is the one approximation and says so.
+//! - **the hands** — [`Hold`] is a mantle: a lip out of
+//!   [`super::ground::Ground::ledge_ahead`], a half-second trajectory up and
+//!   then over, and a capped pull that is the force a pinned hand would need.
+//! - **the forgiveness** — [`Forgiveness`] is coyote time and a jump buffer,
+//!   two counters and a frame, with no physics in it at all.
+//!
+//! And four things that are only there to be *watched*: the anticipation
+//! before a jump, the dip after a landing, a neck that keeps the eyes level
+//! and leads the walk, and [`Dangle`] — cloth on a body, a hood and a satchel
+//! on soft joints, swinging.
+//!
 //! The whole thing is also a [`crate::step::Step`] over a [`World`], with the
 //! [`Drive`] packed into an [`Action`] — see [`BodyStep`] — so a policy drives
 //! the same body a player does.
@@ -29,7 +54,7 @@
 //! Metres, radians, seconds; z up. The body's own frame is `+x` forward,
 //! `+y` left, `+z` up.
 
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 use std::sync::Arc;
 
 use phyz_contact::{ContactCache, ContactMaterial};
@@ -38,7 +63,7 @@ use phyz_model::{GeomInstance, Geometry, Model, ModelBuilder, State};
 use phyz_rigid::forward_kinematics;
 
 use super::gait::Gait;
-use super::ground::{Ground, step_on};
+use super::ground::{Ground, LedgeProbe, step_on};
 use super::medium::{Immersed, Medium};
 use super::tool::{Pose, Tool};
 use crate::step::{Action, Step};
@@ -152,6 +177,176 @@ pub const JOINT_ZETA: f64 = 1.5;
 /// is worth all of `μ N`. See [`Consts::drive`].
 pub const SLIDING: f64 = 0.15;
 
+// ---- the jump ---------------------------------------------------------------
+
+/// A boot's grip on sand: what a *running* body needs and a sliding capsule
+/// does not.
+///
+/// The capsule keeps [`BodySpec::capsule`]'s 0.35 and that is not an
+/// oversight. 0.35 is the number `sims/rune` chose for a body that is *meant*
+/// to slide — a glass capsule on wet sand, deliberately far below the marble's
+/// grip, so that the level's own sea and its slopes read the way they were
+/// written. A boot is not glass. Leather on damp sand measures around 0.6–0.7,
+/// and the difference is what makes an acceleration *friction-limited* rather
+/// than controller-limited: at 0.35 the ground can only carry `μ g` = 3.4 m/s²
+/// and a start to 2.6 m/s takes 0.76 s whatever the controller asks for; at
+/// 0.65 it can carry 6.4 and the run arrives in the time constant. It is also
+/// what makes a turnaround *skid*: the friction circle is finite either way,
+/// and a body asking for more than `μ g` sideways slides, visibly.
+pub const BOOT_FRICTION: f64 = 0.65;
+
+/// How deep a tap of the jump key squats before it pushes, metres of drop at
+/// the hips.
+pub const CROUCH_TAP: f64 = 0.062;
+
+/// And how deep a full wind-up does. Bounded by the leg: the hip cannot get
+/// closer to the ankle than the two bones fold to.
+pub const CROUCH_DEEP: f64 = 0.100;
+
+/// The anticipation every jump has, seconds: how long the squat takes before
+/// the push begins even for a tap.
+///
+/// It is latency and it is *worth* it. A body that leaves the ground on the
+/// same frame the key went down has no push in it — the legs are still
+/// straight, there is nothing to extend — so the jump would have to be a
+/// number added to a velocity, which is the thing this controller is written
+/// not to do. Eighty milliseconds is five frames at sixty: long enough for the
+/// squat to be on screen, short enough that the hand does not feel it.
+pub const WIND_MIN: f64 = 0.160;
+
+/// How fast the squat's own target arrives, seconds. Shorter than
+/// [`WIND_MIN`], so the legs have time to *get* there before the push starts:
+/// a 67 mm squat is 67 mm of hip travel through a contact solver, and asking
+/// for it in eighty milliseconds bought seven.
+pub const SQUAT_MS: f64 = 0.060;
+
+/// The longest a held key deepens the squat for, seconds — [`WIND_MIN`] plus
+/// the design's 150 ms of wind-up.
+pub const WIND_MAX: f64 = WIND_MIN + 0.150;
+
+/// How long the leg's target takes to travel from the squat to full
+/// extension, seconds.
+pub const PUSH_MS: f64 = 0.035;
+
+/// How far *past* straight the push commands the knee, radians.
+///
+/// The joint limit is what actually stops the knee; commanding the target only
+/// as far as straight would have the PD's error — and so its torque — fall to
+/// zero exactly where the body still needs pushing. Overdriving keeps the
+/// torque up all the way to the limit, which is what a leg does.
+pub const PUSH_OVER_RAD: f64 = 0.60;
+
+/// How far in front of the toes the hands can reach for a lip, metres, and how
+/// far past it the climb puts the body down.
+pub const MANTLE_REACH: f64 = 0.55;
+pub const MANTLE_OVER: f64 = 0.35;
+
+/// How much harder a leg joint pulls while it is pushing off, as a multiple
+/// of its standing stiffness.
+///
+/// The one number in the jump that is *tuned* rather than derived, and this is
+/// what it is tuned against: `tests/feel.rs` measures the apex of a tap and of
+/// a wind-up and this is the knob that moves both. Everything else about the
+/// jump — the travel, the exit velocity, the flight time, the distance a
+/// running jump covers — falls out of the contact solver once this is set.
+pub const PUSH_GAIN: f64 = 4.0;
+
+/// And how much of its damping it keeps.
+///
+/// **A leg extending explosively is not a damped leg.** [`JOINT_ZETA`]'s 1.5
+/// is written for a limb nobody wants to watch ring, and with
+/// [`JOINT_ARMATURE`]'s rotor in it that is a damper of about 32 N·m·s/rad on
+/// a knee — which at the 49 rad/s a push-off asks for is three thousand
+/// newton-metres against it. Measured before this constant existed: the knee's
+/// extension rate saturated at 1.9 m/s however hard the spring pulled, and the
+/// wind-up jumped 0.17 m. The damper is what a stance needs and a push-off
+/// does not.
+pub const PUSH_DAMP: f64 = 1.0;
+
+/// How fast a body has to be coming down for its arrival to be a *landing*,
+/// m/s.
+///
+/// A run has a flight phase; the foot that ends it is arriving at half a metre
+/// a second and is a stride, not an event. A jump's landing arrives at three
+/// and a half. Under this the knees take it without being told and no camera
+/// is kicked.
+pub const LANDING_MPS: f64 = 0.8;
+
+/// How long a landing takes to absorb, seconds.
+pub const ABSORB_S: f64 = 0.25;
+
+/// The deepest a landing dips the hips, metres, and how much of an impulse it
+/// takes to get there. A drop from a metre is about 130 N·s on a 30 kg body.
+pub const DIP_MAX: f64 = 0.060;
+pub const DIP_PER_IMPULSE: f64 = 0.060 / 110.0;
+
+/// How fast a body may turn in the air, rad/s.
+///
+/// **An approximation, and a small one.** Angular momentum about the vertical
+/// is conserved for a body with nothing to push on, so a figure in the air
+/// cannot turn *for free* — but it is not rigid either: swinging the arms and
+/// the trailing leg one way turns the trunk the other, and a cat does rather
+/// better than this with no external torque at all. The rig has the limbs and
+/// not the controller for them, so the yaw the player asks for is applied to
+/// the facing and the upright spring turns the whole body onto it, capped at a
+/// rate a real counter-swing could plausibly buy. It is a torque and never a
+/// force, so the centre of mass is untouched: the parabola is gravity's.
+pub const AIR_YAW_RATE: f64 = PI;
+
+/// The forgiveness windows, in frames at sixty.
+pub const COYOTE_FRAMES: usize = 8;
+pub const BUFFER_FRAMES: usize = 6;
+
+/// The frame those windows are quoted in, seconds.
+pub const FRAME: f64 = 1.0 / 60.0;
+
+// ---- the mantle -------------------------------------------------------------
+
+/// The lowest lip worth taking in the hands, metres. Below it, walk up.
+pub const MANTLE_MIN: f64 = 0.30;
+
+/// The highest, metres.
+///
+/// 1.2 for the hero, which is above its own head and below the cove's
+/// headland risers at 1.6 — so the level's edges stay edges unless the level
+/// says otherwise.
+pub const MANTLE_MAX: f64 = 1.20;
+
+/// How long a climb takes, seconds.
+pub const MANTLE_S: f64 = 0.50;
+
+/// How often the field is asked whether there is a lip, seconds.
+pub const MANTLE_POLL: f64 = 0.020;
+
+/// How hard the hands may pull, as a multiple of body weight. A person can
+/// hold about twice their own weight on two hands for half a second.
+pub const MANTLE_PULL: f64 = 8.0;
+
+// ---- the cute -----------------------------------------------------------------
+
+/// How often a standing body breathes, Hz, and how far the hips rise and fall
+/// with it, metres.
+pub const BREATH_HZ: f64 = 0.25;
+pub const BREATH_M: f64 = 0.005;
+
+/// How far the head leads the walk, seconds of look-ahead, and how far it
+/// tilts into a turn, radians per rad/s of yaw.
+pub const LOOK_AHEAD_S: f64 = 0.35;
+pub const HEAD_TILT: f64 = 0.10;
+
+/// How far an ankle bends, radians. Forty-five degrees, which is past a
+/// person's and about right for a boot on a figure whose legs are 210 mm long.
+pub const ANKLE_MAX: f64 = 0.80;
+
+/// How much the stance leg straightens over a stride, as a fraction of the
+/// hip's swing — the vertical bob.
+///
+/// The hero's legs are 210 mm long with 14 mm of slack ([`Gait`]'s module
+/// docs), so a stride is a bob rather than a step; this is what makes the bob
+/// *read*. It is a real one: the stance knee extends, the hips rise, and the
+/// swing knee bends to carry the foot over. Nothing is added to a height.
+pub const BOB_RATIO: f64 = 2.5;
+
 // ---- the description -------------------------------------------------------
 
 /// A lump of stuff: a capsule between two points, or a ball when they are the
@@ -232,6 +427,31 @@ pub enum PivotKind {
     Spherical,
 }
 
+/// A link that is not held anywhere: cloth on a body, swinging.
+///
+/// A hood or a satchel is not a limb. It has no business being held at a pose
+/// by a joint stiff enough to carry a ground reaction, and it has no business
+/// hanging straight down either — a cowl sits on a head and a bag rides a hip,
+/// and where they *sit* is where the costume put them. So a dangler's PD is a
+/// soft spring about its own rest pose at `omega`, damped at `zeta`, with the
+/// same gravity compensation every other joint gets so the rest pose is the
+/// rest pose rather than a sag.
+///
+/// `zeta` is never below 0.5 anywhere in this crate. Under that the thing
+/// wobbles for a second after every step and the figure reads as floppy
+/// instead of as cloth; at 0.6 a landing bounces it once and it is done.
+#[derive(Clone, Copy, Debug)]
+pub struct Dangle {
+    pub omega: f64,
+    pub zeta: f64,
+}
+
+impl Dangle {
+    pub fn new(omega: f64, zeta: f64) -> Self {
+        Self { omega, zeta: zeta.max(0.5) }
+    }
+}
+
 /// One link of the rig: a joint, and the stuff that hangs off it.
 #[derive(Clone, Debug)]
 pub struct Link {
@@ -249,11 +469,19 @@ pub struct Link {
     pub collision: Vec<Lump>,
     /// A revolute joint's soft limits, radians.
     pub limits: Option<[f64; 2]>,
+    /// Cloth rather than limb: a soft spring about the rest pose. See
+    /// [`Dangle`].
+    pub dangle: Option<Dangle>,
 }
 
 impl Link {
     pub fn new(name: impl Into<String>, pivot: Vec3, kind: PivotKind, parent: Option<usize>) -> Self {
-        Self { name: name.into(), pivot, kind, parent, lumps: Vec::new(), collision: Vec::new(), limits: None }
+        Self { name: name.into(), pivot, kind, parent, lumps: Vec::new(), collision: Vec::new(), limits: None, dangle: None }
+    }
+
+    pub fn dangling(mut self, omega: f64, zeta: f64) -> Self {
+        self.dangle = Some(Dangle::new(omega, zeta));
+        self
     }
 
     pub fn with(mut self, lump: Lump) -> Self {
@@ -295,6 +523,9 @@ impl Foot {
 pub struct Leg {
     pub hip: usize,
     pub knee: usize,
+    /// The boot's own joint: what keeps the sole on the ground while the two
+    /// bones above it fold. See [`ANKLE_MAX`].
+    pub ankle: usize,
     /// 0 is the body's right, 1 its left.
     pub side: usize,
 }
@@ -344,8 +575,20 @@ pub struct BodySpec {
     pub capsule: Option<(f64, f64)>,
     /// How fast a joint PD answers, rad/s. Zero leaves the limbs limp.
     pub joint_omega: f64,
+    /// Which link is the head's, when there is one: what the neck PD drives.
+    pub neck: Option<usize>,
+    /// The band of lip this body will take in its hands, metres above the
+    /// feet. See [`MANTLE_MIN`] and [`MANTLE_MAX`].
+    pub mantle_min: f64,
+    pub mantle_max: f64,
     pub dt: f64,
 }
+
+/// How much of a hood's bounding ball is actually cloth, and how much of a
+/// satchel's is actually bag. Both are shells; filling them solid would put a
+/// third of the figure's mass in its dressing.
+const HOOD_FILL: f64 = 0.030;
+const SATCHEL_FILL: f64 = 0.55;
 
 // ---- the two constructors --------------------------------------------------
 
@@ -374,6 +617,11 @@ impl BodySpec {
             leg_length: height / 2.0,
             capsule: Some((radius, height)),
             joint_omega: JOINT_OMEGA,
+            neck: None,
+            // A capsule has no hands. The band is here so the field is never
+            // a special case; nothing ever reports a lip to it.
+            mantle_min: MANTLE_MIN,
+            mantle_max: MANTLE_MAX,
             dt: 1e-3,
         }
     }
@@ -421,7 +669,10 @@ impl BodySpec {
         // which is the mistake this line exists to not make again.
         let nod = -Vec3::y();
         let torso = push(&mut links, Link::new("torso", s.torso, PivotKind::Revolute(nod), Some(0)).limited(-0.6, 0.6).with(Lump::ball(s.chest, s.chest_r, s.torso_density)));
-        push(&mut links, Link::new("neck", s.neck, PivotKind::Revolute(nod), Some(torso)).limited(-0.6, 0.6).with(Lump::ball(s.head, s.head_r, s.head_density)));
+        // A ball joint, because a head does three things: it pitches to stay
+        // level while the trunk leans, it rolls into a turn, and it looks
+        // where the body is going. A hinge does one of them.
+        let neck = push(&mut links, Link::new("neck", s.neck, PivotKind::Spherical, Some(torso)).with(Lump::ball(s.head, s.head_r, s.head_density)));
 
         let mut legs = Vec::new();
         let mut feet = Vec::new();
@@ -450,7 +701,7 @@ impl BodySpec {
                     .colliding(Lump::ball(boot_at, s.boot_r, s.boot_density))
                     .colliding(Lump::ball(toe_at, toe_r, s.boot_density)),
             );
-            legs.push(Leg { hip, knee, side });
+            legs.push(Leg { hip, knee, ankle, side });
             feet.push(Foot { link: ankle, centre: boot_at, radius: s.boot_r });
         }
 
@@ -483,13 +734,35 @@ impl BodySpec {
             }
         }
 
+        // ---- the cloth ------------------------------------------------------
+        // Two danglers, appended last so nothing above them moves index. The
+        // hood hinges fore-and-aft at the nape, so a landing bounces it; the
+        // satchel hinges about the body's own forward, so a turn swings it
+        // out. Both are shells and not solids — a hood is cloth over air —
+        // which is what the density fractions are, and both are dressing that
+        // the renderer finds by lump depth rather than by name.
+        push(
+            &mut links,
+            Link::new("hood", s.hood_pivot, PivotKind::Revolute(nod), Some(2))
+                .limited(-0.22, 0.22)
+                .dangling(10.0, 0.6)
+                .with(Lump::ball(s.hood, s.hood_r, s.torso_density * HOOD_FILL)),
+        );
+        push(
+            &mut links,
+            Link::new("satchel", s.satchel_pivot, PivotKind::Revolute(Vec3::x()), Some(0))
+                .limited(-0.30, 0.30)
+                .dangling(9.0, 0.6)
+                .with(Lump::ball(s.satchel, s.satchel_r, s.leg_density * SATCHEL_FILL)),
+        );
+
         Self {
             name: "hero".into(),
             links,
             feet,
             legs,
             arm,
-            friction: 0.35,
+            friction: BOOT_FRICTION,
             upright_omega: UPRIGHT_OMEGA,
             yaws: true,
             walk: WALK,
@@ -497,6 +770,9 @@ impl BodySpec {
             leg_length: (s.hip[0].z - s.ankle[0].z).abs().max(1e-3),
             capsule: s.capsule,
             joint_omega: JOINT_OMEGA,
+            neck: Some(neck),
+            mantle_min: MANTLE_MIN,
+            mantle_max: MANTLE_MAX,
             dt: 1e-3,
         }
     }
@@ -525,6 +801,13 @@ impl BodySpec {
 
     pub fn with_dt(mut self, dt: f64) -> Self {
         self.dt = dt;
+        self
+    }
+
+    /// The band of lip this body takes in its hands, metres above the feet.
+    pub fn with_mantle(mut self, min: f64, max: f64) -> Self {
+        self.mantle_min = min;
+        self.mantle_max = max;
         self
     }
 }
@@ -576,6 +859,15 @@ pub struct Skeleton {
     pub shoulder: [Vec3; 2],
     pub elbow: [Vec3; 2],
     pub hand: [Vec3; 2],
+    /// The nape: where a cowl hinges, and the centre of the cloth that hangs
+    /// off it. `sims/rune/hero/figure.rs::Pivots` states both.
+    pub hood_pivot: Vec3,
+    pub hood: Vec3,
+    pub hood_r: f64,
+    /// The bag on the left hip, and where its strap turns.
+    pub satchel_pivot: Vec3,
+    pub satchel: Vec3,
+    pub satchel_r: f64,
     pub leg_r: f64,
     pub boot_r: f64,
     pub arm_r: f64,
@@ -628,11 +920,29 @@ pub struct Drive {
     pub yaw_delta: f64,
     pub lean_delta: f64,
     pub aim: Option<Vec3>,
+    /// **Start the push now.** One step's worth: the rising edge a
+    /// [`Forgiveness`] has already decided is allowed.
+    pub jump: bool,
+    /// Whether the key is still down. A held key deepens the squat, up to
+    /// [`WIND_MAX`]; letting go launches.
+    pub jump_held: bool,
+    /// Crouch and stay there.
+    pub crouch: bool,
 }
 
 impl Drive {
     /// Hands off the controls.
-    pub const STILL: Self = Self { forward: 0.0, strafe: 0.0, run: false, yaw_delta: 0.0, lean_delta: 0.0, aim: None };
+    pub const STILL: Self = Self {
+        forward: 0.0,
+        strafe: 0.0,
+        run: false,
+        yaw_delta: 0.0,
+        lean_delta: 0.0,
+        aim: None,
+        jump: false,
+        jump_held: false,
+        crouch: false,
+    };
 
     /// Walking along the facing and nothing else.
     pub fn walking(forward: f64) -> Self {
@@ -644,20 +954,25 @@ impl Drive {
         Self { forward, run: true, ..Self::STILL }
     }
 
-    /// As an [`Action`], so a policy drives the same body: nine numbers,
-    /// `[forward, strafe, run, yaw, lean, aim_x, aim_y, aim_z, aiming]`.
+    /// As an [`Action`], so a policy drives the same body: twelve numbers,
+    /// `[forward, strafe, run, yaw, lean, aim_x, aim_y, aim_z, aiming, jump,
+    /// jump_held, crouch]`.
     pub fn action(&self) -> Action {
         let a = self.aim.unwrap_or_else(Vec3::zeros);
+        let b = |v: bool| if v { 1.0 } else { 0.0 };
         Action::new(vec![
             self.forward,
             self.strafe,
-            if self.run { 1.0 } else { 0.0 },
+            b(self.run),
             self.yaw_delta,
             self.lean_delta,
             a.x,
             a.y,
             a.z,
-            if self.aim.is_some() { 1.0 } else { 0.0 },
+            b(self.aim.is_some()),
+            b(self.jump),
+            b(self.jump_held),
+            b(self.crouch),
         ])
     }
 
@@ -672,7 +987,98 @@ impl Drive {
             yaw_delta: at(3),
             lean_delta: at(4),
             aim: (at(8) > 0.5).then(|| Vec3::new(at(5), at(6), at(7))),
+            jump: at(9) > 0.5,
+            jump_held: at(10) > 0.5,
+            crouch: at(11) > 0.5,
         }
+    }
+}
+
+// ---- the forgiveness ----------------------------------------------------------
+
+/// Coyote time and a jump buffer: the two windows that make a jump key feel
+/// like it works.
+///
+/// Pure input logic. It holds two clocks and no physics, it is told whether
+/// the feet are down, and it says when a press should be honoured — so it is
+/// tested on a synthetic clock and not on a body ([`tests`] in
+/// `crates/kosm/tests/feel.rs`).
+///
+/// - **Coyote**, [`COYOTE_FRAMES`] frames: a press up to eight frames *after*
+///   the last frame the feet were on something still jumps. A player who ran
+///   off a lip and pressed a moment late meant to jump off the lip.
+/// - **Buffer**, [`BUFFER_FRAMES`] frames: a press up to six frames *before*
+///   the feet arrive fires on the frame they do. A player who pressed a moment
+///   early meant to jump on landing.
+///
+/// Both are quoted in frames at [`FRAME`] and are exact: the eighth frame
+/// fires and the ninth does not, whatever `dt` the caller runs at.
+#[derive(Clone, Copy, Debug)]
+pub struct Forgiveness {
+    coyote_s: f64,
+    buffer_s: f64,
+    /// How long since the feet were last down, seconds.
+    since_ground: f64,
+    /// How long ago the press that has not fired yet happened, or `None`.
+    pressed: Option<f64>,
+    was_down: bool,
+    /// Whether the feet have come back up since the last time this fired: a
+    /// press cannot fire twice off one take-off.
+    spent: bool,
+}
+
+impl Default for Forgiveness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Forgiveness {
+    pub fn new() -> Self {
+        Self {
+            coyote_s: COYOTE_FRAMES as f64 * FRAME,
+            buffer_s: BUFFER_FRAMES as f64 * FRAME,
+            since_ground: 0.0,
+            pressed: None,
+            was_down: false,
+            spent: false,
+        }
+    }
+
+    /// The windows, in seconds.
+    pub fn windows(&self) -> (f64, f64) {
+        (self.coyote_s, self.buffer_s)
+    }
+
+    /// One tick of the input clock. `down` is the key, `grounded` is whether
+    /// the feet are on anything; the answer is whether the push starts now.
+    pub fn step(&mut self, down: bool, grounded: bool, dt: f64) -> bool {
+        if grounded {
+            self.since_ground = 0.0;
+            self.spent = false;
+        } else {
+            self.since_ground += dt;
+        }
+        if down && !self.was_down {
+            self.pressed = Some(0.0);
+        } else if let Some(age) = self.pressed.as_mut() {
+            *age += dt;
+        }
+        self.was_down = down;
+        let Some(age) = self.pressed else { return false };
+        // A press is live for `buffer` seconds; the ground is live for
+        // `coyote` after it is left. The `1e-9` is the floating-point slack
+        // that makes "the eighth frame" mean the eighth frame.
+        if age > self.buffer_s + 1e-9 {
+            self.pressed = None;
+            return false;
+        }
+        if self.spent || self.since_ground > self.coyote_s + 1e-9 {
+            return false;
+        }
+        self.pressed = None;
+        self.spent = true;
+        true
     }
 }
 
@@ -710,6 +1116,21 @@ pub struct Snapshot {
     pub parts: Vec<Part>,
     /// Where the held tool is, if there is one.
     pub held: Option<Pose>,
+    /// Nothing under the feet and nothing in the hands.
+    pub airborne: bool,
+    /// How deep the hips are commanded below their standing height, metres:
+    /// the squat, the landing dip and the breath, in one number. Positive is
+    /// down, negative is a leg pushing past its standing length. **The
+    /// picture's cue that a jump is coming.**
+    pub crouch: f64,
+    /// Set on the one snapshot a push-off leaves the ground on.
+    pub jumped: bool,
+    /// Set on the one snapshot the feet arrive on, with the impulse the
+    /// landing took, N·s. What a camera kicks on and what a sim puffs sand
+    /// with.
+    pub landed: Option<f64>,
+    /// Whether the hands have a lip.
+    pub mantling: bool,
 }
 
 // ---- the derived numbers ---------------------------------------------------
@@ -734,6 +1155,72 @@ pub struct Consts {
     /// Every link at or under each link, walked once so a per-step gravity
     /// compensation does not walk the tree again.
     pub subtrees: Vec<Vec<usize>>,
+    /// What a leg can do, when there is one: the two bones, the rest pose,
+    /// and how far the hips can travel between a fold and a straight leg.
+    pub leg: Option<LegGeometry>,
+}
+
+/// A leg as the squat sees it: two bones and the triangle they make.
+///
+/// The push-off and the landing are both a *hip height*, and a hip height is
+/// the distance from the hip to the ankle — so a crouch of `d` metres is one
+/// call to the law of cosines and two joint targets, and nothing anywhere adds
+/// a number to a position.
+#[derive(Clone, Copy, Debug)]
+pub struct LegGeometry {
+    /// Thigh and shin, metres.
+    pub upper: f64,
+    pub lower: f64,
+    /// Hip to ankle at rest, metres, and the two angles that pose is.
+    pub rest: f64,
+    rest_bend: f64,
+    rest_thigh: f64,
+    /// The most the hips can drop before the leg has folded as far as it
+    /// folds with the ankle still under it, metres.
+    pub squat_max: f64,
+    /// And how far they can rise: the slack in a bent leg.
+    pub rise_max: f64,
+}
+
+impl LegGeometry {
+    fn of(hip: Vec3, knee: Vec3, ankle: Vec3) -> Option<Self> {
+        let (u, l) = ((knee - hip).norm(), (ankle - knee).norm());
+        let rest = (ankle - hip).norm();
+        if !(u > 1e-6 && l > 1e-6 && rest > 1e-6) {
+            return None;
+        }
+        let (rest_bend, rest_thigh) = (bend_at(u, l, rest), thigh_at(u, l, rest));
+        // Folded as far as the ankle can stay under the hip: the shin at a
+        // right angle to the line, which is `sqrt(|u² − l²|)` of reach.
+        let shortest = (u * u - l * l).abs().sqrt().max((u - l).abs()) + 1e-3;
+        Some(Self {
+            upper: u,
+            lower: l,
+            rest,
+            rest_bend,
+            rest_thigh,
+            squat_max: (rest - shortest).max(0.0),
+            rise_max: (u + l - 1e-3 - rest).max(0.0),
+        })
+    }
+
+    /// The hip's forward swing and the knee's extra bend for a hip `drop`
+    /// metres below the rest pose. Negative drop straightens the leg.
+    pub fn squat(&self, drop: f64) -> (f64, f64) {
+        let d = (self.rest - drop).clamp(self.rest - self.squat_max, self.rest + self.rise_max);
+        (thigh_at(self.upper, self.lower, d) - self.rest_thigh, bend_at(self.upper, self.lower, d) - self.rest_bend)
+    }
+}
+
+/// The interior bend of a two-bone chain whose ends are `d` apart, radians
+/// off straight.
+fn bend_at(u: f64, l: f64, d: f64) -> f64 {
+    ((d * d - u * u - l * l) / (2.0 * u * l)).clamp(-1.0, 1.0).acos()
+}
+
+/// And how far the upper bone leans off the line between them.
+fn thigh_at(u: f64, l: f64, d: f64) -> f64 {
+    ((u * u + d * d - l * l) / (2.0 * u * d.max(1e-9))).clamp(-1.0, 1.0).acos()
 }
 
 impl Consts {
@@ -803,6 +1290,14 @@ impl Consts {
                     own += tensor.trace() / 3.0 + m * d.norm_sq();
                 }
                 let own = own.max(1e-6);
+                // Cloth answers to itself. A dangler holds no ground reaction
+                // and carries nothing, so its spring is its own inertia at
+                // its own frequency and nothing else — which is what makes it
+                // swing where a limb would hold.
+                if let Some(d) = spec.links[i].dangle {
+                    let k = (own * d.omega * d.omega).max(1e-9);
+                    return (k, 2.0 * d.zeta * (k * own).sqrt());
+                }
                 let mine = subtree(spec, i);
                 let underfoot = spec.feet.iter().enumerate().find(|(_, f)| mine.contains(&f.link));
                 let (load, lever) = match underfoot {
@@ -829,7 +1324,11 @@ impl Consts {
             .collect();
 
         let subtrees = (0..spec.links.len()).map(|i| subtree(spec, i)).collect();
-        Self { mass, com, com_height, foot_drop: spec.links[0].pivot.z - pivot_z, i_pivot, k, c, joint, subtrees }
+        let leg = spec.legs.first().and_then(|leg| {
+            let foot = spec.feet.iter().find(|f| subtree(spec, leg.knee).contains(&f.link))?;
+            LegGeometry::of(spec.links[leg.hip].pivot, spec.links[leg.knee].pivot, spec.links[foot.link].pivot)
+        });
+        Self { mass, com, com_height, foot_drop: spec.links[0].pivot.z - pivot_z, i_pivot, k, c, joint, subtrees, leg }
     }
 
     /// The horizontal drive force: the velocity controller's share, plus the
@@ -906,6 +1405,46 @@ fn subtree(spec: &BodySpec, i: usize) -> Vec<usize> {
 
 // ---- the body --------------------------------------------------------------
 
+/// Where a push-off has got to.
+///
+/// Nothing here adds a velocity to anything. `Wind` and `Launch` are two
+/// trajectories for the leg's own PD target; the ground reaction is the
+/// contact solver's answer to a leg extending against it, and `Air` is the
+/// body doing what a body with no contacts does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Push {
+    None,
+    /// Squatting. `t` seconds in; deeper the longer the key is held.
+    Wind { t: f64 },
+    /// Extending, from a squat `depth` metres deep.
+    Launch { t: f64, depth: f64 },
+    /// Absorbing a landing `dip` metres deep.
+    Absorb { t: f64, dip: f64 },
+}
+
+/// Two hands on a lip, and where the climb is going.
+///
+/// **How the pull is a pull.** The hands are not modelled as contacts: phyz's
+/// contact set is what the ground reports, and a lip is not a body. So the
+/// hold is a *pinned hand* — a bilateral constraint between the hand and the
+/// edge, resolved the cheap way, as the force that constraint would need. The
+/// root is driven along a fixed half-second trajectory from where the lip was
+/// taken to a stance on top of it, by a critically damped PD whose output is
+/// capped at [`MANTLE_PULL`] times body weight, which is about what two hands
+/// hold. Gravity is paid out of the same cap and not cancelled behind the
+/// solver's back. The arm's own PD aims at the edge for the whole climb, so
+/// the hands are where the pull says they are.
+///
+/// It is an approximation and it is the documented one: a real mantle is the
+/// hands and then a foot, and this is the hands the whole way.
+#[derive(Clone, Copy, Debug)]
+struct Hold {
+    edge: Vec3,
+    from: Vec3,
+    to: Vec3,
+    t: f64,
+}
+
 /// An articulated body, stepping.
 pub struct Body {
     spec: BodySpec,
@@ -928,6 +1467,25 @@ pub struct Body {
     /// The mean contact normal from the last step: how steep what the body is
     /// standing on is. `None` in the air.
     support: Option<Vec3>,
+    /// How long since the feet last touched anything, seconds.
+    air_time: f64,
+    push: Push,
+    /// The hips' commanded drop below their standing height, metres.
+    crouch: f64,
+    /// The hands' lip, while there is one.
+    hold: Option<Hold>,
+    /// How long before the hands may take another lip, seconds.
+    mantle_wait: f64,
+    /// The breathing clock, seconds, and the knee-only bob it drives, metres.
+    breath: f64,
+    breath_drop: f64,
+    /// The events of the last step.
+    landed: Option<f64>,
+    jumped: bool,
+    /// The force the *controller* put on the root last step, world newtons —
+    /// not gravity, not a contact, not the medium. Zero in the air, and
+    /// `tests/feel.rs` is what says so.
+    root_force: Vec3,
 }
 
 impl Body {
@@ -995,6 +1553,16 @@ impl Body {
             tool: None,
             aim: None,
             support: None,
+            air_time: 0.0,
+            push: Push::None,
+            crouch: 0.0,
+            hold: None,
+            mantle_wait: 0.0,
+            breath: 0.0,
+            breath_drop: 0.0,
+            landed: None,
+            jumped: false,
+            root_force: Vec3::zeros(),
         }
     }
 
@@ -1026,13 +1594,235 @@ impl Body {
         }
     }
 
-    /// One step: the controllers, then the contact solve.
+    /// One step: the hands, the controllers, then the contact solve.
     pub fn step(&mut self, drive: &Drive, ground: &dyn Ground, medium: &dyn Medium, dt: f64) {
         if (self.model.dt - dt).abs() > f64::EPSILON {
             self.model.dt = dt;
         }
+        self.landed = None;
+        self.jumped = false;
+        self.hands(drive, ground, dt);
+        self.legs(drive, dt);
         self.control(drive, medium, dt);
+        let was_up = self.airborne();
+        let falling = -self.centre_velocity().z;
+        let air = self.air_time;
         self.support = step_on(&self.model, &mut self.state, ground, &self.material, &mut self.cache);
+        if self.support.is_some() {
+            self.air_time = 0.0;
+        } else {
+            self.air_time += dt;
+        }
+        // **The landing.** Not every frame the feet touch: a walking figure
+        // loses and finds its contacts constantly, and a landing that fired on
+        // every one of those would kick the camera through a stroll. A tenth
+        // of a second of air is a fall.
+        if was_up && air > 0.10 && falling > LANDING_MPS && self.support.is_some() {
+            let impulse = self.consts.mass * falling;
+            self.landed = Some(impulse);
+            // …and a landing does not cancel a jump. A running stride has a
+            // flight phase of its own, so the arrival that ends it used to
+            // wipe the wind-up half way through the squat and a running jump
+            // never left the ground.
+            if matches!(self.push, Push::None | Push::Absorb { .. }) {
+                self.push = Push::Absorb { t: 0.0, dip: (DIP_PER_IMPULSE * impulse).clamp(0.02, DIP_MAX) };
+            }
+        }
+    }
+
+    /// Whether the body has nothing under its feet and nothing in its hands.
+    ///
+    /// The word the controller means by it: with no contact and no hold there
+    /// is nothing to push against, so [`Body::root_force`] is zero and the
+    /// trajectory is gravity's.
+    pub fn airborne(&self) -> bool {
+        self.support.is_none() && self.hold.is_none()
+    }
+
+    /// The force the controller put on the root last step, world newtons.
+    /// Zero while [`Body::airborne`].
+    pub fn root_force(&self) -> Vec3 {
+        self.root_force
+    }
+
+    /// The impulse the landing on this step took, N·s, or `None`.
+    pub fn landed(&self) -> Option<f64> {
+        self.landed
+    }
+
+    /// Whether the feet left the ground on this step under their own push.
+    pub fn jumped(&self) -> bool {
+        self.jumped
+    }
+
+    /// Whether the hands have a lip.
+    pub fn mantling(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    /// The hips' commanded drop below their standing height, metres: the
+    /// squat, the landing dip and the breath in one number.
+    pub fn crouch(&self) -> f64 {
+        self.crouch + self.breath_drop
+    }
+
+    /// The hands: take a lip, or carry on up the one they have.
+    fn hands(&mut self, drive: &Drive, ground: &dyn Ground, dt: f64) {
+        if let Some(mut h) = self.hold {
+            h.t += dt;
+            // Let go when the boots are over the lip, or when the climb has
+            // had half again as long as it should have needed.
+            let there = (self.root() - h.to).norm() < 0.08;
+            self.hold = Some(h);
+            if there || h.t >= 1.5 * MANTLE_S {
+                self.hold = None;
+                self.mantle_wait = 0.35;
+            }
+            return;
+        }
+        if self.mantle_wait > 0.0 {
+            self.mantle_wait -= dt;
+            return;
+        }
+        // Hands, and a body actually going at it. A lip nobody is walking
+        // into is scenery.
+        if self.spec.arm.is_none() || drive.forward <= 0.1 {
+            return;
+        }
+        let facing = self.facing_dir();
+        let feet = self.footing();
+        let probe = LedgeProbe::new(self.spec.mantle_min, self.spec.mantle_max, MANTLE_REACH, MANTLE_OVER);
+        // A field's answer costs a ladder of samples up the face, and a body
+        // running at 2.6 m/s covers 52 mm in the twenty milliseconds between
+        // two asks — a tenth of the reach. So the probe is polled at
+        // [`MANTLE_POLL`] rather than run every millisecond; a hit takes the
+        // lip on the spot and a miss waits one poll.
+        self.mantle_wait = MANTLE_POLL;
+        let Some(lip) = ground.ledge_ahead(feet, facing, &probe) else { return };
+        if lip.height < self.spec.mantle_min || lip.height > self.spec.mantle_max {
+            return;
+        }
+        self.mantle_wait = 0.0;
+        let from = self.root();
+        let to = lip.edge - lip.normal * MANTLE_OVER + Vec3::z() * self.consts.foot_drop;
+        self.hold = Some(Hold { edge: lip.edge, from, to, t: 0.0 });
+    }
+
+    /// The legs: the squat, the push and the absorb, as one hip height.
+    fn legs(&mut self, drive: &Drive, dt: f64) {
+        let leg = self.consts.leg;
+        let rise = leg.map_or(0.0, |l| l.rise_max);
+        // **The air clock, not the contact.** A running figure loses and finds
+        // its feet every stride, so a jump that asked `is there a contact this
+        // millisecond` refused half the presses at a run and aborted the push
+        // on the other half — measured: a running jump never left the ground
+        // at all. A tenth of a second of air is off the ground; anything less
+        // is a stride.
+        let grounded = self.air_time <= 0.10 && self.hold.is_none();
+        self.breath += dt;
+        // A press is only a jump when there is something to push off.
+        if drive.jump && grounded && matches!(self.push, Push::None | Push::Absorb { .. }) {
+            self.push = Push::Wind { t: 0.0 };
+        }
+        self.push = match self.push {
+            Push::Wind { t } => {
+                // **A squat needs something to squat against.** A run has a
+                // flight phase, and a wind-up that kept folding through it put
+                // the hero in the air with its knees up and then landed it on
+                // them: the plant took a metre and a half a second out of a
+                // 2.4 m/s run before the push had begun. So the clock stops
+                // while the feet are off the ground and the legs hold what
+                // they have.
+                let t = if self.air_time <= 0.03 { t + dt } else { t };
+                if t >= WIND_MAX || (t >= WIND_MIN && !drive.jump_held) {
+                    Push::Launch { t: 0.0, depth: self.wind_depth(t) }
+                } else {
+                    Push::Wind { t }
+                }
+            }
+            Push::Launch { t, depth } => {
+                let t = t + dt;
+                // The push is over when the feet are off the ground — which
+                // is the *body's* answer and not the clock's — or when the
+                // leg has run out of leg.
+                if self.air_time > 0.03 || t > 2.0 * PUSH_MS {
+                    if self.air_time > 0.03 {
+                        self.jumped = true;
+                    }
+                    Push::None
+                } else {
+                    Push::Launch { t, depth }
+                }
+            }
+            Push::Absorb { t, dip } => {
+                let t = t + dt;
+                if t >= ABSORB_S { Push::None } else { Push::Absorb { t, dip } }
+            }
+            Push::None => Push::None,
+        };
+        // What the hips are asked for, this step.
+        let want = match self.push {
+            Push::Wind { t } => self.wind_depth(t),
+            Push::Launch { t, depth } => {
+                // **The ramp accelerates, because a jump does.** A leg whose
+                // target travels at a constant rate hands the body that rate
+                // and no more — measured, and it is why the first version of
+                // this hopped ninety millimetres: 112 mm of travel over 100 ms
+                // is 1.1 m/s, which is 65 mm of apex whatever the gains are.
+                // A `t²` ramp over the same travel leaves at *twice* the mean,
+                // which is what a leg extending under an increasing ground
+                // reaction actually does, and the exit velocity is then
+                // `2 · travel / PUSH_MS` — one line of arithmetic tying the
+                // squat's depth to the apex, and the reason a wind-up is worth
+                // holding for.
+                let e = (t / PUSH_MS).clamp(0.0, 1.0);
+                depth + (-rise - depth) * e * e
+            }
+            // A dip that decays: `dip · (1 − s)` with a cosine ease, so the
+            // knees give and come back rather than snapping.
+            Push::Absorb { t, dip } => dip * 0.5 * (1.0 + (PI * (t / ABSORB_S).clamp(0.0, 1.0)).cos()),
+            Push::None => {
+                if drive.crouch {
+                    CROUCH_TAP
+                } else if self.air_time > 0.05 {
+                    // A small tuck: knees up, so the feet arrive first. Off
+                    // the *air clock* and not off `support`, because a walking
+                    // figure loses a contact constantly and a tuck that
+                    // flickered with them would shake the body apart.
+                    0.02
+                } else {
+                    0.0
+                }
+            }
+        };
+        // Nothing here steps. The squat, the tuck and the breath all arrive
+        // through a 30 ms lag, which is faster than any of them moves and slow
+        // enough that a change of state is not a jolt through the legs; the
+        // push is the exception, because a push that eased in would not be one.
+        self.crouch = match self.push {
+            Push::Launch { .. } => want,
+            _ => self.crouch + (want - self.crouch) * (dt / 0.03).min(1.0),
+        };
+        // **Breathing.** A body standing still is not still: the hips rise
+        // and fall five millimetres at a quarter of a hertz, which is a slow
+        // breath. It is kept apart from [`Body::crouch`] so that a jump's
+        // squat, a landing's dip and a breath do not have to share one lag —
+        // the first two are events and the third never stops.
+        let standing = self.push == Push::None
+            && self.hold.is_none()
+            && !drive.crouch
+            && self.air_time <= 0.05
+            && self.velocity().x.hypot(self.velocity().y) < super::gait::STANDING;
+        let breath = if standing { BREATH_M * (TAU * BREATH_HZ * self.breath).sin() } else { 0.0 };
+        self.breath_drop += (breath - self.breath_drop) * (dt / 0.03).min(1.0);
+    }
+
+    /// How deep the squat is `t` seconds into a wind-up: [`CROUCH_TAP`] by
+    /// [`WIND_MIN`], easing on toward [`CROUCH_DEEP`] while the key is held.
+    fn wind_depth(&self, t: f64) -> f64 {
+        let a = smooth((t / SQUAT_MS).clamp(0.0, 1.0));
+        let b = ((t - WIND_MIN) / (WIND_MAX - WIND_MIN)).clamp(0.0, 1.0);
+        CROUCH_TAP * a + (CROUCH_DEEP - CROUCH_TAP) * b
     }
 
     /// Step for `seconds` with the same drive held down.
@@ -1046,7 +1836,15 @@ impl Body {
     /// Everything the controllers write, in one place.
     fn control(&mut self, drive: &Drive, medium: &dyn Medium, dt: f64) {
         let (xforms, vels) = forward_kinematics(&self.model, &self.state);
-        self.facing = wrap(self.facing + drive.yaw_delta);
+        // **Turning in the air is capped, and it is a torque.** See
+        // [`AIR_YAW_RATE`]: the facing turns, the upright spring drives the
+        // body onto it, and nothing horizontal is added to the centre of mass.
+        let yaw = if self.airborne() {
+            drive.yaw_delta.clamp(-AIR_YAW_RATE * dt, AIR_YAW_RATE * dt)
+        } else {
+            drive.yaw_delta
+        };
+        self.facing = wrap(self.facing + yaw);
         self.tilt = (self.tilt + drive.lean_delta).clamp(-TILT_MAX, TILT_MAX);
 
         let r_bw = self.body_to_world();
@@ -1091,7 +1889,18 @@ impl Body {
         // `DRIVE_ASSIST`) from stealing the start out from under the velocity
         // controller's time constant.
         self.drive_lean += (want_lean - self.drive_lean) * (dt / TAU_LEAN).min(1.0);
-        let lean = self.drive_lean + facing_dir * self.tilt;
+        // **A plant at speed is a lean, or it is a brake.** Squatting on two
+        // feet that are ahead of the centre of mass turns run into height —
+        // which is what a long jumper's plant does, and measured here it took
+        // a 2.4 m/s run down to 1.0 before the push began. Leaning into the
+        // plant puts the centre of mass over the feet, so the same push leaves
+        // at a flatter angle and the run survives it. The lean is what a body
+        // does; the height it costs is what distance is bought with.
+        let plant = match self.push {
+            Push::Wind { .. } | Push::Launch { .. } => LEAN_MAX * (horizontal.norm() / self.spec.run).min(1.0),
+            _ => 0.0,
+        };
+        let lean = self.drive_lean + facing_dir * (self.tilt + plant);
 
         // ---- the medium, first, because it says what the feet are carrying ---
         let (water_force, water_torque, submerged) = self.medium_forces(&xforms, medium, velocity);
@@ -1099,7 +1908,19 @@ impl Body {
 
         // ---- the upright spring and the drive --------------------------------
         let mut torque = self.upright_torque(&r_bw, lean, omega);
-        let mut force = self.consts.drive(a_des, horizontal, self.spec.friction, normal);
+        // **Nothing pushes on nothing.** With no feet down and no hands on a
+        // lip there is no drive force at all: no air steering, no hold-to-go-
+        // higher, no faster-than-gravity anything. The upright spring's
+        // *torque* stays, because a torque on a free body moves its angular
+        // momentum and not its centre of mass, and landing feet-first is what
+        // it buys.
+        let mut force = if self.hold.is_some() {
+            self.mantle_pull(dt)
+        } else if self.support.is_none() {
+            Vec3::zeros()
+        } else {
+            self.consts.drive(a_des, horizontal, self.spec.friction, normal)
+        };
         // **Standing on a hill is not sliding down it.** The friction
         // compensation above cancels the sand, and a cancelled sand cannot
         // hold a body on a slope: on the cove's six per cent beach the being
@@ -1121,6 +1942,7 @@ impl Body {
             let g = Vec3::new(0.0, 0.0, -GRAVITY);
             force -= (g - n * g.dot(n)) * (self.consts.mass * hold);
         }
+        self.root_force = force;
         force += water_force;
         torque += water_torque - omega * (medium.spin_damping() * self.consts.c * submerged);
 
@@ -1131,22 +1953,135 @@ impl Body {
 
         // ---- the joints ------------------------------------------------------
         let mut targets = vec![Vec3::zeros(); self.spec.links.len()];
-        self.gait.advance(horizontal.norm(), dt);
+        // Per joint, a scale on the spring and a scale on the damper.
+        let mut gain = vec![(1.0f64, 1.0f64); self.spec.links.len()];
+        let speed = horizontal.norm();
+        self.gait.advance(speed, dt);
+        // The squat, the push, the landing dip and the breath, as one hip
+        // height, turned into two joint angles by the leg's own triangle.
+        let (squat_hip, squat_knee) = self.consts.leg.map_or((0.0, 0.0), |l| l.squat(self.crouch));
+        let (breath_hip, breath_knee) = self.consts.leg.map_or((0.0, 0.0), |l| l.squat(self.breath_drop));
+        let over = match self.push {
+            Push::Launch { t, .. } => PUSH_OVER_RAD * (t / PUSH_MS).clamp(0.0, 1.0),
+            _ => 0.0,
+        };
+        // A squat is a leg holding the body down and wants its damper; a push
+        // is a leg throwing it and does not.
+        // **A push-off is not a stride.** The plant is both feet, together:
+        // the gait fades out over the wind-up and comes back after the
+        // landing, so the push is the same two-legged extension standing or
+        // running. Left in, the stride had one leg swinging forward while the
+        // other was asked to extend, and a running jump left the ground at
+        // 1.3 m/s where a standing one left at 3.4.
+        let stride = match self.push {
+            Push::Wind { t } => 1.0 - smooth(t / WIND_MIN),
+            Push::Launch { .. } => 0.0,
+            Push::Absorb { t, .. } => smooth(t / ABSORB_S),
+            Push::None => 1.0,
+        };
+        let legs = match self.push {
+            Push::Launch { .. } => Some((PUSH_GAIN, PUSH_DAMP)),
+            Push::Wind { .. } => Some((PUSH_GAIN, 1.0)),
+            _ => None,
+        };
         for leg in &self.spec.legs {
             let (hip, knee, side) = (leg.hip, leg.knee, leg.side);
+            // **The bob.** Half a bend either way: the stance knee
+            // straightens while the other leg is swinging — the hips rise over
+            // the plant — and both bend as the swing passes, so they fall
+            // between the plants. Twice a stride, which is what a run looks
+            // like from behind, and on a figure with 210 mm of leg and 14 mm
+            // of slack it is the only stride there is.
+            let bob = stride * BOB_RATIO * self.gait.amplitude(speed) * (0.5 - self.gait.lift(1 - side, speed));
+            let bend = stride * self.gait.knee(side, speed) + bob + squat_knee + breath_knee - over;
+            let swing = stride * self.gait.hip(side, speed) + squat_hip + breath_hip;
             // The hip is a ball joint; a swing *forward* turns the thigh's
             // `−z` toward `+x`, which is a rotation about `−y`. The knee's own
             // hinge already points the other way, so its target is positive.
-            targets[hip] = -Vec3::y() * self.gait.hip(side, horizontal.norm());
-            targets[knee] = Vec3::y() * self.gait.knee(side, horizontal.norm());
+            targets[hip] = -Vec3::y() * swing;
+            targets[knee] = Vec3::y() * bend;
+            // **The ankle, and it is not a detail.** The hip turns the thigh
+            // one way about `ŷ` and the knee turns the shin the other, so a
+            // boot whose joint holds it at rest *relative to the shin* tips
+            // with the shin: fold the leg to squat and the sole ends up
+            // pointing backwards with the heel driven into the sand. The
+            // contact solver then does exactly what it should — it pushes
+            // back — and the squat stalls. Measured before this line existed:
+            // a hundred millimetres of commanded squat bought thirty-six, at a
+            // rate that did not move when the leg's gains were quadrupled,
+            // which is the signature of a geometric block rather than a weak
+            // spring. Counter-rotating the boot by what the two bones above it
+            // did keeps the sole flat, and past [`ANKLE_MAX`] it does what a
+            // real one does and lets the heel come up.
+            targets[leg.ankle] = Vec3::y() * (swing - bend).clamp(-ANKLE_MAX, ANKLE_MAX);
+            if let Some(g) = legs {
+                gain[hip] = g;
+                gain[knee] = g;
+                gain[leg.ankle] = g;
+            }
         }
-        self.aim = drive.aim;
-        if let (Some(arm), Some(goal)) = (self.spec.arm, drive.aim) {
+        // **The head.** A neck PD from the velocity: it counter-pitches the
+        // trunk's own lean so the eyes stay level, leads the walk by
+        // [`LOOK_AHEAD_S`] of yaw, and rolls into a turn. Nothing keyframed —
+        // it is three numbers read off the body's own motion.
+        if let Some(neck) = self.spec.neck {
+            let pitch = -r_bw.mul_vec(Vec3::z()).dot(facing_dir).asin();
+            let lead = if speed > 1e-3 {
+                wrap(horizontal.y.atan2(horizontal.x) - self.facing) * (speed / self.spec.run).min(1.0)
+            } else {
+                0.0
+            };
+            let roll = (HEAD_TILT * omega.z * self.spec.run.max(1e-3)).clamp(-0.25, 0.25);
+            let look = Vec3::new(roll, -pitch, LOOK_AHEAD_S * lead * 2.0);
+            targets[neck] = clamp_norm(look, 0.35);
+        }
+        // The hands, while they have a lip: the arm aims at the edge and the
+        // legs are along for the ride.
+        self.aim = match self.hold {
+            Some(h) => Some(h.edge),
+            None => drive.aim,
+        };
+        if let (Some(arm), Some(goal)) = (self.spec.arm, self.aim) {
             let (shoulder, elbow) = self.arm_targets(&xforms, &arm, goal);
             targets[arm.shoulder] = shoulder;
             targets[arm.elbow] = self.hinge_axis(arm.elbow) * elbow;
         }
-        self.joint_pd(&xforms, &targets);
+        self.joint_pd(&xforms, &targets, &gain);
+    }
+
+    /// The pull the hands are taking, world newtons.
+    ///
+    /// A critically damped PD on the root along the climb's own trajectory,
+    /// with the body's weight in it and the whole thing capped at
+    /// [`MANTLE_PULL`] times that weight. See [`Hold`].
+    fn mantle_pull(&self, dt: f64) -> Vec3 {
+        let Some(h) = self.hold else { return Vec3::zeros() };
+        // **Up first, then over.** A straight line from where the lip was
+        // taken to a stance on top of it runs *through the face*: the boots
+        // catch on the rock, the pull saturates dragging them along it, and
+        // the climb stalls a hundred and fifty millimetres short with the body
+        // lying back at 25°. Measured. A mantle is not a diagonal — it is a
+        // pull-up and then a step over — so the vertical leads and the
+        // horizontal follows, with enough overlap that the two read as one
+        // move.
+        let path = |s: f64| {
+            let up = smooth((s / 0.6).min(1.0));
+            let over = smooth(((s - 0.35) / 0.65).max(0.0));
+            Vec3::new(
+                h.from.x + (h.to.x - h.from.x) * over,
+                h.from.y + (h.to.y - h.from.y) * over,
+                h.from.z + (h.to.z - h.from.z) * up,
+            )
+        };
+        let s = (h.t / MANTLE_S).clamp(0.0, 1.0);
+        let want = path(s);
+        // The trajectory's own velocity, so the damper fights the error and
+        // not the climb.
+        let ahead = ((h.t + dt) / MANTLE_S).clamp(0.0, 1.0);
+        let want_vel = (path(ahead) - want) * (1.0 / dt.max(1e-9));
+        let (m, w) = (self.consts.mass, 12.0);
+        let pull = (want - self.root()) * (m * w * w) + (want_vel - self.velocity()) * (2.0 * m * w) + Vec3::new(0.0, 0.0, m * GRAVITY);
+        clamp_norm(pull, MANTLE_PULL * m * GRAVITY)
     }
 
     /// How fast the whole body's centre of mass is going, world axes.
@@ -1252,11 +2187,12 @@ impl Body {
     /// A PD on every joint but the root, toward `targets` — a rotation vector
     /// per link, in that joint's own rest frame. Zero is the rig's rest pose,
     /// which is what a body that is standing settles to.
-    fn joint_pd(&mut self, xforms: &[SpatialTransform], targets: &[Vec3]) {
+    fn joint_pd(&mut self, xforms: &[SpatialTransform], targets: &[Vec3], gain: &[(f64, f64)]) {
         for (i, link) in self.spec.links.iter().enumerate().skip(1) {
             let joint_idx = self.model.bodies[i].joint_idx;
             let (q0, v0) = (self.model.q_offsets[joint_idx], self.model.v_offsets[joint_idx]);
-            let (k, c) = self.consts.joint[i];
+            let (gk, gc) = gain.get(i).copied().unwrap_or((1.0, 1.0));
+            let (k, c) = (self.consts.joint[i].0 * gk, self.consts.joint[i].1 * gc);
             // What the limb weighs, held. The PD is then a spring on the
             // *error* rather than a spring that has to out-pull gravity, which
             // is the difference between an arm that reaches a target and an
@@ -1489,6 +2425,11 @@ impl Body {
                 .map(|(i, link)| Part { name: link.name.clone(), pose: Pose::new(xforms[i].pos, xforms[i].rot.transpose()) })
                 .collect(),
             held: self.held().map(|(p, _)| p),
+            airborne: self.airborne(),
+            crouch: self.crouch(),
+            jumped: self.jumped,
+            landed: self.landed,
+            mantling: self.hold.is_some(),
         }
     }
 
@@ -1759,6 +2700,19 @@ fn mat_to_quat(m: &Mat3) -> Quat {
     Quat { w, v: Vec3::new(x, y, z) }.normalize()
 }
 
+/// A vector, no longer than `max`.
+fn clamp_norm(v: Vec3, max: f64) -> Vec3 {
+    let n = v.norm();
+    if n > max && n > 1e-12 { v * (max / n) } else { v }
+}
+
+/// Smoothstep on `0..=1`: flat at both ends, so a trajectory written on it
+/// starts and finishes at rest.
+fn smooth(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Wrap an angle into `(-π, π]`, so a facing spun a hundred times reads the
 /// same as one that has not.
 pub fn wrap(a: f64) -> f64 {
@@ -1804,6 +2758,14 @@ impl Skeleton {
             chest: hero_local(0.0, 0.0, 452.0),
             head: hero_local(0.0, 0.0, 885.0),
             skirt: hero_local(0.0, 0.0, 248.0),
+            // The cowl hinges at the nape and its cloth sits a little behind
+            // the crown; the bag rides the left hip, outside the skirt.
+            hood_pivot: hero_local(0.0, -125.0, 760.0),
+            hood: hero_local(0.0, -41.0, 885.0),
+            hood_r: 0.230,
+            satchel_pivot: hero_local(-174.0, -30.0, 380.0),
+            satchel: hero_local(-281.0, -30.0, 346.0),
+            satchel_r: 0.110,
             hip,
             knee,
             ankle,

@@ -397,6 +397,14 @@ struct State {
     want: Vec3,
     time: f64,
     started: bool,
+    /// How far the eye has been knocked down, metres, and how fast it is
+    /// coming back. See [`Rig::kick`].
+    kick: f64,
+    kick_vel: f64,
+    /// A field-of-view offset, degrees, and its own return. See
+    /// [`Rig::pulse_fov`].
+    pulse: f64,
+    pulse_vel: f64,
 }
 
 impl Default for State {
@@ -411,9 +419,23 @@ impl Default for State {
             want: Vec3::zeros(),
             time: 0.0,
             started: false,
+            kick: 0.0,
+            kick_vel: 0.0,
+            pulse: 0.0,
+            pulse_vel: 0.0,
         }
     }
 }
+
+/// How fast a kick and a pulse come back, rad/s. Fast enough to be a jolt and
+/// not a lurch: at 18 the eye is back inside a fifth of a second.
+const KICK_OMEGA: f64 = 18.0;
+
+/// How far a landing knocks the eye down, metres per N·s of impulse, and the
+/// most it ever does. A drop from half a metre is about 100 N·s on a 30 kg
+/// body, which is 30 mm.
+const KICK_PER_IMPULSE: f64 = 0.30e-3;
+const KICK_MAX: f64 = 0.05;
 
 /// How [`Lens::see`] finds the subject in a world.
 type SubjectOf = Arc<dyn Fn(&World) -> Subject + Send + Sync>;
@@ -506,6 +528,10 @@ impl Rig {
         if !s.started || !(dt > 0.0) {
             if !s.started {
                 s = State {
+                    kick: s.kick,
+                    kick_vel: s.kick_vel,
+                    pulse: s.pulse,
+                    pulse_vel: s.pulse_vel,
                     eye: want,
                     eye_vel: Vec3::zeros(),
                     aim_off: aim_want,
@@ -552,6 +578,22 @@ impl Rig {
         s.fov = fov.x;
         s.fov_vel = fov_v.x;
 
+        // **The kick and the pulse**, both springs back to zero, so the eye is
+        // knocked and recovers rather than being animated. `kick` is a landing
+        // and `pulse` is the two degrees of field the apex of a jump opens up;
+        // neither moves where the camera *is*, only where it is looking from
+        // and how wide.
+        let mut k = Vec3::new(s.kick, 0.0, 0.0);
+        let mut kv = Vec3::new(s.kick_vel, 0.0, 0.0);
+        spring(&mut k, &mut kv, Vec3::zeros(), Vec3::zeros(), KICK_OMEGA, dt);
+        s.kick = k.x;
+        s.kick_vel = kv.x;
+        let mut p = Vec3::new(s.pulse, 0.0, 0.0);
+        let mut pv = Vec3::new(s.pulse_vel, 0.0, 0.0);
+        spring(&mut p, &mut pv, Vec3::zeros(), Vec3::zeros(), KICK_OMEGA, dt);
+        s.pulse = p.x;
+        s.pulse_vel = pv.x;
+
         // The clamp is on the *state*, not on the output: an eye that has been
         // pushed out of the rock carries on from where it actually is, the way
         // a body that has hit something does.
@@ -559,6 +601,31 @@ impl Rig {
         s.time += dt;
         self.state.set(s);
         self.camera_from(&s, subject)
+    }
+
+    /// **Knock the eye down.** `impulse` is [`Body::landed`]'s, in N·s; the
+    /// spring brings it back inside a fifth of a second.
+    ///
+    /// [`Body::landed`]: super::body::Body::landed
+    pub fn kick(&self, impulse: f64) {
+        let mut s = self.state.get();
+        s.kick = (s.kick + KICK_PER_IMPULSE * impulse.max(0.0)).min(KICK_MAX);
+        self.state.set(s);
+    }
+
+    /// **Open the field of view by `degrees`**, springing back. Two at the
+    /// apex of a jump is enough to feel and not enough to see as a zoom.
+    pub fn pulse_fov(&self, degrees: f64) {
+        let mut s = self.state.get();
+        s.pulse += degrees;
+        self.state.set(s);
+    }
+
+    /// How far the eye is currently knocked down, metres, and how many degrees
+    /// of field the pulse has added. Reported, for a test.
+    pub fn kicked(&self) -> (f64, f64) {
+        let s = self.state.get();
+        (s.kick, s.pulse)
     }
 
     /// The camera as it stands, without advancing anything.
@@ -710,7 +777,9 @@ impl Rig {
         let k = &self.knobs;
         let u = k.units_per_metre;
         let p = |v: Vec3| kosm_render::Point3::new(v.x * u, v.y * u, v.z * u);
-        let eye = p(s.eye);
+        // The kick is on the eye alone and not on the aim: the camera dips and
+        // keeps looking at the same place, which is what a jolt is.
+        let eye = p(s.eye - Vec3::new(0.0, 0.0, s.kick));
         let aim = p(subject.position + s.aim_off);
         // The look, rounded ten metres out: a millimetre there is a tenth of
         // a milliradian, far under what the picture can show.
@@ -728,10 +797,11 @@ impl Rig {
                 (v.z / step).round() * step,
             )
         };
+        let wide = s.fov + s.pulse;
         let fov = if k.fov_quantum_deg > 0.0 {
-            (s.fov / k.fov_quantum_deg).round() * k.fov_quantum_deg
+            (wide / k.fov_quantum_deg).round() * k.fov_quantum_deg
         } else {
-            s.fov
+            wide
         };
         kosm_render::Camera::look_at(q(eye), q(far), kosm_render::Vec3::new(0.0, 0.0, 1.0), fov)
     }

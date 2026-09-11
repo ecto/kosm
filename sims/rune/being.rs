@@ -166,6 +166,16 @@ pub fn hero_skeleton(rig: &Rig) -> Skeleton {
         shoulder: [at(p.shoulder[0]), at(p.shoulder[1])],
         elbow: [at(p.elbow[0]), at(p.elbow[1])],
         hand: [at(p.hand[0]), at(p.hand[1])],
+        hood_pivot: at(p.hood),
+        hood: at(p.hood_cloth),
+        // A cowl a little proud of a 456 mm head. Big enough that the
+        // renderer's lump-depth binding hands it the *hood* solid and small
+        // enough that the head keeps its own; `kosm::player`'s `HOOD_FILL` is
+        // what stops a bounding ball of cloth weighing like a bollard.
+        hood_r: 1.01 * rig.head_r / 1000.0,
+        satchel_pivot: at(p.satchel),
+        satchel: at(p.satchel_bag),
+        satchel_r: 0.110,
         leg_r: rig.leg_r / 1000.0,
         boot_r: rig.boot_r / 1000.0,
         arm_r: rig.arm_r / 1000.0,
@@ -284,15 +294,37 @@ pub struct Input {
     pub strafe: f64,
     pub yaw_delta: f64,
     pub tilt_delta: f64,
+    /// Shift: the velocity target is the run instead of `walk_mps`.
+    pub run: bool,
+    /// Space, on the frame the forgiveness layer says the press counts.
+    pub jump: bool,
+    /// …and whether it is still down, which is what deepens the squat.
+    pub jump_held: bool,
+    /// Ctrl, or C.
+    pub crouch: bool,
 }
 
 impl Input {
     /// Hands off the controls.
-    pub const STILL: Self = Self { forward: 0.0, strafe: 0.0, yaw_delta: 0.0, tilt_delta: 0.0 };
+    pub const STILL: Self = Self {
+        forward: 0.0,
+        strafe: 0.0,
+        yaw_delta: 0.0,
+        tilt_delta: 0.0,
+        run: false,
+        jump: false,
+        jump_held: false,
+        crouch: false,
+    };
 
     /// Walking along the facing and nothing else.
     pub fn walking(forward: f64) -> Self {
         Self { forward, ..Self::STILL }
+    }
+
+    /// Running along it.
+    pub fn running(forward: f64) -> Self {
+        Self { forward, run: true, ..Self::STILL }
     }
 
     /// As the controller's own drive.
@@ -300,10 +332,13 @@ impl Input {
         Drive {
             forward: self.forward,
             strafe: self.strafe,
-            run: false,
+            run: self.run,
             yaw_delta: self.yaw_delta,
             lean_delta: self.tilt_delta,
             aim: None,
+            jump: self.jump,
+            jump_held: self.jump_held,
+            crouch: self.crouch,
         }
     }
 }
@@ -324,6 +359,12 @@ pub struct Snapshot {
     /// Where the being is looking and how far it is leaning, radians.
     pub facing: f64,
     pub tilt: f64,
+    /// Nothing under the feet and nothing in the hands.
+    pub airborne: bool,
+    /// The one frame a push-off leaves the ground on, and the one the feet
+    /// arrive on with the impulse it took, N·s. What the camera kicks on.
+    pub jumped: bool,
+    pub landed: Option<f64>,
     /// The hinge angle, radians: 0 closed, [`DOOR_LIMIT`] wide open.
     pub door_angle: f64,
     /// The door's body frame — at the hinge, `rot` world → body.
@@ -704,6 +745,29 @@ impl Cove {
         self.body.tilt()
     }
 
+    /// Nothing under the feet and nothing in the hands.
+    pub fn airborne(&self) -> bool {
+        self.body.airborne()
+    }
+
+    /// The impulse the landing on this step took, N·s, or `None`.
+    pub fn landed(&self) -> Option<f64> {
+        self.body.landed()
+    }
+
+    /// Whether the feet left the sand on this step under their own push.
+    pub fn jumped(&self) -> bool {
+        self.body.jumped()
+    }
+
+    /// Whether the hands have a lip. The cove's headland risers are 1.6 m and
+    /// the hero's reach is [`kosm::player::body::MANTLE_MAX`]'s 1.2, so this
+    /// is false on every edge of the level as it stands — which is the point:
+    /// the headlands are still the wall the cove is written around.
+    pub fn mantling(&self) -> bool {
+        self.body.mantling()
+    }
+
     /// Where the being's centre rests standing at `(x, y)` with no lean.
     pub fn resting_centre(&self, x: f64, y: f64) -> Vec3 {
         Vec3::new(x, y, self.beach.z_at(x, y) + self.capsule.1 / 2.0)
@@ -804,6 +868,9 @@ impl Cove {
             being_vel: (v, snap.root_vel.1),
             facing: snap.facing,
             tilt: snap.tilt,
+            airborne: snap.airborne,
+            jumped: snap.jumped,
+            landed: snap.landed,
             door_angle: self.door_angle(),
             door: self.door_transform(),
             gate_open: self.gate,

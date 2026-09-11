@@ -197,12 +197,23 @@ fn the_gait_is_locked_to_the_speed_and_settles_when_stopped() {
     let mut body = hero();
     body.run_for(2.0, &Drive::walking(1.0), &ground, &Air);
     let speed = body.speed();
-    let predicted = body.gait().stride_hz(speed);
     // A fifth of a second, which at this cadence is a fifth of a turn: short
     // enough that the wrapped phase cannot be ambiguous about how far it went.
+    //
+    // The prediction is the **mean** of the frequency over the window and not
+    // its value at one instant, because a walking speed is not a constant: the
+    // stance knee extends over each plant and the hips rise, so the centre of
+    // mass ripples a few per cent over a stride (`feel.rs::a_run_bobs` is the
+    // same fact, measured on purpose). One instant of that ripple is not the
+    // frequency the phase averaged over a fifth of a second.
     let window = 0.2;
     let before = body.gait().phase;
-    body.run_for(window, &Drive::walking(1.0), &ground, &Air);
+    let mut predicted = 0.0;
+    let steps = (window / DT).round() as usize;
+    for _ in 0..steps {
+        body.step(&Drive::walking(1.0), &ground, &Air, DT);
+        predicted += body.gait().stride_hz(body.speed()) / steps as f64;
+    }
     let after = body.gait().phase;
     let measured = (after - before).rem_euclid(2.0 * PI) / (2.0 * PI) / window;
     println!(

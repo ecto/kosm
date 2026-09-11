@@ -229,6 +229,13 @@ struct Controls {
     strafe: f64,
     yaw: f64,
     tilt: f64,
+    /// Shift, Space and Ctrl (or C). All three are *held* states — the jump's
+    /// rising edge is decided on the simulation thread by
+    /// [`kosm::player::Forgiveness`], which needs to know whether the feet are
+    /// down and so cannot live up here.
+    run: bool,
+    jump: bool,
+    crouch: bool,
 }
 
 type Held = Arc<Mutex<Controls>>;
@@ -769,6 +776,9 @@ fn simulate(
     // enormous step.
     let cap = 4 * steps_per_frame;
 
+    // Coyote time and the jump buffer, on the frame clock. See
+    // [`kosm::player::Forgiveness`].
+    let mut forgive = kosm::player::Forgiveness::new();
     let mut start = Instant::now();
     *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(cove.snapshot());
     let _ = tx.send(Timed { frame: cove.snapshot(), due: start });
@@ -807,11 +817,23 @@ fn simulate(
         // The mouse is a quantity of turn over the frame, so it is divided by
         // the steps the frame is made of; the keys are a force and are not.
         let per = if steps > 0 { 1.0 / steps as f64 } else { 0.0 };
+        // **The jump's rising edge is decided here**, once per frame, by the
+        // forgiveness layer: coyote time from the last frame the feet were
+        // down, and a buffer for a press that arrived early. It is a *frame*
+        // clock and not the solver's — the windows are quoted in frames at
+        // sixty and this loop is the thing that runs at sixty — so it is
+        // stepped once with the frame's own length and the answer is spent on
+        // the first substep.
+        let fire = forgive.step(controls.jump, !cove.airborne(), 1.0 / fps);
         let input = Input {
             forward: controls.forward,
             strafe: controls.strafe,
             yaw_delta: controls.yaw * per,
             tilt_delta: controls.tilt * per,
+            run: controls.run,
+            jump: fire,
+            jump_held: controls.jump,
+            crouch: controls.crouch,
         };
         let lap = Instant::now();
         let open = gate.load(Ordering::Relaxed);
@@ -820,8 +842,11 @@ fn simulate(
             said_open = true;
             eprintln!("rune   the rune holds: the door is swinging");
         }
-        for _ in 0..steps {
-            cove.step(&input);
+        // The push starts on the substep the frame's press was granted and
+        // not on every one of them: a `jump` held down for twenty substeps is
+        // one press, not twenty.
+        for k in 0..steps {
+            cove.step(&Input { jump: input.jump && k == 0, ..input });
         }
         solved += lap.elapsed();
 
@@ -1617,11 +1642,29 @@ impl Tracer {
         // come through, so the still and the window cannot disagree about it.
         let cam = match self.rig.as_ref() {
             None => quantised(&cove_render::camera(&self.scene, placement)),
-            Some(rig) => rig.follow(&subject_of(frame), dt),
+            Some(rig) => {
+                // **What the body does to the camera.** A landing knocks the
+                // eye down by the impulse it took and the rig's own spring
+                // brings it back; leaving the ground opens two degrees of
+                // field that close again the same way. Both are events off
+                // `Snapshot`, both are springs, and neither moves the aim —
+                // so the picture is jolted rather than animated.
+                if let Some(impulse) = frame.landed {
+                    rig.kick(impulse);
+                }
+                if frame.jumped {
+                    rig.pulse_fov(JUMP_FOV_DEG);
+                }
+                rig.follow(&subject_of(frame), dt)
+            }
         };
         cam.with_projection(self.projection)
     }
 }
+
+/// How much field of view a jump opens, degrees. Two is a breath, and the
+/// rig's spring has it back inside a fifth of a second.
+const JUMP_FOV_DEG: f64 = 2.0;
 
 /// The body, as the camera needs it.
 ///
@@ -2148,7 +2191,6 @@ impl RasterTier {
         rs.bloom_radius_px = film.bloom_radius_px;
         rs.ao_radius_m = a.parameter_or("ao_radius_m", 0.3) as f32;
         rs.ao_strength = a.parameter_or("ao_strength", 1.0) as f32;
-
 
         // One material per surface the level names, through
         // `materials::gpu` — which *is* `materials::pbr` laid over the
@@ -3015,6 +3057,10 @@ fn snapshot_of(p: &Placement, scene: &CoveScene) -> Snapshot {
         being_vel: (Vec3::zeros(), Vec3::zeros()),
         facing: f.y.atan2(f.x),
         tilt: 0.0,
+        // A still is a pose: nobody is in the air and nothing has landed.
+        airborne: false,
+        jumped: false,
+        landed: None,
         door_angle: p.door_angle,
         door: phyz_math::SpatialTransform::new(
             Mat3::identity(),
@@ -3371,6 +3417,16 @@ impl viewport::Scene for App {
             Key::D => Some(KEY_D),
             _ => None,
         };
+        // Shift runs, Space jumps, Ctrl (or C) crouches. Each is one held
+        // bool, set on the press and cleared on the release the viewport
+        // guarantees — the same contract the four walking keys are on.
+        let modal = |k: Key| matches!(k, Key::Shift | Key::Space | Key::Ctrl);
+        let set = |c: &mut Controls, k: Key, down: bool| match k {
+            Key::Shift => c.run = down,
+            Key::Space => c.jump = down,
+            Key::Ctrl => c.crouch = down,
+            _ => {}
+        };
         match event {
             Event::Resized(px) => self.window_px = px,
             Event::Look(dx, dy) => {
@@ -3384,12 +3440,16 @@ impl viewport::Scene for App {
                 if let Some(i) = index(k) {
                     self.keys[i] = true;
                     self.walk();
+                } else if modal(k) {
+                    set(&mut self.held.lock().unwrap_or_else(|e| e.into_inner()), k, true);
                 }
             }
             Event::KeyUp(k) => {
                 if let Some(i) = index(k) {
                     self.keys[i] = false;
                     self.walk();
+                } else if modal(k) {
+                    set(&mut self.held.lock().unwrap_or_else(|e| e.into_inner()), k, false);
                 }
             }
             // The cove is walked, not orbited: a drag is the same look the
@@ -3505,6 +3565,9 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 ///   from the start, so a headless run walks and then stops without a hand on
 ///   the keyboard; in a `--shot` it steps the being for the first `N` passes
 ///   and stands for the rest, which is the picture of the climb back.
+/// - `--jump` adds a scripted Space a second into a `--walk` — the same held
+///   bool a key press sets, so the simulation cannot tell the difference — and
+///   the pace line is then read with a push-off and a landing in it.
 ///
 /// And the camera's own two:
 ///
@@ -3571,7 +3634,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         eprintln!("rune   --cpu: this tier is the CPU integrator either way");
     }
     let frames: usize = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0);
-    window(frames, budget, walk, projection, shutter_flag(args)?, tier, settle)
+    window(frames, budget, walk, args.flag("jump"), projection, shutter_flag(args)?, tier, settle)
 }
 
 /// The window the cove opens at, physical pixels. The raster tier draws at
@@ -3608,6 +3671,7 @@ pub fn window(
     frames: usize,
     budget: Budget,
     walk: u32,
+    jump: bool,
     projection: Option<Projection>,
     shutter: Option<bool>,
     tier: Tier,
@@ -3651,9 +3715,23 @@ pub fn window(
             while !ready.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            eprintln!("rune   --walk {walk}: holding W for {walk} s, then standing");
+            eprintln!("rune   --walk {walk}: holding W for {walk} s, then standing{}", if jump { " (with a jump a second in)" } else { "" });
             held.lock().unwrap_or_else(|e| e.into_inner()).forward = 1.0;
-            std::thread::sleep(Duration::from_secs(walk as u64));
+            // `--jump`: a second into the walk, hold Space for a full wind-up
+            // and let go. It is exactly the held bool a key press sets, so the
+            // simulation cannot tell the difference — which is what makes it
+            // a measurement of the pace with a jump in it rather than a
+            // separate code path.
+            if jump && walk > 1 {
+                std::thread::sleep(Duration::from_secs(1));
+                held.lock().unwrap_or_else(|e| e.into_inner()).jump = true;
+                std::thread::sleep(Duration::from_millis(320));
+                held.lock().unwrap_or_else(|e| e.into_inner()).jump = false;
+                eprintln!("rune   --walk --jump: jumped");
+                std::thread::sleep(Duration::from_secs(walk as u64 - 1));
+            } else {
+                std::thread::sleep(Duration::from_secs(walk as u64));
+            }
             held.lock().unwrap_or_else(|e| e.into_inner()).forward = 0.0;
             eprintln!("rune   --walk: let go of W");
         });

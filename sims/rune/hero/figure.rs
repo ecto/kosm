@@ -327,7 +327,36 @@ impl Rig {
             shoulder: [self.shoulder(1.0), self.shoulder(-1.0)],
             elbow: [solve_elbow(1.0), solve_elbow(-1.0)],
             hand: [self.hand_right, self.hand_left],
+            hood: self.hood_pivot(),
+            hood_cloth: self.hood_cloth(),
+            satchel: self.satchel_pivot(),
+            satchel_bag: self.satchel_bag(),
         }
+    }
+
+    /// Where the cowl hinges: the nape, behind and below the head's centre.
+    /// Leaned with the torso, because the neck is.
+    pub fn hood_pivot(&self) -> [f64; 3] {
+        self.lean([0.0, -0.55 * self.head_r, self.head_z - 0.55 * self.head_r])
+    }
+
+    /// And where its cloth sits. The hood body's own bounding centroid is a
+    /// little *behind* the head's — the crown ball is set back and the nape
+    /// fold is further back still — which is what lets a lump here take the
+    /// hood without taking the head with it.
+    pub fn hood_cloth(&self) -> [f64; 3] {
+        self.lean([0.0, -0.18 * self.head_r, self.head_z])
+    }
+
+    /// Where the satchel's strap turns, on the hero's left hip.
+    pub fn satchel_pivot(&self) -> [f64; 3] {
+        [-0.65 * self.skirt_r, self.pelvis_y - 30.0, self.hip_z + 74.0]
+    }
+
+    /// And the bag itself, hanging clear of the cloak's flare. The same
+    /// `-0.90 · skirt_r - 40` the geometry uses.
+    pub fn satchel_bag(&self) -> [f64; 3] {
+        [-0.90 * self.skirt_r - 40.0, self.pelvis_y - 30.0, self.hip_z + 40.0]
     }
 
     /// How much longer the two leg bones are than the drop from hip to ankle.
@@ -394,6 +423,17 @@ pub struct Pivots {
     /// Not a joint: the IK target the arm was solved to. Here because the
     /// controller's arm PD drives exactly this.
     pub hand: [[f64; 3]; 2],
+    /// The nape, where the cowl hinges, and where its cloth sits. Not a bone:
+    /// a hood is cloth on a body and swings, so `kosm::player` hangs it off
+    /// the neck on a soft joint with light damping and it bounces on a
+    /// landing. See [`kosm::player::Dangle`].
+    pub hood: [f64; 3],
+    pub hood_cloth: [f64; 3],
+    /// The same for the bag on the left hip: where its strap turns, and where
+    /// the bag itself is. It hinges about the figure's own forward, so a turn
+    /// swings it out.
+    pub satchel: [f64; 3],
+    pub satchel_bag: [f64; 3],
 }
 
 impl Pivots {

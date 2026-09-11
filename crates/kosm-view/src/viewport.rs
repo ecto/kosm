@@ -56,6 +56,9 @@ pub enum Key {
     S,
     D,
     Shift,
+    /// Either control key, or `C`: one key for "crouch", because the two are
+    /// the two things everybody's hand reaches for.
+    Ctrl,
 }
 
 /// What the window tells the scene about.
@@ -477,6 +480,7 @@ fn key_of(code: KeyCode) -> Option<Key> {
         KeyCode::KeyS => Key::S,
         KeyCode::KeyD => Key::D,
         KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
+        KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::KeyC => Key::Ctrl,
         _ => return None,
     })
 }
