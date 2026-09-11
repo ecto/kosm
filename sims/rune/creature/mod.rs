@@ -36,8 +36,10 @@ use kosm_render::TriMesh;
 use vcad_kernel::Solid;
 use vcad_kernel_raytrace::BrepGeom;
 
-mod body;
-mod look;
+/// The animal, as CAD: `assemble` writes its bodies into any open builder,
+/// so a level can stand one in itself the way `kosm run rune/creature` does.
+pub mod body;
+pub mod look;
 
 use body::Creature;
 

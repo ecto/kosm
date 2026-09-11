@@ -199,7 +199,12 @@ pub struct Layout {
 const REFERENCE_H: f64 = 1200.0;
 
 /// The layout, from any source of knobs.
-fn layout(knob: &dyn Fn(&str, f64) -> f64) -> Layout {
+///
+/// `layout(&|_, default| default)` is the doll at its authored proportions
+/// with nothing registered on the document — which is what a *level* that
+/// wants the figure as a prop asks for, since the automaton's forty knobs are
+/// the automaton's business and not the cove's.
+pub fn layout(knob: &dyn Fn(&str, f64) -> f64) -> Layout {
     let h = knob("height_mm", 1200.0);
     // A length knob: its default is millimetres on the reference 1.2 m doll,
     // and whatever it resolves to is rescaled to *this* doll's height. So
@@ -526,7 +531,30 @@ fn lens_mesh(r: f64, h: f64, segments: usize, rings: usize) -> TriMesh {
 pub fn doll(params: &Params) -> anyhow::Result<Built> {
     build(params, |b| {
         let l = layout(&|name, default| b.param(name, default));
+        let f = b.param("lens_f_mm", 2450.0);
+        assemble(b, &l, f, true);
+    })
+}
 
+/// The doll's bodies into a builder that is already open, at the doll's own
+/// origin — the soles on `z = 0`, `+y` its facing.
+///
+/// [`doll`] is this with a document of its own; a level that wants the figure
+/// standing in it calls this and then places what
+/// [`kosm::build::Builder::bodies_since`] hands back. Nothing in here is
+/// authored in world coordinates, which is the whole reason the same closure
+/// serves the turntable and the doorstep.
+///
+/// `glass` is the one thing a *level* turns off. The automaton's lens and its
+/// two eyes are intersections of spheres two and a half metres across — the
+/// kernel's worst case, which is why [`parts`] substitutes [`lens_mesh`] for
+/// them — and, worse, a transmissive body in the cove would join the caustic
+/// pass's aim ([`kosm_render::caustics::is_caustic_refractor`] looks for
+/// exactly that) and spend the rune's photons on a bystander. So the cove
+/// takes the doll without its glass: what is left in the hands is the brass
+/// bezel, which is the ring the instrument is *missing* its lens from.
+pub fn assemble(b: &Builder, l: &Layout, lens_f_mm: f64, glass: bool) {
+    {
         // ---- the legs ------------------------------------------------------
         // Ball at the hip, ball at the knee, ball at the ankle; lacquered rods
         // between them; a porcelain capsule for the foot, laid along the
@@ -665,8 +693,11 @@ pub fn doll(params: &Params) -> anyhow::Result<Built> {
             // is wide, which is as convex as a sphere of that radius allows
             // before the rim goes to a knife edge.
             let r_eye = 0.866 * l.eye_d;
-            let eyes = b.body("eyes");
-            eyes.material("glass").decorative();
+            let eyes = glass.then(|| {
+                let eyes = b.body("eyes");
+                eyes.material("glass").decorative();
+                eyes
+            });
             let bezels = b.body("eye_bezels");
             bezels.material("brass").decorative();
             for side in [-1.0f64, 1.0] {
@@ -675,10 +706,14 @@ pub fn doll(params: &Params) -> anyhow::Result<Built> {
                 let dir = [sy * cp, cy * cp, sp];
                 let seat = scale(dir, l.head_r - 0.10 * l.eye_d);
                 let at = [seat[0], seat[1], hc + seat[2]];
-                eyes.add(aim(biconvex(b, r_eye, 0.5 * l.eye_d), dir, at));
+                if let Some(eyes) = eyes.as_ref() {
+                    eyes.add(aim(biconvex(b, r_eye, 0.5 * l.eye_d), dir, at));
+                }
                 bezels.add(aim(b.torus(0.5 * l.eye_d, 0.10 * l.eye_d), dir, at));
             }
-            eyes.rotate_x(l.head_tilt).at(0.0, 0.0, pivot);
+            if let Some(eyes) = eyes.as_ref() {
+                eyes.rotate_x(l.head_tilt).at(0.0, 0.0, pivot);
+            }
             bezels.rotate_x(l.head_tilt).at(0.0, 0.0, pivot);
         }
 
@@ -687,17 +722,18 @@ pub fn doll(params: &Params) -> anyhow::Result<Built> {
         // before this document is built, so the same closure serves the
         // turntable (where nothing constrains it) and the doorstep (where the
         // keyhole does).
-        let f = b.param("lens_f_mm", 2450.0);
-        let (r_lens, _t) = l.lens_radius(f);
-        b.body("lens")
-            .material("glass")
-            .decorative()
-            .add(aim(biconvex(b, r_lens, l.lens_h()), l.lens_axis(), l.lens_centre()));
+        let (r_lens, _t) = l.lens_radius(lens_f_mm);
+        if glass {
+            b.body("lens")
+                .material("glass")
+                .decorative()
+                .add(aim(biconvex(b, r_lens, l.lens_h()), l.lens_axis(), l.lens_centre()));
+        }
         b.body("bezel")
             .material("brass")
             .decorative()
             .add(aim(b.torus(l.lens_h(), l.bezel_minor), l.lens_axis(), l.lens_centre()));
-    })
+    }
 }
 
 // ---- the pose --------------------------------------------------------------
