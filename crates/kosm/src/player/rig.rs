@@ -287,6 +287,18 @@ pub struct RigKnobs {
     pub shutter_max: u32,
     /// The speed at which the shutter is fully open, metres per second.
     pub shutter_speed: f64,
+    /// How far a body at rest may drift before the rig follows it, metres.
+    /// A standing body breathes, and a camera that followed the breath would
+    /// never be still — and a camera that is never still is one the history
+    /// and the settle blend can never converge under. Only at rest: a walking
+    /// body is followed exactly.
+    pub dead_zone: f64,
+    /// Below this speed the body is at rest, metres per second: its velocity
+    /// buys no look-ahead and no field of view, and [`RigKnobs::dead_zone`]
+    /// holds.
+    pub rest_speed: f64,
+    /// How far a body at rest may lean before the rig follows it, radians.
+    pub dead_lean: f64,
 }
 
 impl Default for RigKnobs {
@@ -314,6 +326,9 @@ impl Default for RigKnobs {
             fov_quantum_deg: 0.01,
             shutter_max: 4,
             shutter_speed: 2.6,
+            dead_zone: 0.02,
+            rest_speed: 0.08,
+            dead_lean: 0.5f64.to_radians(),
         }
     }
 }
@@ -353,6 +368,9 @@ impl RigKnobs {
             fov_quantum_deg: p("cam_fov_quantum_deg", d.fov_quantum_deg),
             shutter_max: p("cam_shutter_max", d.shutter_max as f64).max(1.0) as u32,
             shutter_speed: p("cam_shutter_speed", d.shutter_speed).max(1e-3),
+            dead_zone: p("cam_dead_zone_mm", 20.0) / 1000.0,
+            rest_speed: p("cam_rest_speed", 0.08),
+            dead_lean: p("cam_dead_lean_deg", 0.5).to_radians(),
         }
     }
 
@@ -405,6 +423,12 @@ struct State {
     /// [`Rig::pulse_fov`].
     pulse: f64,
     pulse_vel: f64,
+    /// Where the rig thinks a resting body is, and how far it thinks it
+    /// leans: held until the body leaves [`RigKnobs::dead_zone`].
+    anchor: Vec3,
+    anchor_lean: f64,
+    /// Whether the body was at rest last frame.
+    resting: bool,
 }
 
 impl Default for State {
@@ -423,6 +447,9 @@ impl Default for State {
             kick_vel: 0.0,
             pulse: 0.0,
             pulse_vel: 0.0,
+            anchor: Vec3::zeros(),
+            anchor_lean: 0.0,
+            resting: false,
         }
     }
 }
@@ -520,6 +547,8 @@ impl Rig {
     pub fn follow(&self, subject: &Subject, dt: f64) -> kosm_render::Camera {
         let k = &self.knobs;
         let mut s = self.state.get();
+        let framed = self.framed(subject, &mut s);
+        let subject = &framed;
 
         let want = self.place(subject);
         let aim_want = self.aim_offset(subject);
@@ -541,6 +570,9 @@ impl Rig {
                     want,
                     time: 0.0,
                     started: true,
+                    anchor: s.anchor,
+                    anchor_lean: s.anchor_lean,
+                    resting: s.resting,
                 };
                 self.state.set(s);
             }
@@ -691,6 +723,42 @@ impl Rig {
     }
 
     /// The wanted eye: the ideal one, shortened by the arm and floored.
+    /// The subject the rig frames: the body's place, not its breath.
+    ///
+    /// Walking, it is the body exactly. At rest — below
+    /// [`RigKnobs::rest_speed`] — the rig holds the place it saw on the first
+    /// frame of rest and moves it only as far as the body leaves
+    /// [`RigKnobs::dead_zone`], with the lean held the same way, and a resting
+    /// body's velocity buys no look-ahead. Snapping on the first frame of rest
+    /// keeps where a camera settles exactly where it settled before there was
+    /// a zone.
+    fn framed(&self, subject: &Subject, s: &mut State) -> Subject {
+        let k = &self.knobs;
+        let resting = subject.speed < k.rest_speed;
+        if !s.started || !resting || !s.resting {
+            s.anchor = subject.position;
+            s.anchor_lean = subject.lean;
+        } else {
+            let d = subject.position - s.anchor;
+            let n = d.norm();
+            if n > k.dead_zone {
+                s.anchor = s.anchor + d * ((n - k.dead_zone) / n);
+            }
+            let dl = subject.lean - s.anchor_lean;
+            if dl.abs() > k.dead_lean {
+                s.anchor_lean += dl - k.dead_lean * dl.signum();
+            }
+        }
+        s.resting = resting;
+        Subject {
+            position: s.anchor,
+            velocity: if resting { Vec3::zeros() } else { subject.velocity },
+            facing: subject.facing,
+            speed: if resting { 0.0 } else { subject.speed },
+            lean: s.anchor_lean,
+        }
+    }
+
     fn place(&self, s: &Subject) -> Vec3 {
         self.clamp_eye(s, self.ideal_eye(s))
     }
