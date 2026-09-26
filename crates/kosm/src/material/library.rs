@@ -55,6 +55,7 @@ const NAMES: &[&str] = &[
     "water",
     "sea water",
     "red wine",
+    "white wine",
     "soap film",
     "jelly",
     "lacquer",
@@ -351,6 +352,23 @@ fn build(key: &str) -> Option<Material> {
             .cite(
                 estimated("ethanol–water mixtures at 13 % v/v (density, viscosity, surface tension); CRC for the endpoints"),
                 estimated("refractive index of 13 % ethanol–water; transmittance shaped on published red-wine spectra, 1 cm path"),
+                estimated("clear; a still surface is smooth"),
+            )
+            .done(),
+        "white wine" => B::new("white wine")
+            .mech(990.0, 2.1e9, 0.5, 0.0)
+            .rub(0.0, 0.0)
+            .look([1.0, 1.0, 1.0], 0.02)
+            .clear(Dielectric::clear(1.3430, 55.0).with_absorption(
+                // straw: a little of the blue gone within a centimetre
+                Spectrum::new([0.86, 0.92, 0.97, 0.99, 0.995, 0.995]),
+                0.01,
+            ))
+            .flows(1.5e-3)
+            .tension(0.047)
+            .cite(
+                estimated("ethanol–water mixtures at 12 % v/v (density, viscosity, surface tension); CRC for the endpoints"),
+                estimated("refractive index of 12 % ethanol–water; straw transmittance shaped on published white-wine spectra, 1 cm path"),
                 estimated("clear; a still surface is smooth"),
             )
             .done(),

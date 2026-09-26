@@ -29,6 +29,8 @@ const AROUND: usize = 192;
 
 /// The goblet's solid: sizes in metres.
 pub struct Shape {
+    /// The library name of what is in it.
+    pub wine: &'static str,
     /// The bowl's inner surface, base to rim, `(r, z)`; the shell solver's profile.
     pub inner: Vec<[f64; 2]>,
     pub wall: f64,
@@ -132,6 +134,52 @@ pub fn lathe(curve: &[[f64; 2]]) -> TriMesh {
     TriMesh::new(positions, Vec::new(), &indices)
 }
 
+/// The wine's free surface with ripples on it at time `t`: a polar mesh,
+/// fine (a tenth of a millimetre) in the band by the wall where the ripples
+/// live, coarse inside, with shading normals from the ripples' own slope so
+/// the light bends by the exact gradient rather than the facets'.
+pub fn rippled_surface(shape: &Shape, level: f64, rip: &kosm::fluid::Ripples, t: f64) -> TriMesh {
+    let r_wall = shape.inner_r(level);
+    let band = (4.0 / rip.alpha).min(0.6 * r_wall);
+    let step = (rip.wavelength() / 10.0).min(1e-4);
+    let mut rings = vec![];
+    let mut r = r_wall;
+    while r > r_wall - band {
+        rings.push(r);
+        r -= step;
+    }
+    let inner = r_wall - band;
+    for i in 1..=12 {
+        rings.push(inner * (1.0 - i as f64 / 12.0));
+    }
+    let mut positions = Vec::with_capacity(rings.len() * AROUND);
+    let mut normals = Vec::with_capacity(rings.len() * AROUND);
+    for &r in &rings {
+        for j in 0..AROUND {
+            let a = std::f64::consts::TAU * j as f64 / AROUND as f64;
+            let (x, y) = (r * a.cos(), r * a.sin());
+            positions.push(Point3::new(x, y, level + rip.height(r, a, t)));
+            let (gx, gy) = if r > 0.0 { rip.slope(x, y, t) } else { (0.0, 0.0) };
+            normals.push(Vec3::new(-gx, -gy, 1.0).normalize());
+        }
+    }
+    // outer ring to the axis: the same winding as `lathe`, so the normal is up
+    let mut indices = vec![];
+    for i in 0..rings.len() - 1 {
+        for j in 0..AROUND {
+            let k = (j + 1) % AROUND;
+            let (a, b, c, d) = (i * AROUND + j, i * AROUND + k, (i + 1) * AROUND + k, (i + 1) * AROUND + j);
+            for tri in [[a, c, d], [a, b, c]] {
+                let [p, q, r] = tri.map(|i| positions[i]);
+                if (q - p).cross(&(r - p)).norm() > 1e-18 {
+                    indices.extend(tri.map(|i| i as u32));
+                }
+            }
+        }
+    }
+    TriMesh::new(positions, normals, &indices)
+}
+
 /// The light, the table and the camera.
 pub struct Stage {
     pub sun_el_deg: f64,
@@ -145,7 +193,7 @@ pub struct Stage {
 
 pub fn scene(shape: &Shape, level: f64, surface: Option<TriMesh>, stage: &Stage) -> Scene<TriMesh> {
     let glass = material::named("soda-lime glass").expect("glass").pbr();
-    let wine = material::named("red wine").expect("wine").pbr();
+    let wine = material::named(shape.wine).expect("the wine is in the library").pbr();
     let mut wet = wine;
     wet.ior = wine.ior / glass.ior;
     wet.abbe = 0.0; // a ratio of two dispersive indices is not a Cauchy index
@@ -203,6 +251,27 @@ pub fn frame(scene: &Scene<TriMesh>, map: &CausticMap, shape: &Shape, stage: &St
     image::RgbaImage::from_raw(stage.width, stage.height, film.to_srgb8(stage.exposure, false)).expect("the film is width × height")
 }
 
+/// A close-up of the wine's surface by the side wall (square to the sun's
+/// azimuth), from where the sun's reflection in a flat surface would land in
+/// the lens: a still surface shows one glint, a rippled one a band of them.
+///
+/// The spot and the sun have to see each other over the rim, and so do the
+/// spot and the lens: a shadow ray takes glass as opaque. At the side wall,
+/// 3 mm in, the open chord runs 14 mm each way, so a sun above about 50°
+/// clears a 17 mm freeboard. Use a high sun for this view.
+pub fn surface_closeup(scene: &Scene<TriMesh>, shape: &Shape, level: f64, stage: &Stage) -> image::RgbaImage {
+    let (az, el) = (stage.sun_az_deg.to_radians(), stage.sun_el_deg.to_radians());
+    let r = shape.inner_r(level) - 3e-3;
+    let side = az + std::f64::consts::FRAC_PI_2;
+    let p = Point3::new(r * side.cos(), r * side.sin(), level);
+    let mirror = Vec3::new(-el.cos() * az.cos(), -el.cos() * az.sin(), el.sin());
+    let inward = Vec3::new(-side.cos(), -side.sin(), 0.0);
+    let cam = Camera::look_at(p + mirror * 0.2, p + inward * 0.004, Vec3::new(0.0, 0.0, 1.0), 12.0);
+    let opts = PathTraceOptions { spp: stage.spp, max_depth: 16, ..PathTraceOptions::default() };
+    let film = kosm_render::pathtrace::render(scene, &cam, stage.width, stage.height, &opts);
+    image::RgbaImage::from_raw(stage.width, stage.height, film.to_srgb8(stage.exposure, false)).expect("the film is width × height")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +279,7 @@ mod tests {
 
     fn goblet() -> Shape {
         let bowl = kosm::shell::Profile::goblet(0.04, 0.09, 0.005, 40);
-        Shape { inner: bowl.points, wall: 1.2e-3, stem_r: 0.004, stem_h: 0.07, foot_r: 0.035, foot_t: 0.003 }
+        Shape { wine: "red wine", inner: bowl.points, wall: 1.2e-3, stem_r: 0.004, stem_h: 0.07, foot_r: 0.035, foot_t: 0.003 }
     }
 
     #[test]

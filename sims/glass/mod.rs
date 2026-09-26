@@ -16,9 +16,16 @@
 //! - `frame.png`: the goblet filled to the tuned level, on linen in low sun,
 //!   with its caustic (`render.rs`); skipped by `--no-frame`.
 //!
+//! - `ripple.mp4` (with `--ripple_frames N`): the surface ripples the ring
+//!   drives (`kosm::fluid::ripple`), seen as the sun's glint on the wine by
+//!   the far wall, strobed at 1 + 1/48 of the period so it moves at a
+//!   watchable pace. `--drive` scales the tap. (On the tablecloth the same
+//!   ripples move the caustic by about 2 mm: below the photon gather radius,
+//!   so the table view is the wrong place to look for them.)
+//!
 //! Knobs: `rim_r`, `bowl_h`, `base_r`, `wall_t`, `fill` (millimetres),
 //! `contact_ms`, `seconds`, `target_hz`, `sun_el`, `sun_az` (degrees),
-//! `width`, `height`, `spp`, `photons`.
+//! `width`, `height`, `spp`, `photons`, `exposure`, `drive`, `ripple_frames`, `white` (1 pours white wine).
 
 mod render;
 
@@ -46,6 +53,9 @@ fn params(args: &kosm_cli::Args) -> Vec<Param> {
         knob("spp", 64.0),
         knob("photons", 2_000_000.0),
         knob("exposure", 0.7),
+        knob("drive", 1.0),
+        knob("white", 0.0),
+        knob("ripple_frames", 0.0),
     ]
 }
 
@@ -59,6 +69,7 @@ pub struct Goblet {
     pub wall: f64,
     pub glass: kosm::audio::Material,
     pub wine: f64,
+    pub wine_name: &'static str,
     pub rim_r: f64,
     pub height: f64,
 }
@@ -67,12 +78,14 @@ impl Goblet {
     pub fn from_params(params: &[Param]) -> Self {
         let mm = |name| get(params, name) * 1e-3;
         let glass = material::named("soda-lime glass").expect("soda-lime glass is in the library");
-        let wine = material::named("red wine").expect("red wine is in the library");
+        let wine_name = if get(params, "white") > 0.5 { "white wine" } else { "red wine" };
+        let wine = material::named(wine_name).expect("the wine is in the library");
         Self {
             bowl: Profile::goblet(mm("rim_r"), mm("bowl_h"), mm("base_r"), SEGMENTS),
             wall: mm("wall_t"),
             glass: glass.modal(),
             wine: wine.fluid().density,
+            wine_name,
             rim_r: mm("rim_r"),
             height: mm("bowl_h"),
         }
@@ -84,7 +97,7 @@ impl Goblet {
 
     /// The whole goblet, stem and foot, for the renderer.
     fn shape(&self) -> render::Shape {
-        render::Shape { inner: self.bowl.points.clone(), wall: self.wall, stem_r: 0.004, stem_h: 0.07, foot_r: 0.035, foot_t: 0.003 }
+        render::Shape { wine: self.wine_name, inner: self.bowl.points.clone(), wall: self.wall, stem_r: 0.004, stem_h: 0.07, foot_r: 0.035, foot_t: 0.003 }
     }
 
     /// Every mode worth hearing at a fill level (metres), lowest first.
@@ -111,6 +124,24 @@ impl Goblet {
         shell::strike(&self.bank(level), self.bowl.nodes() - 2, 1e-3, contact_s, seconds, SR, |hz| {
             kosm::audio::radiation_efficiency(hz, area, wall, glass)
         })
+    }
+
+    /// The ripples a rim tap of `impulse` N·s leaves on wine at `level`:
+    /// the (2, 0) mode's displacement at the waterline sets their amplitude.
+    ///
+    /// The solver's mass matrix leaves out the ∫cos² nθ dθ = π of the
+    /// circumference, so a physically mass-normalized shape is φ/√π, and an
+    /// impulse P at the rim (θ = 0) leaves the waterline moving with
+    /// amplitude P φ(rim) φ(waterline) / (π ω).
+    pub fn ripples(&self, level: f64, impulse: f64) -> kosm::fluid::Ripples {
+        let note = self.note(level);
+        let omega = std::f64::consts::TAU * note.hz;
+        let rim = self.bowl.nodes() - 2;
+        let at_level = self.bowl.points.iter().position(|q| q[1] >= level).unwrap_or(rim);
+        let amp = impulse * (note.radial(rim) * note.radial(at_level)).abs() / (std::f64::consts::PI * omega);
+        let r = self.shape().inner_r(level);
+        let wine = material::named(self.wine_name).expect("the wine is in the library").fluid();
+        kosm::fluid::Ripples::from_wall(note.hz, 2, amp, note.decay, r, &wine)
     }
 
     /// Newton on the fill: the level whose note is `target` Hz, or `None` when
@@ -214,6 +245,47 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         rec.png("frame.png", &render::frame(&scene, &map, &shape, &stage))?;
         println!("frame: total {:.1} s", t0.elapsed().as_secs_f64());
         rec.metric("photons_deposited", map.len())?;
+
+        // the ripples: the tap's waterline motion, strobed a little slower
+        // than the note so the light moves slowly, as under a stroboscope
+        let impulse = 1e-3 * get(&params, "drive");
+        let rip = goblet.ripples(level, impulse);
+        println!(
+            "ripples: λ {:.2} mm, reach {:.1} mm, wall amplitude {:.2} µm, slope {:.4}",
+            rip.wavelength() * 1e3,
+            1e3 / rip.alpha,
+            rip.amp * 1e6,
+            rip.amp * rip.k
+        );
+        rec.metric("ripple_wavelength_mm", rip.wavelength() * 1e3)?;
+        rec.metric("ripple_reach_mm", 1e3 / rip.alpha)?;
+        rec.metric("ripple_amp_um", rip.amp * 1e6)?;
+        rec.metric("ripple_slope", rip.amp * rip.k)?;
+        let frames = get(&params, "ripple_frames") as usize;
+        if frames > 0 {
+            let dir = rec.path("ripple")?;
+            std::fs::create_dir_all(&dir)?;
+            let period = std::f64::consts::TAU / rip.omega;
+            let t0 = std::time::Instant::now();
+            for f in 0..frames {
+                let t = f as f64 * period * (1.0 + 1.0 / 48.0);
+                let top = render::rippled_surface(&shape, level, &rip, t);
+                let scene = render::scene(&shape, level, Some(top), &stage);
+                render::surface_closeup(&scene, &shape, level, &stage).save(dir.join(format!("frame_{f:03}.png")))?;
+            }
+            println!("ripple: {frames} frames in {:.1} s", t0.elapsed().as_secs_f64());
+            let mp4 = rec.path("ripple.mp4")?;
+            let st = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-framerate", "24", "-i"])
+                .arg(dir.join("frame_%03d.png"))
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "17"])
+                .arg(&mp4)
+                .status();
+            match st {
+                Ok(s) if s.success() => println!("ripple: → {}", mp4.display()),
+                _ => println!("ripple: no ffmpeg; frames are in {}", dir.display()),
+            }
+        }
     }
     rec.finish()?;
     Ok(())
