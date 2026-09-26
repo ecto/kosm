@@ -9,8 +9,8 @@
 //!   printed, and the caustic is re-traced;
 //! - **Space** taps the rim: `glass.wav`'s sound through the speakers, and the
 //!   ripples it drives on the wine;
-//! - **Shift** (held) rubs the rim: the glass harmonica, and ripples that
-//!   stay while you rub;
+//! - **Shift** (held) rubs the rim: the glass harmonica, looping for as long
+//!   as it is held, and ripples that stay while you rub;
 //! - **Left / Right** swing the sun round, **A / D** lower and raise it;
 //! - **Home** pours to the tuned note (A4) and resets the view.
 //!
@@ -121,6 +121,24 @@ impl Window {
         Some(sink)
     }
 
+    /// The rub's attack once, then its steady tail round and round until the
+    /// sink is stopped. The loop runs from one upward zero crossing to the one
+    /// nearest a second later, so the seam lands on the same phase of the
+    /// note and does not click.
+    fn play_looped(&self, mono: Vec<f32>) -> Option<rodio::Sink> {
+        use rodio::Source;
+        let (_, handle) = self.audio.as_ref()?;
+        let sink = rodio::Sink::try_new(handle).ok()?;
+        let up = |from: usize| (from..mono.len() - 1).find(|&i| mono[i] <= 0.0 && mono[i + 1] > 0.0);
+        let start = up((1.5 * SR) as usize)?;
+        let end = up(start + SR as usize)?;
+        let attack = mono[..start].to_vec();
+        let tail = mono[start..end].to_vec();
+        sink.append(rodio::buffer::SamplesBuffer::new(1, SR as u32, attack));
+        sink.append(rodio::buffer::SamplesBuffer::new(1, SR as u32, tail).repeat_infinite());
+        Some(sink)
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         f(&mut self.shared.state.lock().expect("the state lock"))
     }
@@ -161,11 +179,11 @@ impl Scene for Window {
                 let rim = g.bowl.nodes() - 2;
                 let waterline = g.bowl.points.iter().position(|q| q[1] >= level).unwrap_or(rim);
                 let area = g.bowl.area();
-                let rubbed = shell::rub(&bank, rim, g.rim_r, waterline, shell::Rub::default(), 8.0, SR, |hz| {
+                let rubbed = shell::rub(&bank, rim, g.rim_r, waterline, shell::Rub::default(), 3.0, SR, |hz| {
                     kosm::audio::radiation_efficiency(hz, area, g.wall, g.glass)
                 });
                 let steady = *rubbed.amplitude.last().unwrap_or(&0.0);
-                self.rubbing = self.play(rubbed.audio);
+                self.rubbing = self.play_looped(rubbed.audio);
                 self.with(|s| s.rub = Some(steady));
             }
             Event::KeyUp(Key::Shift) => {
