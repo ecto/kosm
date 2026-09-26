@@ -13,8 +13,14 @@
 //!   that plays `target_hz` (A4 by default), found by Newton on the
 //!   eigenproblem's adjoint and checked against central differences.
 //!
+//! - `frame.png`: the goblet filled to the tuned level, on linen in low sun,
+//!   with its caustic (`render.rs`); skipped by `--no-frame`.
+//!
 //! Knobs: `rim_r`, `bowl_h`, `base_r`, `wall_t`, `fill` (millimetres),
-//! `contact_ms`, `seconds`, `target_hz`.
+//! `contact_ms`, `seconds`, `target_hz`, `sun_el`, `sun_az` (degrees),
+//! `width`, `height`, `spp`, `photons`.
+
+mod render;
 
 use kosm::prelude::*;
 use kosm::shell::{self, Liquid, Profile, ShellMode};
@@ -33,6 +39,13 @@ fn params(args: &kosm_cli::Args) -> Vec<Param> {
         knob("contact_ms", 0.15),
         knob("seconds", 4.0),
         knob("target_hz", 440.0),
+        knob("sun_el", 24.0),
+        knob("sun_az", 30.0),
+        knob("width", 640.0),
+        knob("height", 400.0),
+        knob("spp", 64.0),
+        knob("photons", 2_000_000.0),
+        knob("exposure", 0.7),
     ]
 }
 
@@ -67,6 +80,11 @@ impl Goblet {
 
     fn liquid(&self, level: f64) -> Option<Liquid> {
         (level > 0.0).then_some(Liquid { density: self.wine, level })
+    }
+
+    /// The whole goblet, stem and foot, for the renderer.
+    fn shape(&self) -> render::Shape {
+        render::Shape { inner: self.bowl.points.clone(), wall: self.wall, stem_r: 0.004, stem_h: 0.07, foot_r: 0.035, foot_t: 0.003 }
     }
 
     /// Every mode worth hearing at a fill level (metres), lowest first.
@@ -158,8 +176,10 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
 
     // fill it to play the target
     let target = get(&params, "target_hz");
-    match goblet.tune(target) {
+    let tuned = goblet.tune(target);
+    match &tuned {
         Some((level, path)) => {
+            let level = *level;
             let h = 1e-5;
             let fd = (goblet.note(level + h).hz - goblet.note(level - h).hz) / (2.0 * h);
             let adj = goblet.slope(level);
@@ -171,6 +191,29 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
             write_wav(&rec.path("tuned.wav")?, &goblet.tap(level, contact, seconds))?;
         }
         None => println!("tune: {target} Hz is out of this glass's range"),
+    }
+
+    // the picture: filled to the note if there is one, else to the knob
+    if !args.flag("no-frame") {
+        let level = tuned.as_ref().map(|t| t.0).unwrap_or(fill);
+        let shape = goblet.shape();
+        let stage = render::Stage {
+            sun_el_deg: get(&params, "sun_el"),
+            sun_az_deg: get(&params, "sun_az"),
+            width: get(&params, "width") as u32,
+            height: get(&params, "height") as u32,
+            spp: get(&params, "spp") as u32,
+            photons: get(&params, "photons") as usize,
+            exposure: get(&params, "exposure") as f32,
+        };
+        let t0 = std::time::Instant::now();
+        let scene = render::scene(&shape, level, None, &stage);
+        let map = render::caustic_map(&scene, &stage);
+        let t_map = t0.elapsed().as_secs_f64();
+        println!("frame: caustic map {:.1} s, {} photons deposited", t_map, map.len());
+        rec.png("frame.png", &render::frame(&scene, &map, &shape, &stage))?;
+        println!("frame: total {:.1} s", t0.elapsed().as_secs_f64());
+        rec.metric("photons_deposited", map.len())?;
     }
     rec.finish()?;
     Ok(())
