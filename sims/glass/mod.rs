@@ -26,11 +26,18 @@
 //! - `rub.wav`: a wet finger drawn round the rim at the tuned fill, the glass
 //!   harmonica (`shell::rub`, stick-slip friction on the rim's modes).
 //!
+//! `--view` (built with `--features view`) opens the glass in a window: orbit,
+//! pour, tap, rub, move the sun, and hear it. See `game.rs`.
+//!
 //! Knobs: `rim_r`, `bowl_h`, `base_r`, `wall_t`, `fill` (millimetres),
 //! `contact_ms`, `seconds`, `target_hz`, `sun_el`, `sun_az` (degrees),
 //! `width`, `height`, `spp`, `photons`, `exposure`, `drive`, `ripple_frames`, `white` (1 pours white wine), `rub_speed` (m/s), `rub_force` (N).
 
 mod render;
+
+/// The glass, live in a window. `--view`.
+#[cfg(feature = "view")]
+mod game;
 
 use kosm::prelude::*;
 use kosm::shell::{self, Liquid, Profile, ShellMode};
@@ -181,6 +188,13 @@ impl Goblet {
 pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let params = params(args);
     let goblet = Goblet::from_params(&params);
+    #[cfg(feature = "view")]
+    if args.view {
+        kosm_view::init();
+        let fill = get(&params, "fill") * 1e-3;
+        let level = if fill > 0.0 { fill } else { goblet.tune(get(&params, "target_hz")).map(|t| t.0).unwrap_or(0.0) };
+        return game::run(goblet, level, get(&params, "sun_el"), get(&params, "sun_az"));
+    }
     let (contact, seconds) = (get(&params, "contact_ms") * 1e-3, get(&params, "seconds"));
     let fill = get(&params, "fill") * 1e-3;
     let mut rec = Recorder::new(args.out(), "glass", &params, 0)?;
