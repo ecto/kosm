@@ -502,6 +502,152 @@ pub fn strike(modes: &[ShellMode], node: usize, impulse: f64, contact_s: f64, du
         .collect()
 }
 
+/// A wet finger drawn round the rim: the glass harmonica.
+#[derive(Clone, Copy, Debug)]
+pub struct Rub {
+    /// Finger speed along the rim, m/s.
+    pub speed: f64,
+    /// Normal force, N.
+    pub normal: f64,
+    /// Static and kinetic friction of wet skin on clean glass.
+    pub mu_static: f64,
+    pub mu_kinetic: f64,
+    /// Slip speed over which friction falls from static to kinetic, m/s.
+    pub v0: f64,
+    /// The fingertip pressed on the wall is a lossy pad: radial damping,
+    /// N·s/m. It is what keeps the note on the oval, since it bites a mode in
+    /// proportion to (radial / tangential)² at the rim, about n².
+    pub pad: f64,
+}
+
+impl Default for Rub {
+    fn default() -> Self {
+        Self { speed: 0.08, normal: 1.0, mu_static: 0.9, mu_kinetic: 0.4, v0: 0.01, pad: 2.0 }
+    }
+}
+
+/// What a rub produced.
+pub struct Rubbed {
+    /// The sound, mono, peak-normalized to 0.8.
+    pub audio: Vec<f32>,
+    /// The (2, 0) pair's amplitude at the profile point `watch`, m, once per output sample.
+    pub amplitude: Vec<f64>,
+    /// Fraction of the time the finger stuck.
+    pub stick: f64,
+    /// Each mode's final rim displacement amplitude, m, in `modes` order.
+    pub modal: Vec<f64>,
+}
+
+/// Rub the rim: stick-slip friction at a contact point that runs round the
+/// rim at `rub.speed`, driving every mode in `modes` through its
+/// circumferential shape there.
+///
+/// Each mode is a degenerate pair (`cos nθ` and `sin nθ`), since the finger
+/// travels. Friction falls from static to kinetic with slip speed, which is
+/// the negative slope that makes the oscillation grow, exactly as in a bowed
+/// string; each step is solved the way the bowed string is (Friedlander):
+/// the finger sticks if the force needed to hold it is inside the static
+/// cone, else it slips at the speed that balances the friction curve.
+///
+/// A rigid fingertip mostly slips: a rim swinging microns at hundreds of Hz
+/// never catches a finger moving centimetres a second. What sustains the
+/// note is the friction curve's negative slope (the rim moving with the
+/// finger is gripped harder than moving against it), and what limits it is
+/// the curve flattening as the slip swings. A real fingertip also sticks,
+/// by shearing its skin; that compliance is not modelled.
+/// Output is the rim's radial acceleration at θ = 0 through each mode's
+/// radiation efficiency.
+pub fn rub(modes: &[ShellMode], rim: usize, rim_r: f64, watch: usize, rub: Rub, seconds: f64, sr: f64, radiation: impl Fn(f64) -> f64) -> Rubbed {
+    const SUB: usize = 16;
+    let dt = 1.0 / (sr * SUB as f64);
+    let root_pi = PI.sqrt();
+    let k: Vec<(f64, f64, f64, f64, f64, bool)> = modes
+        .iter()
+        .map(|m| {
+            let w = 2.0 * PI * m.hz;
+            // physically mass-normalized shapes: the solver left out ∫cos² = π
+            (w, 2.0 * m.decay, m.shape[rim][2] / root_pi, m.shape[rim][0] / root_pi, radiation(m.hz).sqrt(), m.n == 2 && m.m == 0)
+        })
+        .collect();
+    let nf: Vec<f64> = modes.iter().map(|m| m.n as f64).collect();
+    let watch_r: Vec<f64> = modes.iter().map(|m| m.shape[watch][0] / root_pi).collect();
+    let g: f64 = k.iter().map(|m| m.2 * m.2).sum(); // Σ V², the rim's tangential mobility per unit impulse
+
+    let mut q = vec![[0.0f64; 2]; modes.len()];
+    let mut v = vec![[0.0f64; 2]; modes.len()];
+    let steps = (seconds * sr) as usize;
+    let (mut audio, mut amplitude) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
+    let mut stuck = 0usize;
+    let omega_f = rub.speed / rim_r;
+    let mu = |u: f64| rub.mu_kinetic + (rub.mu_static - rub.mu_kinetic) / (1.0 + u / rub.v0);
+
+    for i in 0..steps * SUB {
+        let t = i as f64 * dt;
+        let theta = omega_f * t;
+        // each mode's free step first: damped oscillator, symplectic Euler
+        for (j, m) in k.iter().enumerate() {
+            for c in 0..2 {
+                v[j][c] += dt * (-m.0 * m.0 * q[j][c] - m.1 * v[j][c]);
+            }
+        }
+        // the glass's tangential velocity under the finger, before friction
+        let basis = |j: usize| ((nf[j] * theta).sin(), -(nf[j] * theta).cos());
+        let vg: f64 = (0..k.len()).map(|j| {
+            let (bc, bs) = basis(j);
+            k[j].2 * (v[j][0] * bc + v[j][1] * bs)
+        }).sum();
+        let u_free = rub.speed - vg;
+        // the impulse friction delivers this step, along the finger's motion
+        let hold = u_free / (g * dt); // force that would stop the slip outright
+        let force = if hold.abs() <= rub.normal * rub.mu_static {
+            stuck += 1;
+            hold
+        } else {
+            // slip: u = u_free − g dt N μ(|u|) sgn, solved by bisection on |u|
+            let sgn = u_free.signum();
+            let (mut lo, mut hi) = (0.0, u_free.abs());
+            for _ in 0..40 {
+                let mid = 0.5 * (lo + hi);
+                if mid + g * dt * rub.normal * mu(mid) > u_free.abs() {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            sgn * rub.normal * mu(0.5 * (lo + hi))
+        };
+        // the pad: radial velocity under the finger, cos/sin nθ halves
+        let wr: f64 = (0..k.len()).map(|j| {
+            let (c, s) = ((nf[j] * theta).cos(), (nf[j] * theta).sin());
+            k[j].3 * (v[j][0] * c + v[j][1] * s)
+        }).sum();
+        let pad = -rub.pad * wr;
+        for j in 0..k.len() {
+            let (bc, bs) = basis(j);
+            let (c, s) = ((nf[j] * theta).cos(), (nf[j] * theta).sin());
+            v[j][0] += dt * (force * k[j].2 * bc + pad * k[j].3 * c);
+            v[j][1] += dt * (force * k[j].2 * bs + pad * k[j].3 * s);
+            q[j][0] += dt * v[j][0];
+            q[j][1] += dt * v[j][1];
+        }
+        if i % SUB == SUB - 1 {
+            // radial acceleration at θ = 0: only the cos half of each pair shows there
+            let p: f64 = k.iter().enumerate().map(|(j, m)| -m.0 * m.0 * q[j][0] * m.3 * m.4).sum();
+            audio.push(p);
+            let a: f64 = k.iter().enumerate().filter(|(_, m)| m.5).map(|(j, _)| (q[j][0].hypot(q[j][1])) * watch_r[j].abs()).sum();
+            amplitude.push(a);
+        }
+    }
+    let peak = audio.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+    let gain = if peak > 0.0 { 0.8 / peak } else { 0.0 };
+    Rubbed {
+        audio: audio.iter().map(|&x| (x * gain) as f32).collect(),
+        amplitude,
+        stick: stuck as f64 / (steps * SUB).max(1) as f64,
+        modal: k.iter().enumerate().map(|(j, m)| q[j][0].hypot(q[j][1]) * m.3.abs()).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +710,29 @@ mod tests {
             let fd = (filled(level + h).hz - filled(level - h).hz) / (2.0 * h);
             assert!((adj - fd).abs() / fd.abs() < 0.01, "level {level}: adjoint {adj:.2} vs fd {fd:.2} Hz/m");
         }
+    }
+
+    #[test]
+    fn a_rubbed_rim_sings_at_its_oval_mode() {
+        let bowl = Profile::goblet(0.04, 0.09, 0.005, 30);
+        let bank: Vec<ShellMode> = (2..=3).flat_map(|n| modes(&bowl, 1.2e-3, GLASS, n, 1)).collect();
+        let note = bank[0].hz;
+        let sr = 44_100.0;
+        let out = rub(&bank, bowl.nodes() - 2, 0.04, bowl.nodes() - 2, Rub::default(), 1.5, sr, |_| 1.0);
+        // it grows from rest and holds
+        let early = out.amplitude[(0.05 * sr) as usize];
+        let late = out.amplitude[out.amplitude.len() - 1];
+        assert!(late > 10.0 * early.max(1e-12), "self-excited: {early:e} → {late:e}");
+        // at the (2,0) frequency: count zero crossings over the last half second
+        let tail = &out.audio[out.audio.len() - (0.5 * sr) as usize..];
+        let crossings = tail.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+        let hz = crossings as f64 / 2.0 / 0.5;
+        assert!((hz - note).abs() / note < 0.02, "sings at {hz:.1} Hz, the oval is {note:.1} Hz");
+        // and saturates: the friction curve flattens as the slip swings, so
+        // the ring settles instead of running away
+        let mid = out.amplitude[(1.0 * sr) as usize];
+        eprintln!("rub: {early:e} → {mid:e} → {late:e} m, stick {:.3}", out.stick);
+        assert!((late / mid - 1.0).abs() < 0.2, "settled: {mid:e} → {late:e}");
     }
 
     #[test]

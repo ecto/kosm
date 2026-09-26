@@ -23,9 +23,12 @@
 //!   ripples move the caustic by about 2 mm: below the photon gather radius,
 //!   so the table view is the wrong place to look for them.)
 //!
+//! - `rub.wav`: a wet finger drawn round the rim at the tuned fill, the glass
+//!   harmonica (`shell::rub`, stick-slip friction on the rim's modes).
+//!
 //! Knobs: `rim_r`, `bowl_h`, `base_r`, `wall_t`, `fill` (millimetres),
 //! `contact_ms`, `seconds`, `target_hz`, `sun_el`, `sun_az` (degrees),
-//! `width`, `height`, `spp`, `photons`, `exposure`, `drive`, `ripple_frames`, `white` (1 pours white wine).
+//! `width`, `height`, `spp`, `photons`, `exposure`, `drive`, `ripple_frames`, `white` (1 pours white wine), `rub_speed` (m/s), `rub_force` (N).
 
 mod render;
 
@@ -55,6 +58,8 @@ fn params(args: &kosm_cli::Args) -> Vec<Param> {
         knob("exposure", 0.7),
         knob("drive", 1.0),
         knob("white", 0.0),
+        knob("rub_speed", 0.08),
+        knob("rub_force", 1.0),
         knob("ripple_frames", 0.0),
     ]
 }
@@ -101,8 +106,13 @@ impl Goblet {
     }
 
     /// Every mode worth hearing at a fill level (metres), lowest first.
+    ///
+    /// From n = 2 up. The n = 1 modes are the bowl swaying on its stem, and
+    /// with the bowl clamped at the stem their frequency is the clamp's, not
+    /// the glass's (the stem's bending is not modelled); a held or standing
+    /// glass damps that sway anyway.
     pub fn bank(&self, level: f64) -> Vec<ShellMode> {
-        let mut bank: Vec<ShellMode> = (1..=7).flat_map(|n| shell::modes_filled(&self.bowl, self.wall, self.glass, n, 2, self.liquid(level))).collect();
+        let mut bank: Vec<ShellMode> = (2..=7).flat_map(|n| shell::modes_filled(&self.bowl, self.wall, self.glass, n, 2, self.liquid(level))).collect();
         bank.sort_by(|a, b| a.hz.total_cmp(&b.hz));
         bank
     }
@@ -223,6 +233,38 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         }
         None => println!("tune: {target} Hz is out of this glass's range"),
     }
+
+    // the glass harmonica: a wet finger round the rim at the tuned fill
+    let level = tuned.as_ref().map(|t| t.0).unwrap_or(fill);
+    let bank = goblet.bank(level);
+    let rim = goblet.bowl.nodes() - 2;
+    let waterline = goblet.bowl.points.iter().position(|q| q[1] >= level).unwrap_or(rim);
+    let finger = shell::Rub { speed: get(&params, "rub_speed"), normal: get(&params, "rub_force"), ..shell::Rub::default() };
+    let area = goblet.bowl.area();
+    let rubbed = shell::rub(&bank, rim, goblet.rim_r, waterline, finger, seconds, SR, |hz| {
+        kosm::audio::radiation_efficiency(hz, area, goblet.wall, goblet.glass)
+    });
+    // the pitch is the mode that swings most at the rim
+    let loudest = bank.iter().zip(&rubbed.modal).max_by(|a, b| a.1.total_cmp(b.1)).map(|(m, _)| m).expect("a bank");
+    let rub_hz = loudest.hz;
+    let steady = *rubbed.amplitude.last().unwrap_or(&0.0);
+    let note = goblet.note(level);
+    let wine = material::named(goblet.wine_name).expect("the wine is in the library").fluid();
+    let sung = kosm::fluid::Ripples::from_wall(note.hz, 2, steady, 0.0, goblet.shape().inner_r(level), &wine);
+    println!(
+        "rub: sings at {rub_hz:.1} Hz (the oval is {:.1}), waterline swings {:.2} µm, ripple slope {:.4}",
+        note.hz,
+        steady * 1e6,
+        sung.amp * sung.k
+    );
+    for (m, a) in bank.iter().zip(&rubbed.modal).filter(|(_, a)| **a > 1e-3 * steady) {
+        println!("  ({},{}) {:7.1} Hz  rim {:.3} µm", m.n, m.m, m.hz, a * 1e6);
+    }
+    write_wav(&rec.path("rub.wav")?, &rubbed.audio)?;
+    rec.metric("rub_hz", rub_hz)?;
+    rec.metric("rub_waterline_um", steady * 1e6)?;
+    rec.metric("rub_ripple_slope", sung.amp * sung.k)?;
+    rec.metric("rub_stick_fraction", rubbed.stick)?;
 
     // the picture: filled to the note if there is one, else to the knob
     if !args.flag("no-frame") {

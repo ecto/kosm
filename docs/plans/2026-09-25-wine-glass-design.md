@@ -1,6 +1,6 @@
 # The wine glass: one substance table, heard, seen and rippling
 
-Date: 2026-09-25. Status: design, proposed. A new sim, `sims/glass/`, and the
+Date: 2026-09-25. Status: built 2026-09-26 (phases 1–5); see "As built" at the end. A new sim, `sims/glass/`, and the
 engine pieces it forces into `kosm`.
 
 ## The claim
@@ -135,3 +135,46 @@ are in the run hash).
 - The wine constants are the least certain numbers. Each one gets a source or
   an `Estimated` mark, and `fit` can recover them from a recording later
   (record a real glass, fit σ and the loading α): that is the natural sequel.
+
+## As built (2026-09-26)
+
+`cargo run --release -p kosm-cli -- run glass --out out/` (add
+`--ripple_frames 96 --sun_el 58` for the video). Engine pieces:
+`kosm::shell` (modes, fill, adjoint, strike, rub), `kosm::fluid::ripple`,
+`red wine` / `white wine` and a `surface_tension` constant in the library.
+
+| check | result |
+|---|---|
+| free cylinder vs Rayleigh's ring | within 2%, n = 2..4 |
+| empty goblet (40 × 90 mm, 1.2 mm wall) | (2,0) 619 Hz; partials 2.65×, 4.95× |
+| fill law vs French 1983 | within 0.08 at every centimetre |
+| d hz / d fill: adjoint vs central differences | equal to 0.1 Hz/m |
+| fill for A4 | 72.8 mm, 4 Newton steps on the adjoint |
+| ripples at A4 in red wine | λ 1.16 mm, reach 8 mm; a tap moves the waterline 12.5 µm |
+| rub (0.08 m/s, 1 N) | sings on (2,0) at 440 Hz, 41.6 µm at the rim; ripple slope 0.18 |
+
+Where it departed from the plan:
+
+- **The gradient is the eigenproblem's adjoint**, dλ = −λ φᵀ dM φ, not duals
+  through the solver. Exact, one solve, checked against central differences.
+- **Added mass** is local potential flow, ρ r / n per wetted strip, faded by
+  tanh(n δ / r) toward the free surface. No fitted α.
+- **The goblet is lathed meshes for kosm-render**, not a `glass.rs` shape. The
+  tracer tracks one medium, so the wet wall is its own glass-to-wine
+  interface surface (index ratio, wine absorption).
+- **A full bowl is a cylindrical lens.** Its red light gathers into a line
+  beside the stem's shadow, and red wine absorbs most of what crosses the
+  bowl.
+- **The ripples do not show on the tablecloth.** They shift the caustic
+  ~2 mm, under the photon gather radius. `ripple.mp4` shows them where they
+  do show: the sun's glint on the band at the side wall, strobed at
+  1 + 1/48 of the period. Sun and lens must both clear the rim, so that
+  needs a sun above ~50°.
+- **n = 1 is dropped.** With the bowl clamped at the stem, the sway modes
+  take their frequency from the clamp. The rub excited them hardest until
+  they were removed.
+- **The rub mostly slips.** A rigid fingertip never catches a rim moving
+  microns, so the negative friction slope sustains the note, and a pad
+  damping (∝ n²) keeps it on the oval. Skin compliance, and so true stick,
+  is not modelled. Faraday's parametric ripples (at ω/2, above a threshold)
+  are out of scope, and the rub's slope 0.18 may be past that threshold.
