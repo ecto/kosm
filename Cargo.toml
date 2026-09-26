@@ -9,6 +9,7 @@ members = [
     "crates/kosm-mpm",
     "crates/kosm-scan",
     "crates/kosm-train",
+    "crates/kosm-qcd",
 ]
 
 [workspace.package]
@@ -57,6 +58,9 @@ tang-3dgs    = { version = "0.1" }
 # them. The convolutions themselves are ours; see `court::denoise::kpn`.
 tang-tensor  = { version = "0.1" }
 tang-train   = { version = "0.1" }
+# SU(3) lattice gauge theory for kosm-qcd: phyz PR #108 (feat/su3-lattice),
+# pinned by rev until it merges and phyz-qft publishes a version with `su3`.
+phyz-qft     = { git = "https://github.com/ecto/phyz", rev = "4c543be", default-features = false }
 
 # One phyz, one tang, one kosm-render — every crate in the graph now resolves
 # from crates.io, so no `[patch]` is needed to unify them. `crates/kosm-scan` is

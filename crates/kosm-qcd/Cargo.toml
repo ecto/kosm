@@ -1,0 +1,34 @@
+[package]
+name = "kosm-qcd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SU(3) gluon fields from phyz-qft: flux tubes and the QCD vacuum, live or from files, native or web"
+repository.workspace = true
+# phyz-qft comes by git rev until phyz publishes its `su3` module, and cargo
+# refuses to publish a crate with git dependencies.
+publish = false
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.36"
+bytemuck = { version = "1", features = ["derive"] }
+image.workspace = true
+serde_json = "1"
+anyhow = "1"
+phyz-qft.workspace = true
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+phyz-qft = { workspace = true, features = ["parallel"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+console_error_panic_hook = "0.1"
+# rand 0.8 (inside phyz-qft) needs the JS entropy source on wasm32-unknown-unknown
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+pollster = "0.4"
