@@ -143,6 +143,7 @@ fn normal_row(len: f64, s: f64, c: f64, xi: f64) -> [f64; 8] {
 }
 
 /// Stiffness and mass for wavenumber `n`, dense, all nodes.
+#[cfg(test)]
 fn assemble(profile: &Profile, h: f64, mat: Material, n: u32) -> (Vec<f64>, Vec<f64>, usize) {
     assemble_with(profile, h, mat, n, None)
 }
