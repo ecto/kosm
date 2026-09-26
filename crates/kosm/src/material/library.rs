@@ -54,6 +54,7 @@ const NAMES: &[&str] = &[
     "lead crystal",
     "water",
     "sea water",
+    "red wine",
     "soap film",
     "jelly",
     "lacquer",
@@ -219,6 +220,12 @@ impl B {
     }
 
     /// Dynamic viscosity, Pa·s — what makes it a liquid.
+    /// Surface tension against air, N/m.
+    fn tension(mut self, sigma: f64) -> Self {
+        self.0.surface_tension = Some(sigma);
+        self
+    }
+
     fn flows(mut self, viscosity: f64) -> Self {
         self.0.viscosity = Some(viscosity);
         self
@@ -320,9 +327,30 @@ fn build(key: &str) -> Option<Material> {
             .look([1.0, 1.0, 1.0], 0.02)
             .clear(Dielectric::clear(1.3330, 55.7))
             .flows(1.0e-3)
+            .tension(0.0728)
             .cite(
-                measured(&format!("{CRC} (20 °C: ρ, bulk modulus, dynamic viscosity)")),
+                measured(&format!("{CRC} (20 °C: ρ, bulk modulus, dynamic viscosity, surface tension)")),
                 measured(RII),
+                estimated("clear; a still surface is smooth"),
+            )
+            .done(),
+        "red wine" | "wine" => B::new("red wine")
+            // 12–14 % ethanol by volume: a little lighter, more viscous and
+            // much lower in surface tension than water
+            .mech(992.0, 2.1e9, 0.5, 0.0)
+            .rub(0.0, 0.0)
+            .look([1.0, 1.0, 1.0], 0.02)
+            .clear(Dielectric::clear(1.3440, 55.0).with_absorption(
+                // anthocyanins: the green and the blue gone within a centimetre,
+                // the red through
+                Spectrum::new([0.02, 0.03, 0.04, 0.10, 0.55, 0.80]),
+                0.01,
+            ))
+            .flows(1.6e-3)
+            .tension(0.047)
+            .cite(
+                estimated("ethanol–water mixtures at 13 % v/v (density, viscosity, surface tension); CRC for the endpoints"),
+                estimated("refractive index of 13 % ethanol–water; transmittance shaped on published red-wine spectra, 1 cm path"),
                 estimated("clear; a still surface is smooth"),
             )
             .done(),

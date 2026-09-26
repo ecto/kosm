@@ -104,8 +104,50 @@ pub fn ring_hz(radius: f64, thickness: f64, mat: Material, n: u32) -> f64 {
     thickness / (radius * radius) * d_over_rho.sqrt() * n * (n * n - 1.0) / (n * n + 1.0).sqrt() / (2.0 * PI)
 }
 
+/// A liquid standing in the bowl to `level` metres above the base.
+///
+/// It loads the wall as added mass: the potential flow inside a circle of
+/// radius r whose wall moves as `w cos nθ` pushes back with a pressure
+/// `ρ r / n` per unit of normal acceleration, so each wetted strip of the
+/// meridian carries `ρ r / n` of extra mass on its normal motion. At the free
+/// surface the pressure is zero, so a strip at depth δ carries only
+/// `tanh(n δ / r)` of that: the lobes' field reaches r/n into the liquid.
+/// Local, one-way (the liquid's own sloshing is ignored), and it is what
+/// makes the note fall as the glass fills: slowly at first, where the oval
+/// mode barely moves, then fast near the rim.
+#[derive(Clone, Copy, Debug)]
+pub struct Liquid {
+    pub density: f64,
+    pub level: f64,
+}
+
+// four-point Gauss on [0, 1]
+const G: [(f64, f64); 4] = [
+    (0.069_431_844_202_973_71, 0.173_927_422_568_726_9),
+    (0.330_009_478_207_571_9, 0.326_072_577_431_273_1),
+    (0.669_990_521_792_428_1, 0.326_072_577_431_273_1),
+    (0.930_568_155_797_026_3, 0.173_927_422_568_726_9),
+];
+
+/// The normal-displacement row over an element's eight dofs at `xi`.
+fn normal_row(len: f64, s: f64, c: f64, xi: f64) -> [f64; 8] {
+    let hm = [1.0 - 3.0 * xi * xi + 2.0 * xi.powi(3), len * (xi - 2.0 * xi * xi + xi.powi(3)), 3.0 * xi * xi - 2.0 * xi.powi(3), len * (-xi * xi + xi.powi(3))];
+    let mut w = [0.0; 8];
+    for node in 0..2 {
+        let o = node * DOF;
+        w[o] = c * hm[2 * node];
+        w[o + 1] = -s * hm[2 * node];
+        w[o + 3] = hm[2 * node + 1];
+    }
+    w
+}
+
 /// Stiffness and mass for wavenumber `n`, dense, all nodes.
 fn assemble(profile: &Profile, h: f64, mat: Material, n: u32) -> (Vec<f64>, Vec<f64>, usize) {
+    assemble_with(profile, h, mat, n, None)
+}
+
+fn assemble_with(profile: &Profile, h: f64, mat: Material, n: u32, liquid: Option<Liquid>) -> (Vec<f64>, Vec<f64>, usize) {
     let dim = profile.nodes() * DOF;
     let mut k = vec![0.0; dim * dim];
     let mut m = vec![0.0; dim * dim];
@@ -113,13 +155,6 @@ fn assemble(profile: &Profile, h: f64, mat: Material, n: u32) -> (Vec<f64>, Vec<
     let a = mat.e * h / (1.0 - mat.nu * mat.nu);
     let d = mat.e * h.powi(3) / (12.0 * (1.0 - mat.nu * mat.nu));
     let nu = mat.nu;
-    // four-point Gauss on [0, 1]
-    const G: [(f64, f64); 4] = [
-        (0.069_431_844_202_973_71, 0.173_927_422_568_726_9),
-        (0.330_009_478_207_571_9, 0.326_072_577_431_273_1),
-        (0.669_990_521_792_428_1, 0.326_072_577_431_273_1),
-        (0.930_568_155_797_026_3, 0.173_927_422_568_726_9),
-    ];
 
     for (e, p) in profile.points.windows(2).enumerate() {
         let (dr, dz) = (p[1][0] - p[0][0], p[1][1] - p[0][1]);
@@ -192,6 +227,27 @@ fn assemble(profile: &Profile, h: f64, mat: Material, n: u32) -> (Vec<f64>, Vec<
             }
         }
 
+        // the wetted part of this frustum, integrated exactly up to the surface
+        if let Some(liq) = liquid.filter(|_| n > 0) {
+            let wet = if dz.abs() < 1e-15 {
+                if p[0][1] < liq.level { 1.0 } else { 0.0 }
+            } else {
+                ((liq.level - p[0][1]) / dz).clamp(0.0, 1.0)
+            };
+            for &(t, wg) in G.iter().filter(|_| wet > 0.0) {
+                let xi = t * wet;
+                let r = p[0][0] + dr * xi;
+                let depth = liq.level - (p[0][1] + dz * xi);
+                let w = normal_row(len, s, c, xi);
+                let f = wg * wet * len * r * liq.density * r / nf * (nf * depth / r).tanh();
+                for i in 0..8 {
+                    for j in 0..8 {
+                        me[i][j] += f * w[i] * w[j];
+                    }
+                }
+            }
+        }
+
         let base = e * DOF;
         for i in 0..8 {
             for j in 0..8 {
@@ -205,7 +261,12 @@ fn assemble(profile: &Profile, h: f64, mat: Material, n: u32) -> (Vec<f64>, Vec<
 
 /// The `count` lowest modes of wavenumber `n`, lowest first.
 pub fn modes(profile: &Profile, thickness: f64, mat: Material, n: u32, count: usize) -> Vec<ShellMode> {
-    let (k, m, dim) = assemble(profile, thickness, mat, n);
+    modes_filled(profile, thickness, mat, n, count, None)
+}
+
+/// [`modes`] with a liquid in the bowl.
+pub fn modes_filled(profile: &Profile, thickness: f64, mat: Material, n: u32, count: usize, liquid: Option<Liquid>) -> Vec<ShellMode> {
+    let (k, m, dim) = assemble_with(profile, thickness, mat, n, liquid);
     let free: Vec<usize> = (0..dim).filter(|&i| !(profile.clamp_base && i < DOF)).collect();
     let f = free.len();
     let pick = |a: &[f64]| -> Vec<f64> {
@@ -246,6 +307,53 @@ pub fn modes(profile: &Profile, thickness: f64, mat: Material, n: u32, count: us
             ShellMode { n, m: mi as u32, hz, decay: PI * hz * mat.loss, shape }
         })
         .collect()
+}
+
+/// d hz / d level for one mode of a filled bowl: the first-order path.
+///
+/// The eigenproblem's own adjoint. For a mass-normalized φ, dλ = −λ φᵀ dM φ.
+/// Raising the surface deepens every wetted strip, and the strip's added mass
+/// `ρ r/n · tanh(n δ/r)` grows by `ρ sech²(n δ/r)` per metre, so dM/dL is
+/// that integrated over the wet wall (the new strip at the waterline adds
+/// nothing: tanh(0) = 0). No second solve, no finite step.
+pub fn d_hz_d_level(profile: &Profile, mode: &ShellMode, liquid: Liquid) -> f64 {
+    if mode.n == 0 {
+        return 0.0;
+    }
+    let nf = mode.n as f64;
+    let mut dm = 0.0;
+    for (e, p) in profile.points.windows(2).enumerate() {
+        let (dr, dz) = (p[1][0] - p[0][0], p[1][1] - p[0][1]);
+        let len = (dr * dr + dz * dz).sqrt();
+        let wet = if dz.abs() < 1e-15 {
+            if p[0][1] < liquid.level { 1.0 } else { 0.0 }
+        } else {
+            ((liquid.level - p[0][1]) / dz).clamp(0.0, 1.0)
+        };
+        if wet == 0.0 {
+            continue;
+        }
+        let q: Vec<f64> = (0..2).flat_map(|k| mode.shape[e + k]).collect();
+        for &(t, wg) in &G {
+            let xi = t * wet;
+            let r = p[0][0] + dr * xi;
+            let depth = liquid.level - (p[0][1] + dz * xi);
+            let row = normal_row(len, dr / len, dz / len, xi);
+            let w: f64 = row.iter().zip(&q).map(|(a, b)| a * b).sum();
+            let sech = 1.0 / (nf * depth / r).cosh();
+            dm += wg * wet * len * r * liquid.density * sech * sech * w * w;
+        }
+    }
+    let lambda = (2.0 * PI * mode.hz).powi(2);
+    -lambda * dm / (8.0 * PI * PI * mode.hz)
+}
+
+/// French's empirical fill law for a wine glass (Am. J. Phys. 51, 688, 1983):
+/// `(f₀/f)² = 1 + α (ρ_l R / 5 ρ_g t) (level/H)⁴`, α ≈ 1.25. The published
+/// check the added-mass model is held to.
+pub fn french_ratio(rim_r: f64, height: f64, thickness: f64, rho_glass: f64, rho_liquid: f64, level: f64) -> f64 {
+    let x = 1.0 + 1.25 * rho_liquid * rim_r / (5.0 * rho_glass * thickness) * (level / height).powi(4);
+    1.0 / x.sqrt()
 }
 
 /// `K x = λ M x` for symmetric K and positive-definite M, dense row-major.
@@ -422,6 +530,39 @@ mod tests {
             let energy: f64 = (0..dim).map(|i| x[i] * (0..dim).map(|j| k[i * dim + j] * x[j]).sum::<f64>()).sum();
             let scale: f64 = (0..dim).map(|i| k[i * dim + i]).sum();
             assert!(energy.abs() < 1e-9 * scale, "n={n}: rigid energy {energy:e} vs trace {scale:e}");
+        }
+    }
+
+    fn filled(level: f64) -> ShellMode {
+        let bowl = Profile::goblet(0.04, 0.09, 0.005, 30);
+        let wine = Liquid { density: 992.0, level };
+        modes_filled(&bowl, 1.2e-3, GLASS, 2, 1, Some(wine)).remove(0)
+    }
+
+    #[test]
+    fn the_note_falls_as_the_glass_fills() {
+        let empty = filled(0.0).hz;
+        let hz: Vec<f64> = (0..=8).map(|i| filled(0.01 * i as f64).hz).collect();
+        assert!(hz.windows(2).all(|w| w[1] <= w[0] + 1e-9), "monotone: {hz:?}");
+        eprintln!("fill law: {:?}", hz.iter().map(|h| h / empty).collect::<Vec<_>>());
+        // the bottom half moves the oval least; each centimetre near the rim more
+        assert!(hz[4] / empty > 0.9, "half full: {:.3}", hz[4] / empty);
+        assert!(hz[7] - hz[8] > hz[3] - hz[4], "steeper near the rim: {hz:?}");
+        for (i, h) in hz.iter().enumerate() {
+            let want = french_ratio(0.04, 0.09, 1.2e-3, GLASS.rho, 992.0, 0.01 * i as f64);
+            assert!((h / empty - want).abs() < 0.08, "{} cm: {:.3} vs French {want:.3}", i, h / empty);
+        }
+    }
+
+    #[test]
+    fn the_adjoint_agrees_with_central_differences() {
+        let bowl = Profile::goblet(0.04, 0.09, 0.005, 30);
+        for level in [0.045, 0.062, 0.078] {
+            let wine = Liquid { density: 992.0, level };
+            let adj = d_hz_d_level(&bowl, &filled(level), wine);
+            let h = 1e-5;
+            let fd = (filled(level + h).hz - filled(level - h).hz) / (2.0 * h);
+            assert!((adj - fd).abs() / fd.abs() < 0.01, "level {level}: adjoint {adj:.2} vs fd {fd:.2} Hz/m");
         }
     }
 
