@@ -321,6 +321,9 @@ pub struct Fluid {
     /// not zero, it is unbounded, and `None` says so without writing an
     /// infinity into a JSON file that cannot hold one.
     pub viscosity: Option<f64>,
+    /// Surface tension against air, N/m, for a liquid whose ripples are short
+    /// enough to feel it.
+    pub surface_tension: Option<f64>,
 }
 
 impl Fluid {
@@ -361,6 +364,8 @@ pub struct Material {
     pub stiffness: Option<f64>,
     /// Dynamic viscosity, Pa·s. `Some` makes it a liquid.
     pub viscosity: Option<f64>,
+    /// Surface tension against air, N/m. Liquids only.
+    pub surface_tension: Option<f64>,
     /// What light does at the surface.
     pub optics: Optics,
     /// Reflectance vs wavelength — `F0` under [`Optics::Conductor`].
@@ -389,6 +394,7 @@ impl Default for Material {
             restitution: 0.2,
             stiffness: None,
             viscosity: None,
+            surface_tension: None,
             optics: Optics::Opaque,
             albedo: Spectrum::rgb([0.60, 0.60, 0.62]),
             roughness: 0.6,
@@ -509,7 +515,7 @@ impl Material {
 
     /// The fluid facet: a density, and a viscosity if it flows.
     pub fn fluid(&self) -> Fluid {
-        Fluid { density: self.density, viscosity: self.viscosity }
+        Fluid { density: self.density, viscosity: self.viscosity, surface_tension: self.surface_tension }
     }
 
     /// Linear RGB for the window's Lambert tier — the old
@@ -752,6 +758,9 @@ impl Material {
         if let Some(mu) = self.viscosity {
             f("viscosity", mu);
         }
+        if let Some(sigma) = self.surface_tension {
+            f("surface_tension", sigma);
+        }
         if let Optics::Dielectric(d) = &self.optics {
             f("n_d", d.n_d);
             f("abbe", d.abbe);
@@ -789,6 +798,7 @@ impl Material {
             "roughness" => self.roughness = value,
             "stiffness" => self.stiffness = Some(value),
             "viscosity" => self.viscosity = Some(value),
+            "surface_tension" => self.surface_tension = Some(value),
             "n_d" => match &mut self.optics {
                 Optics::Dielectric(d) => d.n_d = value,
                 _ => return false,

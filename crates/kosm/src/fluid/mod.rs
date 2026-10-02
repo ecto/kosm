@@ -7,6 +7,7 @@
 use tang::Vec3 as V;
 
 pub mod caustic;
+pub mod ripple;
 pub mod splash;
 pub mod surface;
 
@@ -14,6 +15,7 @@ mod geometry;
 
 pub use caustic::{Caustic, caustic, caustic_for_geometry, caustic_gpu, caustic_gpu_for_geometry};
 pub use geometry::PoolGeometry;
+pub use ripple::Ripples;
 pub use splash::Droplet;
 pub use surface::{Ring, Surface};
 
