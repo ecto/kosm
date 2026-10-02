@@ -445,6 +445,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,8 +1022,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1565,6 +1577,26 @@ dependencies = [
  "bytemuck",
  "pollster 0.4.0",
  "wgpu 30.0.1",
+]
+
+[[package]]
+name = "kosm-qcd"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "console_error_panic_hook",
+ "eframe",
+ "egui",
+ "getrandom 0.2.17",
+ "image",
+ "phyz-qft",
+ "pollster 0.4.0",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -2466,6 +2498,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4586b8307a1aa6015be25c66d6df39fe25a48618dafdca1b02ccf0396325e19f"
 dependencies = [
  "phyz-math",
+]
+
+[[package]]
+name = "phyz-qft"
+version = "0.4.0"
+source = "git+https://github.com/ecto/phyz?rev=4c543be#4c543be7d73baf1f4be7283efcf10804dcbe69a3"
+dependencies = [
+ "rand",
+ "rayon",
 ]
 
 [[package]]
