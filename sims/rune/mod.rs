@@ -40,6 +40,9 @@ pub mod automaton;
 pub mod bake;
 pub mod being;
 pub mod creature;
+/// What the tide left, and who else lives here: the scatter and the two
+/// inhabitants, over `scene.rs`'s geology.
+pub mod dressing;
 /// The adventurer, as four path-traced stills. `kosm run rune/hero`.
 pub mod hero;
 pub mod hint;
@@ -57,6 +60,43 @@ mod probe_tests;
 mod rune_tests;
 #[cfg(test)]
 mod tests;
+
+/// What a root of the cove's *geology* is called: this, and then its own name.
+///
+/// The field is baked from every root that carries the prefix — the beach, the
+/// cliff's twelve beds and its buttress, the headlands' ten steps, the reef's
+/// boulders, the rocks and the tide pools' lips — and they are
+/// separate roots on purpose. `scene.rs`'s module doc has the argument: the
+/// sign of a mesh signed distance is the nearest triangle's pseudonormal, so
+/// the soup of parts and their union agree exactly everywhere outside the
+/// union, and the ten minutes of `vcad_eval` that a forty-metre boolean cost
+/// bought nothing. See [`CoveScene::parts`].
+pub const GROUND: &str = "ground_";
+
+/// Whether a root is one of those.
+pub fn is_ground(name: &str) -> bool {
+    name.starts_with(GROUND)
+}
+
+/// The one root that is drawn as a solid and never baked: the door.
+pub const DOOR: &str = "door";
+
+/// Whether a root is one anything ever wants as **triangles**: the geology,
+/// and the door.
+///
+/// Everything else the level declares — the door's frame, five kinds of
+/// scatter, two figures — is drawn by [`render::Scene`] and by
+/// [`render::raster_meshes`], and both of those take the *instance* walk
+/// ([`kosm::brep::instances`]), which treats a union as a list of placements
+/// and never evaluates a boolean. `vcad_eval` is the other path, and it does:
+/// a root that is a union of six hundred grass blades is six hundred BRep
+/// unions against a solid that grows with every one of them, which is
+/// quadratic and is minutes. Nothing needs that mesh — the STL and
+/// `parts/<root>.stl` are the collision set and its companion — so nothing
+/// pays for it.
+pub fn is_solid_root(name: &str) -> bool {
+    is_ground(name) || name == DOOR
+}
 
 /// The cove's knobs, resolved to simulation units: metres, radians, seconds.
 pub struct CoveScene {
@@ -133,6 +173,12 @@ pub struct CoveScene {
     pub hero_cant: f64,
     pub cell: f64,
     pub pad: f64,
+    /// How thick a bed of the cliff is, metres. The cove's rock is bedded on
+    /// the lattice `door_sill() + k · strata_h`: `scene.rs` cuts the cliff and
+    /// steps the headlands on it, and its `bed_rock` names a root's rock by the
+    /// parity of the bed its top face lands in. One number, two readers, and no
+    /// table of which rock is where.
+    pub strata_h: f64,
 }
 
 impl CoveScene {
@@ -187,6 +233,7 @@ impl CoveScene {
             hero_cant: a.parameter_or("hero_cant_deg", 0.0).to_radians(),
             cell: a.millimetres("sdf_cell_mm")?,
             pad: a.millimetres("sdf_pad_mm")?,
+            strata_h: a.parameter_or("strata_h_mm", 1100.0) * MM,
             authored: a,
         };
         anyhow::ensure!(s.cove > 0.0 && s.cell > 0.0 && s.pad >= 0.0, "the cove needs a positive size and cell and a non-negative pad");
@@ -196,6 +243,7 @@ impl CoveScene {
         anyhow::ensure!(s.being_h > 2.0 * s.being_r, "being_h_mm is the capsule's whole height, so it must clear two radii");
         anyhow::ensure!(s.aperture_z + s.aperture_r < s.door_h, "the aperture must be inside the door");
         anyhow::ensure!(s.door_w.min(s.door_h) > 0.0 && s.door_t > 0.0, "the door needs a size");
+        anyhow::ensure!(s.strata_h > 0.0, "a bed of rock has a thickness");
         Ok(s)
     }
 
@@ -298,17 +346,53 @@ impl CoveScene {
         BakeOpts { cell: self.cell, pad: self.pad, volume: Some(self.volume()), extent: Some(self.extent()) }
     }
 
-    /// The level's roots in metres. Everything the sun and the being can touch
-    /// is ground the bake must see; the door is the one part that moves, so it
-    /// is a body later and a hole in the field now.
+    /// The level's roots in metres, with every piece of the geology in the
+    /// collision set and nothing else.
+    ///
+    /// **The field is every [`is_ground`] root, poured into one triangle
+    /// soup.** It was one root once, and `scene.rs`'s module doc is why it is
+    /// not: the union that made it cost ten minutes of mesh classification and
+    /// bought a field the soup already gives exactly, because the sign is a
+    /// pseudonormal and not a parity. What is *not* in it is what you see
+    /// rather than stand on — a frame round the doorway, five kinds of
+    /// scatter, two figures — and a pebble 60 mm across could not be
+    /// represented in a 100 mm field anyway.
+    ///
+    /// The door is left out for the older reason, which still holds: it is the
+    /// one part of the level that moves, so until it is a hinged body it is a
+    /// door-shaped hole in the cliff, which is what a doorway is.
     pub fn parts(&self) -> anyhow::Result<Vec<Part>> {
-        let mut parts = skatepark::parts_of(&self.authored, &|_| true)?;
+        let mut parts = skatepark::parts_of(&self.solids(), &|_| true)?;
         for part in &mut parts {
-            part.collide = part.name != "door";
+            part.collide = is_ground(&part.name);
         }
-        anyhow::ensure!(parts.iter().any(|p| p.name == "door"), "the cove needs a `door` root");
+        anyhow::ensure!(parts.iter().any(|p| p.name == DOOR), "the cove needs a `door` root");
         anyhow::ensure!(parts.iter().any(|p| p.collides()), "the cove has no ground");
         Ok(parts)
+    }
+
+    /// The level's document with only the [`is_solid_root`] roots left in it.
+    ///
+    /// The document is the whole level and always will be — the picture reads
+    /// every root of it. This is the view of that document taken by the one
+    /// consumer that must *evaluate* the booleans rather than walk them, and
+    /// the reason it exists is in [`is_solid_root`].
+    pub fn solids(&self) -> Solids {
+        let doc = &self.authored.document;
+        let keep: Vec<usize> = self
+            .authored
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| is_solid_root(&body.name))
+            .map(|(i, _)| i)
+            .collect();
+        let mut trimmed = doc.clone();
+        trimmed.roots = keep.iter().filter_map(|i| doc.roots.get(*i).cloned()).collect();
+        Solids {
+            names: keep.iter().filter_map(|i| self.authored.bodies.get(*i).map(|b| b.name.clone())).collect(),
+            doc: trimmed,
+        }
     }
 }
 
@@ -335,6 +419,30 @@ impl DoorFrame {
     }
 }
 
+/// The level's document narrowed to the roots that are evaluated as solids,
+/// as an [`Authored`] the bake and the drawing can take.
+///
+/// [`Authored`]: kosm::build::Authored
+pub struct Solids {
+    /// The document, with the [`is_solid_root`] roots as its roots and every node still in
+    /// it — a node nothing points at costs nothing.
+    pub doc: vcad_ir::Document,
+    /// Their names, in the same order, which is what `parts_of` zips against.
+    pub names: Vec<String>,
+}
+
+impl kosm::build::Authored for Solids {
+    fn document(&self) -> &vcad_ir::Document {
+        &self.doc
+    }
+    fn root_names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+    fn origin(&self) -> String {
+        format!("{} solid roots of the cove built in rust", self.names.len())
+    }
+}
+
 /// `kosm run rune` — evaluate, draw, bake, roll, solve, sweep, report.
 ///
 /// `--view` opens the window instead (needs `--features view`); everything
@@ -358,13 +466,24 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     }
     let dir = out.join("cove");
     fs::create_dir_all(&dir)?;
+    // How long the level takes to *evaluate*, which is the number that went
+    // wrong when the cove was one boolean: `parts_of` runs `vcad_eval` over
+    // [`is_solid_root`], and a union re-classifies both operands' triangles
+    // against each other. It is printed beside the bake's own seconds below
+    // because the two together are what `--view` waits on before it opens.
+    let t_eval = std::time::Instant::now();
     let parts = scene.parts()?;
+    let eval_s = t_eval.elapsed().as_secs_f64();
     let tris: Vec<[Vec3; 3]> = parts.iter().flat_map(|p| p.tris.clone()).collect();
     stl::write_binary_stl(&dir.join("cove.stl"), &tris).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let svg = vcad_render::render_svg_str(&scene.authored.document.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
+    // The drawing is of the solids, for the same reason the STL is: an SVG of
+    // the whole document would evaluate every scattered pebble's union.
+    let t_svg = std::time::Instant::now();
+    let svg = vcad_render::render_svg_str(&scene.solids().doc.to_json()?, 2.0).map_err(|e| anyhow::anyhow!(e))?;
     fs::write(dir.join("cove.svg"), svg)?;
+    let svg_s = t_svg.elapsed().as_secs_f64();
     println!(
-        "cove: {} roots, {} tris → {} and {}; the sand runs from z = {:.2} m at the waterline to {:.2} m at the cliff, the door's sill is {:.2} m and its aperture is at ({:.2}, {:.2}, {:.2}) m",
+        "cove: {} roots evaluated in {eval_s:.1} s and drawn in {svg_s:.1} s, {} tris → {} and {}; the sand runs from z = {:.2} m at the waterline to {:.2} m at the cliff, the door's sill is {:.2} m and its aperture is at ({:.2}, {:.2}, {:.2}) m",
         parts.len(),
         tris.len(),
         dir.join("cove.stl").display(),

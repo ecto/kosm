@@ -125,7 +125,10 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("kosm-render GPU device"),
-                required_features: wgpu::Features::empty(),
+                // The device's clock round each pass, where the adapter has
+                // one — `kosm_view::raster::profile` reads it, and nothing
+                // else here needs a feature at all.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 ..Default::default()

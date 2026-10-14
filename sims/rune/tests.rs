@@ -445,3 +445,205 @@ fn the_reef_has_no_gap_the_being_fits_through() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// The ground is fifty roots and no boolean. `scene.rs`'s module doc is the
+// argument — the sign of a mesh signed distance is the nearest triangle's
+// pseudonormal, so outside the union a soup of parts and their union agree
+// exactly — and everything below is the argument checked where it is allowed
+// to be delicate: *inside*, in the first few millimetres a foot ever reaches.
+
+/// The field at a point, or a readable error.
+fn at(baked: &crate::skatepark::Baked, p: phyz_math::Vec3) -> anyhow::Result<f64> {
+    baked.sdf.sample(p).ok_or_else(|| anyhow::anyhow!("({:+.2}, {:+.2}, {:+.2}) m is outside the baked volume", p.x, p.y, p.z))
+}
+
+/// **The sand is under the feet that stand on it.** Five millimetres below the
+/// sand plane is inside the ground and five above is outside, at the spawn and
+/// at the pose the hero solves the rune from.
+///
+/// This is the check the split into roots is most exposed to. The hero stands
+/// 1.14 m off the cliff's face, which is where the beach slab, the cliff's
+/// lowest beds and the buttress all overlap: if any of their buried faces came
+/// within a foot's penetration of the sand there, the field five millimetres
+/// down would take that face's sign and the boots would find nothing to stand
+/// on. It is also the one place in the cove where being wrong would be
+/// invisible — the still would render, the solve would solve, and the figure
+/// would sink.
+#[test]
+fn the_field_is_the_sand_where_the_being_stands() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    let eps = 0.005;
+    for (what, x, y) in [
+        ("the spawn", scene.spawn_x, scene.spawn_y),
+        ("the solved standing point", scene.hero_x, scene.hero_y),
+        ("the capsule's solution", scene.solution_x, scene.solution_y),
+    ] {
+        let z = scene.sand_z_at(x, y);
+        let on = at(baked, phyz_math::Vec3::new(x, y, z))?;
+        let up = at(baked, phyz_math::Vec3::new(x, y, z + eps))?;
+        let down = at(baked, phyz_math::Vec3::new(x, y, z - eps))?;
+        println!("{what} at ({x:+.2}, {y:+.2}) m: the field is {:+.1} mm on the sand, {:+.1} mm {:.0} mm above it and {:+.1} mm below", on * 1e3, up * 1e3, eps * 1e3, down * 1e3);
+        assert!(up > 0.0, "{what}: {:.1} mm over the sand the field reads {:+.2} mm, which is inside the ground", eps * 1e3, up * 1e3);
+        assert!(down < 0.0, "{what}: {:.1} mm under the sand the field reads {:+.2} mm, which is outside the ground", eps * 1e3, down * 1e3);
+        assert!(on.abs() < scene.cell / 20.0, "{what}: the sand plane itself reads {:+.2} mm", on * 1e3);
+    }
+    Ok(())
+}
+
+/// **The cliff is a wall, and the wall is where the beds say it is — node by
+/// node.**
+///
+/// Read the baked field's own nodes, not points between them, in the node
+/// column three metres along the cliff from the door. Every node up to 400 mm
+/// in front of the local face is air. Every node in the first 100 mm inside a
+/// bed is rock. On a bedding plane, where two beds meet, a node on the strip of
+/// horizontal face between the outer bed's face and the inner's is the surface,
+/// and a node on the buried seam behind it is not air.
+///
+/// Nodes, because the field between them is trilinear: at a proud bed's convex
+/// corner a point 10 mm behind the face blends an air node in front with a
+/// surface node behind and reads +10 mm, which is the grid's resolution and not
+/// a sign. Every bedding plane is also a node row (the lattice is 1.1 m, the
+/// cell 0.1 m, and the sill is on both), and until
+/// [`crate::skatepark::collision_mesh`] welded each part, a whole row of those
+/// nodes in the air in front of the cliff read as rock: an edge carried one
+/// face's normal instead of the sum of two, and the tie between the two
+/// triangles that meet at it went to whichever the tree reached first. This test
+/// used to step over every height within 200 mm of a bedding plane for it; now
+/// it reads every row. [`the_bedding_planes_are_air_in_front_of_the_cliff`] is
+/// the first such row, read where the bug was reported.
+///
+/// A hundred millimetres into the rock and not three hundred, because the
+/// recess is 220 mm deep and the beds share their bedding planes: deeper, the
+/// nearest soup triangle can be the buried seam between two beds, where two
+/// coincident faces point at each other and the soup cannot say which side is
+/// rock. `scene.rs`'s bed loop has that measurement.
+#[test]
+fn the_cliff_is_a_wall_at_every_bed() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    let g = &baked.sdf;
+    let (face, sill, h, top) = (scene.cliff_face_y(), scene.door_sill(), scene.strata_h, scene.cliff_top());
+    let relief = scene.authored.parameter_or("strata_relief_mm", 220.0) * kosm::scene::MM;
+    let batter = scene.authored.parameter_or("batter_deg", 2.5).to_radians().tan();
+    // Bed `k`'s face, exactly as `scene.rs` lays the lattice: the odd beds
+    // stand `relief` proud, and each is set back by the batter at its own top,
+    // clamped at the skyline.
+    let bed_face = |k: f64| {
+        let z1 = (sill + (k + 1.0) * h).min(top);
+        let proud = if (k as i64).rem_euclid(2) == 1 { relief } else { 0.0 };
+        face - proud + batter * (z1 - sill)
+    };
+    // The node column nearest three metres along the cliff from the door:
+    // clear of the doorway and its buttress.
+    let ix = ((scene.door_x - 3.0 - g.origin.x) / g.cell).round() as usize;
+    let node = |iy: usize, iz: usize| g.data[ix + g.nx * (iy + g.ny * iz)] as f64;
+    let (mut air, mut rock, mut surface, mut seam, mut planes) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut bad: Vec<String> = Vec::new();
+    for iz in 0..g.nz {
+        let z = g.origin.z + iz as f64 * g.cell;
+        // between the apron at the cliff's foot and the cornice at its top
+        if z < sill + 0.3 || z > top - 0.15 {
+            continue;
+        }
+        let u = (z - sill) / h;
+        let plane = ((u - u.round()).abs() * h < 1e-6).then_some(u.round());
+        let (outer, inner) = match plane {
+            Some(n) => {
+                planes += 1;
+                let (a, b) = (bed_face(n - 1.0), bed_face(n));
+                (a.min(b), a.max(b))
+            }
+            None => {
+                let f = bed_face(u.floor());
+                (f, f)
+            }
+        };
+        for iy in 0..g.ny {
+            let y = g.origin.y + iy as f64 * g.cell;
+            if y < outer - 0.4 || y > inner + 0.1 {
+                continue;
+            }
+            let d = node(iy, iz);
+            let at = format!("({y:+.2}, {z:.2}) m reads {:+.1} mm", d * 1e3);
+            if y < outer - 1e-3 {
+                air += 1;
+                if d <= 0.0 {
+                    bad.push(format!("{at}, {:.0} mm in front of the face: rock", (outer - y) * 1e3));
+                }
+            } else if plane.is_none() && y > outer + 1e-3 {
+                rock += 1;
+                if d >= 0.0 {
+                    bad.push(format!("{at}, {:.0} mm inside a bed: air", (y - outer) * 1e3));
+                }
+            } else if plane.is_some() && y > outer + 1e-3 && y < inner - 1e-3 {
+                surface += 1;
+                if d.abs() > 1e-3 {
+                    bad.push(format!("{at}, on a bedding plane's exposed face: not the surface"));
+                }
+            } else if plane.is_some() && y > inner + 1e-3 {
+                seam += 1;
+                if d > 1e-3 {
+                    bad.push(format!("{at}, on the seam between two beds: air"));
+                }
+            }
+        }
+    }
+    println!(
+        "the node column at x = {:+.2} m: {air} air, {rock} rock, {surface} on an exposed bedding face and {seam} on a seam, over {planes} bedding planes",
+        g.origin.x + ix as f64 * g.cell
+    );
+    for b in &bad {
+        println!("  {b}");
+    }
+    assert!(bad.is_empty(), "{} nodes disagree with the bed lattice; the first: {}", bad.len(), bad[0]);
+    assert!(planes >= 4 && air > 100 && rock > 50 && surface > 0, "the column read too little: {air} air, {rock} rock, {surface} surface, {planes} planes");
+    Ok(())
+}
+
+/// **A bedding plane is air in front of the cliff.** The row of nodes that
+/// lies exactly in the first bedding plane, three metres along the cliff from
+/// the door and in the air before its face, read the right distance to the
+/// face with the sign inverted: a sheet of rock a node thick standing out from
+/// every bed. The cause was an unwelded collision mesh (see
+/// [`the_cliff_is_a_wall_at_every_bed`]). Read the row up to 50 mm short of
+/// the outer bed's face and check each node is outside, and within a cell's
+/// Lipschitz step of the row above it, which was always right — a flipped sign
+/// cannot sit that close to its neighbour. Past the outer face the plane is the
+/// overhang's own underside, and a node there reads the surface: zero.
+#[test]
+fn the_bedding_planes_are_air_in_front_of_the_cliff() -> anyhow::Result<()> {
+    let (scene, baked) = field()?;
+    let (face, sill, h) = (scene.cliff_face_y(), scene.door_sill(), scene.strata_h);
+    let relief = scene.authored.parameter_or("strata_relief_mm", 220.0) * kosm::scene::MM;
+    let batter = scene.authored.parameter_or("batter_deg", 2.5).to_radians().tan();
+    let bed_face = |k: f64| {
+        let z1 = (sill + (k + 1.0) * h).min(scene.cliff_top());
+        let proud = if (k as i64).rem_euclid(2) == 1 { relief } else { 0.0 };
+        face - proud + batter * (z1 - sill)
+    };
+    // the first bedding plane, and the outer of the two beds that meet in it
+    let (x, z) = (scene.door_x - 3.0, sill + h);
+    let outer = bed_face(0.0).min(bed_face(1.0));
+    let step = scene.cell;
+    let mut y = 15.2;
+    let mut read = 0;
+    while y <= outer - 0.05 {
+        let d = at(baked, phyz_math::Vec3::new(x, y, z))?;
+        let above = at(baked, phyz_math::Vec3::new(x, y, z + step))?;
+        assert!(d > 0.0, "({x:+.2}, {y:+.2}, {z:.2}) m, in front of the cliff in the first bedding plane, reads {:+.1} mm", d * 1e3);
+        assert!(
+            (d - above).abs() <= step + 1e-3,
+            "({x:+.2}, {y:+.2}) reads {:+.1} mm in the bedding plane and {:+.1} mm a cell above it",
+            d * 1e3,
+            above * 1e3
+        );
+        read += 1;
+        y += 0.1;
+    }
+    assert!(read >= 6, "only {read} nodes in front of the outer face at {outer:.3} m");
+    // Behind the outer face the plane is the overhang's own underside: surface.
+    let under = at(baked, phyz_math::Vec3::new(x, outer + 0.5 * relief, z))?;
+    assert!(under.abs() < 0.002, "the overhang's underside reads {:+.1} mm, not the surface", under * 1e3);
+    Ok(())
+}

@@ -229,6 +229,13 @@ struct Controls {
     strafe: f64,
     yaw: f64,
     tilt: f64,
+    /// Shift, Space and Ctrl (or C). All three are *held* states — the jump's
+    /// rising edge is decided on the simulation thread by
+    /// [`kosm::player::Forgiveness`], which needs to know whether the feet are
+    /// down and so cannot live up here.
+    run: bool,
+    jump: bool,
+    crouch: bool,
 }
 
 type Held = Arc<Mutex<Controls>>;
@@ -769,6 +776,9 @@ fn simulate(
     // enormous step.
     let cap = 4 * steps_per_frame;
 
+    // Coyote time and the jump buffer, on the frame clock. See
+    // [`kosm::player::Forgiveness`].
+    let mut forgive = kosm::player::Forgiveness::new();
     let mut start = Instant::now();
     *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(cove.snapshot());
     let _ = tx.send(Timed { frame: cove.snapshot(), due: start });
@@ -807,11 +817,23 @@ fn simulate(
         // The mouse is a quantity of turn over the frame, so it is divided by
         // the steps the frame is made of; the keys are a force and are not.
         let per = if steps > 0 { 1.0 / steps as f64 } else { 0.0 };
+        // **The jump's rising edge is decided here**, once per frame, by the
+        // forgiveness layer: coyote time from the last frame the feet were
+        // down, and a buffer for a press that arrived early. It is a *frame*
+        // clock and not the solver's — the windows are quoted in frames at
+        // sixty and this loop is the thing that runs at sixty — so it is
+        // stepped once with the frame's own length and the answer is spent on
+        // the first substep.
+        let fire = forgive.step(controls.jump, !cove.airborne(), 1.0 / fps);
         let input = Input {
             forward: controls.forward,
             strafe: controls.strafe,
             yaw_delta: controls.yaw * per,
             tilt_delta: controls.tilt * per,
+            run: controls.run,
+            jump: fire,
+            jump_held: controls.jump,
+            crouch: controls.crouch,
         };
         let lap = Instant::now();
         let open = gate.load(Ordering::Relaxed);
@@ -820,8 +842,11 @@ fn simulate(
             said_open = true;
             eprintln!("rune   the rune holds: the door is swinging");
         }
-        for _ in 0..steps {
-            cove.step(&input);
+        // The push starts on the substep the frame's press was granted and
+        // not on every one of them: a `jump` held down for twenty substeps is
+        // one press, not twenty.
+        for k in 0..steps {
+            cove.step(&Input { jump: input.jump && k == 0, ..input });
         }
         solved += lap.elapsed();
 
@@ -1565,7 +1590,10 @@ impl Tracer {
         // one the window saw.
         let e = meter.follow(&self.film.rgb, dt);
         let rgba = if present {
-            self.history.resolve(self.exposure * e as f32, &options(&self.scene, seed, true))
+            // The same chain the raster tier's post pass applies, on the same
+            // radiance: `cove_render::post` is the one statement of it.
+            let film = cove_render::post(&self.scene, self.exposure * e as f32);
+            self.history.resolve_through(&film, &cam, &options(&self.scene, seed, true))
         } else {
             Vec::new()
         };
@@ -1614,11 +1642,29 @@ impl Tracer {
         // come through, so the still and the window cannot disagree about it.
         let cam = match self.rig.as_ref() {
             None => quantised(&cove_render::camera(&self.scene, placement)),
-            Some(rig) => rig.follow(&subject_of(frame), dt),
+            Some(rig) => {
+                // **What the body does to the camera.** A landing knocks the
+                // eye down by the impulse it took and the rig's own spring
+                // brings it back; leaving the ground opens two degrees of
+                // field that close again the same way. Both are events off
+                // `Snapshot`, both are springs, and neither moves the aim —
+                // so the picture is jolted rather than animated.
+                if let Some(impulse) = frame.landed {
+                    rig.kick(impulse);
+                }
+                if frame.jumped {
+                    rig.pulse_fov(JUMP_FOV_DEG);
+                }
+                rig.follow(&subject_of(frame), dt)
+            }
         };
         cam.with_projection(self.projection)
     }
 }
+
+/// How much field of view a jump opens, degrees. Two is a breath, and the
+/// rig's spring has it back inside a fifth of a second.
+const JUMP_FOV_DEG: f64 = 2.0;
 
 /// The body, as the camera needs it.
 ///
@@ -1934,6 +1980,22 @@ pub enum Tier {
 
 /// `--tier raster|trace`. The default is the raster, and it falls back to the
 /// tracer, loudly, when the level asks for something the raster cannot draw.
+/// `--sky gradient|preetham`, over the level's own `sky` knob.
+///
+/// The gradient is kept because the sky is a *look* change and the only
+/// honest way to argue about one is to take the same photograph both ways.
+/// It reaches `cove_render` as a process global; see
+/// [`cove_render::set_sky_model`] for why it is not a parameter.
+fn sky_flag(args: &kosm_cli::Args) -> anyhow::Result<()> {
+    match args.value("sky") {
+        None => {}
+        Some(v) if v == "gradient" => cove_render::set_sky_model(false),
+        Some(v) if v == "preetham" || v == "sky" => cove_render::set_sky_model(true),
+        Some(other) => anyhow::bail!("--sky {other}: gradient or preetham"),
+    }
+    Ok(())
+}
+
 fn tier_flag(args: &kosm_cli::Args) -> anyhow::Result<Tier> {
     match args.value("tier") {
         None => Ok(Tier::Raster),
@@ -1943,9 +2005,11 @@ fn tier_flag(args: &kosm_cli::Args) -> anyhow::Result<Tier> {
     }
 }
 
-/// Where the baked light lives, relative to a run's output.
+/// Where the baked light lives: under a run's output, with a relative `out/`
+/// resolved against the workspace root as `--bake-light` writes it, so a
+/// window opened from any directory finds the same bake.
 fn probes_path(out: &Path) -> std::path::PathBuf {
-    out.join("maps").join("cove").join("probes.bin")
+    bake::probes_path(out)
 }
 
 /// The level's baked light, or a sky-only stand-in.
@@ -1986,9 +2050,6 @@ fn cove_probes(scene: &CoveScene, out: &Path) -> raster::ProbeVolume {
 fn sky_only_probes(scene: &CoveScene) -> raster::ProbeVolume {
     use kosm_render::pathtrace::Environment;
     let (env, _) = cove_render::daylight(scene);
-    let Environment::Gradient(g) = env else {
-        return raster::probes::uniform([0.0; 3], 1.0, [2, 2, 2], 0.2);
-    };
     let (lo, hi) = scene.volume();
     let spacing = 4.0;
     let dims = [
@@ -1996,20 +2057,30 @@ fn sky_only_probes(scene: &CoveScene) -> raster::ProbeVolume {
         (((hi.y - lo.y) / spacing).ceil() as u32 + 1).max(2),
         (((hi.z - lo.z) / spacing).ceil() as u32 + 1).max(2),
     ];
+    // The level's own environment, whichever it is, projected onto SH — so
+    // the fallback is the sky the tracer would have used and not a guess at
+    // it. `Spectrum::rgb`'s spread puts each primary over the two bands it
+    // owns, which `band_to_rgb` inverts exactly.
     raster::probes::from_radiance([lo.x, lo.y, lo.z], spacing, dims, 512, |_, d| {
-        // `GradientEnv`: the ground colour below the horizon, and horizon to
-        // zenith above it — the same lookup the tracer's environment does.
-        let rgb = if d[2] < 0.0 {
-            g.ground
-        } else {
-            let t = d[2] as f32;
-            [
-                g.horizon[0] + (g.zenith[0] - g.horizon[0]) * t,
-                g.horizon[1] + (g.zenith[1] - g.horizon[1]) * t,
-                g.horizon[2] + (g.zenith[2] - g.horizon[2]) * t,
-            ]
+        let dir = kosm_render::math::Vec3::new(d[0], d[1], d[2]);
+        let c = match &env {
+            Environment::Sky(sky) => sky.radiance(dir),
+            Environment::Gradient(g) => {
+                // the ground colour below the horizon, horizon to zenith above
+                let rgb = if d[2] < 0.0 {
+                    g.ground
+                } else {
+                    let t = d[2] as f32;
+                    [
+                        g.horizon[0] + (g.zenith[0] - g.horizon[0]) * t,
+                        g.horizon[1] + (g.zenith[1] - g.horizon[1]) * t,
+                        g.horizon[2] + (g.zenith[2] - g.horizon[2]) * t,
+                    ]
+                };
+                [rgb[0] * g.intensity, rgb[1] * g.intensity, rgb[2] * g.intensity]
+            }
+            _ => [0.2, 0.2, 0.2],
         };
-        let c = [rgb[0] * g.intensity, rgb[1] * g.intensity, rgb[2] * g.intensity];
         [c[2], c[2], c[1], c[1], c[0], c[0]]
     })
 }
@@ -2107,6 +2178,21 @@ impl RasterTier {
         let (lo, hi) = scene.volume();
         rs.bounds = ([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
         rs.exposure = a.parameter_or("exposure", 0.7) as f32;
+        // **The light is the level's, not the tier's.** Every one of these is
+        // the same value `cove_render::post` hands the path tracer, so the
+        // settle blend fades one picture into another picture of the same sky,
+        // in the same haze, through the same lens. `units_per_metre` is the one
+        // field of that film this tier does not take: it works in metres, and
+        // the shader's haze is already metric.
+        let film = cove_render::post(scene, rs.exposure);
+        rs.sky = film.sky;
+        rs.air = film.aerial;
+        rs.vignette = film.vignette;
+        rs.bloom_threshold = film.bloom_threshold;
+        rs.bloom_strength = film.bloom_strength;
+        rs.bloom_radius_px = film.bloom_radius_px;
+        rs.ao_radius_m = a.parameter_or("ao_radius_m", 0.3) as f32;
+        rs.ao_strength = a.parameter_or("ao_strength", 1.0) as f32;
 
         // One material per surface the level names, through
         // `materials::gpu` — which *is* `materials::pbr` laid over the
@@ -2125,7 +2211,10 @@ impl RasterTier {
             i
         };
 
-        let meshes = cove_render::raster_meshes(scene)?;
+        let meshes = merge_parts(
+            cove_render::raster_meshes(scene)?,
+            a.parameter_or("raster_cell_mm", MERGE_CELL_MM),
+        );
         let mut parts = Vec::with_capacity(meshes.len() + 1);
         for m in &meshes {
             let mat = material_of(&mut rs, &m.material);
@@ -2287,6 +2376,95 @@ impl RasterTier {
     ) -> std::sync::Arc<wgpu::Texture> {
         self.raster.draw(device, queue, &self.scene, f)
     }
+}
+
+/// How wide a patch of the static cove is merged into one draw, millimetres.
+///
+/// Six metres: a few dozen patches over the cove, so the frustum test in
+/// `raster::pipeline` still has something to throw away behind the camera,
+/// and a few draws a patch rather than a few hundred.
+const MERGE_CELL_MM: f64 = 6000.0;
+
+/// The cove's parts, merged into one mesh per thing that moves as one.
+///
+/// **One draw per vcad instance was the frame.** The instance walk hands back
+/// a placement per primitive — fourteen hundred of them, every grass blade
+/// and pebble its own — and the raster tier drew each as its own mesh with
+/// its own instance buffer: three draws apiece, a `write_buffer` apiece, four
+/// and a half milliseconds of encoding before the device ran a triangle, and
+/// three times that with the reference tracer busy on every other core.
+///
+/// A part's frame in the world is `frame(role) · to_world`, and the first
+/// factor depends on the role alone — the hinge for the door, the link for a
+/// piece of the hero, the identity for the ground. So every part that shares
+/// a role and a material can have its own `to_world` baked into its vertices
+/// and be drawn as one mesh at the identity, and the picture cannot tell: the
+/// shader's position is the same product, and its normal is
+/// `normalize(M₃ · n)`, which is unchanged by normalising the inner factor
+/// first. The ground is split further into patches of `cell_mm` by where each
+/// part is, so what is behind the camera is still a draw that can be culled.
+fn merge_parts(meshes: Vec<cove_render::RasterMesh>, cell_mm: f64) -> Vec<cove_render::RasterMesh> {
+    use std::collections::HashMap;
+    let cell_mm = cell_mm.max(1.0);
+    let mut out: Vec<cove_render::RasterMesh> = Vec::new();
+    let mut at: HashMap<(String, String, i64, i64), usize> = HashMap::new();
+    for m in meshes {
+        let r = m.to_world;
+        let place = |p: &[f64; 3]| -> [f64; 3] {
+            std::array::from_fn(|k| r[k][0] * p[0] + r[k][1] * p[1] + r[k][2] * p[2] + r[k][3])
+        };
+        let turn = |n: &[f64; 3]| -> [f64; 3] {
+            let v: [f64; 3] = std::array::from_fn(|k| r[k][0] * n[0] + r[k][1] * n[1] + r[k][2] * n[2]);
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if l > 1e-12 { [v[0] / l, v[1] / l, v[2] / l] } else { [0.0, 0.0, 1.0] }
+        };
+        // The same normals `Mesh::from_mm` would have made for this part on
+        // its own: smoothing after the merge would weld across two parts
+        // that happen to touch, which the unmerged tier never did.
+        let smooth;
+        let normals = if m.normals.len() == m.positions.len() {
+            &m.normals
+        } else {
+            smooth = raster::smooth_normals(&m.positions, &m.indices);
+            &smooth
+        };
+        let positions: Vec<[f64; 3]> = m.positions.iter().map(place).collect();
+        let normals: Vec<[f64; 3]> = normals.iter().map(turn).collect();
+        let (cx, cy) = if m.role == cove_render::Role::Ground && !positions.is_empty() {
+            let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+            for p in &positions {
+                for k in 0..2 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (
+                ((lo[0] + hi[0]) * 0.5 / cell_mm).floor() as i64,
+                ((lo[1] + hi[1]) * 0.5 / cell_mm).floor() as i64,
+            )
+        } else {
+            (0, 0)
+        };
+        let key = (format!("{:?}", m.role), m.material.clone(), cx, cy);
+        let i = *at.entry(key).or_insert_with(|| {
+            out.push(cove_render::RasterMesh {
+                name: m.name.clone(),
+                material: m.material.clone(),
+                positions: Vec::new(),
+                normals: Vec::new(),
+                indices: Vec::new(),
+                to_world: IDENTITY_ROWS,
+                role: m.role,
+            });
+            out.len() - 1
+        });
+        let g = &mut out[i];
+        let base = g.positions.len() as u32;
+        g.positions.extend(positions);
+        g.normals.extend(normals);
+        g.indices.extend(m.indices.iter().map(|k| k + base));
+    }
+    out
 }
 
 /// A row-major identity, millimetres.
@@ -2573,6 +2751,12 @@ fn raster_worker(
                 got_maps as f64 / elapsed,
                 if moved { "moving" } else { "still" },
             );
+            // The device's own clock, pass by pass: the "drawing" above is
+            // the encode and the submit, which is CPU time and backpressure,
+            // and it is not where a trim should be aimed.
+            if let Some(p) = tier.raster.profile() {
+                eprintln!("rune   passes: {}", p.line());
+            }
             frames = 0;
             got_maps = 0;
         }
@@ -2973,6 +3157,10 @@ fn snapshot_of(p: &Placement, scene: &CoveScene) -> Snapshot {
         being_vel: (Vec3::zeros(), Vec3::zeros()),
         facing: f.y.atan2(f.x),
         tilt: 0.0,
+        // A still is a pose: nobody is in the air and nothing has landed.
+        airborne: false,
+        jumped: false,
+        landed: None,
         door_angle: p.door_angle,
         door: phyz_math::SpatialTransform::new(
             Mat3::identity(),
@@ -3009,6 +3197,7 @@ fn raster_still(
     projection: Option<Projection>,
     settle_in: bool,
     passes: u32,
+    profile: u32,
 ) -> anyhow::Result<()> {
     let size = (size.0.max(16), if size.1 == 0 { (size.0 * 9 / 16).max(9) } else { size.1 });
     let ctx = kosm_render::gpu::GpuContext::init_blocking()
@@ -3112,6 +3301,51 @@ fn raster_still(
         scene.open_frac,
         path.display()
     );
+
+    // `--profile N`: the same frame N more times, each one waited for, and the
+    // device's own clock round every pass averaged over them. Waiting is what
+    // a window does not do and is why this is the number to trim against: a
+    // window's "drawing" is the encode plus whatever backpressure the driver
+    // applied, and two sessions sharing the machine move it by a factor of two.
+    if profile > 0 {
+        f.caustics_dirty = false;
+        let warm = 3;
+        let mut sum = raster::Report::default();
+        let mut wall = Vec::with_capacity(profile as usize);
+        let mut encode = Vec::with_capacity(profile as usize);
+        for i in 0..profile + warm {
+            let t = Instant::now();
+            let _ = tier.draw(device, queue, &f);
+            let enc = t.elapsed().as_secs_f64() * 1e3;
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if i < warm {
+                continue;
+            }
+            wall.push(ms);
+            encode.push(enc);
+            if let Some(r) = tier.raster.profile() {
+                for (a, b) in sum.ms.iter_mut().zip(r.ms.iter()) {
+                    *a += b / profile as f64;
+                }
+                sum.span += r.span / profile as f64;
+                sum.shadow = r.shadow;
+                sum.camera = r.camera;
+            }
+        }
+        wall.sort_by(|a, b| a.total_cmp(b));
+        encode.sort_by(|a, b| a.total_cmp(b));
+        let median = wall[wall.len() / 2];
+        let (lo, hi) = (wall[0], wall[wall.len() - 1]);
+        println!(
+            "rune   profile over {profile} frames at {}×{}: encode {:.2} ms median, submit-to-idle \
+             {median:.2} ms median ({lo:.2}–{hi:.2})",
+            size.0,
+            size.1,
+            encode[encode.len() / 2],
+        );
+        println!("rune   passes: {}", sum.line());
+    }
     Ok(())
 }
 
@@ -3329,6 +3563,16 @@ impl viewport::Scene for App {
             Key::D => Some(KEY_D),
             _ => None,
         };
+        // Shift runs, Space jumps, Ctrl (or C) crouches. Each is one held
+        // bool, set on the press and cleared on the release the viewport
+        // guarantees — the same contract the four walking keys are on.
+        let modal = |k: Key| matches!(k, Key::Shift | Key::Space | Key::Ctrl);
+        let set = |c: &mut Controls, k: Key, down: bool| match k {
+            Key::Shift => c.run = down,
+            Key::Space => c.jump = down,
+            Key::Ctrl => c.crouch = down,
+            _ => {}
+        };
         match event {
             Event::Resized(px) => self.window_px = px,
             Event::Look(dx, dy) => {
@@ -3342,12 +3586,16 @@ impl viewport::Scene for App {
                 if let Some(i) = index(k) {
                     self.keys[i] = true;
                     self.walk();
+                } else if modal(k) {
+                    set(&mut self.held.lock().unwrap_or_else(|e| e.into_inner()), k, true);
                 }
             }
             Event::KeyUp(k) => {
                 if let Some(i) = index(k) {
                     self.keys[i] = false;
                     self.walk();
+                } else if modal(k) {
+                    set(&mut self.held.lock().unwrap_or_else(|e| e.into_inner()), k, false);
                 }
             }
             // The cove is walked, not orbited: a drag is the same look the
@@ -3463,6 +3711,9 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 ///   from the start, so a headless run walks and then stops without a hand on
 ///   the keyboard; in a `--shot` it steps the being for the first `N` passes
 ///   and stands for the rest, which is the picture of the climb back.
+/// - `--jump` adds a scripted Space a second into a `--walk` — the same held
+///   bool a key press sets, so the simulation cannot tell the difference — and
+///   the pace line is then read with a push-off and a landing in it.
 ///
 /// And the camera's own two:
 ///
@@ -3472,6 +3723,14 @@ fn set_knob(built: &mut kosm::build::Built, name: &str, value: f64) {
 ///   reprojects through it, so a walking player under an `f·θ` camera
 ///   converges exactly as a pinhole one does. The still and the window take
 ///   the same flag, so a `--shot` is a picture of what the window shows.
+/// - `--sky gradient|preetham` (over the level's `sky` knob, the model by
+///   default) is which sky the cove hangs under. Preetham's is warm at the
+///   horizon, blue at the zenith and bright around the sun; the gradient is
+///   the two-colour lerp the level had before, kept so the same photograph
+///   can be taken both ways. The knobs are `sky_turbidity` (2.5),
+///   `sky_intensity` and `ground_albedo`; the haze over it is `air_density`
+///   and `air_scale_m`, and the film is `vignette`, `bloom`,
+///   `bloom_threshold` and `bloom_radius_px`.
 /// - `--shutter on|off` (over the level's `cam_shutter`, on by default) folds
 ///   [`Rig::shutter_passes`] passes into one presented frame while the eye is
 ///   moving. The frame rate drops and the passes integrate the motion between
@@ -3497,6 +3756,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
     let walk: u32 = num("walk").unwrap_or(0);
     let projection = projection_flag(args)?;
     let tier = tier_flag(args)?;
+    sky_flag(args)?;
     let settle = !args.flag("no-settle");
     if let Some(path) = args.value("shot") {
         return match tier {
@@ -3510,6 +3770,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
                 projection,
                 settle && args.flag("settle"),
                 num("passes").unwrap_or(64),
+                num("profile").unwrap_or(0),
             ),
         };
     }
@@ -3520,7 +3781,7 @@ pub fn run(args: &kosm_cli::Args) -> anyhow::Result<()> {
         eprintln!("rune   --cpu: this tier is the CPU integrator either way");
     }
     let frames: usize = args.value("frames").and_then(|v| v.parse().ok()).unwrap_or(0);
-    window(frames, budget, walk, projection, shutter_flag(args)?, tier, settle)
+    window(frames, budget, walk, args.flag("jump"), projection, shutter_flag(args)?, tier, settle)
 }
 
 /// The window the cove opens at, physical pixels. The raster tier draws at
@@ -3557,6 +3818,7 @@ pub fn window(
     frames: usize,
     budget: Budget,
     walk: u32,
+    jump: bool,
     projection: Option<Projection>,
     shutter: Option<bool>,
     tier: Tier,
@@ -3600,9 +3862,23 @@ pub fn window(
             while !ready.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            eprintln!("rune   --walk {walk}: holding W for {walk} s, then standing");
+            eprintln!("rune   --walk {walk}: holding W for {walk} s, then standing{}", if jump { " (with a jump a second in)" } else { "" });
             held.lock().unwrap_or_else(|e| e.into_inner()).forward = 1.0;
-            std::thread::sleep(Duration::from_secs(walk as u64));
+            // `--jump`: a second into the walk, hold Space for a full wind-up
+            // and let go. It is exactly the held bool a key press sets, so the
+            // simulation cannot tell the difference — which is what makes it
+            // a measurement of the pace with a jump in it rather than a
+            // separate code path.
+            if jump && walk > 1 {
+                std::thread::sleep(Duration::from_secs(1));
+                held.lock().unwrap_or_else(|e| e.into_inner()).jump = true;
+                std::thread::sleep(Duration::from_millis(320));
+                held.lock().unwrap_or_else(|e| e.into_inner()).jump = false;
+                eprintln!("rune   --walk --jump: jumped");
+                std::thread::sleep(Duration::from_secs(walk as u64 - 1));
+            } else {
+                std::thread::sleep(Duration::from_secs(walk as u64));
+            }
             held.lock().unwrap_or_else(|e| e.into_inner()).forward = 0.0;
             eprintln!("rune   --walk: let go of W");
         });
@@ -4332,8 +4608,9 @@ mod tests {
     /// **The two regions are not held to one tolerance, and the reason is the
     /// tier's own design.**
     ///
-    /// - The **sand** is sunlit, and on a sunlit surface the direct term is
-    ///   most of the answer. The raster computes it per pixel — the same
+    /// - The **sand** is sunlit — open sand inside the door's apron, where no
+    ///   prop stands — and on a sunlit surface the direct term is most of the
+    ///   answer. The raster computes it per pixel — the same
     ///   `E · max(0, n·s)` the tracer integrates, against a 2048² shadow map
     ///   — so the two agree to a fraction of a code. This is the number that
     ///   catches the mistake that matters: `sims/rune/bake.rs` bakes the
@@ -4347,6 +4624,13 @@ mod tests {
     ///   costs on a plane whose radiance field has a hard horizon in it;
     ///   neither a finer lattice (250 mm) nor eight times the rays moves it,
     ///   which is how we know it is the truncation and not the bake.
+    ///
+    /// **The light is the test's own.** It bakes the level's probe volume
+    /// ([`bake::bake_light`] at [`bake::Light::level`], which is what
+    /// `--bake-light` writes) rather than reading `out/maps/cove/probes.bin`:
+    /// `cargo test` runs in the crate's directory, where no such file is, and
+    /// the raster fell back to the sky alone and read the sand 0.134 off a
+    /// traced frame that had every bounce in it.
     ///
     /// Skips without an adapter, like the rest of the tier's GPU tests.
     #[test]
@@ -4362,14 +4646,14 @@ mod tests {
 
         let mut tracer = Tracer::new(size)?;
         let (frame, sdf) = still_pose(&scene, which)?;
+        let field = Arc::clone(&sdf);
         tracer = tracer.with_rig(sdf, which);
         let lit = Lit { score: live_frac(&scene, &frame, live_photons(&scene.authored)), glint: None };
 
-        let probes = cove_probes(tracer.cove(), Path::new("out"));
-        if probes.suns.is_empty() || probes.data.iter().all(|v| *v == 0.0) {
-            eprintln!("skipping the_cove_agrees_with_the_reference: no baked light");
-            return Ok(());
-        }
+        // The level's own light, baked here against the field the pose stood
+        // on: never a `probes.bin` some earlier run left, and never the
+        // sky-only stand-in a missing one falls back to.
+        let probes = bake::bake_light(tracer.cove(), &bake::Light::level(tracer.cove()), &field, None)?;
         let mut tier = RasterTier::new(
             device,
             queue,
@@ -4445,12 +4729,49 @@ mod tests {
                 project([door.x + dx, face - 0.02, scene.door_sill() + scene.aperture_z])
             })
             .collect();
-        // and the open sand in front of it, out of the hero's own shadow
-        let on_sand: Vec<_> = [(-2.2f64, 3.0f64), (2.2, 3.5), (-1.4, 5.0), (1.4, 5.5)]
+        // and the open sand in front of it. **Inside the door's apron**, which
+        // is the three metres `dressing::Site::clear` stands no prop in: a
+        // patch on a tuft of marram measures the blades and the tracer's noise
+        // in them, not the light, and that is what the patches three to five
+        // metres out came to measure once the rig moved in (0.09 on one tuft
+        // with three of four out of the frame). Seaward of the threshold's
+        // 700 mm, and clear of the hero and the shadow it throws down-sun —
+        // which the hero's settled pose decides, so it is decided here per run
+        // rather than written into the list.
+        let (hero, _) = frame.being;
+        let hero_sand = scene.sand_z_at(hero.x, hero.y);
+        let hero_h = (2.0 * (hero.z - hero_sand)).max(0.5);
+        let sun = scene.sun_dir();
+        let flat = sun.x.hypot(sun.y).max(1e-6);
+        let down = (-sun.x / flat, -sun.y / flat);
+        let reach = hero_h * flat / sun.z.max(1e-3) + 0.5;
+        let shaded = |x: f64, y: f64| {
+            let (px, py) = (x - hero.x, y - hero.y);
+            let along = px * down.0 + py * down.1;
+            let across = (px * down.1 - py * down.0).abs();
+            along > -0.8 && along < reach && across < 0.8
+        };
+        // …and not behind it from the camera: the hero's column on screen,
+        // fattened by its own projected half-metre and the patch's half-width.
+        let column: Vec<(u32, u32)> =
+            (0..=8).filter_map(|k| project([hero.x, hero.y, hero_sand + hero_h * k as f64 / 8.0])).collect();
+        let girth = match (project([hero.x, hero.y, hero.z]), project([hero.x + 0.6, hero.y, hero.z])) {
+            (Some(a), Some(b)) => (a.0 as f64 - b.0 as f64).hypot(a.1 as f64 - b.1 as f64) + 5.0,
+            _ => 40.0,
+        };
+        let behind = |at: (u32, u32)| {
+            column.iter().any(|c| (c.0 as f64 - at.0 as f64).hypot(c.1 as f64 - at.1 as f64) < girth)
+        };
+        let on_sand: Vec<_> = [1.2f64, 1.8, 2.4]
             .iter()
+            .flat_map(|back| [-2.0f64, -1.0, 0.0, 1.0, 2.0].map(|dx| (dx, *back)))
+            .filter(|(dx, back)| dx.hypot(*back) <= super::super::dressing::APRON * MM - 0.4)
             .filter_map(|(dx, back)| {
                 let (x, y) = (door.x + dx, face - back);
-                project([x, y, scene.sand_z_at(x, y) + 0.01])
+                if shaded(x, y) {
+                    return None;
+                }
+                project([x, y, scene.sand_z_at(x, y) + 0.01]).filter(|at| !behind(*at))
             })
             .collect();
 
@@ -4477,9 +4798,11 @@ mod tests {
             anyhow::ensure!(v < 0.10, "the door's face disagrees by {v:.4}, over the L2 bound");
         }
         anyhow::ensure!(
-            sand.is_some() || doorface.is_some(),
-            "neither region landed in the frame; the rig's composition has moved"
+            on_sand.len() >= 2,
+            "{} of the apron's sand patches landed in the frame clear of the hero; the rig's composition has moved",
+            on_sand.len()
         );
+        anyhow::ensure!(doorface.is_some(), "the door's face is out of the frame; the rig's composition has moved");
         Ok(())
     }
 }

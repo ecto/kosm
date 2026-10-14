@@ -5,13 +5,16 @@
 // only the product is projected to the film — which is what makes this tier
 // comparable with the spectral path tracer that baked the probes.
 //
-//   direct   = E_sun · shadow · (albedo/π · wrap(n·l) + GGX)      [6 bands]
+//   direct   = E_sun · pcss(p, n) · (albedo/π · wrap(n·l) + GGX)  [6 bands]
 //            + caustic irradiance where a receiver quad lands
-//   indirect = probes(sun, p, n)                                  [6 bands]
+//   indirect = probes(sun, p, n) · ao                             [6 bands]
 //   colour   = M · (albedo ⊙ (direct + indirect)) + emission + glow
+//   out      = mix(colour, sky(view), 1 − e^{−τ})                 linear HDR
 //
-// then ACES and sRGB, the same two curves `Film::to_srgb8` applies, so the
-// settle blend has no seam.
+// **and stops there.** The exposure, the lens's `cos⁴`, the bloom and the
+// tonemap are `shaders/post.wgsl`, which is `kosm_render::post::Post` in
+// WGSL — the same chain the reference tracer puts its own film through, so
+// the settle blend has no seam.
 
 const PI: f32 = 3.14159265359;
 const BANDS: u32 = 6u;
@@ -42,9 +45,9 @@ struct Uniforms {
     swell: vec4<f32>,
     // its angles and speed: angle1, angle2, speed, the water's index
     swell_angle: vec4<f32>,
-    // the sea's absorption per RGB metre, w the seabed's material index
+    // the sea's absorption per RGB metre, w the *water's* material index
     sea_absorb: vec4<f32>,
-    // x the water's material index, y whether there is a sea at all, zw spare
+    // x the *seabed's* material index, y whether there is a sea at all, zw spare
     sea_flags: vec4<u32>,
     // two receiver rectangles: origin.xyz + w unused, then the u and v edges
     caustic_origin: array<vec4<f32>, 2>,
@@ -54,6 +57,29 @@ struct Uniforms {
     caustic_flags: vec4<f32>,
     // the six-band → linear RGB projection, one row per band
     band_to_rgb: array<vec4<f32>, 6>,
+    // clip → world, for the sky pass's view ray and the AO pass's position
+    inv_view_proj: mat4x4<f32>,
+    // the analytic sky: turbidity, its normaliser, its mean radiance, and the
+    // sun's angular radius (the model is clamped at it; the disc is the sun's)
+    sky_a: vec4<f32>,
+    // the ground half's linear-RGB albedo, w > 0.5 when there is a sky model
+    // at all — without one every sky lookup falls back to the probe read
+    sky_ground: vec4<f32>,
+    // the haze and the occlusion: density per metre, its scale height, the
+    // AO radius in metres, the AO strength
+    air: vec4<f32>,
+    // the frame: width, height, and the rig's own tan(fov/2) across and up
+    screen: vec4<f32>,
+    // the sun's shadow frustum in world metres: its width, its depth range,
+    // the tangent of the sun's angular radius, and one texel of its width
+    shadow_m: vec4<f32>,
+    // the sea's scattering per RGB metre, w the foam's depth in metres. What
+    // the water gives back rather than eats; `water.rs` is the argument.
+    sea_scatter: vec4<f32>,
+    // x the foam's strength, y the wet band's width in metres, zw spare
+    sea_shore: vec4<f32>,
+    // the foam's linear-RGB albedo, from the library's `sea foam`
+    foam_albedo: vec4<f32>,
 };
 
 struct GpuMaterial {
@@ -87,6 +113,10 @@ struct GpuMaterial {
 @group(0) @binding(4) var shadow_smp: sampler_comparison;
 @group(0) @binding(5) var caustic_tex: texture_2d_array<f32>;
 @group(0) @binding(6) var caustic_smp: sampler;
+// The half-resolution ambient occlusion, blurred. One channel, one at every
+// pixel a bake had nothing to say about; see `shaders/ao.wgsl`.
+@group(0) @binding(8) var ao_tex: texture_2d<f32>;
+@group(0) @binding(9) var ao_smp: sampler;
 
 fn band(a: array<vec4<f32>, 2>, i: u32) -> f32 {
     if i < 4u { return a[0][i]; }
@@ -135,6 +165,72 @@ fn swell_normal(x: f32, y: f32) -> vec3<f32> {
     let a1 = u.swell.x * k1 * cos(k1 * (x * c1 + y * s1) - t);
     let a2 = u.swell.z * k2 * cos(k2 * (x * c2 + y * s2) + 1.7 - t);
     return normalize(vec3<f32>(-(a1 * c1 + a2 * c2), -(a1 * s1 + a2 * s2), 1.0));
+}
+
+// ---- the shore -------------------------------------------------------------
+//
+// `water.rs::Sea::depth`, `::foam` and `::wet` are these three functions in
+// Rust and the tests there are what holds the two copies together. The foam
+// and the wet band are **raster-only decorations**: the reference tracer
+// draws one smooth opaque sea and one dry beach, so wherever the tiers are
+// differenced these two regions are excluded and the parity test says so.
+
+// How much water stands over the seabed under a point of the surface. Never
+// negative: where the trough is under the sand there is none, and that is
+// where the foam is.
+fn sea_depth(x: f32, y: f32) -> f32 {
+    let bed = u.sea.x + u.sea.y * (y - u.sea.z);
+    return max(u.sea.x + swell_height(x, y) - bed, 0.0);
+}
+
+// The foam, 0..1. A band where the water has run out, whose edge is displaced
+// by the swell's own phase so it breathes with the sets instead of lying on
+// the beach as a contour line, plus the crests of the swell while it is still
+// shallow — which is a wave breaking.
+fn foam_at(x: f32, y: f32) -> f32 {
+    let strength = u.sea_shore.x;
+    if strength <= 0.0 {
+        return 0.0;
+    }
+    let e = max(u.sea_scatter.w, 1e-4);
+    let amp = max(u.swell.x + u.swell.z, 1e-4);
+    let h = swell_height(x, y);
+    let d = sea_depth(x, y);
+    let edge = max(e * (1.0 + 0.6 * h / amp), 1e-4);
+    let band = 1.0 - smoothstep(0.0, edge, d);
+    let crest = smoothstep(0.45 * amp, 0.95 * amp, h)
+        * (1.0 - smoothstep(8.0 * e, 30.0 * e, d));
+    return clamp(strength * max(band, crest), 0.0, 1.0);
+}
+
+// How wet the ground at a point is: one at and under the water, nothing a
+// band above the swell's current top.
+fn wet_at(p: vec3<f32>) -> f32 {
+    if u.sea_flags.y == 0u {
+        return 0.0;
+    }
+    let level = u.sea.x + swell_height(p.x, p.y);
+    if u.sea_shore.y <= 0.0 {
+        return select(0.0, 1.0, p.z <= level);
+    }
+    return 1.0 - smoothstep(0.0, u.sea_shore.y, p.z - level);
+}
+
+// `kosm::material::Material::wet`'s rule, as a factor: albedo x0.6, roughness
+// x0.75, and the dielectric highlight a wet grain has and a dry one does not.
+// One entry in the library, one rule, applied here to the pixels the sea
+// actually reaches rather than to a second material.
+fn wetted(m: GpuMaterial, w: f32) -> GpuMaterial {
+    var o = m;
+    if w <= 0.0 {
+        return o;
+    }
+    let k = 1.0 - 0.4 * w;
+    o.albedo[0] = m.albedo[0] * k;
+    o.albedo[1] = m.albedo[1] * k;
+    o.roughness = m.roughness * (1.0 - 0.25 * w);
+    o.specular = mix(m.specular, max(m.specular, 0.5), w);
+    return o;
 }
 
 @vertex
@@ -203,10 +299,10 @@ fn sh_cosine(n: vec3<f32>) -> array<f32, 9> {
 // `probe_sh` interpolates the nine coefficients at a point: trilinear over the
 // lattice, linear over the sun's fractional index, probes inside solids
 // dropped and the rest renormalised. `convolve` turns that block into
-// irradiance at a normal. They are separate because **a fragment reads the
-// same block twice** — once at the shading normal and once at the mirror
-// direction for the sky term — and interpolating 54 floats twice is the
-// difference between forty frames a second and sixty.
+// irradiance at a normal. The shading does not take this path any more — see
+// `probe_irradiance2`, which reads the lattice once for both of a fragment's
+// lobes and never builds the block — and the two fallbacks that want a sky
+// out of the probes (no sky model bound) still do.
 fn probe_sh(p: vec3<f32>) -> array<f32, 54> {
     var out: array<f32, 54>;
     for (var i = 0u; i < 54u; i = i + 1u) { out[i] = 0.0; }
@@ -290,10 +386,137 @@ fn probe_irradiance(p: vec3<f32>, n: vec3<f32>) -> array<f32, 6> {
     return convolve(probe_sh(p), n);
 }
 
-// 3×3 PCF with a slope-scaled bias. The bias is stated in *world metres* —
-// one shadow texel, widened by how steeply the surface leans away from the
-// sun — and converted to the map's own depth by the frustum's range, which is
-// the only way a bias survives a sun that moves.
+// Six bands of irradiance at two directions, as two halves of three.
+struct Irradiance2 {
+    n_lo: vec3<f32>,
+    n_hi: vec3<f32>,
+    r_lo: vec3<f32>,
+    r_hi: vec3<f32>,
+};
+
+// **The same two numbers as `convolve(probe_sh(p), n)` and
+// `convolve(probe_sh(p), r)`, summed in the other order.**
+//
+// The cosine lobe is linear in the coefficients, so
+//
+//   Σ_q k_q(n) · (Σ_c w_c L_cq) / Σw  =  (Σ_c w_c Σ_q k_q(n) L_cq) / Σw,
+//
+// and the right-hand side never builds the interpolated block. That block is
+// fifty-four floats written through a loop the compiler cannot unroll, which
+// a GPU keeps in thread memory rather than in registers — and reading it, and
+// copying it into `convolve` twice, was the most expensive thing in the
+// frame: taking the probe read out altogether took a third off the shading
+// pass. This keeps twelve accumulators and the two lobes' nine weights each,
+// and reads every coefficient exactly once. `probe_sh` stays for the two
+// fallbacks that want the block itself.
+fn probe_irradiance2(p: vec3<f32>, n: vec3<f32>, r: vec3<f32>) -> Irradiance2 {
+    var o: Irradiance2;
+    o.n_lo = vec3<f32>(0.0);
+    o.n_hi = vec3<f32>(0.0);
+    o.r_lo = vec3<f32>(0.0);
+    o.r_hi = vec3<f32>(0.0);
+    let nx = u.probe_dims.x;
+    let ny = u.probe_dims.y;
+    let nz = u.probe_dims.z;
+    let ns = u.probe_dims.w;
+    if nx == 0u || ny == 0u || nz == 0u || ns == 0u {
+        return o;
+    }
+    let sp = max(u.probe_origin.w, 1e-6);
+    let t = (p - u.probe_origin.xyz) / sp;
+    let last = vec3<f32>(f32(nx - 1u), f32(ny - 1u), f32(nz - 1u));
+    let cl = clamp(floor(t), vec3<f32>(0.0), max(last - vec3<f32>(1.0), vec3<f32>(0.0)));
+    let f = clamp(t - cl, vec3<f32>(0.0), vec3<f32>(1.0));
+    let base = vec3<u32>(u32(cl.x), u32(cl.y), u32(cl.z));
+
+    let si = clamp(u.knobs.x, 0.0, f32(ns - 1u));
+    let s0 = u32(floor(si));
+    let s1 = min(s0 + 1u, ns - 1u);
+    let ts = si - floor(si);
+    let per_probe = SH * BANDS;
+    let probes_per_sun = nx * ny * nz;
+    let kn = sh_cosine(n);
+    let kr = sh_cosine(r);
+
+    var total = 0.0;
+    for (var c = 0u; c < 8u; c = c + 1u) {
+        let dx = c & 1u;
+        let dy = (c >> 1u) & 1u;
+        let dz = (c >> 2u) & 1u;
+        var w = 1.0;
+        if nx <= 1u { if dx == 1u { w = 0.0; } } else if dx == 0u { w = w * (1.0 - f.x); } else { w = w * f.x; }
+        if ny <= 1u { if dy == 1u { w = 0.0; } } else if dy == 0u { w = w * (1.0 - f.y); } else { w = w * f.y; }
+        if nz <= 1u { if dz == 1u { w = 0.0; } } else if dz == 0u { w = w * (1.0 - f.z); } else { w = w * f.z; }
+        if w <= 0.0 { continue; }
+        let ix = min(base.x + dx, nx - 1u);
+        let iy = min(base.y + dy, ny - 1u);
+        let iz = min(base.z + dz, nz - 1u);
+        let flat = (iz * ny + iy) * nx + ix;
+        if ((probe_inside[flat / 32u] >> (flat % 32u)) & 1u) == 1u { continue; }
+        total = total + w;
+        let a = (s0 * probes_per_sun + flat) * per_probe;
+        let b = (s1 * probes_per_sun + flat) * per_probe;
+        for (var q = 0u; q < SH; q = q + 1u) {
+            let i = a + q * BANDS;
+            var lo = vec3<f32>(probes[i], probes[i + 1u], probes[i + 2u]);
+            var hi = vec3<f32>(probes[i + 3u], probes[i + 4u], probes[i + 5u]);
+            if ts > 0.0 {
+                let j = b + q * BANDS;
+                lo = mix(lo, vec3<f32>(probes[j], probes[j + 1u], probes[j + 2u]), ts);
+                hi = mix(hi, vec3<f32>(probes[j + 3u], probes[j + 4u], probes[j + 5u]), ts);
+            }
+            let wn = w * kn[q];
+            let wr = w * kr[q];
+            o.n_lo = o.n_lo + wn * lo;
+            o.n_hi = o.n_hi + wn * hi;
+            o.r_lo = o.r_lo + wr * lo;
+            o.r_hi = o.r_hi + wr * hi;
+        }
+    }
+    if total > 1e-9 {
+        let inv = 1.0 / total;
+        o.n_lo = o.n_lo * inv;
+        o.n_hi = o.n_hi * inv;
+        o.r_lo = o.r_lo * inv;
+        o.r_hi = o.r_hi * inv;
+    }
+    // L2 ringing can undershoot and irradiance cannot be negative — the same
+    // clamp `convolve` applies, per band, after the whole sum
+    o.n_lo = max(o.n_lo, vec3<f32>(0.0));
+    o.n_hi = max(o.n_hi, vec3<f32>(0.0));
+    o.r_lo = max(o.r_lo, vec3<f32>(0.0));
+    o.r_hi = max(o.r_hi, vec3<f32>(0.0));
+    return o;
+}
+
+// A sixteen-point Poisson-ish disc, used twice: once to look for blockers and
+// once to filter across the penumbra they imply. Spiralled rather than random
+// so the pattern has no clumps and needs no per-pixel rotation to hide them —
+// a rotation would be temporal noise on a tier whose whole claim is that it
+// does not flicker.
+fn disc16(i: u32) -> vec2<f32> {
+    let f = (f32(i) + 0.5) / 16.0;
+    let r = sqrt(f);
+    // the golden angle: successive taps land two fifths of a turn apart
+    let a = f32(i) * 2.39996323;
+    return vec2<f32>(r * cos(a), r * sin(a));
+}
+
+// **PCSS: the sun has a size, so its shadows have an edge that widens.**
+//
+// The 3×3 PCF this replaced filtered over one texel whatever the geometry,
+// which draws every shadow with the same hard edge — a hero's shadow at its
+// own feet and the cliff's thrown forty metres both. The reference tracer
+// samples the sun's *disc*, so its penumbra grows with the distance from the
+// blocker, and at the door the two tiers plainly disagreed.
+//
+// The construction is the standard one, stated in world metres because that
+// is where the sun's angular radius lives, and `shadow_m` carries the
+// frustum's own metres so nothing has to be recovered from a bias:
+//
+//   1. average the depth of the blockers within a search radius,
+//   2. `penumbra = (receiver − blocker) · tan α`, α the disc's radius,
+//   3. filter over that, in the map's own uv.
 fn sun_shadow(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let c = u.sun_view_proj * vec4<f32>(p, 1.0);
     if c.w <= 0.0 {
@@ -306,18 +529,65 @@ fn sun_shadow(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     let cos_l = clamp(dot(n, u.sun_dir.xyz), 0.0, 1.0);
     let tan_l = sqrt(max(1.0 - cos_l * cos_l, 0.0)) / max(cos_l, 0.05);
-    // one texel across, plus the slope's rise over that texel; the frustum's
-    // depth is baked into knobs.y so this arrives already in clip units
-    let bias = u.knobs.y * (1.0 + min(tan_l, 8.0));
     let side = max(u.knobs.z, 1.0);
-    var sum = 0.0;
-    for (var j = -1; j <= 1; j = j + 1) {
-        for (var i = -1; i <= 1; i = i + 1) {
-            let o = vec2<f32>(f32(i), f32(j)) / side;
-            sum = sum + textureSampleCompareLevel(shadow_tex, shadow_smp, uv + o, ndc.z - bias);
+    let texel = 1.0 / side;
+    // one texel of world, widened by the slope's rise across it, already in
+    // the map's own clip depth
+    let bias = u.knobs.y * (1.0 + min(tan_l, 8.0));
+    let extent = max(u.shadow_m.x, 1e-6);
+    let depth_m = max(u.shadow_m.y, 1e-6);
+    let tan_a = u.shadow_m.z;
+    // world metres of penumbra, as a uv radius on the map
+    let per_m = 1.0 / extent;
+
+    // ---- 1. how deep are the blockers -------------------------------------
+    // The search radius is the widest penumbra worth looking for — a blocker
+    // the whole frustum away — capped at eight texels, because past that the
+    // taps scatter into geometry that has nothing to do with this pixel.
+    let search = clamp(tan_a * depth_m * per_m, texel, 8.0 * texel);
+    // **The blocker search needs the bias of its own radius, not of a texel.**
+    // A lit plane that leans away from the sun rises across the search disc by
+    // the slope times its *width*; tested against a one-texel bias, half the
+    // taps on a flat sunlit cliff come back as blockers, the penumbra estimate
+    // follows the sixteen-tap spiral, and the wall wears a set of faint
+    // diagonal stripes. Scaling the same slope-scaled bias by how many texels
+    // wide the search is is the whole fix.
+    let search_bias = bias * max(search / texel, 1.0);
+    var blocker = 0.0;
+    var found = 0.0;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        // `textureLoad` and not a second sampler: PCSS wants a blocker's
+        // *depth*, which a comparison sampler will not give, and a nearest
+        // read of a depth map is exactly what a blocker search wants anyway.
+        let q = clamp(
+            vec2<i32>((uv + disc16(i) * search) * side),
+            vec2<i32>(0, 0),
+            vec2<i32>(i32(side) - 1, i32(side) - 1),
+        );
+        let d = textureLoad(shadow_tex, q, 0);
+        if d < ndc.z - search_bias {
+            blocker = blocker + d;
+            found = found + 1.0;
         }
     }
-    return sum / 9.0;
+    if found < 0.5 {
+        return 1.0;                     // nothing between here and the sun
+    }
+    blocker = blocker / found;
+
+    // ---- 2. how wide is the penumbra --------------------------------------
+    let gap_m = max((ndc.z - blocker) * depth_m, 0.0);
+    // never narrower than a texel: a contact shadow filtered over nothing is
+    // the aliased staircase a PCF exists to hide
+    let radius = clamp(tan_a * gap_m * per_m, texel, 12.0 * texel);
+
+    // ---- 3. filter over it ------------------------------------------------
+    var sum = 0.0;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        sum = sum + textureSampleCompareLevel(
+            shadow_tex, shadow_smp, uv + disc16(i) * radius, ndc.z - bias);
+    }
+    return sum / 16.0;
 }
 
 // The caustic's extra irradiance at a point on a receiver plane, linear RGB.
@@ -460,6 +730,99 @@ fn ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, roughness: f32) -> f32 {
     return dist * gv * gl / max(4.0 * ndv * ndl, 1e-6);
 }
 
+// ---- Preetham's clear sky, the port of `kosm_render::env::SkyEnv` ---------
+//
+// Five Perez coefficients a channel, each affine in turbidity; a zenith
+// chromaticity and luminance from turbidity and the solar zenith angle; and
+// the ratio `F(θ,γ)/F(0,θs)`. The Rust is `crates/kosm-render/src/env.rs` and
+// this is it line for line, because the settle blend fades one into the other
+// and a sky that disagreed would show as a seam across the whole frame.
+//
+// **The sun's disc is not in here.** `γ` is clamped at `u.sky_a.w`, the sun's
+// own angular radius, which caps the circumsolar term at the value it takes
+// on the disc's rim. The disc itself is drawn once, by `fs_sky`, out of the
+// same `Sun` the shading uses.
+
+fn perez_c(t: f32, ch: u32) -> array<f32, 5> {
+    if ch == 0u {
+        return array<f32, 5>(
+            0.1787 * t - 1.4630, -0.3554 * t + 0.4275, -0.0227 * t + 5.3251,
+            0.1206 * t - 2.5771, -0.0670 * t + 0.3703,
+        );
+    }
+    if ch == 1u {
+        return array<f32, 5>(
+            -0.0193 * t - 0.2592, -0.0665 * t + 0.0008, -0.0004 * t + 0.2125,
+            -0.0641 * t - 0.8989, -0.0033 * t + 0.0452,
+        );
+    }
+    return array<f32, 5>(
+        -0.0167 * t - 0.2608, -0.0950 * t + 0.0092, -0.0079 * t + 0.2102,
+        -0.0441 * t - 1.6537, -0.0109 * t + 0.0529,
+    );
+}
+
+fn perez_f(c: array<f32, 5>, cos_theta: f32, gamma: f32) -> f32 {
+    var k = c;
+    let ct = max(cos_theta, 0.01);
+    let cg = cos(gamma);
+    return (1.0 + k[0] * exp(k[1] / ct)) * (1.0 + k[2] * exp(k[3] * gamma) + k[4] * cg * cg);
+}
+
+// (x, y, Y) at the zenith, Y in kcd/m² — a unit the normaliser divides out.
+fn sky_zenith(t: f32, ts: f32) -> vec3<f32> {
+    let t2 = t * t;
+    let ts2 = ts * ts;
+    let ts3 = ts2 * ts;
+    let x = t2 * (0.00166 * ts3 - 0.00375 * ts2 + 0.00209 * ts)
+        + t * (-0.02903 * ts3 + 0.06377 * ts2 - 0.03202 * ts + 0.00394)
+        + (0.11693 * ts3 - 0.21196 * ts2 + 0.06052 * ts + 0.25886);
+    let y = t2 * (0.00275 * ts3 - 0.00610 * ts2 + 0.00317 * ts)
+        + t * (-0.04214 * ts3 + 0.08970 * ts2 - 0.04153 * ts + 0.00516)
+        + (0.15346 * ts3 - 0.26756 * ts2 + 0.06670 * ts + 0.26688);
+    let chi = (4.0 / 9.0 - t / 120.0) * (PI - 2.0 * ts);
+    let lum = (4.0453 * t - 4.9710) * tan(chi) - 0.2155 * t + 2.4192;
+    return vec3<f32>(x, y, max(lum, 0.05));
+}
+
+fn xyy_to_rgb(x: f32, y: f32, big_y: f32) -> vec3<f32> {
+    let yy = max(y, 1e-4);
+    let xx = x / yy * big_y;
+    let zz = (1.0 - x - yy) / yy * big_y;
+    return vec3<f32>(
+        3.2404542 * xx - 1.5371385 * big_y - 0.4985314 * zz,
+        -0.9692660 * xx + 1.8760108 * big_y + 0.0415560 * zz,
+        0.0556434 * xx - 0.2040259 * big_y + 1.0572252 * zz,
+    );
+}
+
+// The model above the horizon, before the normaliser and the intensity.
+fn sky_upper(d: vec3<f32>) -> vec3<f32> {
+    let t = u.sky_a.x;
+    let cy = perez_c(t, 0u);
+    let cx = perez_c(t, 1u);
+    let cyy = perez_c(t, 2u);
+    let cos_theta = max(d.z, 0.0);
+    let theta_s = acos(max(clamp(u.sun_dir.z, -1.0, 1.0), 0.0));
+    let gamma = max(acos(clamp(dot(normalize(d), u.sun_dir.xyz), -1.0, 1.0)), u.sky_a.w);
+    let z = sky_zenith(t, theta_s);
+    let big_y = z.z * perez_f(cy, cos_theta, gamma) / max(perez_f(cy, 1.0, theta_s), 1e-4);
+    let x = z.x * perez_f(cx, cos_theta, gamma) / max(perez_f(cx, 1.0, theta_s), 1e-4);
+    let y = z.y * perez_f(cyy, cos_theta, gamma) / max(perez_f(cyy, 1.0, theta_s), 1e-4);
+    return max(xyy_to_rgb(x, y, max(big_y, 0.0)), vec3<f32>(0.0));
+}
+
+fn sky_model(d: vec3<f32>) -> vec3<f32> {
+    let k = u.sky_a.y * u.sky_a.z;
+    if d.z >= 0.0 {
+        return sky_upper(d) * k;
+    }
+    let h = sky_upper(normalize(vec3<f32>(d.x, d.y, 0.02)));
+    let t = clamp(sqrt(-d.z), 0.0, 1.0);
+    let s = t * t * (3.0 - 2.0 * t);
+    return mix(h, h * u.sky_ground.rgb, s) * k;
+}
+
 // The gradient sky the level hangs under, as a direction lookup. The probes
 // carry the sky's *irradiance*; this is its radiance, which is what a mirror
 // and the sea's surface need.
@@ -474,7 +837,14 @@ fn sky_from(sh: array<f32, 54>, d: vec3<f32>) -> vec3<f32> {
     return c / PI;
 }
 
+// The sky a mirror, the sea and the haze see. With a model bound it is the
+// model; without one it is the probe volume's own low-frequency read, which
+// is what this tier had before there was a sky and what the datasheet ball is
+// still drawn under.
 fn sky_rgb(d: vec3<f32>) -> vec3<f32> {
+    if u.sky_ground.w > 0.5 {
+        return sky_model(normalize(d));
+    }
     return sky_from(probe_sh(u.eye.xyz), d);
 }
 
@@ -489,7 +859,13 @@ fn to_rgb(bands: array<f32, 6>) -> vec3<f32> {
 
 // The shared shading of an opaque surface: everything but the sea and the
 // lens goes through here.
-fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+//
+// `ao` is the ambient occlusion at this pixel: it multiplies the **indirect**
+// half and nothing else. The direct sun already has the shadow map, which
+// resolves what a hemisphere of screen-space taps cannot and would be
+// double-counted if the two were multiplied together — a rock in its own
+// shadow would go twice as dark as the reference has it.
+fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, ao: f32) -> vec3<f32> {
     let l = u.sun_dir.xyz;
     let shadow = sun_shadow(p, n);
 
@@ -526,8 +902,14 @@ fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3
     for (var b = 0u; b < BANDS; b = b + 1u) {
         direct[b] = sun_band(b) * shadow * lambert;
     }
-    let sh = probe_sh(p);
-    var indirect = convolve(sh, n);
+    // The probes, read once for both lobes: the diffuse one at the normal and
+    // the sky's reflection at the mirror direction.
+    let refl = reflect(-v, n);
+    let e = probe_irradiance2(p, n, normalize(refl));
+    var indirect = array<f32, 6>(
+        e.n_lo.x * ao, e.n_lo.y * ao, e.n_lo.z * ao,
+        e.n_hi.x * ao, e.n_hi.y * ao, e.n_hi.z * ao,
+    );
 
     // ---- the diffuse half: spectral, then projected ----------------------
     var lit = array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -546,9 +928,14 @@ fn shade_solid(m: GpuMaterial, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3
         sun_band(3u), sun_band(4u), sun_band(5u),
     ));
     colour = colour + fspec * spec_weight * sun_rgb * shadow;
-    // and the sky's own reflection, at the mirror direction
-    let refl = reflect(-v, n);
-    colour = colour + fresnel(f0, ndv) * sky_from(sh, refl) * (1.0 - m.roughness * 0.85);
+    // and the sky's own reflection, at the mirror direction: `sky_from`, off
+    // the irradiance the fused read already took there. The sky's reflection
+    // is ambient too, so the occlusion applies to it — a rock in a crevice
+    // does not mirror a sky it cannot see.
+    let sky_refl = to_rgb(array<f32, 6>(
+        e.r_lo.x, e.r_lo.y, e.r_lo.z, e.r_hi.x, e.r_hi.y, e.r_hi.z,
+    )) / PI;
+    colour = colour + fresnel(f0, ndv) * sky_refl * (1.0 - m.roughness * 0.85) * ao;
 
     // ---- what it emits ---------------------------------------------------
     var em = array<f32, 6>(
@@ -578,6 +965,15 @@ fn shade_sea(p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     let f0 = 0.02;
     let fr = f0 + (1.0 - f0) * pow(1.0 - cos_i, 5.0);
 
+    // the horizon fade, first, because at 1 nothing under the water is seen
+    // and at 0 the horizon's own sky is not
+    let far = clamp((u.sea.z - p.y) / max(u.sea.w, 1e-3), 0.0, 1.0);
+    let fade = smoothstep(0.55, 1.0, far);
+    let horizon = sky_rgb(normalize(vec3<f32>(d.x, d.y, 0.02)));
+    if fade >= 1.0 {
+        return horizon;
+    }
+
     // the seabed: the beach's own plane, carried on under the water
     let slope = u.sea.y;
     let denom = dr.z - slope * dr.y;
@@ -589,7 +985,7 @@ fn shade_sea(p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
             let q = p + dr * t;
             let sand = materials[u.sea_flags.x];
             let sn = normalize(vec3<f32>(0.0, -slope, 1.0));
-            under = shade_solid(sand, q, sn, -dr);
+            under = shade_solid(sand, q, sn, -dr, 1.0);
             dist = t;
         }
     }
@@ -605,9 +1001,7 @@ fn shade_sea(p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
 
     // the horizon: past the lattice's reach the sea becomes the sky it
     // reflects, so the far edge of the field is not an edge
-    let far = clamp((u.sea.z - p.y) / max(u.sea.w, 1e-3), 0.0, 1.0);
-    let fade = smoothstep(0.55, 1.0, far);
-    return mix(c, sky_rgb(normalize(vec3<f32>(d.x, d.y, 0.02))), fade);
+    return mix(c, horizon, fade);
 }
 
 // The lens: a thin disc with a view-dependent Fresnel highlight and the sky
@@ -636,27 +1030,59 @@ fn shade_lens(m: GpuMaterial, p: vec3<f32>, n_in: vec3<f32>, v: vec3<f32>) -> ve
     return fr * sky_rgb(reflect(-v, n)) + (vec3<f32>(1.0) - fr) * through + fr * spec * sun_rgb;
 }
 
-// ---- the film ---------------------------------------------------------------
+// ---- the air ----------------------------------------------------------------
 
-// `kosm_render::cpu::film::tonemap_aces`, character for character.
-fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-fn linear_to_srgb1(x: f32) -> f32 {
-    if x <= 0.0031308 {
-        return 12.92 * x;
+// **Aerial perspective, as a closed form.** `kosm_render::post::Aerial` is
+// this function in Rust and the tracer applies it to `Film::depth`, so the two
+// tiers haze by the same amount at the same distance. It is a single-scatter
+// approximation with an exponential density and the sky's own radiance as the
+// in-scattered colour — the reference does *not* trace a medium, and that is
+// stated in `post.rs` rather than hidden here.
+//
+//   τ = ρ · d · e^{−z₀/H} · (1 − e^{−u}) / u,   u = (z₁ − z₀) / H
+//
+// written that way and not as a difference of exponentials over `Δz`, which
+// cancels catastrophically in `f32` on a near-level view ray and banded the
+// beach when it was tried.
+fn haze(z0: f32, z1: f32, d: f32) -> f32 {
+    if u.air.x <= 0.0 || d <= 0.0 {
+        return 0.0;
     }
-    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+    let h = max(u.air.y, 1e-3);
+    let uu = (z1 - z0) / h;
+    var f = 1.0 - 0.5 * uu + uu * uu / 6.0;
+    if abs(uu) >= 1e-3 {
+        f = (1.0 - exp(-uu)) / uu;
+    }
+    let tau = u.air.x * d * exp(-z0 / h) * f;
+    return 1.0 - exp(-tau);
 }
 
-fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(linear_to_srgb1(c.x), linear_to_srgb1(c.y), linear_to_srgb1(c.z));
+fn with_air(c: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    if u.air.x <= 0.0 || u.sky_ground.w <= 0.5 {
+        return c;
+    }
+    let rel = p - u.eye.xyz;
+    let d = length(rel);
+    let a = haze(u.eye.z, p.z, d);
+    return mix(c, sky_model(rel / max(d, 1e-6)), a);
+}
+
+// ---- the film ---------------------------------------------------------------
+//
+// **This pass writes linear HDR, not bytes.** The exposure, the vignette, the
+// bloom and the tonemap are one pass later, in `shaders/post.wgsl`, which is
+// `kosm_render::post::Post` written in WGSL — so the two tiers apply the same
+// chain to the same radiance and the settle blend still has no seam.
+
+// The ambient occlusion at this pixel, from the half-resolution buffer.
+fn ao_at(frag: vec2<f32>) -> f32 {
+    if u.air.w <= 0.0 {
+        return 1.0;
+    }
+    let uv = frag / max(u.screen.xy, vec2<f32>(1.0));
+    let a = textureSampleLevel(ao_tex, ao_smp, uv, 0.0).r;
+    return clamp(1.0 - (1.0 - a) * u.air.w, 0.0, 1.0);
 }
 
 @fragment
@@ -675,10 +1101,70 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else if in.kind == 2u {
         c = shade_lens(m, in.wpos, n, v);
     } else {
-        c = shade_solid(m, in.wpos, n, v);
+        c = shade_solid(m, in.wpos, n, v, ao_at(in.clip.xy));
     }
     c = c + in.glow.rgb;
-    return vec4<f32>(linear_to_srgb(tonemap_aces(c * u.eye.w)), 1.0);
+    return vec4<f32>(with_air(c, in.wpos), 1.0);
+}
+
+// ---- the sky, as a pass -----------------------------------------------------
+//
+// A full-screen quad at the far plane, before the geometry: what a ray that
+// hits nothing shows. It replaces a constant clear colour, which is what this
+// tier used to draw the sky as and which is why the cove's horizon was a flat
+// grey band whatever the sun was doing.
+//
+// **The disc is drawn here and only here.** `SkyEnv` clamps its circumsolar
+// term at the sun's own angular radius, so the model has no disc in it; this
+// adds `Sun`'s, once, at the radiance the shading uses — irradiance over the
+// disc's solid angle. Its edge is smoothed over a twentieth of the radius,
+// because a hard step on a cone half a degree across is a staircase at any
+// resolution a window runs at.
+
+struct SkyOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
+    var o: SkyOut;
+    let x = f32(i & 1u);
+    let y = f32(i >> 1u);
+    let ndc = vec2<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0);
+    o.clip = vec4<f32>(ndc, 0.0, 1.0);
+    o.ndc = ndc;
+    return o;
+}
+
+@fragment
+fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
+    // the view ray, out of the same 4×4 the geometry is drawn with, so the
+    // sky and the silhouettes in front of it cannot be two cameras
+    let near = u.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
+    let far = u.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let d = normalize(far.xyz / far.w - near.xyz / near.w);
+    var c: vec3<f32>;
+    if u.sky_ground.w > 0.5 {
+        c = sky_model(d);
+    } else {
+        c = sky_from(probe_sh(u.eye.xyz), d);
+    }
+    let cos_a = dot(d, u.sun_dir.xyz);
+    let cos_r = cos(u.sun_dir.w);
+    let soft = 0.05 * (1.0 - cos_r);
+    if cos_a > cos_r - soft {
+        var sun_rgb = to_rgb(array<f32, 6>(
+            sun_band(0u), sun_band(1u), sun_band(2u),
+            sun_band(3u), sun_band(4u), sun_band(5u),
+        ));
+        // radiance is irradiance over the disc's solid angle, which is what
+        // `Sun::radiance` is on the tracer
+        let omega = max(6.28318530718 * (1.0 - cos_r), 1e-12);
+        let edge = smoothstep(cos_r - soft, cos_r + soft, cos_a);
+        c = c + sun_rgb / omega * edge;
+    }
+    return vec4<f32>(c, 1.0);
 }
 
 // ---- the blit of the offscreen colour onto whatever is showing --------------

@@ -529,6 +529,38 @@ impl Builder {
         drop(inner);
         Body { inner: self.inner.clone(), index }
     }
+
+    /// How many bodies have been declared so far.
+    ///
+    /// Paired with [`Builder::bodies_since`] this is how a **sub-assembly**
+    /// authored at its own origin — a figure, a machine, a prop with twenty
+    /// named parts — is dropped into a level and then placed. The assembly's
+    /// own function knows nothing about where it ends up, and the level does
+    /// not have to thread a transform through every one of its bodies.
+    pub fn bodies(&self) -> usize {
+        self.inner.borrow().bodies.len()
+    }
+
+    /// The bodies declared since [`Builder::bodies`] last read `from`.
+    ///
+    /// ```
+    /// use kosm::prelude::*;
+    /// let built = build(&Params::default(), |b| {
+    ///     let mark = b.bodies();
+    ///     b.body("hub").material("brass").sphere(20.0);
+    ///     b.body("pin").material("steel").cylinder(4.0, 60.0);
+    ///     // …authored at the origin, then stood up over there:
+    ///     for part in b.bodies_since(mark) {
+    ///         part.rotate_z(30.0).at(500.0, 0.0, 0.0);
+    ///     }
+    /// })?;
+    /// assert_eq!(built.bodies.len(), 2);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn bodies_since(&self, from: usize) -> Vec<Body> {
+        let len = self.inner.borrow().bodies.len();
+        (from.min(len)..len).map(|index| Body { inner: self.inner.clone(), index }).collect()
+    }
 }
 
 /// A CSG subtree under construction. Millimetres and degrees.
@@ -656,6 +688,14 @@ impl Body {
 
     fn is_dynamic(&self) -> bool {
         self.inner.borrow().bodies[self.index].mass.is_some()
+    }
+
+    /// What this body is called — the name it was declared with.
+    ///
+    /// For a caller holding a handle out of [`Builder::bodies_since`], which
+    /// is the one place a `Body` arrives without its name in hand.
+    pub fn name(&self) -> String {
+        self.inner.borrow().bodies[self.index].name.clone()
     }
 
     /// Union a shape onto this body.

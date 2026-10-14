@@ -20,8 +20,8 @@ use tang::{Scalar, Vec3};
 /// The average of the s- and p-polarised reflectances, which is what an
 /// unpolarised source and an unpolarised sensor see.
 pub fn fresnel<S: Scalar>(n1: S, n2: S, cos_i: S, cos_t: S) -> S {
-    let rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t);
-    let rp = (n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i);
+    let rs = (n1 * cos_i - n2 * cos_t) * (n1 * cos_i + n2 * cos_t).recip();
+    let rp = (n1 * cos_t - n2 * cos_i) * (n1 * cos_t + n2 * cos_i).recip();
     S::HALF * (rs * rs + rp * rp)
 }
 
@@ -31,7 +31,9 @@ pub fn fresnel<S: Scalar>(n1: S, n2: S, cos_i: S, cos_t: S) -> S {
 /// Returns the refracted direction and the two cosines (which
 /// [`fresnel`] wants next), or `None` on total internal reflection.
 pub fn refract<S: Scalar>(d: Vec3<S>, n: Vec3<S>, n1: S, n2: S) -> Option<(Vec3<S>, S, S)> {
-    let eta = n1 / n2;
+    // `recip` and not a division, so an `f64` and a `Dual` answer the same
+    // to the bit: the dual divides by multiplying by the reciprocal
+    let eta = n1 * n2.recip();
     let cos_i = -d.dot(&n);
     let k = S::ONE - eta * eta * (S::ONE - cos_i * cos_i);
     if k < S::ZERO {

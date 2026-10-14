@@ -68,7 +68,20 @@ fn substance(name: &str) -> Option<Substance> {
         // The cliff, the boulders and the door are all one rock, cut three
         // ways; what separates them in the picture is colour, below.
         "rock" | "stone" | DOOR => material::named(DOOR)?,
+        // …and the cove is *bedded*, so there is a second rock and a third.
+        // `limestone` is the pale bed that alternates with the granite up the
+        // cliff and up the headland steps; `basalt` is the darker stone the
+        // door's lintel, jambs and threshold are cut from, and it is darker
+        // than either bed on purpose: what makes the doorway read as a made
+        // thing from across the beach is that it is the one black shape in a
+        // wall of grey.
+        "limestone" | "basalt" => material::named(name)?,
         "water" => material::named("sea water")?,
+        // What the tide left. Every one of them is an entry in the library in
+        // its own right, and the shell keeps its film — see below.
+        "driftwood" | "coral" | "kelp" => material::named(name)?,
+        "shell" => material::named("shell (nacre)")?,
+        "marram" => material::named("marram grass")?,
         "porcelain" | "brass" => material::named(name)?,
         // The hero's costume. Every one of these is an entry in the library
         // in its own right — `sims/rune/hero/figure.rs` weighs the figure out
@@ -107,11 +120,43 @@ fn cove(name: &str) -> Option<Pbr> {
         // in the frame sits back from the sand instead of competing with it,
         // and so the sky's colour has something cool to land on.
         "rock" => flat("rock", [0.13, 0.19, 0.33], 0.9)?,
+        // The pale bed. Every other stratum of the cliff and every other tread
+        // of the headland stair, alternating with the granite above — which is
+        // what turns one grey wall into a geology you can read the age of. Cool
+        // and light, so the banding is a difference of *value* under a low sun
+        // and not a difference of hue: at this elevation the sun rakes the
+        // proud beds and leaves the recessed ones in sky light, and a warm
+        // second rock would have fought the sand for the eye.
+        "limestone" => flat("limestone", [0.31, 0.34, 0.39], 0.9)?,
+        // The dressed stone of the door's frame. Near-black, the darkest
+        // surface in the level: the lintel and the jambs are the silhouette
+        // that says "door" from four hundred metres of beach, before the
+        // keyhole's rim is a pixel.
+        "basalt" => flat("basalt", [0.075, 0.085, 0.105], 0.8)?,
         // The door: the same stone, cut and dressed. Darker and warmer than
         // the cliff it is set into — that difference is the whole reason the
         // door reads as a door from across the beach, before the aperture is
         // visible at all.
         "stone" | DOOR => flat(DOOR, [0.24, 0.20, 0.16], 0.85)?,
+        // ---- what the tide left ------------------------------------------
+        // Sun-bleached grey, and the one wood in the cove. Rougher than the
+        // hero's leather and lighter than the sand it lies on, so a log reads
+        // as a pale bar rather than as a shadow.
+        "driftwood" => flat("driftwood", [0.55, 0.53, 0.48], 0.8)?,
+        "coral" => Pbr { specular: 0.25, subsurface: 0.0, ..flat("coral", [0.74, 0.44, 0.38], 0.8)? },
+        // Wet, so smooth: the one thing on the reef with a highlight on it.
+        "kelp" => Pbr { specular: 0.6, subsurface: 0.0, ..flat("kelp", [0.085, 0.115, 0.055], 0.30)? },
+        // Marram. Grey-green and dry, a shade cooler and much darker than the
+        // sand, so a tuft is a silhouette of thin tapers and not a smudge.
+        "marram" => Pbr { specular: 0.25, subsurface: 0.0, ..flat("marram", [0.30, 0.35, 0.15], 0.65)? },
+        // The one exception to the flat rule, and it earns it the way the sea's
+        // smoothness does. `shell (nacre)` is four hundred nanometres of
+        // aragonite platelet and the interference between the platelets *is*
+        // the iridescence — take the film off and what is left is a white
+        // pebble. It costs one lobe on six objects a hundred and fifty
+        // millimetres across, and it buys the only colour on the beach that
+        // moves when the camera does.
+        "shell" => Pbr { specular: 0.6, subsurface: 0.0, ..substance("shell")?.pbr() },
         // The sea. Opaque on purpose (see the module note): a saturated teal
         // body colour under a smooth dielectric surface, so the swell is
         // legible as a field of sky reflections and the water is still teal
@@ -178,6 +223,32 @@ fn cove(name: &str) -> Option<Pbr> {
         // The satchel and its strap: russet leather, the one warm accent on
         // the figure and the mark that says which way it is facing.
         "leather" => flat("leather", [0.30, 0.105, 0.045], 0.65)?,
+        // ---- the creature ----------------------------------------------------
+        // The animal of `sims/rune/creature`, sitting in the near tide pool.
+        // Its own `look.rs` is the palette — one file, so a repaint reaches its
+        // four stills and the cove together — and the cove takes exactly three
+        // things off it, each of them a rule this level already has:
+        //
+        // - **no transmission.** The bell is a converging meniscus and in the
+        //   creature's own stills it refracts. In the cove it may not: a second
+        //   transmissive body joins
+        //   [`kosm_render::caustics::is_caustic_refractor`]'s aim and spends
+        //   the rune's photons on a bystander thirty metres from the door. It
+        //   is the same argument the sea's arm makes, and it is why the
+        //   automaton comes without its lens.
+        // - **no subsurface.** The cove's look is flat, and the same line above
+        //   takes the walk off the hero's skin.
+        // - **no emission.** The heart glows in the portrait. Here the only
+        //   self-lit things in the level are the keyhole's rim and the glint,
+        //   because the hint is light and a second light is a second hint.
+        "bell" | "limbs" | "gills" | "core" | "eyes" => {
+            let p = super::creature::look::creature(name)?;
+            Pbr { transmission: 0.0, subsurface: 0.0, emissive: [0.0; 3], specular: 0.4, ..p }
+        }
+        // The heart with its light taken away is a black sphere, so it is
+        // painted rather than dimmed: the amber the portrait's glow was, as an
+        // albedo, under the bell where almost nothing reaches it anyway.
+        "heart" => flat("sand", [0.62, 0.29, 0.11], 0.5)?,
         _ => return None,
     })
 }
@@ -403,8 +474,12 @@ pub fn gpu_glint(radiance: f64) -> GpuMaterial {
 
 /// Every name the cove paints, so a tier that wants a table can build one.
 pub const NAMES: &[&str] = &[
-    "sand", "rock", "stone", DOOR, "water", "porcelain", "brass", "lacquer", "cloak", "cream",
-    "skin", "blush", "ink", "boot", "leather",
+    "sand", "rock", "limestone", "basalt", "stone", DOOR, "water", "porcelain", "brass", "lacquer",
+    "cloak", "cream", "skin", "blush", "ink", "boot", "leather",
+    // what the tide left
+    "driftwood", "coral", "kelp", "marram", "shell",
+    // and the creature in the near pool
+    "bell", "limbs", "gills", "core", "eyes", "heart",
 ];
 
 #[cfg(test)]

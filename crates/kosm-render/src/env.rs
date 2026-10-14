@@ -359,6 +359,252 @@ pub fn load_hdr(path: &std::path::Path) -> Result<EnvMap, String> {
     parse_hdr(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+// ─── the analytic clear sky ───────────────────────────────────────────────
+
+/// A Preetham clear-sky model: warm horizon, blue zenith, a glow around the
+/// sun, and a ground half below.
+///
+/// # Why this and not a gradient
+///
+/// [`GradientEnv`](crate::pathtrace::GradientEnv) is two colours and a lerp.
+/// It cannot know where the sun is, so it cannot put the bright, desaturated
+/// aureole around it that a real sky has, and it cannot warm the horizon in
+/// the sun's own azimuth while leaving the opposite one cold. Those two
+/// asymmetries are most of what makes a late-afternoon beach read as a
+/// *place* rather than as a studio backdrop, and they cost eight polynomial
+/// evaluations per lookup.
+///
+/// Preetham rather than Hosek–Wilkie on purpose: Hosek is nine coefficients
+/// per channel out of a fitted table, which is a data blob this crate's
+/// dependency rule would have to carry. Preetham is five Perez coefficients
+/// per channel, each an affine function of turbidity, and the whole model is
+/// forty lines that port to WGSL character for character — which is what the
+/// raster tier needs, because the two tiers have to agree about the sky or
+/// the settle blend has a seam at the horizon.
+///
+/// # The sun disc is **not** in here
+///
+/// [`Sun`](crate::pathtrace::Sun) owns the disc, on both tiers, and this
+/// model excludes it: the Perez angle `γ` is clamped to
+/// [`SkyEnv::sun_radius`] before it is evaluated, which caps the circumsolar
+/// term at the value it has on the disc's own rim. So the glow is here and
+/// the disc is the sun's, exactly once, and a camera ray that lands in the
+/// cone gets `sky + Sun::radiance_in` with no double count.
+///
+/// # Units
+///
+/// Preetham's zenith luminance is in kcd/m², which is nobody's render
+/// units. The model is normalised at construction so that the **mean
+/// radiance over the upper hemisphere is one**, and [`SkyEnv::intensity`] is
+/// then that mean in the tracer's own units — the same number
+/// `sky_intensity` always was. Turbidity therefore changes the sky's *shape*
+/// and *colour* without changing the exposure, which is what makes it a knob
+/// a level author can turn.
+///
+/// ```
+/// use kosm_render::env::SkyEnv;
+/// use kosm_render::math::Vec3;
+/// let sky = SkyEnv::new(Vec3::new(-0.35, -0.45, 0.42), 2.5, [0.42, 0.36, 0.24], 0.42, 0.02);
+/// let zenith = sky.radiance(Vec3::new(0.0, 0.0, 1.0));
+/// let horizon = sky.radiance(Vec3::new(1.0, 0.0, 0.02));
+/// // the zenith is blue and the horizon is not
+/// assert!(zenith[2] / zenith[0] > horizon[2] / horizon[0]);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct SkyEnv {
+    /// Unit vector **toward** the sun.
+    pub sun_dir: Vec3,
+    /// Preetham's turbidity: 2 is an exceptionally clear day, 3 a normal
+    /// clear one, 6 hazy, 10 the kind of murk that turns the sky white.
+    pub turbidity: f32,
+    /// Linear-RGB albedo of the ground half — what a downward ray finds.
+    pub ground_albedo: [f32; 3],
+    /// Mean radiance over the upper hemisphere, in the tracer's units.
+    pub intensity: f32,
+    /// The sun's angular radius, radians. The circumsolar term is clamped at
+    /// it so the disc belongs to [`Sun`](crate::pathtrace::Sun) alone.
+    pub sun_radius: f32,
+    /// The normaliser that makes the mean upper-hemisphere luminance one.
+    /// Derived by [`SkyEnv::new`]; the raster tier uploads it so the two
+    /// tiers scale the same model by the same number.
+    pub scale: f32,
+}
+
+/// The five Perez coefficients of one channel, as affine functions of
+/// turbidity — the model's whole parameterisation.
+#[inline]
+fn perez_coeffs(t: f32) -> ([f32; 5], [f32; 5], [f32; 5]) {
+    (
+        // Y (luminance)
+        [
+            0.1787 * t - 1.4630,
+            -0.3554 * t + 0.4275,
+            -0.0227 * t + 5.3251,
+            0.1206 * t - 2.5771,
+            -0.0670 * t + 0.3703,
+        ],
+        // x
+        [
+            -0.0193 * t - 0.2592,
+            -0.0665 * t + 0.0008,
+            -0.0004 * t + 0.2125,
+            -0.0641 * t - 0.8989,
+            -0.0033 * t + 0.0452,
+        ],
+        // y
+        [
+            -0.0167 * t - 0.2608,
+            -0.0950 * t + 0.0092,
+            -0.0079 * t + 0.2102,
+            -0.0441 * t - 1.6537,
+            -0.0109 * t + 0.0529,
+        ],
+    )
+}
+
+/// Perez's five-parameter sky function, `F(θ, γ)`.
+///
+/// `cos_theta` is the cosine of the angle from the zenith and `gamma` the
+/// angle from the sun. The `1/cosθ` in the first factor is why a direction on
+/// the horizon needs a floor under it: at `cosθ = 0` the exponential is
+/// either zero or infinite depending on the sign of `B`, and the model is not
+/// defined there.
+#[inline]
+fn perez(c: &[f32; 5], cos_theta: f32, gamma: f32) -> f32 {
+    let ct = cos_theta.max(0.01);
+    let cg = gamma.cos();
+    (1.0 + c[0] * (c[1] / ct).exp()) * (1.0 + c[2] * (c[3] * gamma).exp() + c[4] * cg * cg)
+}
+
+/// Preetham's zenith chromaticity and luminance at a solar zenith angle.
+fn zenith(t: f32, theta_s: f32) -> (f32, f32, f32) {
+    let (t2, ts) = (t * t, theta_s);
+    let (ts2, ts3) = (ts * ts, ts * ts * ts);
+    let x = t2 * (0.00166 * ts3 - 0.00375 * ts2 + 0.00209 * ts)
+        + t * (-0.02903 * ts3 + 0.06377 * ts2 - 0.03202 * ts + 0.00394)
+        + (0.11693 * ts3 - 0.21196 * ts2 + 0.06052 * ts + 0.25886);
+    let y = t2 * (0.00275 * ts3 - 0.00610 * ts2 + 0.00317 * ts)
+        + t * (-0.04214 * ts3 + 0.08970 * ts2 - 0.04153 * ts + 0.00516)
+        + (0.15346 * ts3 - 0.26756 * ts2 + 0.06670 * ts + 0.26688);
+    let chi = (4.0 / 9.0 - t / 120.0) * (core::f32::consts::PI - 2.0 * ts);
+    let lum = (4.0453 * t - 4.9710) * chi.tan() - 0.2155 * t + 2.4192;
+    (x, y, lum.max(0.05))
+}
+
+/// CIE xyY to linear sRGB, with the luminance carried through unchanged.
+///
+/// The matrix is written to its published eight figures rather than to the
+/// seven an `f32` can hold, because `shaders/scene.wgsl` has the same nine
+/// literals and the two have to be read as the same matrix by a person.
+#[allow(clippy::excessive_precision)]
+#[inline]
+fn xyy_to_rgb(x: f32, y: f32, big_y: f32) -> [f32; 3] {
+    let y = y.max(1e-4);
+    let (xx, zz) = (x / y * big_y, (1.0 - x - y) / y * big_y);
+    [
+        3.2404542 * xx - 1.5371385 * big_y - 0.4985314 * zz,
+        -0.9692660 * xx + 1.8760108 * big_y + 0.0415560 * zz,
+        0.0556434 * xx - 0.2040259 * big_y + 1.0572252 * zz,
+    ]
+}
+
+impl SkyEnv {
+    /// A sky under a sun at `sun_dir`, normalised to `intensity`.
+    pub fn new(
+        sun_dir: Vec3,
+        turbidity: f32,
+        ground_albedo: [f32; 3],
+        intensity: f32,
+        sun_radius: f32,
+    ) -> Self {
+        let mut me = Self {
+            sun_dir: sun_dir.normalize(),
+            turbidity: turbidity.clamp(1.7, 10.0),
+            ground_albedo,
+            intensity,
+            sun_radius: sun_radius.clamp(1e-4, 0.5),
+            scale: 1.0,
+        };
+        me.scale = 1.0 / me.mean_upper().max(1e-6);
+        me
+    }
+
+    /// Solid-angle-weighted mean of the raw (unscaled) model over the upper
+    /// hemisphere. Cheap enough to do at construction — a 32×128 quadrature
+    /// is four thousand Perez evaluations, once.
+    fn mean_upper(&self) -> f32 {
+        let mut bare = *self;
+        bare.scale = 1.0;
+        bare.intensity = 1.0;
+        let (mut sum, mut weight) = (0.0f64, 0.0f64);
+        let (nj, ni) = (32usize, 128usize);
+        for j in 0..nj {
+            let theta = 0.5 * core::f64::consts::PI * (j as f64 + 0.5) / nj as f64;
+            let (st, ct) = theta.sin_cos();
+            for i in 0..ni {
+                let phi = core::f64::consts::TAU * (i as f64 + 0.5) / ni as f64;
+                let d = Vec3::new(st * phi.cos(), st * phi.sin(), ct);
+                let c = bare.upper(d);
+                sum += (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) as f64 * st;
+                weight += st;
+            }
+        }
+        if weight > 0.0 { (sum / weight) as f32 } else { 1.0 }
+    }
+
+    /// The model above the horizon, before [`Self::scale`] and
+    /// [`Self::intensity`].
+    fn upper(&self, d: Vec3) -> [f32; 3] {
+        let (cy, cx, cyy) = perez_coeffs(self.turbidity);
+        let cos_theta = d.z.max(0.0) as f32;
+        let cos_theta_s = self.sun_dir.z.clamp(-1.0, 1.0) as f32;
+        let theta_s = cos_theta_s.max(0.0).acos();
+        // The disc belongs to `Sun`: clamping γ here caps the circumsolar
+        // term at the value it takes on the disc's rim, so what is left is
+        // the aureole and nothing else.
+        let gamma = (d.normalize().dot(self.sun_dir).clamp(-1.0, 1.0) as f32)
+            .acos()
+            .max(self.sun_radius);
+        let (xz, yz, lz) = zenith(self.turbidity, theta_s);
+        let f0 = |c: &[f32; 5]| perez(c, 1.0, theta_s);
+        let big_y = lz * perez(&cy, cos_theta, gamma) / f0(&cy).max(1e-4);
+        let x = xz * perez(&cx, cos_theta, gamma) / f0(&cx).max(1e-4);
+        let y = yz * perez(&cyy, cos_theta, gamma) / f0(&cyy).max(1e-4);
+        let c = xyy_to_rgb(x, y, big_y.max(0.0));
+        [c[0].max(0.0), c[1].max(0.0), c[2].max(0.0)]
+    }
+
+    /// Radiance from `d`, in the tracer's units. Below the horizon this is
+    /// the ground: the sky at the horizon in that azimuth, fading into the
+    /// albedo's own colour at the nadir.
+    pub fn radiance(&self, d: Vec3) -> [f32; 3] {
+        let k = self.scale * self.intensity;
+        if d.z >= 0.0 {
+            let c = self.upper(d);
+            return [c[0] * k, c[1] * k, c[2] * k];
+        }
+        // The horizon in the same azimuth, so the ground and the sky meet
+        // rather than step.
+        let flat = Vec3::new(d.x, d.y, 0.02).normalize();
+        let h = self.upper(flat);
+        let t = ((-d.z as f32).sqrt()).clamp(0.0, 1.0);
+        let s = t * t * (3.0 - 2.0 * t);
+        // Half the horizon's radiance is what a Lambertian ground of albedo
+        // one returns under a sky of that radiance and the sun behind it —
+        // near enough for a term nothing in the frame looks at directly.
+        let g = [
+            self.ground_albedo[0] * h[0],
+            self.ground_albedo[1] * h[1],
+            self.ground_albedo[2] * h[2],
+        ];
+        [
+            (h[0] + (g[0] - h[0]) * s) * k,
+            (h[1] + (g[1] - h[1]) * s) * k,
+            (h[2] + (g[2] - h[2]) * s) * k,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +660,81 @@ mod tests {
                 peak > 4.0 * BUILTIN_MEAN,
                 "{} peak radiance {peak} is too flat to need a CDF",
                 kind.name()
+            );
+        }
+    }
+
+
+
+    /// The sky's shape, in the four statements that make it a sky and not a
+    /// wash: the zenith is bluer than the horizon, the sun's own side of the
+    /// sky is brighter than the far side, the aureole is brighter still, and
+    /// nothing anywhere is negative.
+    #[test]
+    fn the_sky_is_blue_above_and_warm_toward_the_sun() {
+        use super::SkyEnv;
+        let d = Vec3::new(-0.35, -0.45, 0.42).normalize();
+        let sky = SkyEnv::new(d, 2.5, [0.42, 0.36, 0.24], 0.42, 0.02);
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let zenith = sky.radiance(Vec3::new(0.0, 0.0, 1.0));
+        let near = sky.radiance(Vec3::new(d.x, d.y, 0.05).normalize());
+        let far = sky.radiance(Vec3::new(-d.x, -d.y, 0.05).normalize());
+        let aureole = sky.radiance((d + Vec3::new(0.05, 0.0, 0.0)).normalize());
+        assert!(zenith[2] / zenith[0] > near[2] / near[0], "the zenith is not the blue end");
+        assert!(lum(near) > lum(far), "the sun's own horizon is not the bright one");
+        assert!(lum(aureole) > lum(zenith), "there is no glow around the sun");
+        for v in [zenith, near, far, aureole, sky.radiance(Vec3::new(0.0, 0.0, -1.0))] {
+            assert!(v.iter().all(|c| *c >= 0.0 && c.is_finite()), "{v:?}");
+        }
+    }
+
+    /// **Turbidity changes the look and not the exposure.** The model is
+    /// normalised to a mean radiance over the upper hemisphere, so a level
+    /// author can turn the haze up without the frame going dark — which is
+    /// the only reason it is a knob rather than a constant.
+    #[test]
+    fn turbidity_holds_the_exposure() {
+        use super::SkyEnv;
+        let d = Vec3::new(-0.35, -0.45, 0.42).normalize();
+        for t in [2.0f32, 2.5, 4.0, 7.0] {
+            let sky = SkyEnv::new(d, t, [0.4; 3], 0.42, 0.02);
+            let (mut sum, mut weight) = (0.0f64, 0.0f64);
+            let n = 120;
+            for j in 0..n {
+                let theta = 0.5 * core::f64::consts::PI * (j as f64 + 0.5) / n as f64;
+                let (st, ct) = theta.sin_cos();
+                for i in 0..n {
+                    let phi = core::f64::consts::TAU * (i as f64 + 0.5) / n as f64;
+                    let c = sky.radiance(Vec3::new(st * phi.cos(), st * phi.sin(), ct));
+                    sum += (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) as f64 * st;
+                    weight += st;
+                }
+            }
+            let mean = sum / weight;
+            assert!(
+                (mean - 0.42).abs() < 0.02,
+                "turbidity {t} gives mean radiance {mean:.4}, not the 0.42 it was asked for"
+            );
+        }
+    }
+
+    /// **The disc is the sun's, not the sky's.** The model's circumsolar term
+    /// is clamped at the sun's own angular radius, so looking straight at the
+    /// sun through the sky alone gives the rim's value and not a spike — and
+    /// `Sun::radiance_in` is free to add the disc exactly once.
+    #[test]
+    fn the_sky_leaves_the_disc_to_the_sun() {
+        use super::SkyEnv;
+        let d = Vec3::new(-0.3, -0.4, 0.5).normalize();
+        let sky = SkyEnv::new(d, 2.5, [0.4; 3], 0.42, 0.02);
+        let centre = sky.radiance(d);
+        // a direction on the disc's own rim: the sun tilted by its radius
+        let side = d.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let rim = sky.radiance((d + side * 0.02).normalize());
+        for c in 0..3 {
+            assert!(
+                (centre[c] - rim[c]).abs() < 0.02 * centre[c].max(1e-3),
+                "the sky has its own disc: centre {centre:?} against rim {rim:?}"
             );
         }
     }

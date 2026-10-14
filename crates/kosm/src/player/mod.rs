@@ -29,8 +29,11 @@ pub mod meter;
 pub mod rig;
 pub mod tool;
 
-pub use body::{Arm, Body, BodySpec, BodyStep, Consts, Drive, Foot, Leg, Link, Lump, Part, PivotKind, Skeleton, Snapshot};
+pub use body::{
+    Arm, Body, BodySpec, BodyStep, Consts, Dangle, Drive, Foot, Forgiveness, Leg, Link, Lump, Part,
+    PivotKind, Skeleton, Snapshot,
+};
 pub use gait::Gait;
-pub use ground::{Colliders, Ground, Netted, Nowhere, Plane, SdfGround};
+pub use ground::{Colliders, Ground, LedgeInfo, LedgeProbe, Netted, Nowhere, Plane, SdfGround, Terrace};
 pub use medium::{Air, Immersed, Immersion, Medium, Water};
 pub use tool::{Pose, Tool};

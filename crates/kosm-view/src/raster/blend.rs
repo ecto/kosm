@@ -15,6 +15,11 @@
 //!
 //! The CPU version stays, and stays tested: `--shot --tier raster --settle`
 //! blends a still that is *going* to a file, where the bytes are the point.
+//!
+//! Both inputs have already been through the level's own film — the tonemap,
+//! the `cos⁴` vignette and the bloom that `kosm_render::post::Post` states
+//! once and both tiers apply — so this pass is a mix of two finished frames
+//! and adds nothing of its own.
 
 use std::sync::Arc;
 

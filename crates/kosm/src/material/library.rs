@@ -106,6 +106,7 @@ const NAMES: &[&str] = &[
     "coral",
     "shell (nacre)",
     "kelp",
+    "marram grass",
     "sea foam",
     // emitters
     "candle flame",
@@ -135,6 +136,8 @@ const ASHBY: &str = "Ashby, Materials Selection in Mechanical Design, 4th ed., A
 const RAO: &str = "Rao, Mechanical Vibrations 6th ed., material damping tables";
 const ETB: &str = "Engineering ToolBox, coefficients of friction, dry";
 const RII: &str = "refractiveindex.info, room-temperature dispersion data";
+const POPE_FRY: &str = "Pope & Fry, Appl. Opt. 36(33) 8710 (1997), pure-water absorption; \
+     Smith & Baker, Appl. Opt. 20(2) 177 (1981) agrees to a few per cent over these bands";
 const OPTICS4: &str = "Bass et al., Handbook of Optics vol. 4, tabulated n and k";
 const WOOD: &str = "USDA Wood Handbook, FPL-GTR-190, ch. 5";
 const LOOK: &str = "kosm's window tier: the linear RGB the old `materials` colour table gave this name";
@@ -330,11 +333,31 @@ fn build(key: &str) -> Option<Material> {
             .mech(1025.0, 2.3e9, 0.5, 0.0)
             .rub(0.0, 0.0)
             .look([1.0, 1.0, 1.0], 0.02)
-            .clear(Dielectric::clear(1.3390, 55.0))
+            .clear(Dielectric::clear(1.3390, 55.0).with_absorption(
+                // **Why the sea is teal.** Pope & Fry's pure-water absorption
+                // coefficients, `a(λ)` in reciprocal metres, at this band
+                // set: 0.0455, 0.0179, 0.0476, 0.0799, 0.2755, 0.4390.
+                // Written here as what one metre transmits, `e^{−a}`, which
+                // is what `Absorption` is. Red goes first — a metre of clear
+                // water keeps under two thirds of it — and blue travels
+                // furthest, which is the whole of the colour of water and
+                // the reason a body of it darkens toward cyan with depth
+                // rather than toward grey.
+                //
+                // Salt does not change this: at 35 PSU the difference from
+                // pure water is under a per cent over the visible, which is
+                // below the resolution of six bands. What *does* change a
+                // real sea is what is suspended in it, and that is
+                // scattering rather than absorption — a level that wants
+                // turbid water adds it on top of these (the cove does; see
+                // `kosm_view::raster::Sea::scatter`).
+                Spectrum::new([0.9555, 0.9823, 0.9535, 0.9232, 0.7592, 0.6447]),
+                1.0,
+            ))
             .flows(1.07e-3)
             .cite(
                 measured(&format!("{CRC} (35 PSU, 20 °C)")),
-                measured(RII),
+                measured(&format!("{RII}; {POPE_FRY}")),
                 estimated("clear; a still surface is smooth"),
             )
             .done(),
@@ -787,6 +810,24 @@ fn build(key: &str) -> Option<Material> {
                 estimated("hydrated kelp blade: near-seawater density, a rubbery modulus"),
                 estimated("translucent"),
                 estimated("dark olive, wet and glossy"),
+            )
+            .done(),
+        // Ammophila arenaria, the grass that holds a dune together. A blade is
+        // a rolled tube of thick-walled fibre with a waxy cuticle — that roll
+        // is the plant's answer to salt wind — so it is stiffer, drier and
+        // paler than a lawn grass, and it stands up instead of lying over.
+        // The one plant the cove needs, and the look note in the design says
+        // why: "the one thing that style needs and we do not have is grass".
+        "marram grass" | "marram" => B::new("marram grass")
+            .mech(600.0, 2.0e9, 0.35, 0.10)
+            .rub(0.35, 0.15)
+            .look([0.40, 0.44, 0.21], 0.65)
+            .sss(Subsurface::organic_mm(0.4, 1.2, 0.6))
+            .stiffness(3.0e3)
+            .cite(
+                estimated("a dry grass blade: half the density of water, a fibre modulus a thousandth of wood's along the leaf"),
+                estimated("thin and translucent: a blade a third of a millimetre thick lights up against the sun"),
+                estimated("grey-green, dusty, drier than any lawn"),
             )
             .done(),
         "sea foam" | "foam" => B::new("sea foam")

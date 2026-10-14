@@ -38,6 +38,7 @@ pub mod math;
 pub mod neural;
 pub mod optics;
 pub mod pathtrace;
+pub mod post;
 mod ray;
 mod sah;
 pub mod sampler;
@@ -49,7 +50,7 @@ pub mod tlas;
 
 pub use analytic::{Analytic, Frame, Prim};
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
-pub use env::{BuiltinEnv, generate as generate_env, parse_hdr};
+pub use env::{BuiltinEnv, SkyEnv, generate as generate_env, parse_hdr};
 pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
 pub use heightfield::HeightField;
 pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
@@ -58,6 +59,7 @@ pub use pathtrace::{
     AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
     Pbr, PixelFilter, Projection, Scene, Sun, denoise, render, render_into, studio_rig,
 };
+pub use post::{Aerial, Post};
 pub use ray::{Hit, Ray};
 pub use spectrum::{BK7_SELLMEIER, cauchy_index, cie_xyz, hero_weight, sellmeier_index};
 pub use splats::{Splats, unpack_payload};

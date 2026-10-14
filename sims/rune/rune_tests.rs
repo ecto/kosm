@@ -314,6 +314,16 @@ fn the_hint_matches_central_differences() {
 /// total internal reflection: sixty-odd rays in half a million changed their
 /// minds, and the score moved in its seventh digit. `trace_onto` shares one
 /// reciprocal instead, which is the same arithmetic on both scalars.
+///
+/// **And not only in the cone.** Every division on `S` between the lamp and
+/// the keyhole is a reciprocal now — the landing `t`, the grid cell, Snell's
+/// ratio and Fresnel's two in `kosm_render::optics`, the shapes' normals and
+/// roots in `glass.rs`, and the score's own ratio in `hint.rs`. Before that
+/// the claim held only where the rounding happened to agree: when the arm's
+/// solve was made exact and the staged lens moved, 590 of the grid's cells a
+/// band came out an ulp apart and the score's real part landed one ulp off
+/// (0.8038051637735457 against …456) at the staged doorstep, at the solution
+/// and at the solved hold's doorstep alike. After it, not one cell differs.
 #[test]
 fn the_dual_carries_the_score_it_differentiates() {
     let scene = reachable();
@@ -439,8 +449,14 @@ fn the_heros_arithmetic_is_where_the_body_puts_the_lens() {
             pose.x, pose.y, pose.aim_el.to_degrees(), pose.cant.to_degrees(),
             want.pos.x, want.pos.y, want.pos.z, miss * 1e3, turn.to_degrees(), body.lean().to_degrees(),
         );
-        assert!(miss < 0.01, "the glass is {:.1} mm from where the arithmetic said", miss * 1e3);
-        assert!(turn.to_degrees() < 1.0, "the optical axis is {:.2}° off", turn.to_degrees());
+        // Five millimetres and half a degree. Both hands land *on* the aim —
+        // the two-link solve is exact and the joints hold the arm's weight as
+        // feed-forward — so the gap is the PD's tracking and the few
+        // millimetres the settled pelvis breathes and leans off `hero_root`.
+        // It was 11.6 mm and 1.54° while the solve left the shoulder's twist
+        // to chance and so passed every millimetre of the pelvis to the hand.
+        assert!(miss < 0.005, "the glass is {:.1} mm from where the arithmetic said", miss * 1e3);
+        assert!(turn.to_degrees() < 0.5, "the optical axis is {:.2}° off", turn.to_degrees());
     }
 }
 
@@ -548,16 +564,27 @@ fn the_lens_is_one_solid_to_both_tracers() {
 ///   — a relabelling, which changes no score — instead of sliding under a
 ///   keyhole that is not sliding with it.
 ///
-/// What the six knobs read at 200² rays a band and a step of 2 cm and
-/// 1.15°: `x` 0.4 %, `y` 0.2 %, `yaw` 0.13 %, `aim_el` 0.07 %, `aim_az`
-/// 0.01 %, `cant` 0.17 %. The two that are still noise — `x` and `y` — are
-/// the two whose derivative is a thousandth of the others': the beam is
-/// smaller than the keyhole at the doorstep, so walking a centimetre either
-/// way is free and the score is flat in them by design.
+/// Staged at the doorstep for the way the **solved** pose holds the glass
+/// (its lift, swing and cant, with the chief ray putting the boots down).
+/// The beam is smaller than the keyhole there, so walking a centimetre
+/// either way is free and the score is flat in `x` and `y` by design; the
+/// four that turn the glass carry the check. Measured at 200² rays a band and
+/// a step of 2 cm: `x` −0.0003/−0.0003, `y` +0.0004/+0.0004, `yaw`
+/// −0.0723/−0.0724, `aim_el` +0.0419/+0.0418, `aim_az` +0.0049/+0.0049,
+/// `cant` +0.0670/+0.0671 (dual/difference).
+///
+/// Why not the default hold's doorstep any more: when the two-link solve was
+/// made exact the default hold's lens moved 18 cm and turned 14°, and there
+/// the beam straddles the keyhole's edge in `x`, where the score is curved on
+/// the scale of the step. The 2 cm difference then reads −0.4798 against a
+/// dual of −0.4518 (5.9 %), and halving the step walks it in — −0.4591,
+/// −0.4540, −0.4526, −0.4523 at 1 cm to 1.25 mm — so the dual is right and
+/// the step's truncation is what failed. Same bound, same step; the pose it
+/// is taken at is the solution's.
 #[test]
 fn the_heros_hint_matches_central_differences() {
     let scene = CoveScene::bundled().unwrap();
-    let seed = rune::hero_doorstep(&scene, &rune::HeroPose::default());
+    let seed = rune::hero_doorstep(&scene, &rune::HeroPose::solution(&scene));
     let rays = 200 * 200;
     let h = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02];
     let dual = hint::gradient_hero(&scene, &seed, rays);
@@ -632,8 +659,11 @@ fn the_heros_beam_lands_where_the_chief_ray_says() {
 /// * the analytic area's own approximation: `π h² cos θ` plus a rectangular
 ///   knife edge is a flat disc's silhouette, and a biconvex lens is not flat.
 ///
-/// Measured here: **7.2 %** of the hard aperture at the staged doorstep and
-/// **5.0 %** with the wrist turned a further 45°. The 4.9 % is the feather
+/// Measured here: **9.1 %** of the hard aperture at the staged doorstep and
+/// **6.0 %** with the wrist turned a further 45° — 7.2 % and 5.0 % before the
+/// arm's two-link solve was made exact and moved the staged lens 18 cm and
+/// 14°, which is the formula's share moving and not the feather's, as it
+/// should. Same bounds; the new lens reads inside them. The 4.9 % is the feather
 /// and does not move; the rest is the formula, and it does — which is the
 /// whole argument for [`hint::score_lens_of`] dividing one lattice sum by
 /// another rather than by an analytic area. An analytic denominator would

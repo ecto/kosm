@@ -430,6 +430,17 @@ impl EnvMap {
 pub enum Environment {
     /// Smooth analytic studio gradient. Sampled by the BSDF alone.
     Gradient(GradientEnv),
+    /// Preetham's analytic clear sky. Also low-frequency — the sun's disc is
+    /// [`Sun`]'s and not the sky's, so what is left has no spike in it and
+    /// BSDF sampling integrates it as cleanly as the gradient.
+    ///
+    /// **The GPU integrator does not carry this one.** Its own environment is
+    /// either a packed [`EnvMap`] or the three radiances
+    /// `GpuRenderState::set_gradient_env` takes, so a scene handed to the GPU
+    /// tier under a sky renders under that tier's gradient instead. The CPU
+    /// integrator, the probe bake and `kosm-view`'s raster tier all read the
+    /// model itself; nothing that draws a sky today goes through the GPU tier.
+    Sky(crate::env::SkyEnv),
     /// Lat-long HDR image. Joins MIS as a third sampling strategy.
     Image(Box<EnvMap>),
 }
@@ -451,6 +462,11 @@ impl Environment {
         })
     }
 
+    /// Preetham's analytic clear sky. See [`crate::env::SkyEnv`].
+    pub fn sky(sky: crate::env::SkyEnv) -> Self {
+        Environment::Sky(sky)
+    }
+
     /// Wrap a lat-long HDR map.
     pub fn image(map: EnvMap) -> Self {
         Environment::Image(Box::new(map))
@@ -460,6 +476,7 @@ impl Environment {
     pub(crate) fn radiance(&self, d: Vec3) -> [f32; 3] {
         match self {
             Environment::Gradient(g) => g.radiance(d),
+            Environment::Sky(s) => s.radiance(d),
             Environment::Image(m) => m.radiance(d),
         }
     }
@@ -468,7 +485,7 @@ impl Environment {
     #[inline]
     pub(crate) fn is_importance_sampled(&self) -> bool {
         match self {
-            Environment::Gradient(_) => false,
+            Environment::Gradient(_) | Environment::Sky(_) => false,
             Environment::Image(m) => m.is_sampleable(),
         }
     }
@@ -478,7 +495,7 @@ impl Environment {
     #[inline]
     pub(crate) fn pdf(&self, d: Vec3) -> f32 {
         match self {
-            Environment::Gradient(_) => 0.0,
+            Environment::Gradient(_) | Environment::Sky(_) => 0.0,
             Environment::Image(m) => m.pdf(d),
         }
     }
@@ -487,7 +504,7 @@ impl Environment {
     #[inline]
     pub(crate) fn sample(&self, r1: f64, r2: f64) -> Option<(Vec3, [f32; 3], f32)> {
         match self {
-            Environment::Gradient(_) => None,
+            Environment::Gradient(_) | Environment::Sky(_) => None,
             Environment::Image(m) => m.sample(r1, r2),
         }
     }

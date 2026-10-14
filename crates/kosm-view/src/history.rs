@@ -928,6 +928,30 @@ impl History {
     /// [`Self::set_denoise_floor`] is the opt-out, for a tier whose noise does
     /// not fall the way that reasoning assumes.
     pub fn resolve(&self, exposure: f32, opts: &PathTraceOptions) -> Vec<u8> {
+        self.resolved(opts).to_srgb8(exposure, false)
+    }
+
+    /// The same picture through a level's own film — haze, exposure, the
+    /// lens's `cos⁴`, bloom, ACES, sRGB.
+    ///
+    /// **The two tiers have to agree here or the settle blend has a seam.**
+    /// `kosm_view::raster` applies [`kosm_render::post::Post`] in a shader at
+    /// the end of its chain; this is the reference applying the same struct
+    /// to the same radiance, so a converging frame fades into the raster one
+    /// without changing its contrast, its corners or its bloom half way
+    /// through. `camera` is the rig the film was traced with: the vignette
+    /// wants its field of view and the haze its eye.
+    pub fn resolve_through(
+        &self,
+        post: &kosm_render::post::Post,
+        camera: &kosm_render::Camera,
+        opts: &PathTraceOptions,
+    ) -> Vec<u8> {
+        post.apply(&self.resolved(opts), camera, false)
+    }
+
+    /// The mean so far, denoised where it is still noisy, as a linear film.
+    fn resolved(&self, opts: &PathTraceOptions) -> Film {
         let n = (self.size.0 as usize) * (self.size.1 as usize);
         let mut film = Film {
             width: self.size.0,
@@ -968,7 +992,7 @@ impl History {
                 }
             }
         }
-        film.to_srgb8(exposure, false)
+        film
     }
 }
 
