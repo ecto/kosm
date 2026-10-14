@@ -35,6 +35,7 @@ pub mod prelude;
 pub mod room;
 pub mod run;
 pub mod scene;
+pub mod shell;
 pub mod snapshot;
 pub mod step;
 pub mod task;

@@ -60,9 +60,10 @@ tang-3dgs.workspace = true
 rayon = "1"
 rustfft = "6"
 anyhow = "1"
+rodio = { version = "0.20", optional = true }
 
 [features]
 default = []
 # A sim's own viewer mode (`kosm run court --view`). Off by default: egui and
 # eframe are the heaviest thing in the graph and the agent loop is headless.
-view = ["dep:kosm-view", "dep:eframe", "dep:egui", "dep:bytemuck", "dep:wgpu", "dep:pollster", "dep:vcad-kernel-gpu", "kosm-render/gpu"]
+view = ["dep:kosm-view", "dep:rodio", "dep:eframe", "dep:egui", "dep:bytemuck", "dep:wgpu", "dep:pollster", "dep:vcad-kernel-gpu", "kosm-render/gpu"]
