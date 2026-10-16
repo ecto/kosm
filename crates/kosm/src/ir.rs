@@ -93,6 +93,17 @@ impl Program {
         Self::interp(g, outputs, inputs, input_lens)
     }
 
+    /// `n` independent copies of one program, compiled side by side.
+    ///
+    /// A native program's buffers are the library's static arrays, so two
+    /// workers cannot share one; each copy is its own build in its own
+    /// directory. The compiles run in parallel, so `n` copies cost about
+    /// what one does on a machine with `n` cores.
+    pub fn compile_n(g: &TensorGraph, outputs: &[TensorId], inputs: &[&[f32]], n: usize) -> Vec<Self> {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().map(|_| Self::compile(g, outputs, inputs)).collect()
+    }
+
     /// The reference interpreter, always: f64 throughout. For tests, and for
     /// anything whose numbers must not move when the compiler does.
     pub fn interpreted(g: &TensorGraph, outputs: &[TensorId], inputs: &[&[f64]]) -> Self {
