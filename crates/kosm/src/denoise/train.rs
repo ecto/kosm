@@ -44,10 +44,11 @@
 
 use kosm_render::pathtrace::{Film, PathTraceOptions};
 use rayon::prelude::*;
-use tang_train::{ModuleAdam, Optimizer, Parameter};
 
 use super::dataset::{Dataset, Sample, TIERS, Tile, from_f16, tiles};
-use super::kpn::{DEMOD_FLOOR, Grads, Kpn, features, illumination};
+use super::kpn::{C_IN, DEMOD_FLOOR, K, KS, Kpn, ParamInputs, features, forward_graph, illumination};
+use crate::ir::{Adam, Arg, ExprId, Form, Monoid, Program, TensorGraph, TensorId, View, lit, optimize, pick};
+use tang::Scalar;
 
 /// Weight on the gradient-domain term, relative to the L1.
 pub const GRAD_WEIGHT: f32 = 0.1;
@@ -74,75 +75,44 @@ fn tone(x: f32) -> f32 {
     x / (1.0 + x.max(0.0))
 }
 
-/// Its derivative.
-#[inline]
-fn tone_d(x: f32) -> f32 {
-    let d = 1.0 + x.max(0.0);
-    1.0 / (d * d)
-}
-
-/// The loss and its gradient with respect to the *demodulated* filtered
-/// illumination, which is what [`Kpn::backward`] wants.
+/// The still-image loss of one tile, in plain loops: the reference the graph
+/// in [`TrainGraph`] is checked against, and the definition worth reading.
 ///
-/// `out` and `g` are planar `[3][n]`; `albedo` and `reference` are
-/// interleaved, as the dataset stores them.
-pub fn loss_and_grad(
-    out: &[f32],
-    albedo: &[f32],
-    reference: &[f32],
-    s: usize,
-    g: &mut [f32],
-) -> f32 {
+/// `out` is planar `[3][n]` demodulated filtered illumination, `albedo` and
+/// `reference` interleaved, as the dataset stores them.
+pub fn loss(out: &[f32], albedo: &[f32], reference: &[f32], s: usize) -> f32 {
     let n = s * s;
-    g.fill(0.0);
     let a = |c: usize, p: usize| albedo[p * 3 + c].max(DEMOD_FLOOR);
-
-    // The tone-compressed prediction and target, kept so the gradient term
-    // can difference them without recomputing.
     let mut tp = vec![0.0f32; 3 * n];
     let mut tt = vec![0.0f32; 3 * n];
-    let mut dtp = vec![0.0f32; 3 * n];
     for c in 0..3 {
         for p in 0..n {
-            let pred = out[c * n + p] * a(c, p);
-            tp[c * n + p] = tone(pred);
+            tp[c * n + p] = tone(out[c * n + p] * a(c, p));
             tt[c * n + p] = tone(reference[p * 3 + c]);
-            // d tone(pred) / d out
-            dtp[c * n + p] = tone_d(pred) * a(c, p);
         }
     }
-
     let inv = 1.0 / (3 * n) as f32;
     let mut loss = 0.0;
     for i in 0..3 * n {
-        let d = tp[i] - tt[i];
-        loss += d.abs() * inv;
-        g[i] += d.signum() * inv * dtp[i];
+        loss += (tp[i] - tt[i]).abs() * inv;
     }
-
     // Forward differences in x and y, in the same tone-compressed space.
     // The border tap is skipped rather than clamped: a clamped difference is
     // identically zero in both images and would only dilute the term.
     let pairs = 3 * 2 * s * s.saturating_sub(1);
     if pairs > 0 {
         let k = GRAD_WEIGHT / pairs as f32;
-        let edge = |i: usize, j: usize, g: &mut [f32], loss: &mut f32| {
-            let d = (tp[j] - tp[i]) - (tt[j] - tt[i]);
-            *loss += k * d.abs();
-            let sg = d.signum() * k;
-            g[j] += sg * dtp[j];
-            g[i] -= sg * dtp[i];
-        };
+        let edge = |i: usize, j: usize| k * ((tp[j] - tp[i]) - (tt[j] - tt[i])).abs();
         for c in 0..3 {
             let base = c * n;
             for y in 0..s {
-                for x in 0..s.saturating_sub(1) {
-                    edge(base + y * s + x, base + y * s + x + 1, g, &mut loss);
+                for x in 0..s - 1 {
+                    loss += edge(base + y * s + x, base + y * s + x + 1);
                 }
             }
-            for y in 0..s.saturating_sub(1) {
+            for y in 0..s - 1 {
                 for x in 0..s {
-                    edge(base + y * s + x, base + (y + 1) * s + x, g, &mut loss);
+                    loss += edge(base + y * s + x, base + (y + 1) * s + x);
                 }
             }
         }
@@ -150,44 +120,181 @@ pub fn loss_and_grad(
     loss
 }
 
-/// The temporal consistency term and its gradient with respect to both
-/// frames' demodulated filtered illumination.
+/// The temporal consistency term, in plain loops, for the same purpose.
 ///
 /// `cur` and `next` are planar `[3][n]` network outputs for the same tile at
 /// consecutive frames; `valid` is one flag per pixel from [`kept_history`].
-/// Both gradients are *added* to, so a caller can fold this on top of
-/// [`loss_and_grad`]'s.
-pub fn temporal_loss_and_grad(
-    cur: &[f32],
-    next: &[f32],
-    albedo: &[f32],
-    valid: &[bool],
-    s: usize,
-    g_cur: &mut [f32],
-    g_next: &mut [f32],
-) -> f32 {
+pub fn temporal_loss(cur: &[f32], next: &[f32], albedo: &[f32], valid: &[bool], s: usize) -> f32 {
     let n = s * s;
-    let live = valid.iter().filter(|v| **v).count();
-    if live == 0 {
-        return 0.0;
-    }
-    let k = TEMPORAL_WEIGHT / (3 * live) as f32;
+    let k = temporal_scale(valid);
     let mut loss = 0.0;
     for c in 0..3 {
-        for p in 0..n {
-            if !valid[p] {
-                continue;
-            }
+        for p in (0..n).filter(|&p| valid[p]) {
             let a = albedo[p * 3 + c].max(DEMOD_FLOOR);
-            let (pc, pn) = (cur[c * n + p] * a, next[c * n + p] * a);
-            let d = tone(pn) - tone(pc);
-            loss += k * d.abs();
-            let sg = d.signum() * k;
-            g_next[c * n + p] += sg * tone_d(pn) * a;
-            g_cur[c * n + p] -= sg * tone_d(pc) * a;
+            loss += k * (tone(next[c * n + p] * a) - tone(cur[c * n + p] * a)).abs();
         }
     }
     loss
+}
+
+/// The temporal term's weight per live pixel-channel: [`TEMPORAL_WEIGHT`]
+/// spread over the pixels that kept their history, zero if none did.
+fn temporal_scale(valid: &[bool]) -> f32 {
+    let live = valid.iter().filter(|v| **v).count();
+    if live == 0 { 0.0 } else { TEMPORAL_WEIGHT / (3 * live) as f32 }
+}
+
+// ---------------------------------------------------------------------------
+// The training step as a graph
+// ---------------------------------------------------------------------------
+
+/// One tile size's whole training step as a [`TensorGraph`]: the forward over
+/// the tile (and over its successor frame, when `paired`), the loss, and the
+/// gradient of that loss with respect to every parameter — `backward`'s, not
+/// ours.
+///
+/// Inputs, in order: the seven parameter blocks ([`ParamInputs`]), then
+/// `feat` `[C_IN, s, s]`, `illum` `[3, s, s]`, the floored albedo `[3, s, s]`
+/// and the tone-mapped reference `[3, s, s]`, all planar; when paired, the
+/// successor's `feat` and `illum`, the validity mask `[s, s]` as 0/1 and the
+/// temporal scale `[1]`. Outputs: the loss `[1]`, then the seven gradients
+/// in parameter order — which is [`Kpn::flat`]'s.
+pub struct TrainGraph {
+    pub size: usize,
+    pub hidden: usize,
+    pub paired: bool,
+    pub graph: TensorGraph,
+    pub outputs: Vec<TensorId>,
+}
+
+/// Number of parameter inputs ahead of a tile's data.
+const N_PARAMS: usize = 7;
+
+impl TrainGraph {
+    pub fn new(hidden: usize, s: usize, paired: bool) -> Self {
+        let mut g = TensorGraph::new();
+        let p = ParamInputs::declare(&mut g, hidden);
+        let feat = g.input(&[C_IN, s, s]);
+        let illum = g.input(&[3, s, s]);
+        let alb = g.input(&[3, s, s]);
+        let tt = g.input(&[3, s, s]);
+        let out = forward_graph(&mut g, &p, feat, illum, hidden, s);
+        let tp = tone_graph(&mut g, out, alb);
+        let mut terms = vec![still_loss_graph(&mut g, tp, tt, s)];
+        if paired {
+            let feat_n = g.input(&[C_IN, s, s]);
+            let illum_n = g.input(&[3, s, s]);
+            let valid = g.input(&[s, s]);
+            let kt = g.input(&[1usize]);
+            let out_n = forward_graph(&mut g, &p, feat_n, illum_n, hidden, s);
+            let tn = tone_graph(&mut g, out_n, alb);
+            let args = vec![
+                pick(tn, 4, &[Some(1), Some(2), Some(3)]),
+                pick(tp, 4, &[Some(1), Some(2), Some(3)]),
+                pick(valid, 4, &[Some(2), Some(3)]),
+                Arg { src: kt, view: View { guard: false, forms: vec![Form::constant(4, 0)] } },
+            ];
+            let lt = g
+                .comp(&[1usize], &[3, s, s], args, Some(Monoid::sum()), |v| vec![v[3] * v[2] * (v[0] - v[1]).abs()])
+                .expect("temporal");
+            terms.push(lt);
+        }
+        let total = g.map(&terms, |v| v.iter().skip(1).fold(v[0], |a, b| a + *b)).expect("total");
+        let grads = g.backward(total, &p.all()).expect("backward");
+        let mut outs = vec![total];
+        outs.extend(grads);
+        let (graph, outputs) = optimize(&g, &outs);
+        Self { size: s, hidden, paired, graph, outputs }
+    }
+
+    /// Load it: natively, `n` independent copies for `n` workers.
+    pub fn programs(&self, n: usize) -> Vec<Program> {
+        let zeros = self.zero_inputs();
+        let refs: Vec<&[f32]> = zeros.iter().map(|v| v.as_slice()).collect();
+        Program::compile_n(&self.graph, &self.outputs, &refs, n)
+    }
+
+    /// The reference interpreter, f64 throughout, for the tests.
+    pub fn interpreted(&self) -> Program {
+        let zeros: Vec<Vec<f64>> = self.zero_inputs().iter().map(|v| vec![0.0; v.len()]).collect();
+        let refs: Vec<&[f64]> = zeros.iter().map(|v| v.as_slice()).collect();
+        Program::interpreted(&self.graph, &self.outputs, &refs)
+    }
+
+    fn zero_inputs(&self) -> Vec<Vec<f32>> {
+        let (s, h) = (self.size, self.hidden);
+        let n = s * s;
+        let mut v = vec![
+            vec![0.0; h * C_IN * KS * KS],
+            vec![0.0; h],
+            vec![0.0; h * h * KS * KS],
+            vec![0.0; h],
+            vec![0.0; K * h * KS * KS],
+            vec![0.0; K],
+            vec![0.0; kosm_render::neural::VETO],
+            vec![0.0; C_IN * n],
+            vec![0.0; 3 * n],
+            vec![0.0; 3 * n],
+            vec![0.0; 3 * n],
+        ];
+        if self.paired {
+            v.extend([vec![0.0; C_IN * n], vec![0.0; 3 * n], vec![0.0; n], vec![0.0; 1]]);
+        }
+        v
+    }
+}
+
+/// `tone(out · albedo)`, planar.
+fn tone_graph(g: &mut TensorGraph, out: TensorId, alb: TensorId) -> TensorId {
+    g.map(&[out, alb], |v| {
+        let p = v[0] * v[1];
+        p / (lit(1.0) + p.max(lit(0.0)))
+    })
+    .expect("tone")
+}
+
+/// [`loss`] as a graph over the tone-mapped prediction and reference: the
+/// L1, and the two forward-difference terms read through a guarded view one
+/// pixel over — zero past the edge, where the mask drops the term anyway; the
+/// guard is what lets `backward` invert the offset by elimination.
+fn still_loss_graph(g: &mut TensorGraph, tp: TensorId, tt: TensorId, s: usize) -> TensorId {
+    let n = s * s;
+    let inv = 1.0 / (3 * n) as f64;
+    let at = |x: TensorId| pick(x, 4, &[Some(1), Some(2), Some(3)]);
+    let l1 = g
+        .comp(&[1usize], &[3, s, s], vec![at(tp), at(tt)], Some(Monoid::sum()), |v| {
+            vec![(v[0] - v[1]).abs() * lit(inv)]
+        })
+        .expect("l1");
+    if s < 2 {
+        return l1;
+    }
+    let k = (GRAD_WEIGHT / (3 * 2 * s * (s - 1)) as f32) as f64;
+    let over = |x: TensorId, axis: usize| {
+        let mut forms = vec![Form::unit(4, 1), Form::unit(4, 2), Form::unit(4, 3)];
+        forms[axis].offset = 1;
+        Arg { src: x, view: View { guard: true, forms } }
+    };
+    // The difference runs over the whole tile and the last column (row) is
+    // masked off by an `iota` select, rather than the reduction stopping one
+    // short. A pick view over a shorter range than its source is a forward
+    // `TensorGraph::backward` gets wrong: inverting it renames the reduce
+    // coordinate onto the source's full extent, so the gradient picks up the
+    // one point the forward never visited (tang bfc8003). Full range and a
+    // mask is the same sum with a gradient that is right.
+    let coord = g.iota(&[s], 0);
+    let diff = |g: &mut TensorGraph, axis: usize| {
+        let mut args = vec![over(tp, axis), at(tp), over(tt, axis), at(tt)];
+        args.push(pick(coord, 4, &[Some(axis + 1)]));
+        g.comp(&[1usize], &[3, s, s], args, Some(Monoid::sum()), |v| {
+            let term = lit(k) * ((v[0] - v[1]) - (v[2] - v[3])).abs();
+            vec![ExprId::select(lit(s as f64 - 1.5) - v[4], term, lit(0.0))]
+        })
+        .expect("gradient term")
+    };
+    let gx = diff(g, 2);
+    let gy = diff(g, 1);
+    g.map(&[l1, gx, gy], |v| v[0] + v[1] + v[2]).expect("still loss")
 }
 
 /// RMSE between two interleaved RGB images, measured through [`tone`].
@@ -403,19 +510,92 @@ impl Default for Fit {
     }
 }
 
+/// One loaded training step per tile shape a worker has seen.
+struct Worker {
+    programs: Vec<((usize, bool), Program)>,
+}
+
+impl Worker {
+    fn program(&mut self, key: (usize, bool)) -> &mut Program {
+        let i = self.programs.iter().position(|(k, _)| *k == key).expect("a program per tile shape");
+        &mut self.programs[i].1
+    }
+
+    /// One tile's loss and gradient, added into `grad` (flat, file order).
+    fn run(&mut self, net: &Kpn, t: &Prepared, grad: &mut [f32]) -> f32 {
+        let key = (t.size, t.next.is_some());
+        let p = self.program(key);
+        for (k, b) in net.blocks().iter().enumerate() {
+            p.write(k, b);
+        }
+        let (alb, tt) = planar_targets(t);
+        p.write(N_PARAMS, &t.feat);
+        p.write(N_PARAMS + 1, &t.illum);
+        p.write(N_PARAMS + 2, &alb);
+        p.write(N_PARAMS + 3, &tt);
+        if let Some(nx) = t.next.as_ref() {
+            let valid: Vec<f32> = nx.valid.iter().map(|&v| if v { 1.0 } else { 0.0 }).collect();
+            p.write(N_PARAMS + 4, &nx.feat);
+            p.write(N_PARAMS + 5, &nx.illum);
+            p.write(N_PARAMS + 6, &valid);
+            p.write(N_PARAMS + 7, &[temporal_scale(&nx.valid)]);
+        }
+        p.run();
+        let mut at = 0;
+        for k in 0..N_PARAMS {
+            let gk = p.read(1 + k);
+            for (a, b) in grad[at..at + gk.len()].iter_mut().zip(&gk) {
+                *a += b;
+            }
+            at += gk.len();
+        }
+        p.read(0)[0]
+    }
+}
+
+/// The floored albedo and the tone-mapped reference, planar, as
+/// [`TrainGraph`] reads them.
+fn planar_targets(t: &Prepared) -> (Vec<f32>, Vec<f32>) {
+    let n = t.size * t.size;
+    let mut alb = vec![0.0f32; 3 * n];
+    let mut tt = vec![0.0f32; 3 * n];
+    for c in 0..3 {
+        for p in 0..n {
+            alb[c * n + p] = t.albedo[p * 3 + c].max(DEMOD_FLOOR);
+            tt[c * n + p] = tone(t.reference[p * 3 + c]);
+        }
+    }
+    (alb, tt)
+}
+
 /// Fit `net` to `train`, reporting `(epoch, mean loss)` as it goes.
 ///
-/// The optimiser is `tang_train`'s `ModuleAdam`, stepped over the same
-/// `Parameter`s the network holds; the gradients come from
-/// [`Kpn::backward`] rather than from a `Module::backward`, because the
-/// convolutions here are ours (see [`super::kpn`]).
+/// Every tile shape in `train` — its size, and whether it has a successor
+/// frame — gets one [`TrainGraph`], built once and lowered once per rayon
+/// worker; a batch is split across the workers, each runs its tiles through
+/// its own native program, and the gradients are summed and averaged before
+/// one step of [`crate::ir::Adam`], which is `tang_train::ModuleAdam`'s
+/// update (β = 0.9, 0.999, ε = 1e-8, no decay, no clipping) as a graph.
 pub fn fit(
     net: &mut Kpn,
     train: &[Prepared],
     cfg: &Fit,
     mut report: impl FnMut(usize, f32),
 ) -> Vec<f32> {
-    let mut opt = ModuleAdam::new(cfg.lr);
+    let mut keys: Vec<(usize, bool)> = train.iter().map(|t| (t.size, t.next.is_some())).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let n_workers = rayon::current_num_threads().min(cfg.batch.max(1)).max(1);
+    let mut workers: Vec<Worker> = (0..n_workers).map(|_| Worker { programs: Vec::new() }).collect();
+    for &(s, paired) in &keys {
+        let graph = TrainGraph::new(net.hidden, s, paired);
+        for (w, p) in workers.iter_mut().zip(graph.programs(n_workers)) {
+            w.programs.push(((s, paired), p));
+        }
+    }
+
+    let n_params = net.parameters();
+    let mut opt = Adam::new(n_params, cfg.lr);
     let mut order: Vec<usize> = (0..train.len()).collect();
     let mut rng = cfg.seed | 1;
     let mut curve = Vec::with_capacity(cfg.epochs);
@@ -433,50 +613,30 @@ pub fn fit(
         let mut total = 0.0f64;
         let mut seen = 0usize;
         for chunk in order.chunks(cfg.batch) {
-            let zero = Grads::zeros(net);
-            let (grads, loss) = chunk
-                .par_iter()
-                .map(|&i| {
-                    let t = &train[i];
-                    let n = t.size * t.size;
-                    let act = net.forward(&t.feat, &t.illum, t.size);
-                    let mut g = vec![0.0f32; 3 * n];
-                    let mut l =
-                        loss_and_grad(&act.out, &t.albedo, &t.reference, t.size, &mut g);
-                    let mut gr = Grads::zeros(net);
-                    // The temporal term needs the successor frame's forward
-                    // too, and contributes a gradient to both. Its backward
-                    // accumulates into the same `Grads`, which is what makes
-                    // the two frames one training example rather than two.
-                    if let Some(nx) = t.next.as_ref() {
-                        let act_n = net.forward(&nx.feat, &nx.illum, t.size);
-                        let mut gn = vec![0.0f32; 3 * n];
-                        l += temporal_loss_and_grad(
-                            &act.out,
-                            &act_n.out,
-                            &t.albedo,
-                            &nx.valid,
-                            t.size,
-                            &mut g,
-                            &mut gn,
-                        );
-                        net.backward(&nx.feat, &nx.illum, &act_n, &gn, &mut gr);
+            let shared: &Kpn = net;
+            let parts: Vec<(Vec<f32>, f64)> = workers
+                .par_iter_mut()
+                .enumerate()
+                .map(|(wi, w)| {
+                    let mut grad = vec![0.0f32; n_params];
+                    let mut loss = 0.0f64;
+                    for &i in chunk.iter().skip(wi).step_by(n_workers) {
+                        loss += w.run(shared, &train[i], &mut grad) as f64;
                     }
-                    net.backward(&t.feat, &t.illum, &act, &g, &mut gr);
-                    (gr, l as f64)
+                    (grad, loss)
                 })
-                .reduce(
-                    || (zero.clone(), 0.0f64),
-                    |mut a, b| {
-                        a.0.add(&b.0);
-                        a.1 += b.1;
-                        a
-                    },
-                );
-            let mut grads = grads;
-            grads.scale(1.0 / chunk.len() as f32);
-            step(net, &grads, &mut opt);
-            total += loss;
+                .collect();
+            let k = 1.0 / chunk.len() as f64;
+            let mut grad = vec![0.0f64; n_params];
+            for (g, l) in &parts {
+                for (a, b) in grad.iter_mut().zip(g) {
+                    *a += *b as f64 * k;
+                }
+                total += l;
+            }
+            let mut flat: Vec<f64> = net.flat().iter().map(|&v| v as f64).collect();
+            opt.step(&mut flat, &grad);
+            net.set_flat(&flat.iter().map(|&v| v as f32).collect::<Vec<_>>());
             seen += chunk.len();
         }
         let mean = (total / seen.max(1) as f64) as f32;
@@ -484,32 +644,6 @@ pub fn fit(
         report(epoch, mean);
     }
     curve
-}
-
-/// Hand the accumulated gradients to the optimiser and take one step.
-fn step(net: &mut Kpn, g: &Grads, opt: &mut ModuleAdam) {
-    let set = |p: &mut Parameter<f32>, v: &[f32]| {
-        p.grad = Some(tang_tensor::Tensor::new(v.to_vec(), p.data.shape().clone()));
-    };
-    set(&mut net.l1.weight, &g.w1);
-    set(&mut net.l1.bias, &g.b1);
-    set(&mut net.l2.weight, &g.w2);
-    set(&mut net.l2.bias, &g.b2);
-    set(&mut net.l3.weight, &g.w3);
-    set(&mut net.l3.bias, &g.b3);
-    set(&mut net.veto, &g.veto);
-    // The order is fixed for the life of the run; `ModuleAdam` sizes its
-    // moment vectors on the first step and indexes them positionally.
-    let mut params: Vec<&mut Parameter<f32>> = vec![
-        &mut net.l1.weight,
-        &mut net.l1.bias,
-        &mut net.l2.weight,
-        &mut net.l2.bias,
-        &mut net.l3.weight,
-        &mut net.l3.bias,
-        &mut net.veto,
-    ];
-    opt.step(&mut params);
 }
 
 /// What an evaluation says about one tier.
@@ -576,98 +710,145 @@ pub fn evaluate(
 mod tests {
     use super::*;
 
-    /// The temporal term is a new gradient path and it flows into *two*
-    /// forwards, which is exactly the kind of term that is easy to get
-    /// backwards. Both halves are differenced.
-    #[test]
-    fn the_temporal_gradient_agrees_with_a_finite_difference() {
-        let s = 4;
+    /// A tile with structure: fireflies so the clamp is live, an edge, a
+    /// mask with holes so the temporal term has both kinds of pixel.
+    fn toy(s: usize, seed: usize) -> Prepared {
         let n = s * s;
-        let mut cur = vec![0.0f32; 3 * n];
-        let mut next = vec![0.0f32; 3 * n];
-        let mut albedo = vec![0.0f32; 3 * n];
-        for i in 0..3 * n {
-            cur[i] = 0.2 + (i % 7) as f32 * 0.09;
-            next[i] = 0.2 + (i % 5) as f32 * 0.13;
-            albedo[i] = 0.3 + (i % 5) as f32 * 0.07;
-        }
-        // Some pixels held their history and some did not; a mask of all-true
-        // would not test that the mask is read at all.
-        let valid: Vec<bool> = (0..n).map(|p| p % 3 != 0).collect();
-        let mut gc = vec![0.0f32; 3 * n];
-        let mut gn = vec![0.0f32; 3 * n];
-        temporal_loss_and_grad(&cur, &next, &albedo, &valid, s, &mut gc, &mut gn);
-
-        let eps = 1e-3;
-        let mut d0 = vec![0.0f32; 3 * n];
-        let mut d1 = vec![0.0f32; 3 * n];
-        let mut probe = |v: &mut Vec<f32>, i: usize, other: &[f32], first: bool| -> f32 {
-            let o = v[i];
-            v[i] = o + eps;
-            let lp = if first {
-                temporal_loss_and_grad(v, other, &albedo, &valid, s, &mut d0, &mut d1)
-            } else {
-                temporal_loss_and_grad(other, v, &albedo, &valid, s, &mut d0, &mut d1)
-            };
-            v[i] = o - eps;
-            let lm = if first {
-                temporal_loss_and_grad(v, other, &albedo, &valid, s, &mut d0, &mut d1)
-            } else {
-                temporal_loss_and_grad(other, v, &albedo, &valid, s, &mut d0, &mut d1)
-            };
-            v[i] = o;
-            (lp - lm) / (2.0 * eps)
+        let h = |i: usize, k: usize| (((i + 13 * seed) * 2654435761 + k * 40503) % 1009) as f32 / 1009.0;
+        let mut t = Tile {
+            size: s,
+            tier: 4,
+            mean: (0..3 * n).map(|i| 0.1 + h(i, 1) * if i % 23 == 0 { 40.0 } else { 1.0 }).collect(),
+            variance: (0..n).map(|i| 0.02 * h(i, 2)).collect(),
+            count: (0..n).map(|i| 1.0 + (h(i, 3) * 6.0).floor()).collect(),
+            normal: (0..3 * n).map(|i| if i % 3 == 2 { 1.0 } else { 0.0 }).collect(),
+            depth: (0..n).map(|p| if p % s < s / 2 { 800.0 } else { 2400.0 }).collect(),
+            albedo: (0..3 * n).map(|i| 0.05 + 0.7 * h(i, 4)).collect(),
+            id: (0..n).map(|p| (1 + (p % s) / 3) as f32).collect(),
+            reference: (0..3 * n).map(|i| 0.05 + 0.5 * h(i, 5)).collect(),
+            next: None,
         };
-        for i in (0..3 * n).step_by(5) {
-            let snapshot = next.clone();
-            let num = probe(&mut cur, i, &snapshot, true);
-            let scale = num.abs().max(gc[i].abs()).max(1e-6);
-            assert!(
-                (num - gc[i]).abs() / scale < 5e-2,
-                "cur {i}: analytic {}, numeric {num}",
-                gc[i]
-            );
-            let snapshot = cur.clone();
-            let num = probe(&mut next, i, &snapshot, false);
-            let scale = num.abs().max(gn[i].abs()).max(1e-6);
-            assert!(
-                (num - gn[i]).abs() / scale < 5e-2,
-                "next {i}: analytic {}, numeric {num}",
-                gn[i]
-            );
+        let count = t.count.clone();
+        t.next = Some(Box::new(crate::denoise::dataset::TileNext {
+            mean: (0..3 * n).map(|i| 0.1 + h(i, 6)).collect(),
+            variance: (0..n).map(|i| 0.02 * h(i, 7)).collect(),
+            count: (0..n).map(|p| if p % 3 == 0 { 1.0 } else { count[p] + 1.0 }).collect(),
+        }));
+        Prepared::of(&t)
+    }
+
+    /// Every input a [`TrainGraph`] takes, in order, as f64.
+    fn inputs(net: &Kpn, t: &Prepared) -> Vec<Vec<f64>> {
+        let wide = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+        let (alb, tt) = planar_targets(t);
+        let mut v: Vec<Vec<f64>> = net.blocks().iter().map(|b| wide(b)).collect();
+        v.extend([wide(&t.feat), wide(&t.illum), wide(&alb), wide(&tt)]);
+        if let Some(nx) = t.next.as_ref() {
+            let valid: Vec<f64> = nx.valid.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+            v.extend([wide(&nx.feat), wide(&nx.illum), valid, vec![temporal_scale(&nx.valid) as f64]]);
+        }
+        v
+    }
+
+    fn interpret(graph: &TrainGraph, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let mut p = graph.interpreted();
+        for (k, x) in inputs.iter().enumerate() {
+            p.write_f64(k, x);
+        }
+        p.run();
+        (0..graph.outputs.len()).map(|i| p.read_f64(i)).collect()
+    }
+
+    /// The graph's loss is [`loss`] plus [`temporal_loss`] over the
+    /// reference forward's two answers: same terms, same weights, same mask.
+    #[test]
+    fn the_graph_loss_is_the_reference_loss() {
+        let s = 6;
+        let net = Kpn::new(4, 3);
+        let t = toy(s, 1);
+        let nx = t.next.as_ref().unwrap();
+        assert!(nx.valid.iter().any(|v| *v) && nx.valid.iter().any(|v| !*v));
+        let cur = net.forward(&t.feat, &t.illum, s).out;
+        let next = net.forward(&nx.feat, &nx.illum, s).out;
+        let want = loss(&cur, &t.albedo, &t.reference, s) + temporal_loss(&cur, &next, &t.albedo, &nx.valid, s);
+        let got = interpret(&TrainGraph::new(4, s, true), &inputs(&net, &t))[0][0];
+        assert!(((want as f64) - got).abs() < 1e-5 * got.abs().max(1e-3), "reference {want}, graph {got}");
+
+        let still = loss(&cur, &t.albedo, &t.reference, s) as f64;
+        let mut lone = toy(s, 1);
+        lone.next = None;
+        let got = interpret(&TrainGraph::new(4, s, false), &inputs(&net, &lone))[0][0];
+        assert!((still - got).abs() < 1e-5 * got.abs().max(1e-3), "still: reference {still}, graph {got}");
+    }
+
+    /// The whole step's gradient — loss, both frames, the temporal term —
+    /// along one direction through every parameter, against a central
+    /// difference of the same graph's loss. All f64, so the window is wide
+    /// and the tolerance tight: this is the test that caught the gradient
+    /// terms' one-short reduction (see [`still_loss_graph`]), which was off by
+    /// a few percent in every block whatever the step.
+    #[test]
+    fn the_step_gradient_agrees_with_a_finite_difference() {
+        let s = 5;
+        let net = Kpn::new(3, 9);
+        let t = toy(s, 2);
+        let graph = TrainGraph::new(3, s, true);
+        let base = inputs(&net, &t);
+        let out = interpret(&graph, &base);
+        let dir: Vec<Vec<f64>> = base[..N_PARAMS]
+            .iter()
+            .enumerate()
+            .map(|(k, b)| (0..b.len()).map(|i| if ((i + 31 * k) * 2654435761 >> 9) & 1 == 0 { 1.0 } else { -1.0 }).collect())
+            .collect();
+        let ana: f64 = (0..N_PARAMS).map(|k| out[1 + k].iter().zip(&dir[k]).map(|(g, d)| g * d).sum::<f64>()).sum();
+        let at = |e: f64| {
+            let mut x = base.clone();
+            for k in 0..N_PARAMS {
+                for (v, d) in x[k].iter_mut().zip(&dir[k]) {
+                    *v += e * d;
+                }
+            }
+            interpret(&graph, &x)[0][0]
+        };
+        let eps = 1e-6;
+        let num = (at(eps) - at(-eps)) / (2.0 * eps);
+        assert!(ana.abs() > 1e-4, "degenerate: {ana}");
+        assert!((ana - num).abs() < 1e-4 * ana.abs().max(num.abs()) + 1e-8, "graph {ana}, secant {num}");
+    }
+
+    /// The compiled C program and the interpreter run the same graph: the
+    /// same loss and every gradient, to `f32`.
+    #[test]
+    fn the_native_step_matches_the_interpreter() {
+        let s = 8;
+        let net = Kpn::new(4, 5);
+        let t = toy(s, 3);
+        let graph = TrainGraph::new(4, s, true);
+        let want = interpret(&graph, &inputs(&net, &t));
+        let native = graph.programs(1).pop().unwrap();
+        if !native.is_native() {
+            eprintln!("no C compiler; the native half of this test is the interpreter against itself");
+        }
+        let mut grad = vec![0.0f32; net.parameters()];
+        let l = Worker { programs: vec![((s, true), native)] }.run(&net, &t, &mut grad);
+        assert!((l as f64 - want[0][0]).abs() < 1e-5 * want[0][0].abs().max(1e-3), "loss: native {l}, interp {}", want[0][0]);
+        let flat: Vec<f64> = want[1..].iter().flatten().copied().collect();
+        let scale = flat.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (i, (a, b)) in grad.iter().zip(&flat).enumerate() {
+            assert!((*a as f64 - b).abs() < 1e-4 * scale, "grad {i}: native {a}, interp {b} (scale {scale})");
         }
     }
 
+    /// A few epochs on a few tiles move the loss down, and the trained
+    /// weights still round-trip through the file the renderer reads.
     #[test]
-    fn the_loss_gradient_agrees_with_a_finite_difference() {
-        let s = 4;
-        let n = s * s;
-        let mut out = vec![0.0f32; 3 * n];
-        let mut albedo = vec![0.0f32; 3 * n];
-        let mut reference = vec![0.0f32; 3 * n];
-        for i in 0..3 * n {
-            out[i] = 0.2 + (i % 7) as f32 * 0.11;
-            albedo[i] = 0.3 + (i % 5) as f32 * 0.07;
-            reference[i] = 0.25 + (i % 11) as f32 * 0.09;
-        }
-        let mut g = vec![0.0f32; 3 * n];
-        loss_and_grad(&out, &albedo, &reference, s, &mut g);
-        let eps = 1e-3;
-        let mut scratch = vec![0.0f32; 3 * n];
-        for i in (0..3 * n).step_by(5) {
-            let o = out[i];
-            out[i] = o + eps;
-            let lp = loss_and_grad(&out, &albedo, &reference, s, &mut scratch);
-            out[i] = o - eps;
-            let lm = loss_and_grad(&out, &albedo, &reference, s, &mut scratch);
-            out[i] = o;
-            let num = (lp - lm) / (2.0 * eps);
-            let scale = num.abs().max(g[i].abs()).max(1e-4);
-            assert!(
-                (num - g[i]).abs() / scale < 5e-2,
-                "index {i}: analytic {}, numeric {num}",
-                g[i]
-            );
-        }
+    fn a_short_fit_descends() {
+        let s = 8;
+        let tiles: Vec<Prepared> = (0..6).map(|i| toy(s, 10 + i)).collect();
+        let mut net = Kpn::new(4, 1);
+        let cfg = Fit { epochs: 12, batch: 3, lr: 5e-3, seed: 4 };
+        let curve = fit(&mut net, &tiles, &cfg, |_, _| {});
+        assert!(curve.last().unwrap() < &(0.95 * curve[0]), "{curve:?}");
+        assert!(net.flat().iter().all(|v| v.is_finite()));
     }
 }

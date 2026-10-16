@@ -11,6 +11,5 @@ exclude = ["out/"]
 
 [dependencies]
 kosm = { path = "../kosm", version = "0.0.1" }
-tang-tensor.workspace = true
-tang-train.workspace = true
+tang.workspace = true
 rayon = "1"

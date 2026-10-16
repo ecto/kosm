@@ -19,11 +19,13 @@
 //! * [`kpn`] — the network: three 3x3 convolutions predicting a normalised
 //!   5x5 filter kernel per pixel, applied to the *demodulated* illumination
 //!   exactly where the à-trous filter would have run.
-//! * [`train`] — the fit, with `tang_train`'s `Parameter` and `ModuleAdam`
-//!   over hand-written convolution kernels; see [`kpn`] for why the layers
-//!   are ours rather than `tang_train::Conv2d`'s. The loss is L1 through a
-//!   tone curve, plus gradients, plus a temporal consistency term that only
-//!   a paired dataset can express.
+//! * [`train`] — the fit: the forward over both frames of a tile and the
+//!   loss as one [`crate::ir`] graph per tile size, its gradient derived by
+//!   `TensorGraph::backward`, run natively one program per worker and
+//!   stepped by [`crate::ir::Adam`]; see [`kpn`] for what is derived and
+//!   how the clamp-to-edge padding is built. The loss is L1 through a tone
+//!   curve, plus gradients, plus a temporal consistency term that only a
+//!   paired dataset can express.
 //!
 //! The weights come out as the `.bin` `kosm_render::gpu::neural::Weights`
 //! loads, so the thing trained here is the thing the viewport runs.

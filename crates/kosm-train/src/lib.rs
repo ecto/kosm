@@ -41,6 +41,7 @@
 pub mod artifact;
 pub mod bc;
 pub mod env;
+pub mod net;
 pub mod ppo;
 pub mod search;
 

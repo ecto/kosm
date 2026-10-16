@@ -24,6 +24,7 @@ pub mod frame;
 pub mod garage;
 pub mod gate;
 pub mod glass;
+pub mod ir;
 pub mod lamp;
 pub mod ledger;
 pub mod lens;

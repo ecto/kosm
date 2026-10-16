@@ -1909,13 +1909,16 @@ stipulated. A U-Net's downsamples are exactly what would let it hallucinate a
 shadow, and a hallucinated shadow that flickers is worse than the grain it
 replaced.
 
-The convolutions are hand-written `f32` loops with hand-written backward
-passes. `tang_train::Conv2d` exists and is gradient-checked, but its forward is
-`Tensor::from_fn` over a multi-dimensional `get`; this network is 80 MMAC per
-tile forward and that difference is a training run against a weekend. What
-`tang_train` does supply is what it is good at: `Parameter` holding the weights
-and their gradients, and `ModuleAdam` stepping them. The backward pass is
-checked against a directional finite difference through every layer.
+The convolutions were first hand-written `f32` loops with hand-written
+backward passes. They are now a tang tensor-IR graph (`kosm::ir`): the forward
+over both frames of a tile and the loss are written once, the gradient of every
+weight, bias and veto scalar is `TensorGraph::backward`'s, and the graph is
+lowered to C and run one native program per worker — about four times the
+tile-passes per second of the hand loops, with the same loss curve. Clamp-to-edge
+padding, which no affine view can express, is built from guarded `±1`-offset
+reads gated by `iota` selects. The derived gradient is checked against a
+directional finite difference of the plain-loop reference forward through
+every layer.
 
 The loss is L1 on `x/(1+x)`-compressed radiance plus a tenth-weight
 gradient-domain term — L1 rather than L2 because L2's optimum under uncertainty
