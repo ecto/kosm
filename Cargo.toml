@@ -61,8 +61,9 @@ tang-3dgs    = { version = "0.1" }
 tang-compile = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
 tang-expr    = { version = "0.1" }
 tang-gpu     = { version = "0.1" }
-# The denoiser's training loop: `Parameter` holds the weights, `ModuleAdam` steps
-# them. The convolutions themselves are ours; see `court::denoise::kpn`.
+# kosm-train's PPO/BC networks still hold their weights in tang-train's
+# `Parameter`s. kosm itself no longer uses either: the denoiser trains as a
+# `TensorGraph` (see `kosm::denoise::kpn`). Drop these when kosm-train moves too.
 tang-tensor  = { version = "0.1" }
 tang-train   = { version = "0.1" }
 # SU(3) lattice gauge theory for kosm-qcd: phyz PR #108 (feat/su3-lattice),

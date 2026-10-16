@@ -1674,8 +1674,6 @@ dependencies = [
  "tang-compile",
  "tang-expr",
  "tang-gpu",
- "tang-tensor",
- "tang-train",
  "toml",
  "vcad",
  "vcad-eval",
