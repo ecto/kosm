@@ -32,6 +32,9 @@ kosm-mpm = { path = "../kosm-mpm", version = "0.0.1" }
 kosm-render = { path = "../kosm-render", version = "0.2" }
 tang.workspace = true
 tang-3dgs.workspace = true
+tang-compile.workspace = true
+tang-expr.workspace = true
+tang-gpu.workspace = true
 tang-tensor.workspace = true
 tang-train.workspace = true
 kosm-scan = { path = "../kosm-scan", version = "0.0.1" }

@@ -54,6 +54,13 @@ hound        = "3.5"
 image        = { version = "0.25", default-features = false, features = ["png"] }
 tang         = { version = "0.2" }
 tang-3dgs    = { version = "0.1" }
+# The tensor IR (`tang_compile::tensor::TensorGraph`) and its CPU runtime
+# (`tang_gpu::cpu::CpuProgram`). tang-compile is not on crates.io yet, so it is
+# pinned by rev, and `[patch.crates-io]` below points every published tang crate
+# at the same rev so the graph still holds one `tang`.
+tang-compile = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-expr    = { version = "0.1" }
+tang-gpu     = { version = "0.1" }
 # The denoiser's training loop: `Parameter` holds the weights, `ModuleAdam` steps
 # them. The convolutions themselves are ours; see `court::denoise::kpn`.
 tang-tensor  = { version = "0.1" }
@@ -74,3 +81,11 @@ phyz-qft     = { git = "https://github.com/ecto/phyz", rev = "4c543be", default-
 # b8e9cb2. `cargo publish` drops it from the packaged manifest.
 [patch.crates-io]
 kosm-render = { path = "crates/kosm-render" }
+# tang main at the rev tang-compile is pinned to (see `tang-compile` above). Drop
+# these once tang-compile publishes and tang's crates.io versions catch up.
+tang         = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-expr    = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-gpu     = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-3dgs    = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-la      = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-tensor  = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
