@@ -30,7 +30,13 @@ unpublished dependencies and can go out at any time.
 
 ## What each repo owes
 
-Nothing. Every row landed on 2026-09-10: tang 0.2.1; tang-la, tang-ad,
+tang: `tang-compile` (the tensor IR, `kosm::ir`) is unpublished, so the workspace
+pins tang main by git rev and `[patch.crates-io]` redirects tang, tang-expr,
+tang-gpu, tang-3dgs, tang-la and tang-tensor to it. kosm cannot `cargo publish`
+until tang-compile 0.1.0 and matching tang releases land; then the rev and the
+patch entries go.
+
+Before that, every row landed on 2026-09-10: tang 0.2.1; tang-la, tang-ad,
 tang-expr 0.1.1; tang-tensor, tang-train, tang-3dgs 0.1.0; the phyz family
 (including the first `phyz-camera`) 0.4.0; the vcad family 0.10.0. The root
 `[workspace.dependencies]` names those versions, `kosm-render` is 0.2.0, and

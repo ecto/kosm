@@ -186,7 +186,9 @@ impl Program {
     }
 }
 
-fn input_lens(g: &TensorGraph) -> Vec<usize> {
+/// Element count of every graph input, in input order — what a fresh
+/// [`Program::compile`] has to be handed.
+pub fn input_lens(g: &TensorGraph) -> Vec<usize> {
     g.nodes()
         .iter()
         .filter(|n| matches!(n.op, tang_compile::tensor::Op::Input(_)))

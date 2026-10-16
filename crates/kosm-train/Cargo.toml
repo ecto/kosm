@@ -12,5 +12,4 @@ exclude = ["out/"]
 [dependencies]
 kosm = { path = "../kosm", version = "0.0.1" }
 tang.workspace = true
-tang-compile.workspace = true
 rayon = "1"

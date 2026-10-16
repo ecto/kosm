@@ -1802,7 +1802,6 @@ dependencies = [
  "kosm",
  "rayon",
  "tang",
- "tang-compile",
 ]
 
 [[package]]
@@ -3668,16 +3667,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tang-ad"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67759a0059717e6704887054248a7aa765fb9ba12ab803233be8cb3b3dfbcce"
-dependencies = [
- "tang",
- "tang-la",
-]
-
-[[package]]
 name = "tang-compile"
 version = "0.1.0"
 source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
@@ -3718,36 +3707,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "tang-optim"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8611ed6ffd0d7f627cb8c2c93bcc9923038888f8401574396bf450ce51d7143"
-dependencies = [
- "tang",
- "tang-ad",
- "tang-la",
-]
-
-[[package]]
 name = "tang-tensor"
 version = "0.1.0"
 source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
 dependencies = [
  "tang",
  "tang-la",
-]
-
-[[package]]
-name = "tang-train"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe0c5ee63dd1cfeb75a9f2fbadbc8b4399f1b755b2e04031a4f8c77520a82d97"
-dependencies = [
- "tang",
- "tang-ad",
- "tang-la",
- "tang-optim",
- "tang-tensor",
 ]
 
 [[package]]

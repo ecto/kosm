@@ -160,6 +160,12 @@ let mut hi = world.clone(); hi.state_mut().q[5] += h;
 let d_score_d_height = (score(&hi) - score(&lo)) / (2.0 * h);
 ```
 
+Every network kosm trains (PPO, BC, the denoiser) is a tang tensor-IR graph
+(`kosm::ir`): the forward is written once as comprehensions, the gradient is
+`TensorGraph::backward`'s, and `ir::Program` runs it as C built by the system
+compiler (f32), or through the f64 interpreter where there is no compiler or
+under `KOSM_IR=interp`. Do not hand-write a backward pass.
+
 The first-order path is phyz's convex-contact adjoint through
 `phyz_diff::convex_adjoint_gradient`, and tang duals through
 `kosm::frame` / `kosm::light` for the render and the optics.
@@ -283,12 +289,14 @@ four stages (build → run → observe → optimise-optional). Copy it.
 - **Render budget.** `Camera`'s `spp` is the cost. Four is a thumbnail,
   ninety-six is the marble's beauty frame and takes seconds per frame.
   A test or a template stays small.
-- **Externals.** phyz, vcad and tang are crates.io versions in the workspace
-  `Cargo.toml` — a clean clone builds with no sibling checkouts. `.cargo/config.toml`
+- **Externals.** phyz and vcad are crates.io versions in the workspace
+  `Cargo.toml`; tang is one git rev of tang main (`tang-compile`, the tensor IR,
+  is not published yet, and `[patch.crates-io]` points every published tang
+  crate at the same rev). A clean clone builds with no sibling checkouts. `.cargo/config.toml`
   (untracked; copy `.cargo/config.toml.example` and point it at your
   checkouts) patches those same sources back to local paths, so edits next
   door still land in a kosm build; CI runs without it. `docs/publishing.md`
-  has the versions. Every crate in the graph names the same published `tang`,
+  has the versions. Every crate in the graph resolves to the same `tang`,
   so `tang::Scalar` is one trait. Changing any of it is a full rebuild.
 - **One phyz.** There used to be a gap here: ipse-map pinned phyz twelve commits
   behind the rev kosm pins, cargo will not let a manifest `[patch]` pull a git URL

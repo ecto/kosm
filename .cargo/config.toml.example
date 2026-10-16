@@ -25,8 +25,11 @@ phyz-collision = { path = "../phyz/crates/phyz-collision" }
 [patch."https://github.com/ecto/tang"]
 tang         = { path = "../tang/crates/tang" }
 tang-3dgs    = { path = "../tang/crates/tang-3dgs" }
+tang-compile = { path = "../tang/crates/tang-compile" }
+tang-expr    = { path = "../tang/crates/tang-expr" }
+tang-gpu     = { path = "../tang/crates/tang-gpu" }
+tang-la      = { path = "../tang/crates/tang-la" }
 tang-tensor  = { path = "../tang/crates/tang-tensor" }
-tang-train   = { path = "../tang/crates/tang-train" }
 
 
 # vcad and phyz reach tang through crates.io; the manifest sends that to the git

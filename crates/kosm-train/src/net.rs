@@ -219,11 +219,7 @@ pub(crate) fn forward_graph(dims: (usize, usize, usize), rows: usize) -> (Tensor
 
 /// Zero inputs of the right lengths for a fresh [`Program::compile`].
 pub(crate) fn zero_inputs(g: &TensorGraph) -> Vec<Vec<f32>> {
-    g.nodes()
-        .iter()
-        .filter(|n| matches!(n.op, tang_compile::tensor::Op::Input(_)))
-        .map(|n| vec![0.0; tang_compile::tensor::numel(&n.shape)])
-        .collect()
+    kosm::ir::input_lens(g).into_iter().map(|n| vec![0.0; n]).collect()
 }
 
 /// Compile with every input zero; the caller writes the real ones.
