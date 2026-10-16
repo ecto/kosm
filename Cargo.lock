@@ -1803,8 +1803,8 @@ version = "0.0.1"
 dependencies = [
  "kosm",
  "rayon",
- "tang-tensor",
- "tang-train",
+ "tang",
+ "tang-compile",
 ]
 
 [[package]]

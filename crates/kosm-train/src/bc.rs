@@ -6,10 +6,15 @@
 //! owns). The arrays are `Vec<f64>` here and the observation is written
 //! straight into the network's input width, since there is no blind mask and
 //! no command block to pack around.
+//!
+//! The regression is a [`kosm::ir`] graph: the MLP forward, the masked
+//! squared error, and [`TensorGraph::backward`] for the gradient — compiled
+//! once per fit at a fixed minibatch, with a ragged last minibatch padded at
+//! weight zero — stepped by [`kosm::ir::Adam`].
 
-use tang_tensor::{Shape, Tensor};
-use tang_train::{ModuleAdam, Optimizer};
+use kosm::ir::{Adam, Monoid, TensorGraph, TensorId, pick};
 
+use crate::net::{MlpVars, compile_zeroed, mlp};
 use crate::ppo::{Actor, Mlp};
 use crate::search::XorShift;
 
@@ -148,9 +153,13 @@ pub fn fit_net(net: &mut Mlp, act_dim: usize, samples: &[BcSample], fit: BcFit) 
     // Variance per dimension, to convert a standardised loss back to the
     // action's own squared units.
     let var: Vec<f64> = stats.std.iter().map(|s| s * s).collect();
-    let mut opt = ModuleAdam::new(fit.lr);
-    let mut rng = XorShift::new(fit.seed);
     let n = samples.len();
+    let b = fit.minibatch.max(1).min(n);
+    let (g, outs) = mse_graph(b, net.dims);
+    let mut program = compile_zeroed(&g, &outs);
+    program.write_f64(IN_VAR, &var);
+    let mut opt = Adam::new(net.params().len(), fit.lr);
+    let mut rng = XorShift::new(fit.seed);
     let mut losses = Vec::with_capacity(fit.epochs);
     for _ in 0..fit.epochs {
         // Fisher-Yates from the same PRNG, as the PPO update does.
@@ -161,38 +170,82 @@ pub fn fit_net(net: &mut Mlp, act_dim: usize, samples: &[BcSample], fit: BcFit) 
         }
         let mut acc = 0.0;
         let mut batches = 0usize;
-        for chunk in order.chunks(fit.minibatch.max(1)) {
-            let b = chunk.len();
-            let mut x = Tensor::zeros(Shape::from_slice(&[b, a_in]));
-            for (row, &i) in chunk.iter().enumerate() {
-                let s = &samples[i];
+        for chunk in order.chunks(b) {
+            let mut x = vec![0.0; b * a_in];
+            let mut y = vec![0.0; b * act_dim];
+            let mut wt = vec![0.0; b];
+            for row in 0..b {
+                // Padding repeats the first row at weight zero.
+                let s = &samples[chunk[if row < chunk.len() { row } else { 0 }]];
                 let k = s.obs.len().min(a_in);
-                x.data_mut()[row * a_in..row * a_in + k].copy_from_slice(&s.obs[..k]);
-            }
-            net.zero_grad();
-            let out = net.forward(&x);
-            let mut grad = Tensor::zeros(Shape::from_slice(&[b, act_dim]));
-            let mut loss = 0.0;
-            for (row, &i) in chunk.iter().enumerate() {
+                x[row * a_in..row * a_in + k].copy_from_slice(&s.obs[..k]);
                 for d in 0..act_dim {
-                    let err =
-                        out.data()[row * act_dim + d] - stats.standardize(&samples[i].act, d);
-                    // Reported in the action's units: a standardised residual
-                    // on dimension `d` is worth `var[d]` of real variance.
-                    loss += err * err * var[d];
-                    grad.data_mut()[row * act_dim + d] = 2.0 * err / (b * act_dim) as f64;
+                    y[row * act_dim + d] = stats.standardize(&s.act, d);
+                }
+                if row < chunk.len() {
+                    wt[row] = 1.0 / (chunk.len() * act_dim) as f64;
                 }
             }
-            net.backward(&grad);
-            let mut params = net.parameters_mut();
-            opt.step(&mut params);
-            acc += loss / (b * act_dim) as f64;
+            program.write_f64(IN_X, &x);
+            program.write_f64(IN_Y, &y);
+            program.write_f64(IN_WT, &wt);
+            MlpVars::write(&mut program, IN_NET, net);
+            program.run();
+            let grad: Vec<f64> = (OUT_GRAD..OUT_GRAD + 6).flat_map(|i| program.read_f64(i)).collect();
+            let mut w = net.to_flat();
+            opt.step(&mut w, &grad);
+            net.set_flat(&w);
+            acc += program.read_f64(OUT_REPORT)[0];
             batches += 1;
         }
         losses.push(acc / batches.max(1) as f64);
     }
     stats.fold_into(net);
     losses
+}
+
+// Inputs and outputs of [`mse_graph`].
+const IN_X: usize = 0; //   [B, in]   observations
+const IN_Y: usize = 1; //   [B, act]  standardised targets
+const IN_WT: usize = 2; //  [B]       1/(b·act) on real rows, 0 on padding
+const IN_VAR: usize = 3; // [act]     per-dimension action variance
+const IN_NET: usize = 4; // 6 tensors, flat order
+const OUT_REPORT: usize = 1; // [1] the loss in the action's own squared units
+const OUT_GRAD: usize = 2; //   6 tensors
+
+/// `Σ_{r,d} w_r (net(x)_{r,d} − y_{r,d})²` and its gradient — the
+/// `2·err/(b·act)` ipse wrote by hand — plus the same sum weighted by
+/// `var[d]`, which is what [`fit_net`] reports: a standardised residual on
+/// dimension `d` is worth `var[d]` of real variance.
+pub(crate) fn mse_graph(b: usize, dims: (usize, usize, usize)) -> (TensorGraph, Vec<TensorId>) {
+    let o = dims.2;
+    let mut g = TensorGraph::new();
+    let x = g.input(&[b, dims.0]);
+    let y = g.input(&[b, o]);
+    let wt = g.input(&[b]);
+    let var = g.input(&[o]);
+    let p = MlpVars::inputs(&mut g, dims);
+    let out = mlp(&mut g, x, p, b, dims);
+    // `[1] ⊕ [B, act]`: rows and action dims both ride reduce coordinates.
+    let args = |extra: TensorId, picks: &[Option<usize>]| {
+        vec![pick(out, 3, &[Some(1), Some(2)]), pick(y, 3, &[Some(1), Some(2)]), pick(wt, 3, &[Some(1)]), pick(extra, 3, picks)]
+    };
+    let loss = g
+        .comp(&[1usize], &[b, o], args(wt, &[Some(1)]), Some(Monoid::sum()), |v| {
+            let e = v[0] - v[1];
+            vec![v[2] * e * e]
+        })
+        .expect("mse");
+    let report = g
+        .comp(&[1usize], &[b, o], args(var, &[Some(2)]), Some(Monoid::sum()), |v| {
+            let e = v[0] - v[1];
+            vec![v[2] * e * e * v[3]]
+        })
+        .expect("report");
+    let grads = g.backward(loss, &p.0).expect("backward");
+    let mut outs = vec![loss, report];
+    outs.extend(grads);
+    kosm::ir::optimize(&g, &outs)
 }
 
 #[cfg(test)]
@@ -222,6 +275,7 @@ mod tests {
             &samples,
             BcFit { epochs: 300, lr: 5e-3, minibatch: 256, seed: 1 },
         );
+        eprintln!("bc: loss {:.4e} -> {:.4e}", losses[0], losses[losses.len() - 1]);
         assert!(
             losses[losses.len() - 1] < losses[0] * 0.05,
             "loss barely moved: {:.3e} -> {:.3e}",
@@ -232,12 +286,13 @@ mod tests {
         // And the folded network predicts raw actions, not standardised ones.
         let mut err = 0.0;
         for s in samples.iter().take(64) {
-            let p = actor.net.forward(&crate::ppo::actor_input(&s.obs, 3));
+            let p = actor.net.forward(&s.obs);
             for d in 0..2 {
-                err += (p.data()[d] - s.act[d]).powi(2);
+                err += (p[d] - s.act[d]).powi(2);
             }
         }
         let rms = (err / (64.0 * 2.0)).sqrt();
+        eprintln!("bc: cloned rms {rms:.4e}");
         assert!(rms < 3e-4, "cloned actor is off by {rms:.3e}");
     }
 }

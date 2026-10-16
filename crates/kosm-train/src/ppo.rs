@@ -1,10 +1,10 @@
 //! PPO, generic over [`Env`].
 //!
 //! Lifted from `ipse-sim`'s `rl.rs` and made to forget the robot. What is
-//! verbatim: [`Mlp`] (including its flat parameter order, which is a
-//! documented fact of the artifact format), the GAE and clipped-surrogate
-//! update in [`process_iteration`], the KL brake, the Huber value clip, and
-//! every default in [`PpoConfig`]. What changed:
+//! verbatim: [`Mlp`]'s flat parameter order (a documented fact of the
+//! artifact format) and its seeded initialisation, the GAE and
+//! clipped-surrogate update in [`process_iteration`], the KL brake, the Huber
+//! value clip, and every default in [`PpoConfig`]. What changed:
 //!
 //! - **Runtime dims.** `OBS_DIM`, `ACT_DIM`, `CMD_DIM` and `CRITIC_DIM` were
 //!   consts and the arrays were `[f64; N]`. They are `Vec<f64>` and numbers
@@ -27,138 +27,41 @@
 //!   is gone, because its own doc comment in ipse says to leave it at zero —
 //!   AR(1) exploration makes the behaviour policy differ from the target
 //!   policy and every importance ratio is then wrong.
+//! - **The gradient is derived, not written.** ipse's update carried three
+//!   hand-derived derivatives — `∂logp/∂μ = z/σ`, `∂logp/∂log σ = z² − 1`,
+//!   and the clipped value gradient `2·clamp(err, ±δ)/b` — each pushed back
+//!   through `tang_train`'s layer-by-layer backward. Now the whole minibatch
+//!   objective is one [`kosm::ir`] graph ([`loss_graph`]): both networks'
+//!   forwards, the Gaussian log-prob, the ratio, the clipped surrogate with
+//!   its active-branch tolerance, the entropy bonus and the Huber value loss,
+//!   and [`TensorGraph::backward`] produces every gradient, `log_std`'s
+//!   included. The derivatives above are what it produces; the test
+//!   `the_loss_gradient_is_the_one_ipse_derived` holds it to them and to
+//!   finite differences.
+//! - **f32.** The graph is compiled to C and run natively in `f32`
+//!   ([`kosm::ir::Program`]); the weights are kept in `f64` between steps
+//!   and in every artifact. The optimiser is [`kosm::ir::Adam`], the same
+//!   update `tang_train::ModuleAdam` made (β 0.9 / 0.999, ε 1e-8, no weight
+//!   decay, no clipping).
 //!
 //! The critic is asymmetric: it reads the observation *plus* whatever
 //! [`Env::privileged`] returns, which the actor never sees.
 
+use kosm::ir::{Adam, ExprId, Monoid, Program, TensorGraph, TensorId, id, lit, pick};
 use rayon::prelude::*;
-use tang_tensor::{Shape, Tensor};
-use tang_train::{Linear, Module, ModuleAdam, Optimizer, Parameter, Tanh};
+use tang::Scalar;
 
 use crate::env::Env;
+pub use crate::net::Mlp;
+use crate::net::{MlpVars, compile_zeroed, mlp};
 use crate::search::XorShift;
-
-/// A two-hidden-layer tanh MLP, `f64`, with flat import/export.
-///
-/// Hand-rolled rather than `Sequential` so the parameter order is a stable,
-/// documented fact of the artifact format: `l1.w, l1.b, l2.w, l2.b, l3.w,
-/// l3.b`, row-major.
-pub struct Mlp {
-    l1: Linear<f64>,
-    a1: Tanh<f64>,
-    l2: Linear<f64>,
-    a2: Tanh<f64>,
-    l3: Linear<f64>,
-    pub dims: (usize, usize, usize),
-}
-
-impl Mlp {
-    pub fn new(input: usize, hidden: usize, output: usize, seed: u64) -> Self {
-        Self {
-            l1: Linear::new(input, hidden, seed ^ 0x11),
-            a1: Tanh::new(),
-            l2: Linear::new(hidden, hidden, seed ^ 0x22),
-            a2: Tanh::new(),
-            l3: Linear::new(hidden, output, seed ^ 0x33),
-            dims: (input, hidden, output),
-        }
-    }
-
-    pub fn forward(&mut self, x: &Tensor<f64>) -> Tensor<f64> {
-        let x = self.l1.forward(x);
-        let x = self.a1.forward(&x);
-        let x = self.l2.forward(&x);
-        let x = self.a2.forward(&x);
-        self.l3.forward(&x)
-    }
-
-    pub fn backward(&mut self, grad: &Tensor<f64>) {
-        let g = self.l3.backward(grad);
-        let g = self.a2.backward(&g);
-        let g = self.l2.backward(&g);
-        let g = self.a1.backward(&g);
-        let _ = self.l1.backward(&g);
-    }
-
-    pub fn parameters_mut(&mut self) -> Vec<&mut Parameter<f64>> {
-        let mut p = self.l1.parameters_mut();
-        p.extend(self.l2.parameters_mut());
-        p.extend(self.l3.parameters_mut());
-        p
-    }
-
-    pub fn zero_grad(&mut self) {
-        for p in self.parameters_mut() {
-            p.zero_grad();
-        }
-    }
-
-    /// A fresh net with the same weights and no cached activations — for
-    /// forwarding slices of one batch on several threads. `forward` is
-    /// `&mut self` because tang caches for `backward`, so one net cannot be
-    /// shared across workers; a copy per worker can.
-    pub fn clone_weights(&self) -> Self {
-        Self::from_flat(self.dims.0, self.dims.1, self.dims.2, &self.to_flat())
-            .expect("clone_weights: from_flat of to_flat")
-    }
-
-    pub fn to_flat(&self) -> Vec<f64> {
-        let mut out = Vec::new();
-        for t in [
-            &self.l1.weight.data,
-            &self.l1.bias.data,
-            &self.l2.weight.data,
-            &self.l2.bias.data,
-            &self.l3.weight.data,
-            &self.l3.bias.data,
-        ] {
-            out.extend_from_slice(t.data());
-        }
-        out
-    }
-
-    pub fn from_flat(input: usize, hidden: usize, output: usize, flat: &[f64]) -> Option<Self> {
-        let mut m = Self::new(input, hidden, output, 0);
-        let mut at = 0;
-        for t in [
-            &mut m.l1.weight.data,
-            &mut m.l1.bias.data,
-            &mut m.l2.weight.data,
-            &mut m.l2.bias.data,
-            &mut m.l3.weight.data,
-            &mut m.l3.bias.data,
-        ] {
-            let n = t.data().len();
-            if at + n > flat.len() {
-                return None;
-            }
-            t.data_mut().copy_from_slice(&flat[at..at + n]);
-            at += n;
-        }
-        (at == flat.len()).then_some(m)
-    }
-
-    pub fn param_count(input: usize, hidden: usize, output: usize) -> usize {
-        input * hidden + hidden + hidden * hidden + hidden + hidden * output + output
-    }
-
-    /// Scale the output layer's initial weights. The initial policy is then
-    /// near-zero mean — plain PD at whatever pose the env spawns in, a
-    /// controller that already works — and exploration is the log-std rather
-    /// than Xavier noise saturating the clamp. Measured in ipse: without
-    /// this, 120 iterations sat at 0.56 s episodes because the policy was
-    /// fighting its own initialization.
-    pub fn scale_output(&mut self, k: f64) {
-        for v in self.l3.weight.data.data_mut() {
-            *v *= k;
-        }
-    }
-}
 
 /// The actor: an MLP mean plus a global learned log-std vector.
 pub struct Actor {
     pub net: Mlp,
-    pub log_std: Parameter<f64>,
+    /// Log of the exploration std, per action dimension. A parameter of the
+    /// update like any weight: [`loss_graph`] differentiates it.
+    pub log_std: Vec<f64>,
     /// Applied-action clamp, in the action's own units.
     pub act_clamp: f64,
     obs_dim: usize,
@@ -167,15 +70,12 @@ pub struct Actor {
 
 impl Actor {
     pub fn new(obs_dim: usize, act_dim: usize, hidden: usize, seed: u64) -> Self {
-        let mut log_std = Parameter::new(Tensor::zeros(Shape::from_slice(&[act_dim])));
-        for v in log_std.data.data_mut() {
-            // std ≈ 0.05. Measured, not taste: at std 0.2 the exploration
-            // itself shook the K1 down in 0.6 s, every episode, so PPO never
-            // saw the standing regime its own mean already occupied.
-            // Exploration around a working controller has to be gentle
-            // enough to leave it working.
-            *v = -3.0;
-        }
+        // std ≈ 0.05. Measured, not taste: at std 0.2 the exploration
+        // itself shook the K1 down in 0.6 s, every episode, so PPO never
+        // saw the standing regime its own mean already occupied.
+        // Exploration around a working controller has to be gentle
+        // enough to leave it working.
+        let log_std = vec![-3.0; act_dim];
         let mut net = Mlp::new(obs_dim, hidden, act_dim, seed);
         net.scale_output(0.01);
         Self { net, log_std, act_clamp: 0.3, obs_dim, act_dim }
@@ -196,64 +96,16 @@ impl Actor {
         }
     }
 
-    /// Deterministic action: the mean, clamped.
-    pub fn mean_action(&mut self, obs: &[f64]) -> Vec<f64> {
-        let x = actor_input(obs, self.obs_dim);
-        let m = self.net.forward(&x);
-        let mut a: Vec<f64> = m.data()[..self.act_dim].to_vec();
+    /// Deterministic action: the mean, clamped. Shorter observations are
+    /// zero-padded and longer ones truncated, so a mismatch is a quiet wrong
+    /// answer unless the caller checks [`Actor::obs_dim`]; [`train_from`]
+    /// asserts the widths agree up front.
+    pub fn mean_action(&self, obs: &[f64]) -> Vec<f64> {
+        let mut a = self.net.forward(obs);
+        a.truncate(self.act_dim);
         self.clamp_action(&mut a);
         a
     }
-
-    /// The weights and exploration widths only — enough to rebuild an actor
-    /// on a worker thread. `forward` caches for `backward`, so one actor
-    /// cannot be shared across threads, but a snapshot can.
-    fn snapshot(&self) -> ActorSnapshot {
-        ActorSnapshot {
-            dims: self.net.dims,
-            flat: self.net.to_flat(),
-            log_std: self.log_std.data.data().to_vec(),
-            act_clamp: self.act_clamp,
-            obs_dim: self.obs_dim,
-            act_dim: self.act_dim,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ActorSnapshot {
-    dims: (usize, usize, usize),
-    flat: Vec<f64>,
-    log_std: Vec<f64>,
-    act_clamp: f64,
-    obs_dim: usize,
-    act_dim: usize,
-}
-
-impl ActorSnapshot {
-    fn rebuild(&self) -> Actor {
-        let mut log_std = Parameter::new(Tensor::zeros(Shape::from_slice(&[self.act_dim])));
-        log_std.data.data_mut().copy_from_slice(&self.log_std);
-        Actor {
-            net: Mlp::from_flat(self.dims.0, self.dims.1, self.dims.2, &self.flat)
-                .expect("actor snapshot round-trips"),
-            log_std,
-            act_clamp: self.act_clamp,
-            obs_dim: self.obs_dim,
-            act_dim: self.act_dim,
-        }
-    }
-}
-
-/// One observation as a row tensor of the network's input width. Shorter
-/// observations are zero-padded and longer ones truncated, so a mismatch is a
-/// quiet wrong answer rather than a panic only if the caller ignores
-/// [`Actor::obs_dim`]; [`train_from`] asserts the widths agree up front.
-pub(crate) fn actor_input(obs: &[f64], input_dim: usize) -> Tensor<f64> {
-    let mut t = Tensor::zeros(Shape::from_slice(&[input_dim]));
-    let n = obs.len().min(input_dim);
-    t.data_mut()[..n].copy_from_slice(&obs[..n]);
-    t
 }
 
 /// PPO hyperparameters. Defaults are ipse's measured ones; the config exists
@@ -370,10 +222,15 @@ impl Episode {
     }
 }
 
+
 /// Roll one stochastic episode on one environment.
+///
+/// The mean is [`Mlp::forward`]: one compiled program per worker thread,
+/// reused across steps and iterations, with the weights rewritten only when
+/// the actor has changed since that thread last ran it.
 fn rollout<E: Env + ?Sized>(
     env: &mut E,
-    actor: &mut Actor,
+    actor: &Actor,
     cfg: &PpoConfig,
     rng: &mut XorShift,
     seed: u64,
@@ -381,7 +238,7 @@ fn rollout<E: Env + ?Sized>(
 ) -> Episode {
     let act_dim = actor.act_dim;
     let mut obs = env.reset(seed);
-    let std: Vec<f64> = actor.log_std.data.data().iter().map(|l| l.exp()).collect();
+    let std: Vec<f64> = actor.log_std.iter().map(|l| l.exp()).collect();
     let mut samples = Vec::new();
     let mut delay_queue: std::collections::VecDeque<Vec<f64>> = std::collections::VecDeque::new();
     let mut applied = vec![0.0; act_dim];
@@ -395,12 +252,11 @@ fn rollout<E: Env + ?Sized>(
             }
         }
         let priv_obs = privileged_or_zeros(env, priv_dim);
-        let x = actor_input(&obs, actor.obs_dim);
-        let mean = actor.net.forward(&x);
+        let mean = actor.net.forward(&obs);
         let mut act = vec![0.0; act_dim];
         let mut logp = 0.0;
         for i in 0..act_dim {
-            let m = mean.data()[i];
+            let m = mean[i];
             let z = rng.normal();
             act[i] = m + std[i] * z;
             logp += -0.5 * z * z - std[i].ln() - 0.5 * (2.0 * std::f64::consts::PI).ln();
@@ -455,6 +311,7 @@ fn privileged_or_zeros<E: Env + ?Sized>(env: &E, priv_dim: usize) -> Vec<f64> {
     p
 }
 
+
 /// One iteration's episodes, collected across the environments in parallel.
 ///
 /// Episode seeds are drawn up front on the calling thread so worker
@@ -462,6 +319,8 @@ fn privileged_or_zeros<E: Env + ?Sized>(env: &E, priv_dim: usize) -> Vec<f64> {
 /// same batch on any machine. Environments are used round-robin, each one
 /// running its share sequentially (an `Env` is `&mut self`, so it cannot be
 /// two episodes at once) while rayon runs the environments side by side.
+/// The actor is shared by reference: its forward is `&self`, and each worker
+/// thread runs it through its own compiled program.
 pub fn collect<E: Env + Send>(
     envs: &mut [E],
     actor: &Actor,
@@ -470,7 +329,6 @@ pub fn collect<E: Env + Send>(
 ) -> Vec<Episode> {
     assert!(!envs.is_empty(), "collect needs at least one environment");
     let priv_dim = priv_dim_of(&envs[0]);
-    let snap = actor.snapshot();
     let n_envs = envs.len();
     let seeds: Vec<u64> = (0..cfg.episodes_per_iter).map(|_| rng.next_u64()).collect();
 
@@ -484,11 +342,10 @@ pub fn collect<E: Env + Send>(
                 .filter(|(i, _)| i % n_envs == e)
                 .map(|(i, &s)| (i, s))
                 .collect();
-            let mut a = snap.rebuild();
             mine.into_iter()
                 .map(|(i, s)| {
                     let mut r = XorShift::new(s);
-                    (i, rollout(env, &mut a, cfg, &mut r, s, priv_dim))
+                    (i, rollout(env, actor, cfg, &mut r, s, priv_dim))
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -529,22 +386,271 @@ pub struct PpoIter {
 /// saturates, so one absurd return cannot drag the critic.
 const VALUE_HUBER: f64 = 10.0;
 
+
+// Graph inputs of [`loss_graph`], in declaration order. Per-row tensors are
+// `[B, …]` for the fixed minibatch `B`; a ragged last minibatch is padded
+// with copies of its first row at weight zero, so one compiled program
+// serves every minibatch of every iteration.
+const IN_XA: usize = 0; //       [B, obs]      actor input
+const IN_XC: usize = 1; //       [B, critic]   critic input (obs ++ privileged)
+const IN_ACT: usize = 2; //      [B, act]      the sampled action
+const IN_LOGP: usize = 3; //     [B]           its log-prob under the behaviour policy
+const IN_ADV: usize = 4; //      [B]           normalised GAE advantage
+const IN_RET: usize = 5; //      [B]           value target
+const IN_WT: usize = 6; //       [B]           1/b on real rows, 0 on padding
+const IN_CLIP: usize = 7; //     [1]           surrogate clip ε
+const IN_ENT: usize = 8; //      [1]           entropy coefficient
+const IN_VDELTA: usize = 9; //   [1]           Huber δ, in return units
+const IN_ACTOR: usize = 10; //   6 tensors     actor mean MLP, flat order
+const IN_LOG_STD: usize = 16; // [act]
+const IN_CRITIC: usize = 17; //  6 tensors     critic MLP, flat order
+
+// Outputs of [`loss_graph`].
+#[cfg_attr(not(test), allow(dead_code))]
+const OUT_LOSS: usize = 0; //  [1] the objective `backward` differentiates
+const OUT_PLOSS: usize = 1; // [1] the clipped surrogate alone (logged)
+const OUT_VLOSS: usize = 2; // [1] plain MSE of the value (logged; the gradient is Huber's)
+const OUT_K3: usize = 3; //    [1] Schulman's k3, `mean(r − 1 − ln r)` — the KL brake
+const OUT_GRAD: usize = 4; //  13 tensors: actor ×6, log_std, critic ×6
+
+/// The whole PPO minibatch objective as one graph, and its gradient.
+///
+/// For each row (weight `w`, `Σw = 1`):
+///
+/// - `μ = actor(x_a)`, `z = (a − μ)·e^{−log σ}`,
+///   `logp = Σ_d −½z² − log σ_d − ½ln 2π` — the same expression the rollout
+///   evaluated when it sampled `a`;
+/// - `r = e^{logp − logp_old}`, `c = clamp(r, 1 ± ε)`, and the surrogate
+///   `−min(r·A, c·A)` where the unclipped branch counts as the minimum
+///   within `1e-12` — ipse's tie rule, so a ratio inside the clip interval
+///   always carries its gradient and one outside it carries none;
+/// - `e = critic(x_c) − ret` and the Huber loss `e²` inside `|e| ≤ δ`,
+///   `2δ|e| − δ²` outside, whose gradient is ipse's `2·clamp(e, ±δ)`.
+///
+/// The objective is `Σ w·surrogate − c_H·Σ_d log σ_d + Σ w·huber`: the
+/// entropy of a diagonal Gaussian is `Σ log σ` plus a constant. The actor
+/// and critic terms share no parameter, so one `backward` gives each
+/// network the gradient of its own loss.
+pub(crate) fn loss_graph(
+    b: usize,
+    actor: (usize, usize, usize),
+    critic: (usize, usize, usize),
+) -> (TensorGraph, Vec<TensorId>) {
+    let (od, _, ad) = actor;
+    let cd = critic.0;
+    assert_eq!(critic.2, 1, "the critic has one output");
+    let mut g = TensorGraph::new();
+    let xa = g.input(&[b, od]);
+    let xc = g.input(&[b, cd]);
+    let act = g.input(&[b, ad]);
+    let logp_old = g.input(&[b]);
+    let adv = g.input(&[b]);
+    let ret = g.input(&[b]);
+    let wt = g.input(&[b]);
+    let clip = g.input(&[1usize]);
+    let ent_coef = g.input(&[1usize]);
+    let vdelta = g.input(&[1usize]);
+    let pa = MlpVars::inputs(&mut g, actor);
+    let log_std = g.input(&[ad]);
+    let pc = MlpVars::inputs(&mut g, critic);
+
+    let mean = mlp(&mut g, xa, pa, b, actor);
+    let half_ln_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let logp = g
+        .comp(
+            &[b],
+            &[ad],
+            vec![pick(act, 2, &[Some(0), Some(1)]), pick(mean, 2, &[Some(0), Some(1)]), pick(log_std, 2, &[Some(1)])],
+            Some(Monoid::sum()),
+            |v| {
+                let z = (v[0] - v[1]) * (-v[2]).exp();
+                vec![lit(-0.5) * z * z - v[2] - lit(half_ln_2pi)]
+            },
+        )
+        .expect("logp");
+
+    // A row tensor `[B]` or a scalar `[1]`, read in the `[1] ⊕ [B]` space of
+    // a batch sum: rows ride the reduce coordinate, scalars the output one.
+    let row = |t: TensorId| pick(t, 2, &[Some(1)]);
+    let one = |t: TensorId| pick(t, 2, &[Some(0)]);
+
+    let ploss = g
+        .comp(&[1usize], &[b], vec![row(logp), row(logp_old), row(adv), row(wt), one(clip)], Some(Monoid::sum()), |v| {
+            let r = (v[0] - v[1]).exp();
+            let c = r.clamp(lit(1.0) - v[4], lit(1.0) + v[4]);
+            let (u, k) = (r * v[2], c * v[2]);
+            // `select(p, a, b)` is `a` where `p > 0`: the clipped branch
+            // only once it is below the unclipped one by more than 1e-12.
+            let m = <ExprId as Scalar>::select(u - k - lit(1e-12), k, u);
+            vec![-(v[3] * m)]
+        })
+        .expect("surrogate");
+    let k3 = g
+        .comp(&[1usize], &[b], vec![row(logp), row(logp_old), row(wt)], Some(Monoid::sum()), |v| {
+            let lr = v[0] - v[1];
+            vec![v[2] * (lr.exp() - lit(1.0) - lr)]
+        })
+        .expect("k3");
+    let entropy = g
+        .comp(&[1usize], &[ad], vec![pick(log_std, 2, &[Some(1)])], Some(Monoid::sum()), |v| vec![v[0]])
+        .expect("entropy");
+
+    let value = mlp(&mut g, xc, pc, b, critic); // [B, 1]
+    // `value[row, 0]`: its unit column rides the output coordinate.
+    let val = pick(value, 2, &[Some(1), Some(0)]);
+    let vloss = g
+        .comp(&[1usize], &[b], vec![val.clone(), row(ret), row(wt)], Some(Monoid::sum()), |v| {
+            let e = v[0] - v[1];
+            vec![v[2] * e * e]
+        })
+        .expect("mse");
+    let huber = g
+        .comp(&[1usize], &[b], vec![val, row(ret), row(wt), one(vdelta)], Some(Monoid::sum()), |v| {
+            let e = v[0] - v[1];
+            let (a, d) = (e.abs(), v[3]);
+            let h = <ExprId as Scalar>::select(a - d, lit(2.0) * d * a - d * d, e * e);
+            vec![v[2] * h]
+        })
+        .expect("huber");
+
+    let loss = g
+        .comp(
+            &[1usize],
+            &[] as &[usize],
+            vec![id(ploss, 1, 1), id(entropy, 1, 1), id(huber, 1, 1), id(ent_coef, 1, 1)],
+            None,
+            |v| vec![v[0] - v[3] * v[1] + v[2]],
+        )
+        .expect("loss");
+
+    let mut wrt: Vec<TensorId> = pa.0.to_vec();
+    wrt.push(log_std);
+    wrt.extend(pc.0);
+    let grads = g.backward(loss, &wrt).expect("backward");
+    let mut outs = vec![loss, ploss, vloss, k3];
+    outs.extend(grads);
+    kosm::ir::optimize(&g, &outs)
+}
+
+/// The update's compiled loss and its two optimisers — the state
+/// [`process_iteration`] carries from one iteration to the next.
+///
+/// Compiling the loss is the expensive part (a C compile, a fraction of a
+/// second); it happens once, in [`PpoUpdate::new`], and every minibatch after
+/// that is a write of its rows and the current weights, one run, and two
+/// [`Adam`] steps.
+pub struct PpoUpdate {
+    program: Program,
+    batch: usize,
+    obs_dim: usize,
+    act_dim: usize,
+    critic_dim: usize,
+    opt_actor: Adam,
+    opt_critic: Adam,
+}
+
+impl PpoUpdate {
+    pub fn new(actor: &Actor, critic: &Mlp, cfg: &PpoConfig) -> Self {
+        let batch = cfg.minibatch.max(1);
+        let (g, outs) = loss_graph(batch, actor.net.dims, critic.dims);
+        let n_actor = actor.net.params().len() + actor.act_dim;
+        let n_critic = critic.params().len();
+        Self {
+            program: compile_zeroed(&g, &outs),
+            batch,
+            obs_dim: actor.obs_dim,
+            act_dim: actor.act_dim,
+            critic_dim: critic.dims.0,
+            opt_actor: Adam::new(n_actor, cfg.lr),
+            opt_critic: Adam::new(n_critic, cfg.lr),
+        }
+    }
+
+    /// One minibatch: evaluate the loss and its gradient at the current
+    /// weights, then step both networks. Returns the pre-step surrogate,
+    /// value MSE and k3, each a mean over the real rows.
+    fn step(
+        &mut self,
+        rows: &[&Sample],
+        actor: &mut Actor,
+        critic: &mut Mlp,
+        cfg: &PpoConfig,
+        vdelta: f64,
+    ) -> (f64, f64, f64) {
+        let (b, od, ad, cd) = (self.batch, self.obs_dim, self.act_dim, self.critic_dim);
+        let [xa, xc, act, logp, adv, ret, wt] = pack_rows(rows, b, od, ad, cd);
+        let p = &mut self.program;
+        for (k, v) in [(IN_XA, &xa), (IN_XC, &xc), (IN_ACT, &act), (IN_LOGP, &logp), (IN_ADV, &adv), (IN_RET, &ret), (IN_WT, &wt)] {
+            p.write_f64(k, v);
+        }
+        p.write_f64(IN_CLIP, &[cfg.clip]);
+        p.write_f64(IN_ENT, &[cfg.entropy_coef]);
+        p.write_f64(IN_VDELTA, &[vdelta]);
+        MlpVars::write(p, IN_ACTOR, &actor.net);
+        p.write_f64(IN_LOG_STD, &actor.log_std);
+        MlpVars::write(p, IN_CRITIC, critic);
+        p.run();
+
+        let gather = |p: &Program, from: usize, count: usize| -> Vec<f64> {
+            (from..from + count).flat_map(|i| p.read_f64(i)).collect()
+        };
+        let mut ga = gather(p, OUT_GRAD, 7);
+        let gc = gather(p, OUT_GRAD + 7, 6);
+        let mut wa = actor.net.to_flat();
+        let na = wa.len();
+        wa.extend_from_slice(&actor.log_std);
+        ga.truncate(wa.len());
+        self.opt_actor.step(&mut wa, &ga);
+        actor.net.set_flat(&wa[..na]);
+        actor.log_std.copy_from_slice(&wa[na..]);
+        let mut wc = critic.to_flat();
+        self.opt_critic.step(&mut wc, &gc);
+        critic.set_flat(&wc);
+
+        let scalar = |i: usize| p.read_f64(i)[0];
+        (scalar(OUT_PLOSS), scalar(OUT_VLOSS), scalar(OUT_K3))
+    }
+}
+
+/// A minibatch as [`loss_graph`]'s seven per-row inputs, `IN_XA..=IN_WT`.
+/// Rows past `rows.len()` repeat the first row at weight zero: finite, so
+/// `0 · term` is 0, where a zeroed row's ratio could overflow `f32`.
+fn pack_rows(rows: &[&Sample], b: usize, od: usize, ad: usize, cd: usize) -> [Vec<f64>; 7] {
+    let n = rows.len();
+    assert!(n >= 1 && n <= b, "minibatch of {n} rows for a program of {b}");
+    let mut xa = vec![0.0; b * od];
+    let mut xc = vec![0.0; b * cd];
+    let mut act = vec![0.0; b * ad];
+    let (mut logp, mut adv, mut ret, mut wt) = (vec![0.0; b], vec![0.0; b], vec![0.0; b], vec![0.0; b]);
+    for r in 0..b {
+        let s = rows[if r < n { r } else { 0 }];
+        let k = s.obs.len().min(od);
+        xa[r * od..r * od + k].copy_from_slice(&s.obs[..k]);
+        xc[r * cd..r * cd + k].copy_from_slice(&s.obs[..k]);
+        let p = s.priv_obs.len().min(cd - od);
+        xc[r * cd + od..r * cd + od + p].copy_from_slice(&s.priv_obs[..p]);
+        let k = s.act.len().min(ad);
+        act[r * ad..r * ad + k].copy_from_slice(&s.act[..k]);
+        (logp[r], adv[r], ret[r]) = (s.logp, s.adv, s.ret);
+        wt[r] = if r < n { 1.0 / n as f64 } else { 0.0 };
+    }
+    [xa, xc, act, logp, adv, ret, wt]
+}
+
 /// GAE + the clipped update over one iteration's episodes.
 pub fn process_iteration(
     episodes: Vec<Episode>,
     actor: &mut Actor,
     critic: &mut Mlp,
-    opt_actor: &mut ModuleAdam,
-    opt_critic: &mut ModuleAdam,
+    update: &mut PpoUpdate,
     cfg: &PpoConfig,
     rng: &mut XorShift,
 ) -> PpoIter {
     let obs_dim = actor.obs_dim;
-    let act_dim = actor.act_dim;
     let critic_dim = critic.dims.0;
     let n_eps = episodes.len().max(1);
 
-    // ── GAE ──
+    // ── GAE ── (a scan, so plain Rust; the values are one batched forward)
     let mut all: Vec<Sample> = Vec::new();
     let mut total_reward = 0.0;
     let mut total_len = 0usize;
@@ -564,10 +670,7 @@ pub fn process_iteration(
         }
         let k = ep.last_critic_in.len().min(critic_dim);
         buf[n * critic_dim..n * critic_dim + k].copy_from_slice(&ep.last_critic_in[..k]);
-        let mut x = Tensor::zeros(Shape::from_slice(&[n + 1, critic_dim]));
-        x.data_mut().copy_from_slice(&buf);
-        let values = critic.forward(&x);
-        let v = values.data();
+        let v = critic.forward_rows(&buf);
 
         let last_v = if ep.terminated { 0.0 } else { v[n] };
         let mut gae = 0.0;
@@ -637,104 +740,16 @@ pub fn process_iteration(
             order.swap(i, j);
         }
         for chunk in order.chunks(cfg.minibatch) {
-            let b = chunk.len();
-            let mut xa = Tensor::zeros(Shape::from_slice(&[b, obs_dim]));
-            let mut xc = Tensor::zeros(Shape::from_slice(&[b, critic_dim]));
-            for (row, &i) in chunk.iter().enumerate() {
-                let s = &all[i];
-                let k = s.obs.len().min(obs_dim);
-                xa.data_mut()[row * obs_dim..row * obs_dim + k].copy_from_slice(&s.obs[..k]);
-                xc.data_mut()[row * critic_dim..row * critic_dim + k].copy_from_slice(&s.obs[..k]);
-                let p = s.priv_obs.len().min(critic_dim - obs_dim);
-                xc.data_mut()[row * critic_dim + obs_dim..row * critic_dim + obs_dim + p]
-                    .copy_from_slice(&s.priv_obs[..p]);
-            }
-
-            actor.net.zero_grad();
-            if let Some(g) = actor.log_std.grad.as_mut() {
-                for v in g.data_mut() {
-                    *v = 0.0;
-                }
-            }
-            let mean = actor.net.forward(&xa);
-            let std: Vec<f64> = actor.log_std.data.data().iter().map(|l| l.exp()).collect();
-
-            // New log-probs and the clipped-surrogate gradient wrt mean.
-            let mut dmean = Tensor::zeros(Shape::from_slice(&[b, act_dim]));
-            let mut dlogstd = vec![0.0; act_dim];
-            let mut ploss = 0.0;
-            // Schulman k3: mean(r − 1 − ln r) over THIS minibatch.
-            let mut mb_k3 = 0.0;
-            for (row, &i) in chunk.iter().enumerate() {
-                let s = &all[i];
-                let mut logp = 0.0;
-                for d in 0..act_dim {
-                    let m = mean.data()[row * act_dim + d];
-                    let z = (s.act[d] - m) / std[d];
-                    logp +=
-                        -0.5 * z * z - std[d].ln() - 0.5 * (2.0 * std::f64::consts::PI).ln();
-                }
-                let log_ratio = logp - s.logp;
-                let ratio = log_ratio.exp();
-                mb_k3 += ratio - 1.0 - log_ratio;
-                let clipped = ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip);
-                ploss += -(ratio * s.adv).min(clipped * s.adv);
-                // Gradient flows only through the unclipped branch when it is
-                // the active one.
-                let active = (ratio * s.adv) <= (clipped * s.adv) + 1e-12;
-                if active {
-                    let coef = -s.adv * ratio / b as f64;
-                    for d in 0..act_dim {
-                        let m = mean.data()[row * act_dim + d];
-                        let z = (s.act[d] - m) / std[d];
-                        // d logp / d mean = z / std; d logp / d logstd = z² − 1.
-                        dmean.data_mut()[row * act_dim + d] = coef * (z / std[d]);
-                        dlogstd[d] += coef * (z * z - 1.0);
-                    }
-                }
-            }
-            // Entropy bonus: dH/dlogstd = 1 per dim.
-            for d in 0..act_dim {
-                dlogstd[d] -= cfg.entropy_coef;
-            }
-            actor.net.backward(&dmean);
-            {
-                let g = actor
-                    .log_std
-                    .grad
-                    .get_or_insert_with(|| Tensor::zeros(Shape::from_slice(&[act_dim])));
-                for (gd, d) in g.data_mut().iter_mut().zip(&dlogstd) {
-                    *gd += *d;
-                }
-            }
-            let mut actor_params = actor.net.parameters_mut();
-            actor_params.push(&mut actor.log_std);
-            opt_actor.step(&mut actor_params);
-
-            // Critic: MSE to the GAE returns.
-            critic.zero_grad();
-            let values = critic.forward(&xc);
-            let mut dv = Tensor::zeros(Shape::from_slice(&[b, 1]));
-            let mut vloss = 0.0;
-            for (row, &i) in chunk.iter().enumerate() {
-                let err = values.data()[row] - all[i].ret;
-                vloss += err * err;
-                let d = err.clamp(-vdelta, vdelta);
-                dv.data_mut()[row] = 2.0 * d / b as f64;
-            }
-            critic.backward(&dv);
-            let mut critic_params = critic.parameters_mut();
-            opt_critic.step(&mut critic_params);
-
-            policy_loss_acc += ploss / b as f64;
-            value_loss_acc += vloss / b as f64;
+            let rows: Vec<&Sample> = chunk.iter().map(|&i| &all[i]).collect();
+            let (ploss, vloss, k3) = update.step(&rows, actor, critic, cfg, vdelta);
+            policy_loss_acc += ploss;
+            value_loss_acc += vloss;
             loss_batches += 1;
             // Early stop: one more minibatch past this and the policy is no
             // longer the one the batch was collected under.
-            let brake = mb_k3 / b as f64;
-            brake_acc += brake;
+            brake_acc += k3;
             brake_batches += 1;
-            if brake > cfg.target_kl {
+            if k3 > cfg.target_kl {
                 stop = true;
                 break;
             }
@@ -758,7 +773,7 @@ pub fn process_iteration(
 /// is a fact about *that* rig's action layout, not about PPO, so it belongs
 /// to the caller: set [`Actor::log_std`] directly after calling this.
 pub fn set_init_std(actor: &mut Actor, std: f64) {
-    for v in actor.log_std.data.data_mut() {
+    for v in actor.log_std.iter_mut() {
         *v = std.max(1e-6).ln();
     }
 }
@@ -807,22 +822,13 @@ pub fn train_from<E: Env + Send>(
     actor.act_clamp = cfg.act_clamp;
 
     let mut critic = Mlp::new(obs_dim + priv_dim, cfg.hidden, 1, cfg.seed ^ 0xC217);
-    let mut opt_actor = ModuleAdam::new(cfg.lr);
-    let mut opt_critic = ModuleAdam::new(cfg.lr);
+    let mut update = PpoUpdate::new(&actor, &critic, &cfg);
     let mut rng = XorShift::new(cfg.seed);
     let mut history = Vec::with_capacity(iterations);
 
     for it in 0..iterations {
         let episodes = collect(&mut envs, &actor, &cfg, &mut rng);
-        let iter = process_iteration(
-            episodes,
-            &mut actor,
-            &mut critic,
-            &mut opt_actor,
-            &mut opt_critic,
-            &cfg,
-            &mut rng,
-        );
+        let iter = process_iteration(episodes, &mut actor, &mut critic, &mut update, &cfg, &mut rng);
         progress(it, &iter, &actor);
         history.push(iter);
     }
@@ -899,7 +905,7 @@ pub fn load_actor(path: &str) -> Option<Actor> {
         .collect();
     Some(Actor {
         net: Mlp::from_flat(i, h, o, &flat)?,
-        log_std: Parameter::new(Tensor::zeros(Shape::from_slice(&[act_dim]))),
+        log_std: vec![0.0; act_dim],
         act_clamp: clamp,
         obs_dim,
         act_dim,
@@ -958,9 +964,291 @@ mod tests {
             .map(|h| h.mean_return)
             .sum::<f64>()
             / 10.0;
+        eprintln!("reach: first {first:.3} -> last-10 mean {last:.3}");
         assert!(
             last > first + 3.0,
             "PPO did not learn the reach: {first:.2} -> {last:.2}"
         );
+    }
+
+    /// `Actor::new` at the K1's shape is the network tang_train drew,
+    /// including the 0.01 output scale: a hash of the bits, printed from
+    /// 45e4509.
+    #[test]
+    fn a_k1_shaped_actor_inits_as_it_always_did() {
+        let f = Actor::new(48, 12, 64, 7).net.to_flat();
+        let h = f.iter().fold(0u64, |h, v| h.rotate_left(5) ^ v.to_bits());
+        assert_eq!(h, 0x80bb4b1333cf5646);
+    }
+
+    /// A tiny minibatch for the loss-graph tests: four real rows chosen so
+    /// every branch is live — a ratio inside the clip interval, one clipped
+    /// above with A > 0 (no gradient), one clipped below with A < 0 (no
+    /// gradient), one below with A > 0 (unclipped is the minimum, gradient
+    /// flows) — and returns far enough from the critic that two rows sit on
+    /// the Huber's linear arm. Six slots, so two are padding.
+    struct Fixture {
+        actor: Actor,
+        critic: Mlp,
+        samples: Vec<Sample>,
+        b: usize,
+        clip: f64,
+        ent: f64,
+        vdelta: f64,
+    }
+
+    /// `net` over `rows` (row-major), in f64 through the interpreter.
+    fn forward64(net: &Mlp, rows: &[f64]) -> Vec<f64> {
+        let n = rows.len() / net.dims.0;
+        let (g, outs) = crate::net::forward_graph(net.dims, n);
+        let mut inputs = vec![rows.to_vec()];
+        for (r, _) in Mlp::blocks(net.dims) {
+            inputs.push(net.params()[r].to_vec());
+        }
+        let refs: Vec<&[f64]> = inputs.iter().map(|v| v.as_slice()).collect();
+        let mut p = Program::interpreted(&g, &outs, &refs);
+        p.run();
+        p.read_f64(0)
+    }
+
+    fn logp_of(act: &[f64], mean: &[f64], log_std: &[f64]) -> f64 {
+        (0..act.len())
+            .map(|d| {
+                let z = (act[d] - mean[d]) / log_std[d].exp();
+                -0.5 * z * z - log_std[d] - 0.5 * (2.0 * std::f64::consts::PI).ln()
+            })
+            .sum()
+    }
+
+    fn fixture() -> Fixture {
+        let mut actor = Actor::new(2, 2, 3, 5);
+        actor.net.scale_output(50.0); // undo most of the 0.01, so μ is not ≈ 0
+        actor.log_std = vec![-0.3, 0.2];
+        let critic = Mlp::new(3, 3, 1, 9);
+        // (obs, priv, act, target ratio, adv, ret)
+        let rows: [([f64; 2], f64, [f64; 2], f64, f64, f64); 4] = [
+            ([0.3, -0.5], 0.7, [0.2, -0.1], 1.05, 0.8, 0.05),
+            ([-0.6, 0.1], -0.2, [-0.4, 0.3], 1.6, 1.1, 2.0),
+            ([0.9, 0.4], 0.1, [0.5, 0.6], 0.5, -0.7, -1.5),
+            ([-0.1, -0.9], 0.5, [0.0, -0.5], 0.5, 0.6, 0.1),
+        ];
+        let samples = rows
+            .iter()
+            .map(|&(obs, p, act, r, adv, ret)| {
+                let mean = forward64(&actor.net, &obs);
+                Sample {
+                    obs: obs.to_vec(),
+                    priv_obs: vec![p],
+                    act: act.to_vec(),
+                    logp: logp_of(&act, &mean, &actor.log_std) - r.ln(),
+                    reward: 0.0,
+                    adv,
+                    ret,
+                }
+            })
+            .collect();
+        Fixture { actor, critic, samples, b: 6, clip: 0.2, ent: 0.01, vdelta: 0.3 }
+    }
+
+    impl Fixture {
+        /// Every graph input, f64, with the parameters taken from `theta`
+        /// (actor flat ++ log_std ++ critic flat).
+        fn inputs(&self, theta: &[f64]) -> Vec<Vec<f64>> {
+            let rows: Vec<&Sample> = self.samples.iter().collect();
+            let mut v: Vec<Vec<f64>> = pack_rows(&rows, self.b, 2, 2, 3).into_iter().collect();
+            v.extend([vec![self.clip], vec![self.ent], vec![self.vdelta]]);
+            let na = self.actor.net.params().len();
+            for (r, _) in Mlp::blocks(self.actor.net.dims) {
+                v.push(theta[r].to_vec());
+            }
+            v.push(theta[na..na + 2].to_vec());
+            for (r, _) in Mlp::blocks(self.critic.dims) {
+                v.push(theta[na + 2 + r.start..na + 2 + r.end].to_vec());
+            }
+            v
+        }
+
+        fn theta(&self) -> Vec<f64> {
+            let mut t = self.actor.net.to_flat();
+            t.extend(&self.actor.log_std);
+            t.extend(self.critic.params());
+            t
+        }
+
+        fn graph(&self) -> (TensorGraph, Vec<TensorId>) {
+            loss_graph(self.b, self.actor.net.dims, self.critic.dims)
+        }
+    }
+
+    fn run_interp(g: &TensorGraph, outs: &[TensorId], inputs: &[Vec<f64>]) -> Program {
+        let refs: Vec<&[f64]> = inputs.iter().map(|v| v.as_slice()).collect();
+        let mut p = Program::interpreted(g, outs, &refs);
+        p.run();
+        p
+    }
+
+    /// The gradient `backward` derives, on every parameter including
+    /// `log_std`, against central differences of the same graph's loss in
+    /// f64 — and against the derivatives ipse wrote by hand, so the switch
+    /// from writing them to deriving them is checked to be a no-op.
+    #[test]
+    fn the_loss_gradient_is_the_one_ipse_derived() {
+        let fx = fixture();
+        let (g, outs) = fx.graph();
+        let theta = fx.theta();
+        let p = run_interp(&g, &outs, &fx.inputs(&theta));
+        let grad: Vec<f64> = (OUT_GRAD..OUT_GRAD + 13).flat_map(|i| p.read_f64(i)).collect();
+        assert_eq!(grad.len(), theta.len());
+
+        let eps = 1e-6;
+        for k in 0..theta.len() {
+            let f = |d: f64| {
+                let mut t = theta.clone();
+                t[k] += d;
+                run_interp(&g, &outs[OUT_LOSS..=OUT_LOSS], &fx.inputs(&t)).read_f64(0)[0]
+            };
+            let fd = (f(eps) - f(-eps)) / (2.0 * eps);
+            assert!((fd - grad[k]).abs() < 1e-6 * (1.0 + fd.abs()), "θ[{k}]: fd {fd:.9} vs ir {:.9}", grad[k]);
+        }
+
+        // ipse's hand-derived terms, from f64 forwards of the same nets.
+        let n = fx.samples.len() as f64;
+        let (mut ploss, mut vloss, mut k3) = (0.0, 0.0, 0.0);
+        let mut dlogstd = vec![-fx.ent; 2];
+        let mut db3 = [0.0; 2];
+        let mut dcb3 = 0.0;
+        let (mut active, mut clipped) = (0, 0);
+        for s in &fx.samples {
+            let mean = forward64(&fx.actor.net, &s.obs);
+            let std: Vec<f64> = fx.actor.log_std.iter().map(|l| l.exp()).collect();
+            let lr = logp_of(&s.act, &mean, &fx.actor.log_std) - s.logp;
+            let r = lr.exp();
+            k3 += (r - 1.0 - lr) / n;
+            let c = r.clamp(1.0 - fx.clip, 1.0 + fx.clip);
+            ploss += -(r * s.adv).min(c * s.adv) / n;
+            if r * s.adv <= c * s.adv + 1e-12 {
+                active += 1;
+                let coef = -s.adv * r / n;
+                for d in 0..2 {
+                    let z = (s.act[d] - mean[d]) / std[d];
+                    db3[d] += coef * z / std[d];
+                    dlogstd[d] += coef * (z * z - 1.0);
+                }
+            } else {
+                clipped += 1;
+            }
+            let mut xc = s.obs.clone();
+            xc.extend(&s.priv_obs);
+            let err = forward64(&fx.critic, &xc)[0] - s.ret;
+            vloss += err * err / n;
+            dcb3 += 2.0 * err.clamp(-fx.vdelta, fx.vdelta) / n;
+        }
+        assert_eq!((active, clipped), (2, 2), "the fixture lost a branch");
+        let close = |a: f64, b: f64, what: &str| assert!((a - b).abs() < 1e-10, "{what}: {a} vs {b}");
+        close(p.read_f64(OUT_PLOSS)[0], ploss, "surrogate");
+        close(p.read_f64(OUT_VLOSS)[0], vloss, "value mse");
+        close(p.read_f64(OUT_K3)[0], k3, "k3");
+        let ga_b3 = p.read_f64(OUT_GRAD + 5);
+        let g_ls = p.read_f64(OUT_GRAD + 6);
+        let gc_b3 = p.read_f64(OUT_GRAD + 12);
+        for d in 0..2 {
+            close(ga_b3[d], db3[d], "∂/∂μ through l3.b");
+            close(g_ls[d], dlogstd[d], "∂/∂log σ");
+        }
+        close(gc_b3[0], dcb3, "Huber value gradient through l3.b");
+    }
+
+    /// The compiled f32 program and the f64 interpreter run the same graph.
+    #[test]
+    fn the_native_loss_matches_the_interpreter() {
+        let fx = fixture();
+        let (g, outs) = fx.graph();
+        let inputs = fx.inputs(&fx.theta());
+        let want = run_interp(&g, &outs, &inputs);
+        let mut native = compile_zeroed(&g, &outs);
+        assert!(native.is_native(), "no C compiler: this test needs one");
+        for (k, v) in inputs.iter().enumerate() {
+            native.write_f64(k, v);
+        }
+        native.run();
+        for i in 0..outs.len() {
+            for (a, b) in native.read_f64(i).iter().zip(want.read_f64(i)) {
+                assert!((a - b).abs() < 2e-5 * (1.0 + b.abs()), "output {i}: native {a} vs interp {b}");
+            }
+        }
+    }
+
+    /// `PpoUpdate::step` moves both nets and `log_std`, and a ragged
+    /// minibatch (4 rows into a program of 6) reports the means of its real
+    /// rows only.
+    #[test]
+    fn an_update_step_moves_every_parameter() {
+        let fx = fixture();
+        let (mut actor, mut critic) = (fx.actor, fx.critic);
+        let cfg = PpoConfig { minibatch: fx.b, clip: fx.clip, entropy_coef: fx.ent, ..PpoConfig::default() };
+        let mut up = PpoUpdate::new(&actor, &critic, &cfg);
+        let rows: Vec<&Sample> = fx.samples.iter().collect();
+        let before = (actor.net.to_flat(), actor.log_std.clone(), critic.to_flat());
+        let (_, vloss, _) = up.step(&rows, &mut actor, &mut critic, &cfg, fx.vdelta);
+        let mean_err2: f64 = fx
+            .samples
+            .iter()
+            .map(|s| {
+                let mut xc = s.obs.clone();
+                xc.extend(&s.priv_obs);
+                (forward64(&Mlp::from_flat(3, 3, 1, &before.2).unwrap(), &xc)[0] - s.ret).powi(2)
+            })
+            .sum::<f64>()
+            / 4.0;
+        assert!((vloss - mean_err2).abs() < 1e-5 * (1.0 + mean_err2), "{vloss} vs {mean_err2}");
+        assert_ne!(actor.net.to_flat(), before.0);
+        assert!(actor.log_std.iter().zip(&before.1).all(|(a, b)| a != b));
+        assert_ne!(critic.to_flat(), before.2);
+    }
+}
+
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::env::StepOut;
+
+    /// A K1-shaped env with no physics: 48 observations, 12 actions, a
+    /// fixed linear drift, 200 control steps. For timing the loop, not for
+    /// learning anything.
+    pub(crate) struct Wide {
+        x: Vec<f64>,
+        t: usize,
+    }
+    impl Env for Wide {
+        fn obs_dim(&self) -> usize { 48 }
+        fn act_dim(&self) -> usize { 12 }
+        fn reset(&mut self, seed: u64) -> Vec<f64> {
+            let mut r = XorShift::new(seed);
+            self.x = (0..48).map(|_| 0.1 * r.normal()).collect();
+            self.t = 0;
+            self.x.clone()
+        }
+        fn step(&mut self, a: &[f64]) -> StepOut {
+            for (i, v) in self.x.iter_mut().enumerate() {
+                *v = 0.98 * *v + 0.05 * a[i % 12];
+            }
+            self.t += 1;
+            let reward = -self.x.iter().map(|v| v * v).sum::<f64>();
+            StepOut { obs: self.x.clone(), reward, done: self.t >= 200 }
+        }
+        fn truncated(&self) -> bool { self.t >= 200 }
+    }
+
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn time_ppo_iterations() {
+        let envs: Vec<Wide> = (0..4).map(|_| Wide { x: vec![], t: 0 }).collect();
+        let cfg = PpoConfig { episodes_per_iter: 12, ..PpoConfig::default() };
+        let t0 = std::time::Instant::now();
+        let mut marks = Vec::new();
+        let (_a, _c, h) = train(envs, cfg, 6, |_, _, _| marks.push(t0.elapsed().as_secs_f64()));
+        let per: Vec<f64> = marks.windows(2).map(|w| w[1] - w[0]).collect();
+        eprintln!("first iteration {:.3} s; later iterations {:?} s; grad steps {}", marks[0], per, h[1].grad_steps);
     }
 }
