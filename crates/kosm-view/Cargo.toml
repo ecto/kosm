@@ -19,7 +19,7 @@ name = "kosm-view"
 path = "src/main.rs"
 
 [dependencies]
-kosm-render = { path = "../kosm-render", version = "0.2", features = ["gpu"] }
+kosm-render = { version = "0.2", features = ["gpu"] }
 # The raster tier's contract with the baker: `kosm::material`'s library is the
 # one table both tiers read, and `kosm::light::probes` is the volume it reads.
 kosm = { path = "../kosm", version = "0.0.1" }
