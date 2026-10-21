@@ -18,6 +18,11 @@ pub struct Object<G> {
     /// and moves this, so a jointed assembly re-poses with no re-evaluation
     /// and no BLAS rebuild — only the top-level structure is rebuilt.
     pub transform: Transform,
+    /// Optional spatially varying material. When set, the integrator shades
+    /// each hit with `texture.shade(material, point, normal)` instead of the
+    /// flat [`Self::material`]. `None` (the default) is the historical
+    /// behaviour.
+    pub texture: Option<Arc<Texture>>,
 }
 
 impl<G> Object<G> {
@@ -27,7 +32,14 @@ impl<G> Object<G> {
             bvh,
             material,
             transform: Transform::identity(),
+            texture: None,
         }
+    }
+
+    /// The same object, shaded by `texture`.
+    pub fn with_texture(mut self, texture: Texture) -> Self {
+        self.texture = Some(Arc::new(texture));
+        self
     }
 
     /// A traceable object placed by an object→world transform.
@@ -36,6 +48,7 @@ impl<G> Object<G> {
             bvh,
             material,
             transform,
+            texture: None,
         }
     }
 }
@@ -243,7 +256,13 @@ impl<G: Geometry> Scene<G> {
                 point: found.hit.point,
                 normal: found.hit.normal.into_inner(),
                 tangent: found.hit.dpdu,
-                material: self.objects[found.payload].material,
+                material: {
+                    let o = &self.objects[found.payload];
+                    match &o.texture {
+                        Some(t) => t.shade(o.material, found.hit.point, found.hit.normal.into_inner()),
+                        None => o.material,
+                    }
+                },
             };
         }
 
