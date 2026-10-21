@@ -72,6 +72,7 @@ pub mod light;
 pub mod material;
 pub mod rng;
 pub mod scene;
+pub mod texture;
 #[cfg(test)]
 mod testing;
 
@@ -83,3 +84,4 @@ pub use light::*;
 pub use material::*;
 pub(crate) use rng::*;
 pub use scene::*;
+pub use texture::*;
